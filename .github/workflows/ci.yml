@@ -1,0 +1,169 @@
+name: Platform and Rust validation
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    name: ${{ matrix.os }} / ${{ matrix.events }} / C and Rust${{ matrix.stats && ' / stats' || '' }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {os: ubuntu-24.04, events: epoll}
+          - {os: ubuntu-24.04, events: epoll, stats: 'ON'}
+          - {os: ubuntu-24.04, events: poll}
+          - {os: macos-15, events: kqueue}
+          - {os: macos-15, events: poll}
+          - {os: macos-15-intel, events: kqueue}
+          - {os: macos-15-intel, events: poll}
+          - {os: macos-15, events: kqueue, stats: 'ON'}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install tools
+        shell: bash
+        run: |
+          if [[ "$RUNNER_OS" == macOS ]]; then
+            brew install llvm ninja openssl@3
+            echo "CC=$(brew --prefix llvm)/bin/clang" >> "$GITHUB_ENV"
+            echo "LIBCLANG_PATH=$(brew --prefix llvm)/lib" >> "$GITHUB_ENV"
+            echo 'AR=/usr/bin/ar' >> "$GITHUB_ENV"
+            echo 'RANLIB=/usr/bin/ranlib' >> "$GITHUB_ENV"
+          else
+            sudo apt-get update
+            sudo apt-get install -y clang-19 libclang-19-dev ninja-build libssl-dev
+            # Ubuntu 24.04 allows userns creation but denies capabilities in it.
+            # Enable the isolated network fixtures on this disposable runner.
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+            echo 'CC=clang-19' >> "$GITHUB_ENV"
+            echo 'LIBCLANG_PATH=/usr/lib/llvm-19/lib' >> "$GITHUB_ENV"
+            echo 'AR=/usr/bin/ar' >> "$GITHUB_ENV"
+            echo 'RANLIB=/usr/bin/ranlib' >> "$GITHUB_ENV"
+          fi
+      - uses: dtolnay/rust-toolchain@1.93.1
+        with:
+          components: rustfmt, clippy
+      - name: Rust formatting
+        run: cargo fmt --manifest-path bindings/rust/Cargo.toml --all --check
+      - name: Configure
+        run: |
+          cmake -S . -B build/ci -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER="$CC" -DCMAKE_AR="$AR" -DCMAKE_RANLIB="$RANLIB" \
+            -DDUCT_EVENTS_MODEL=${{ matrix.events }} \
+            -DDUCT_ENABLE_RUNTIME_STATS=${{ matrix.stats || 'OFF' }} \
+            -DDUCT_WITH_NOISE=ON -DDUCT_WITH_OPENSSL=ON \
+            -DDUCT_BUILD_TESTS=ON -DDUCT_BUILD_RUST_TESTS=ON -DDUCT_BUILD_EXAMPLES=OFF
+      - name: Build
+        run: cmake --build build/ci --parallel 4
+      - name: Native, Rust, and ABI tests
+        run: ctest --test-dir build/ci --output-on-failure --parallel 1
+      - name: Check Apple imports and deployment target
+        if: runner.os == 'macOS'
+        run: |
+          if /usr/bin/nm -u build/ci/libductio.a | grep '___ulock_'; then
+            echo 'the private __ulock calls must not be imported' >&2
+            exit 1
+          fi
+          /usr/bin/otool -l build/ci/test/ductio_core_futex_test | grep -A4 LC_BUILD_VERSION | grep 'minos 14.4'
+      - name: Save test evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tests-${{ matrix.os }}-${{ matrix.events }}
+          path: build/ci/Testing/Temporary/
+
+  windows:
+    name: Windows / ${{ matrix.events }} / native
+    runs-on: windows-2025
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        events: [poll, iocp, wsaevent]
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: CLANG64
+          update: true
+          install: >-
+            mingw-w64-clang-x86_64-clang
+            mingw-w64-clang-x86_64-cmake
+            mingw-w64-clang-x86_64-ninja
+            mingw-w64-clang-x86_64-openssl
+      - name: Configure and build
+        run: |
+          cmake -S . -B build/ci -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER=clang -DDUCT_EVENTS_MODEL=${{ matrix.events }} \
+            -DDUCT_WITH_NOISE=ON -DDUCT_WITH_OPENSSL=ON \
+            -DDUCT_BUILD_TESTS=ON -DDUCT_BUILD_RUST_TESTS=OFF -DDUCT_BUILD_EXAMPLES=OFF
+          cmake --build build/ci --parallel 4
+      - run: ctest --test-dir build/ci --output-on-failure --parallel 1
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: tests-windows-${{ matrix.events }}
+          path: build/ci/Testing/Temporary/
+
+  apple-tsan:
+    runs-on: macos-15
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        events: [kqueue, poll]
+    steps:
+      - uses: actions/checkout@v4
+      - run: brew install llvm ninja
+      - name: Configure and build ThreadSanitizer
+        run: |
+          cmake -S . -B build/tsan -G Ninja -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_C_COMPILER="$(brew --prefix llvm)/bin/clang" \
+            -DCMAKE_AR=/usr/bin/ar -DCMAKE_RANLIB=/usr/bin/ranlib \
+            -DCMAKE_C_FLAGS='-fsanitize=thread -fno-omit-frame-pointer' \
+            -DCMAKE_EXE_LINKER_FLAGS=-fsanitize=thread \
+            -DDUCT_EVENTS_MODEL=${{ matrix.events }} \
+            -DDUCT_BUILD_TESTS=ON -DDUCT_BUILD_RUST_TESTS=OFF -DDUCT_BUILD_EXAMPLES=OFF
+          cmake --build build/tsan --parallel 4
+      - name: Race-sensitive contracts
+        env:
+          TSAN_OPTIONS: halt_on_error=1
+        run: ctest --test-dir build/tsan --output-on-failure -R '^(core_futex|events_contract|listener_add|stop_signals|retry_drain_quota|retry_frame_ordering)$'
+
+  ios:
+    name: iOS / ${{ matrix.events }}
+    runs-on: macos-15
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        events: [kqueue, poll]
+    steps:
+      - uses: actions/checkout@v4
+      - run: brew install llvm ninja
+      - name: Build iOS device and simulator archives
+        run: |
+          for sdk in iphoneos iphonesimulator; do
+            cmake -S . -B build/$sdk -G Ninja -DCMAKE_SYSTEM_NAME=iOS \
+              -DCMAKE_OSX_SYSROOT=$sdk -DCMAKE_OSX_ARCHITECTURES=arm64 \
+              -DCMAKE_OSX_DEPLOYMENT_TARGET=17.4 -DCMAKE_BUILD_TYPE=Release \
+              -DDUCT_EVENTS_MODEL=${{ matrix.events }} \
+              -DCMAKE_C_COMPILER="$(brew --prefix llvm)/bin/clang" \
+              -DCMAKE_AR=/usr/bin/ar -DCMAKE_RANLIB=/usr/bin/ranlib \
+              -DDUCT_BUILD_TESTS=OFF -DDUCT_BUILD_EXAMPLES=OFF
+            cmake --build build/$sdk --parallel 4
+          done
+      - name: Exercise the backend in an iOS simulator
+        run: python3 test/apple_simulator_smoke.py build/iphonesimulator

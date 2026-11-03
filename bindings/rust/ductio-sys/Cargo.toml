@@ -1,0 +1,15 @@
+[package]
+name = "ductio-sys"
+version = "0.1.1"
+edition = "2021"
+links = "ductio"
+build = "build.rs"
+license = "Apache-2.0"
+description = "Raw FFI for the DuctIo v-0.1.1 public C API"
+
+[features]
+tls-openssl = []
+
+[build-dependencies]
+bindgen = "0.72"
+cc = "1"

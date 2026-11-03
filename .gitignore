@@ -1,0 +1,32 @@
+# Build artifacts and caches
+build*/
+.cache/
+.clangd
+compile_commands.json
+CMakeUserPresets.json
+*.o
+*.obj
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+
+# Rust
+bindings/rust/target/
+bindings/rust/Cargo.lock
+
+# IDE and editor settings
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+
+# Project tasks and internal docs
+tasks/
+docs/
+
+# Local scripts
+*.sh

@@ -1,0 +1,15 @@
+[package]
+name = "ductio"
+version = "0.1.1"
+edition = "2021"
+license = "Apache-2.0"
+description = "Safe Linux and macOS SDK for DuctIo engine, TCP/UDP sessions, and Noise wires"
+
+[features]
+tls-openssl = ["dep:openssl", "dep:foreign-types", "ductio-sys/tls-openssl"]
+
+[dependencies]
+ductio-sys = { path = "../ductio-sys" }
+zeroize = "1.8"
+openssl = { version = "0.10", optional = true }
+foreign-types = { version = "0.3", optional = true }

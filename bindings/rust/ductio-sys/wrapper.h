@@ -1,0 +1,56 @@
+#include "duct.h"
+#include "duct_noise.h"
+#include "duct_seal_engine.h"
+#include "duct_tls.h"
+#include "duct_tls_openssl.h"
+#include "duct_pmtu.h"
+#include "duct_crypto.h"
+#include "duct_cookie.h"
+#include "duct_codel.h"
+#include "duct_liveness.h"
+#include "duct_redial.h"
+#include "duct_ticks.h"
+
+void ductio_rs_wire_destroy(duct_wire_t *wire);
+duct_result_t ductio_rs_inter_batch(duct_engine_t *engine, duct_handle_t token,
+                                    duct_conn_id_t conn_id, const duct_view_u8 *packets,
+                                    unsigned count);
+size_t ductio_rs_sizeof_engine_cfg(void);
+size_t ductio_rs_alignof_engine_cfg(void);
+size_t ductio_rs_sizeof_proto_cfg(void);
+size_t ductio_rs_alignof_proto_cfg(void);
+size_t ductio_rs_sizeof_response(void);
+size_t ductio_rs_alignof_response(void);
+size_t ductio_rs_sizeof_noise_cfg(void);
+size_t ductio_rs_sizeof_sealed_cfg(void);
+size_t ductio_rs_offset_proto_on_frame(void);
+size_t ductio_rs_offset_response_payload(void);
+size_t ductio_rs_offset_response_control(void);
+size_t ductio_rs_sizeof_result(void);
+size_t ductio_rs_sizeof_xport(void);
+size_t ductio_rs_sizeof_close_reason(void);
+size_t ductio_rs_sizeof_send_flags(void);
+size_t ductio_rs_sizeof_seal_role(void);
+size_t ductio_rs_sizeof_seal_framing(void);
+size_t ductio_rs_sizeof_keypair(void);
+size_t ductio_rs_sizeof_view(void);
+size_t ductio_rs_sizeof_frame(void);
+size_t ductio_rs_sizeof_inter_batch(void);
+size_t ductio_rs_sizeof_wire(void);
+size_t ductio_rs_offset_wire_header_size(void);
+size_t ductio_rs_offset_wire_on_parse(void);
+size_t ductio_rs_offset_wire_create_parser(void);
+size_t ductio_rs_sizeof_host_cfg(void);
+size_t ductio_rs_sizeof_seal_vtbl(void);
+size_t ductio_rs_alignof_seal_vtbl(void);
+int ductio_rs_value_rc_ok(void);
+int ductio_rs_value_rc_invalid_arg(void);
+int ductio_rs_value_rc_drop(void);
+unsigned ductio_rs_value_x_tcp(void);
+unsigned ductio_rs_value_fl_send_owned(void);
+unsigned ductio_rs_value_close_target_session(void);
+unsigned ductio_rs_value_close_internal_error(void);
+unsigned ductio_rs_value_seal_role_initiator(void);
+unsigned ductio_rs_value_seal_role_responder(void);
+unsigned ductio_rs_value_seal_framing_stream(void);
+unsigned ductio_rs_value_seal_framing_datagram(void);

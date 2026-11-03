@@ -1,0 +1,254 @@
+{
+  "version": 3,
+  "vendor": {
+    "DuctIo": {
+      "SPDX-License-Identifier": "Apache-2.0",
+      "Copyright": "Copyright (c) 2026 Duct Software, author: Constantin Papizh"
+    }
+  },
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 21,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "defaults",
+      "hidden": true,
+      "binaryDir": "${sourceDir}/build/${hostSystemName}-${presetName}",
+      "cacheVariables": {
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
+      }
+    },
+    {
+      "name": "dev",
+      "displayName": "Dev (Debug)",
+      "generator": "Ninja",
+      "inherits": ["defaults"],
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "DUCT_ENABLE_LTO": "OFF"
+      }
+    },
+    {
+      "name": "ci",
+      "displayName": "CI (Release + LTO)",
+      "generator": "Ninja",
+      "inherits": ["defaults"],
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "DUCT_ENABLE_LTO": "ON"
+      }
+    },
+    {
+      "name": "reldeb",
+      "displayName": "RelWithDebInfo + LTO",
+      "generator": "Ninja",
+      "inherits": ["defaults"],
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "DUCT_ENABLE_LTO": "ON"
+      }
+    },
+    {
+      "name": "stats",
+      "displayName": "Dev + runtime stats",
+      "generator": "Ninja",
+      "inherits": ["dev"],
+      "cacheVariables": {
+        "DUCT_ENABLE_RUNTIME_STATS": "ON"
+      }
+    },
+    {
+      "name": "dev-openssl",
+      "displayName": "Dev + OpenSSL TLS engine adapter",
+      "generator": "Ninja",
+      "inherits": ["dev"],
+      "cacheVariables": {
+        "DUCT_WITH_OPENSSL": "ON"
+      }
+    },
+    {
+      "name": "dev-noise",
+      "displayName": "Dev + Noise crypto core",
+      "generator": "Ninja",
+      "inherits": ["dev"],
+      "cacheVariables": {
+        "DUCT_WITH_NOISE": "ON"
+      }
+    },
+    {
+      "name": "dev-noise-nomask",
+      "displayName": "Dev + Noise crypto core, raw handshake keys",
+      "generator": "Ninja",
+      "inherits": ["dev-noise"],
+      "cacheVariables": {
+        "DUCT_HANDSHAKE_MASK": "0"
+      }
+    },
+    {
+      "name": "dev-poll",
+      "displayName": "Dev (poll, WSAPoll on Windows) — on Windows run from an MSYS2 mingw64 shell",
+      "inherits": ["dev"],
+      "cacheVariables": {
+        "DUCT_EVENTS_MODEL": "poll"
+      }
+    },
+    {
+      "name": "dev-iocp",
+      "displayName": "Dev (Windows, IOCP) — run from an MSYS2 mingw64 shell",
+      "inherits": ["dev"],
+      "cacheVariables": {
+        "DUCT_EVENTS_MODEL": "iocp"
+      }
+    },
+    {
+      "name": "dev-win-wsaevent",
+      "displayName": "Dev (Windows, WSAEventSelect, <=63 conns/thread) — run from an MSYS2 mingw64 shell",
+      "inherits": ["dev"],
+      "cacheVariables": {
+        "DUCT_EVENTS_MODEL": "wsaevent"
+      }
+    },
+    {
+      "name": "dev-poll-openssl",
+      "displayName": "Dev (poll, WSAPoll on Windows) + OpenSSL — on Windows run from an MSYS2 clang64 shell",
+      "inherits": ["dev-poll"],
+      "cacheVariables": {
+        "DUCT_WITH_OPENSSL": "ON"
+      }
+    },
+    {
+      "name": "dev-iocp-openssl",
+      "displayName": "Dev (Windows, IOCP) + OpenSSL — run from an MSYS2 clang64 shell",
+      "inherits": ["dev-iocp"],
+      "cacheVariables": {
+        "DUCT_WITH_OPENSSL": "ON"
+      }
+    },
+    {
+      "name": "dev-poll-noise",
+      "displayName": "Dev (poll, WSAPoll on Windows) + Noise — on Windows run from an MSYS2 clang64 shell",
+      "inherits": ["dev-poll"],
+      "cacheVariables": {
+        "DUCT_WITH_NOISE": "ON"
+      }
+    },
+    {
+      "name": "dev-iocp-noise",
+      "displayName": "Dev (Windows, IOCP) + Noise — run from an MSYS2 clang64 shell",
+      "inherits": ["dev-iocp"],
+      "cacheVariables": {
+        "DUCT_WITH_NOISE": "ON"
+      }
+    },
+    {
+      "name": "dev-win-wsaevent-noise",
+      "displayName": "Dev (Windows, WSAEventSelect, <=63 conns/thread) + Noise — run from an MSYS2 clang64 shell",
+      "inherits": ["dev-win-wsaevent"],
+      "cacheVariables": {
+        "DUCT_WITH_NOISE": "ON"
+      }
+    },
+    {
+      "name": "ci-poll",
+      "displayName": "CI (poll, WSAPoll on Windows, Release + LTO) — on Windows run from an MSYS2 mingw64 shell",
+      "inherits": ["ci"],
+      "cacheVariables": {
+        "DUCT_EVENTS_MODEL": "poll"
+      }
+    },
+    {
+      "name": "ci-iocp",
+      "displayName": "CI (Windows, IOCP, Release + LTO) — run from an MSYS2 mingw64 shell",
+      "inherits": ["ci"],
+      "cacheVariables": {
+        "DUCT_EVENTS_MODEL": "iocp"
+      }
+    },
+    {
+      "name": "ci-win-wsaevent",
+      "displayName": "CI (Windows, WSAEventSelect, <=63 conns/thread, Release + LTO) — run from an MSYS2 mingw64 shell",
+      "inherits": ["ci"],
+      "cacheVariables": {
+        "DUCT_EVENTS_MODEL": "wsaevent"
+      }
+    }
+  ],
+  "buildPresets": [
+    { "name": "dev",    "displayName": "Dev",    "configurePreset": "dev" },
+    { "name": "ci",     "displayName": "CI",     "configurePreset": "ci" },
+    { "name": "reldeb", "displayName": "RelDeb", "configurePreset": "reldeb" },
+    { "name": "stats",  "displayName": "Stats",  "configurePreset": "stats" },
+    { "name": "dev-openssl", "displayName": "Dev OpenSSL", "configurePreset": "dev-openssl" },
+    { "name": "dev-noise",   "displayName": "Dev Noise",   "configurePreset": "dev-noise" },
+    { "name": "dev-noise-nomask", "displayName": "Dev Noise No Mask", "configurePreset": "dev-noise-nomask" },
+    { "name": "dev-poll", "displayName": "Dev Poll", "configurePreset": "dev-poll" },
+    { "name": "dev-iocp", "displayName": "Dev IOCP", "configurePreset": "dev-iocp" },
+    { "name": "dev-win-wsaevent", "displayName": "Dev WSAEventSelect", "configurePreset": "dev-win-wsaevent" },
+    { "name": "dev-poll-openssl", "displayName": "Dev Poll OpenSSL", "configurePreset": "dev-poll-openssl" },
+    { "name": "dev-iocp-openssl", "displayName": "Dev IOCP OpenSSL", "configurePreset": "dev-iocp-openssl" },
+    { "name": "dev-poll-noise",   "displayName": "Dev Poll Noise",   "configurePreset": "dev-poll-noise" },
+    { "name": "dev-iocp-noise",   "displayName": "Dev IOCP Noise",   "configurePreset": "dev-iocp-noise" },
+    { "name": "dev-win-wsaevent-noise", "displayName": "Dev WSAEventSelect Noise", "configurePreset": "dev-win-wsaevent-noise" },
+    { "name": "ci-poll", "displayName": "CI Poll", "configurePreset": "ci-poll" },
+    { "name": "ci-iocp", "displayName": "CI IOCP", "configurePreset": "ci-iocp" },
+    { "name": "ci-win-wsaevent", "displayName": "CI WSAEventSelect", "configurePreset": "ci-win-wsaevent" }
+  ],
+  "testPresets": [
+    {
+      "name": "dev",
+      "displayName": "Dev",
+      "configurePreset": "dev",
+      "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "dev-openssl",
+      "displayName": "Dev OpenSSL",
+      "configurePreset": "dev-openssl",
+      "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "dev-noise",
+      "displayName": "Dev Noise",
+      "configurePreset": "dev-noise",
+      "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "dev-noise-nomask",
+      "displayName": "Dev Noise No Mask",
+      "configurePreset": "dev-noise-nomask",
+      "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "dev-poll-openssl",
+      "displayName": "Dev Poll OpenSSL",
+      "configurePreset": "dev-poll-openssl",
+      "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "dev-iocp-openssl",
+      "displayName": "Dev IOCP OpenSSL",
+      "configurePreset": "dev-iocp-openssl",
+      "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "dev-poll-noise",
+      "displayName": "Dev Poll Noise",
+      "configurePreset": "dev-poll-noise",
+      "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "dev-iocp-noise",
+      "displayName": "Dev IOCP Noise",
+      "configurePreset": "dev-iocp-noise",
+      "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "dev-win-wsaevent-noise",
+      "displayName": "Dev WSAEventSelect Noise",
+      "configurePreset": "dev-win-wsaevent-noise",
+      "output": { "outputOnFailure": true }
+    }
+  ]
+}

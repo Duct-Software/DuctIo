@@ -1,0 +1,6 @@
+cmake_minimum_required(VERSION 3.21)
+project(DuctIoInstalledConsumer LANGUAGES C)
+find_package(DuctIo CONFIG REQUIRED)
+add_executable(ductio_installed_smoke main.c)
+target_link_libraries(ductio_installed_smoke PRIVATE DuctIo::ductio)
+target_compile_features(ductio_installed_smoke PRIVATE c_std_23)

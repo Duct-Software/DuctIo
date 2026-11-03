@@ -1,0 +1,3 @@
+[workspace]
+members = ["ductio-sys", "ductio"]
+resolver = "2"
