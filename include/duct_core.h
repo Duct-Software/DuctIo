@@ -70,7 +70,8 @@
 /** @brief Write one timestamped line to @p out.
  *  The line is the local time to the millisecond, @c YYYY-MM-DD HH:MM:SS.mmm, a blank, the text
  *  @p fmt formats and a newline. It goes whole to the installed @ref duct_logger_t, which takes
- *  the place of @p out, and otherwise to one @c fwrite on @p out, so that the lines of two threads
+ *  the line with @p out beside it, and otherwise to one @c fwrite on @p out, so that the lines
+ *  of two threads
  *  on one stream stay whole. @p fmt carries no newline. A line is cut to 1023 bytes, newline
  *  included, and a cut message ends in @c "...". The stamp is the calling thread's wall clock,
  *  which follows a step of the system clock within a second.
@@ -79,13 +80,14 @@ duct_nonnull(1, 2) void duct_log(FILE *out, const char *fmt, ...) duct_printf_li
 
 /** @brief Process-wide receiver of the lines @c duct_log writes.
  *  While one is installed, @ref duct_log hands it every finished line in place of writing
- *  to the stream it was given. @c write runs on the thread that logs, on many threads at
- *  once, and takes the line as @c len bytes, stamp and newline included, with no terminator.
- *  It does not call @c duct_log.
+ *  to the stream it was given, that stream as @c out beside the line. @c write runs on the
+ *  thread that logs, on many threads at once, and takes the line as @c len bytes, stamp
+ *  and newline included, with no terminator; a logger that wants the line alone ignores
+ *  @c out. It does not call @c duct_log.
  */
 typedef struct {
-    void (*write)(void *ctx, const char *line, size_t len); /**< Function taking one finished line. */
-    void  *ctx;                                              /**< First argument of @c write. */
+    void (*write)(void *ctx, FILE *out, const char *line, size_t len); /**< Function taking one finished line and the stream the call named. */
+    void  *ctx;                                                        /**< First argument of @c write. */
 } duct_logger_t;
 
 /** @brief Install @p logger as the process's logger.
@@ -395,6 +397,19 @@ static inline size_t duct_page_size(void)
             }                                           \
         } while (0)
 
+    /** @brief Abortive close of @p fd: the peer reads a reset, not a FIN.
+     *  A zero linger makes closesocket send the reset itself. */
+    #define duct_sock_rst_close(fd)                     \
+        do {                                            \
+            if (fd != duct_sock_bad) {                  \
+                duct_sock_t _fd = (fd);                 \
+                struct linger _l = {1, 0};              \
+                duct_discard setsockopt(_fd, SOL_SOCKET, SO_LINGER, \
+                                        (const char *)&_l, sizeof _l); \
+                duct_discard closesocket(_fd);          \
+            }                                           \
+        } while (0)
+
     typedef SOCKET duct_sock_t;
     constexpr auto duct_sock_bad = INVALID_SOCKET;
     #define duct_sock_err WSAGetLastError()
@@ -412,7 +427,18 @@ static inline size_t duct_page_size(void)
                 duct_discard close(_fd);                \
             }                                           \
         } while (0)
-    
+
+    /** @brief Abortive close of @p fd: the peer reads a reset, not a FIN. */
+    #define duct_sock_rst_close(fd)                     \
+        do {                                            \
+            if (fd != duct_sock_bad) {                  \
+                duct_sock_t _fd = (fd);                 \
+                struct linger _l = {1, 0};              \
+                duct_discard setsockopt(_fd, SOL_SOCKET, SO_LINGER, &_l, sizeof _l); \
+                duct_discard close(_fd);                \
+            }                                           \
+        } while (0)
+
     /** @brief Platform socket handle type, invalid-handle sentinel, and close() alias. */
     typedef int duct_sock_t;
     constexpr auto duct_sock_bad = -1;
@@ -591,7 +617,7 @@ static constexpr uint64_t duct_ptr_bound_bytes =
                 /* _al is a power of two: the round-up is a mask. */                        \
                 _p = _al == sizeof(duct_alloc_hdr_t) ? _raw + sizeof(duct_alloc_hdr_t)      \
                    : (unsigned char *)(((size_t)_raw + sizeof(duct_alloc_hdr_t) + _al - 1u) & -_al); \
-                auto _h = (duct_alloc_hdr_t *)(_p - sizeof(duct_alloc_hdr_t));              \
+                auto _h = duct_block_hdr(_p);                                               \
                 _h->back = (size_t)(_p - _raw) / sizeof(duct_alloc_hdr_t);                  \
                 _h->size = _bytes;                                                          \
             }                                                                               \
@@ -643,7 +669,7 @@ static constexpr uint64_t duct_ptr_bound_bytes =
     ({                                                                                      \
         auto _bl = (p);                                                                     \
         static_assert(duct_is_ptr(_bl), "duct_byte_len takes a duct_ptr_t");                \
-        (size_t)((duct_alloc_hdr_t *)((uintptr_t)_bl - sizeof(duct_alloc_hdr_t)))->size;    \
+        (size_t)duct_block_hdr(_bl)->size;                                                  \
     })
 
 /** @brief Element count of the array @p p.
@@ -653,6 +679,20 @@ static constexpr uint64_t duct_ptr_bound_bytes =
     ({                                                                                      \
         auto _lp = (p);                                                                     \
         duct_byte_len(_lp) / sizeof((*_lp)[0]);                                             \
+    })
+
+#define DUCT_CAST(to_type, member, e) \
+    ({ \
+        static_assert(_Generic((e), \
+            typeof(((to_type *)0)->member) *: 1, \
+            const typeof(((to_type *)0)->member) *: 1, \
+            default: 0), \
+                      "DUCT_CAST: the value is not the type this container embeds"); \
+        static_assert(offsetof(to_type, member) == 0u, \
+                      #to_type " embeds " #member " first"); \
+        _Generic((e), \
+                 const typeof(((to_type *)0)->member) *: (const to_type *)(e), \
+                 default: (to_type *)(e)); \
     })
 
 #define DUCT_VIEW_DECLARE(T, name) typedef struct { T *data; size_t size; } name;
@@ -699,6 +739,12 @@ static constexpr uint64_t duct_ptr_bound_bytes =
 #define duct_view_byte_len(v) ({ auto _vb = (v); _vb.size * sizeof(*_vb.data); })
 #define duct_view_at(v, i) ({ auto _vat = (v); assert((i) < _vat.size); _vat.data[(i)]; })
 
+#define duct_block_hdr(p)                                                                   \
+    ({                                                                                      \
+        auto _ah = (p);                                                                     \
+        (duct_alloc_hdr_t *)((uintptr_t)_ah - sizeof(duct_alloc_hdr_t));                    \
+    })
+
 /** @brief Add a holder to the block @p p points at, and answer @p p.
  *  Written where @p p passes to the thread that becomes the holder, ahead of the hand-over, whose
  *  post publishes the count. Every holder ends with its own @ref duct_del, in any order on any
@@ -707,7 +753,7 @@ static constexpr uint64_t duct_ptr_bound_bytes =
 #define duct_share(p)                                                                       \
     ({                                                                                      \
         auto _sp = (p);                                                                     \
-        auto _sh = &((duct_alloc_hdr_t *)((uintptr_t)_sp - sizeof(duct_alloc_hdr_t)))->holders; \
+        auto _sh = &duct_block_hdr(_sp)->holders;                                           \
         if (duct_atomic_load(_sh, relaxed) == 0u)                                           \
             duct_atomic_store(_sh, (uint8_t)2u, relaxed);                                   \
         else {                                                                              \
@@ -730,7 +776,7 @@ static constexpr uint64_t duct_ptr_bound_bytes =
     do {                                                                                    \
         auto _d = (unsigned char *)(uintptr_t)(ptr);                                        \
         if (_d) {                                                                           \
-            auto _h = (duct_alloc_hdr_t *)(_d - sizeof(duct_alloc_hdr_t));                  \
+            auto _h = duct_block_hdr(_d);                                                   \
             if (duct_atomic_load(&_h->holders, relaxed) == 0u                               \
                 || duct_atomic_fetch(sub, &_h->holders, (uint8_t)1u, acq_rel) == 1u) {      \
                 if (!_h->secret || duct_secret_release(_d))                                 \

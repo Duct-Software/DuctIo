@@ -17,6 +17,7 @@
 
 #include <openssl/bio.h>
 #include <openssl/ssl.h>
+#include <openssl/tls1.h>
 
 #include <string.h>
 
@@ -40,6 +41,7 @@ static constexpr size_t s_record_overhead = 17u;
 static constexpr size_t s_engine_hs_budget = 16384u;
 
 typedef struct {
+    struct duct_seal_engine base;
     SSL *ssl;
     /** @brief Per-conn scratch, s_record_ct_max bytes.
      *  Shared by seal()'s per-record cleartext staging and by wbio-draining
@@ -49,7 +51,7 @@ typedef struct {
     duct_ptr_t(uint8_t) scratch;
 } openssl_engine_t;
 
-static duct_seal_engine_t *s_create(void *cfg, duct_seal_role_t role)
+static duct_seal_engine_t *s_create(const duct_seal_engine_vtbl_t *self, void *cfg, duct_seal_role_t role)
 {
     /* A role naming neither side is refused here as well as at wire
      * construction: duct_tls_openssl_vtbl and _vtbl_make are public, so this
@@ -87,7 +89,8 @@ static duct_seal_engine_t *s_create(void *cfg, duct_seal_role_t role)
     e->scratch = duct_new(uint8_t, s_record_ct_max);
     if (!e->scratch)
         goto fail;
-    return (duct_seal_engine_t *)e;
+    e->base.vtbl = self;
+    return &e->base;
 
 fail:
     if (rbio) BIO_free(rbio);
@@ -99,7 +102,7 @@ fail:
 
 static void s_destroy(duct_seal_engine_t *eng)
 {
-    auto e = (openssl_engine_t *)eng;
+    auto e = DUCT_CAST(openssl_engine_t, base, eng);
     SSL_free(e->ssl);
     duct_del(e->scratch);
     duct_del(e);
@@ -148,16 +151,17 @@ static bool s_drain_wbio(openssl_engine_t *e, duct_unseal_ctx_t *ctx)
 static duct_result_t
 s_unseal(duct_seal_engine_t *eng, duct_view_u8 record, duct_unseal_ctx_t *ctx)
 {
-    auto e = (openssl_engine_t *)eng;
+    auto e = DUCT_CAST(openssl_engine_t, base, eng);
     auto rbio = SSL_get_rbio(e->ssl);
     int wrote = BIO_write(rbio, record.data, (int)record.size);
     duct_do_if(wrote != (int)record.size, return rc_invalid_arg);
 
     if (!SSL_is_init_finished(e->ssl)) {
         int rc = SSL_do_handshake(e->ssl);
-        if (rc != 1)
-            duct_do_if(SSL_get_error(e->ssl, rc) != SSL_ERROR_WANT_READ,
-                      return rc_invalid_arg);
+        if (rc != 1) {
+            int err = SSL_get_error(e->ssl, rc);
+            duct_do_if(err != SSL_ERROR_WANT_READ, return rc_invalid_arg);
+        }
     } else {
         size_t cap = 0u;
         auto ct = (uint8_t *)ctx->reserve(ctx, &cap);
@@ -184,7 +188,7 @@ s_unseal(duct_seal_engine_t *eng, duct_view_u8 record, duct_unseal_ctx_t *ctx)
  */
 static size_t s_seal_size(duct_seal_engine_t *eng, size_t ct_len)
 {
-    auto e = (openssl_engine_t *)eng;
+    auto e = DUCT_CAST(openssl_engine_t, base, eng);
     if (!SSL_is_init_finished(e->ssl))
         return 0u;
     size_t n = ct_len / s_record_ct_max;
@@ -208,7 +212,7 @@ static size_t s_seal_size(duct_seal_engine_t *eng, size_t ct_len)
  */
 static void s_seal(duct_seal_engine_t *eng, const duct_view_u8 *spans, size_t n_spans, void *dst)
 {
-    auto e = (openssl_engine_t *)eng;
+    auto e = DUCT_CAST(openssl_engine_t, base, eng);
     auto out = (uint8_t *)dst;
     size_t total = 0u;
     for (size_t i = 0u; i < n_spans; ++i)
@@ -246,7 +250,7 @@ static void s_seal(duct_seal_engine_t *eng, const duct_view_u8 *spans, size_t n_
 
 static void s_close_notify(duct_seal_engine_t *eng, duct_unseal_ctx_t *ctx)
 {
-    auto e = (openssl_engine_t *)eng;
+    auto e = DUCT_CAST(openssl_engine_t, base, eng);
     SSL_shutdown(e->ssl); /* first call sends our close_notify and returns
                              at once, with the peer's reply still outstanding */
     duct_discard s_drain_wbio(e, ctx);
@@ -277,4 +281,45 @@ void duct_tls_openssl_vtbl_make(duct_seal_engine_vtbl_t *out, size_t hs_budget)
     duct_do_if(!out, return);
     *out = s_vtbl;
     out->engine_hs_budget = hs_budget != 0u ? hs_budget : s_engine_hs_budget;
+}
+
+static duct_seal_engine_t *s_client_create(const struct duct_seal_engine_vtbl *self, void *cfg, duct_seal_role_t role)
+{
+    auto cc = (duct_tls_client_cfg_t *)cfg;
+    duct_do_if(!cc || !cc->ctx, return nullptr);
+    auto e = DUCT_CAST(openssl_engine_t, base, s_create(self, cc->ctx, role));
+    duct_do_if(!e, return nullptr);
+    if (cc->sni && !SSL_set_tlsext_host_name(e->ssl, cc->sni)) {
+        s_destroy(&e->base);
+        return nullptr;
+    }
+    return &e->base;
+}
+
+static void s_start(duct_seal_engine_t *eng, duct_unseal_ctx_t *ctx)
+{
+    auto e = DUCT_CAST(openssl_engine_t, base, eng);
+    duct_discard SSL_do_handshake(e->ssl);
+    duct_discard s_drain_wbio(e, ctx);
+}
+
+static const duct_seal_engine_vtbl_t s_client_vtbl = {
+    .name = "tls-client",
+    .create = s_client_create,
+    .destroy = s_destroy,
+    .unseal = s_unseal,
+    .start = s_start,
+    .pdu_hdr_size = duct_tls_record_hdr_size,
+    .pdu_len = duct_tls_record_len,
+    .pdu_overhead = s_record_overhead,
+    .pdu_ct_max = s_record_ct_max,
+    .engine_hs_budget = s_engine_hs_budget,
+    .seal_size = s_seal_size,
+    .seal = s_seal,
+    .close_notify = s_close_notify,
+};
+
+const duct_seal_engine_vtbl_t *duct_tls_openssl_client_vtbl(void)
+{
+    return &s_client_vtbl;
 }

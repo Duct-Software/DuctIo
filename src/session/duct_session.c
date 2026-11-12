@@ -23,7 +23,7 @@
 duct_session_t *duct_session_by_conn(const duct_conn_t *conn)
 {
     return duct_session_attached_by_handle(
-        *(const duct_session_handle_t *)&conn->session_token);
+        (duct_session_handle_t){ .word = conn->session_token });
 }
 
 duct_conn_id_t duct_session_conn_id_by_handle(const duct_session_t *s,
@@ -157,7 +157,7 @@ duct_exec_rc_t duct_session_exec_open(void *self)
         goto fail_release;
 
     auto tok = duct_session_handle_from_live(s);
-    if (!duct_conn_session_bind(conn, *(const duct_handle_t *)&tok)) {
+    if (!duct_conn_session_bind(conn, tok.word)) {
         rc = rc_closed;
         goto fail_release;
     }
@@ -180,7 +180,7 @@ duct_exec_rc_t duct_session_exec_open(void *self)
     duct_response_t out;
     duct_response_reset(&out);
     duct_result_t orc = cfg->on_session_open
-                      ? cfg->on_session_open(s, *(const duct_handle_t *)&tok,
+                      ? cfg->on_session_open(s, tok.word,
                                              msg->user_ctx, &out, s->proto_state)
                       : rc_ok;
     if (orc != rc_ok) {
@@ -235,7 +235,7 @@ duct_exec_rc_t duct_session_exec_conn_join(void *self)
         return duct_msg_done(msg);
     }
     auto tok = duct_session_handle_from_live(s);
-    if (!duct_conn_session_bind(conn, *(const duct_handle_t *)&tok)) {
+    if (!duct_conn_session_bind(conn, tok.word)) {
         duct_discard duct_session_detach_leg(s, msg->conn_id, close_internal_error);
         s_worker_retire_pre_open(conn);
         return duct_msg_done(msg);
@@ -266,7 +266,7 @@ duct_exec_rc_t duct_session_exec_conn_lost(void *self)
     auto msg = (duct_msg_conn_lost *)self;
     auto conn = duct_conn_by_handle(msg->conn);
     duct_do_if(!conn, return exec_done); /* already retired */
-    auto handle = *(const duct_session_handle_t *)&msg->session;
+    auto handle = (duct_session_handle_t){ .word = msg->session };
     auto s = duct_session_by_handle(handle);
     if (s) {
         auto cid = duct_session_conn_id_by_handle(s, msg->conn);
@@ -749,7 +749,7 @@ duct_exec_rc_t duct_session_exec_wire_fence(void *self)
          * was resolved from above. */
         duct_discard duct_worker_tls_ensure_started(msg->conn, (duct_view_u8){});
     }
-    auto handle = *(const duct_session_handle_t *)&msg->session;
+    auto handle = (duct_session_handle_t){ .word = msg->session };
     s_wire_rebind_settle(handle);
     return exec_done;
 }

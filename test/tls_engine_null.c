@@ -20,6 +20,7 @@ static atomic_uint s_unseal_calls = 0u;
 static atomic_uint s_create_calls = 0u;
 static atomic_uint s_destroy_calls = 0u;
 static atomic_uint s_close_notify_calls = 0u;
+static duct_peer_t  s_last_peer = {};
 
 typedef struct {
     bool handshook;
@@ -75,9 +76,10 @@ unsigned tls_null_create_calls(void) { return atomic_load(&s_create_calls); }
 unsigned tls_null_destroy_calls(void) { return atomic_load(&s_destroy_calls); }
 unsigned tls_null_close_notify_calls(void) { return atomic_load(&s_close_notify_calls); }
 
-static duct_seal_engine_t *s_create(void *cfg, [[maybe_unused]] duct_seal_role_t role)
+static duct_seal_engine_t *s_create([[maybe_unused]] const struct duct_seal_engine_vtbl *self,
+                                    [[maybe_unused]] void *cfg,
+                                    [[maybe_unused]] duct_seal_role_t role)
 {
-    (void)cfg;
     atomic_fetch_add(&s_create_calls, 1u);
     auto e = (s_null_engine_t *)malloc(sizeof(s_null_engine_t));
     if (!e)
@@ -103,6 +105,8 @@ s_unseal(duct_seal_engine_t *eng, duct_view_u8 pdu, duct_unseal_ctx_t *ctx)
 {
     atomic_fetch_add(&s_unseal_calls, 1u);
     auto e = (s_null_engine_t *)eng;
+    if (ctx)
+        s_last_peer = ctx->peer;
     static constexpr size_t hdr = 5u;
     auto body = (const uint8_t *)pdu.data + hdr;
     size_t body_len = pdu.size - hdr;
@@ -224,4 +228,10 @@ static const duct_seal_engine_vtbl_t s_vtbl = {
 const duct_seal_engine_vtbl_t *tls_null_vtbl(void)
 {
     return &s_vtbl;
+}
+
+void tls_null_last_peer(duct_peer_t *out)
+{
+    atomic_thread_fence(memory_order_acquire);
+    *out = s_last_peer;
 }

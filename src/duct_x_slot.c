@@ -79,13 +79,13 @@ static void s_retire(duct_x_slot_pool_t *pool, uint32_t chunk)
     if (pool->hooks.down && info->cookie)
         pool->hooks.down(pool->hooks.ctx, info->cookie);
     info->cookie = 0u;
-    size_t page = duct_page_size();
-    uintptr_t lo = (uintptr_t)s_chunk_base(pool, chunk),
-              hi = lo + s_chunk_bytes(pool, chunk);
-    lo = (lo + page - 1u) & ~(page - 1u);
-    hi &= ~(page - 1u);
+    size_t page = duct_page_size(),
+           off = (size_t)(chunk * pool->chunk_slots) * pool->slot_bytes,
+           bytes = s_chunk_bytes(pool, chunk),
+           lo = (off + page - 1u) & ~(page - 1u),
+           hi = (off + bytes) & ~(page - 1u);
     if (hi > lo)
-        duct_vm_discard((void *)lo, hi - lo);
+        duct_vm_discard((uint8_t *)pool->range.base + lo, hi - lo);
     duct_atomic_fetch(sub, &pool->live, 1u, relaxed);
     if (chunk < duct_atomic_load(&pool->grow_at, relaxed))
         duct_atomic_store(&pool->grow_at, chunk, relaxed);

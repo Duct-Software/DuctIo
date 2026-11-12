@@ -155,6 +155,7 @@ typedef enum : uint8_t {
 } hc_out_t;
 
 typedef struct {
+    struct duct_seal_engine base;
     duct_noise_hs_t        *hs;
     hs_ctx_t             *hc; /**< Handshake context of an XKpsk3 first exchange.
                                   *  Null under IKpsk2 and once the exchange has
@@ -162,10 +163,6 @@ typedef struct {
     duct_noise_transport_t  tp,
                             prev;
     const duct_noise_cfg_t *cfg;
-    const duct_seal_engine_vtbl_t *vt; /**< The vtbl that created this instance.
-                              *  Its @c pdu_hdr_size and @c pdu_overhead are the
-                              *  length prefix and the per-PDU overhead this
-                              *  instance writes. */
     duct_ptr_t(uint8_t)     peer_id; /**< The peer's naming, duct_noise_key_size
                               *  bytes of static public key, then on a responder
                               *  the hello its message 1 carried: an allocation
@@ -209,7 +206,7 @@ typedef struct {
 /** @brief Check whether @p e runs the datagram vtbl. */
 static bool s_is_dgram(const noise_engine_t *e)
 {
-    return e->vt == duct_noise_vtbl_dgram();
+    return e->base.vtbl == duct_noise_vtbl_dgram();
 }
 
 /** @brief Split @p hs into @p out, whose counter then crosses the wire as wide as
@@ -309,8 +306,8 @@ static size_t s_pdu_len(duct_view_u8 hdr)
  *          @c noise_pattern_count, a role naming neither side, or an
  *          allocation failure.
  */
-static duct_seal_engine_t *s_create_framed(void *cfg, duct_seal_role_t role,
-                                           const duct_seal_engine_vtbl_t *vt)
+static duct_seal_engine_t *s_create_framed(const duct_seal_engine_vtbl_t *vt, void *cfg,
+                                           duct_seal_role_t role)
 {
     auto c = (const duct_noise_cfg_t *)cfg;
     /* The config names the hello length, and the engine handshake budget
@@ -329,7 +326,7 @@ static duct_seal_engine_t *s_create_framed(void *cfg, duct_seal_role_t role,
     duct_do_if(!e, return nullptr);
     e->cfg = c;
     e->is_initiator = initiator;
-    e->vt = vt;
+    e->base.vtbl = vt;
     e->keys = key_handshaking;
     e->peer_id = duct_new_secret(uint8_t, duct_noise_key_size + c->hello_len);
     duct_do_if(!e->peer_id, return nullptr);
@@ -348,17 +345,17 @@ static duct_seal_engine_t *s_create_framed(void *cfg, duct_seal_role_t role,
     else
         e->hs = s_hs_new(e, noise_pattern_ikpsk2);
     duct_do_if(!e->hs && !e->hc, { duct_del(e->peer_id); return nullptr; });
-    return (duct_seal_engine_t *)duct_move(e);
+    return &duct_move(e)->base;
 }
 
-static duct_seal_engine_t *s_create(void *cfg, duct_seal_role_t role)
+static duct_seal_engine_t *s_create(const duct_seal_engine_vtbl_t *self, void *cfg, duct_seal_role_t role)
 {
-    return s_create_framed(cfg, role, duct_noise_vtbl());
+    return s_create_framed(self, cfg, role);
 }
 
-static duct_seal_engine_t *s_create_dgram(void *cfg, duct_seal_role_t role)
+static duct_seal_engine_t *s_create_dgram(const duct_seal_engine_vtbl_t *self, void *cfg, duct_seal_role_t role)
 {
-    return s_create_framed(cfg, role, duct_noise_vtbl_dgram());
+    return s_create_framed(self, cfg, role);
 }
 
 /** @brief Release the instance, a handshake state or context still live included.
@@ -366,7 +363,7 @@ static duct_seal_engine_t *s_create_dgram(void *cfg, duct_seal_role_t role)
  *  go with it. */
 static void s_destroy(duct_seal_engine_t *eng)
 {
-    auto e = (noise_engine_t *)eng;
+    auto e = DUCT_CAST(noise_engine_t, base, eng);
     duct_noise_hs_destroy(e->hs);
     s_hc_free(e);
     duct_noise_transport_destroy(&e->tp);
@@ -420,7 +417,8 @@ static duct_view_u8 s_msg1_payload(const noise_engine_t *e)
 {
     size_t lead = e->cfg->hello_len;
     auto payload = duct_at(e->hs_payload);
-    memcpy(payload, e->cfg->hello, lead);
+    if (lead)
+        memcpy(payload, e->cfg->hello, lead);
     return (duct_view_u8){ .data = payload, .size = s_hs_pad(payload, lead + duct_noise_hs_pad_max, lead) };
 }
 
@@ -430,7 +428,7 @@ static duct_view_u8 s_msg1_payload(const noise_engine_t *e)
  *  @return false when the message does not write or @p ctx refuses it. */
 static bool s_offer_msg1(noise_engine_t *e, duct_unseal_ctx_t *ctx)
 {
-    size_t hdr = e->vt->pdu_hdr_size;
+    size_t hdr = e->base.vtbl->pdu_hdr_size;
     size_t framed_cap = s_hs_frame_max(e->cfg->hello_len);
     size_t len = 0u;
     return duct_noise_hs_write_msg1(e->hs, s_msg1_payload(e), duct_at(e->hs_frame) + hdr,
@@ -455,7 +453,7 @@ static bool s_answer_msg1(duct_noise_hs_t *hs, duct_unseal_ctx_t *ctx, size_t hd
  *  application traffic until then. */
 static bool s_confirm(noise_engine_t *e, duct_unseal_ctx_t *ctx)
 {
-    size_t hdr = e->vt->pdu_hdr_size;
+    size_t hdr = e->base.vtbl->pdu_hdr_size;
     uint8_t framed[s_len_prefix + s_pdu_overhead];
     size_t len = duct_noise_transport_seal(&e->tp, nullptr, 0u, framed + hdr,
                                            sizeof framed - hdr);
@@ -469,7 +467,7 @@ static bool s_confirm(noise_engine_t *e, duct_unseal_ctx_t *ctx)
  *  @return false when @p ctx refuses it. */
 static bool s_hc_send(noise_engine_t *e, duct_unseal_ctx_t *ctx, uint8_t *framed, size_t len)
 {
-    size_t hdr = e->vt->pdu_hdr_size;
+    size_t hdr = e->base.vtbl->pdu_hdr_size;
     bool sent = s_emit(ctx, framed, hdr, len);
     if (s_is_dgram(e)) {
         memcpy(duct_at(e->hc->last), framed, hdr + len);
@@ -494,7 +492,7 @@ static void s_hc_arm(const noise_engine_t *e, duct_unseal_ctx_t *ctx)
  *  resend is armed once it has written, refused or not. */
 static bool s_hc_offer(noise_engine_t *e, duct_unseal_ctx_t *ctx)
 {
-    size_t hdr = e->vt->pdu_hdr_size;
+    size_t hdr = e->base.vtbl->pdu_hdr_size;
     size_t framed_cap = s_hs_frame_max(e->cfg->hello_len);
     size_t len = 0u;
     bool written = duct_noise_hs_write_msg1_xk(e->hc->hs, s_msg1_payload(e), duct_at(e->hs_frame) + hdr,
@@ -540,7 +538,7 @@ static void s_emit_opening(noise_engine_t *e, duct_unseal_ctx_t *ctx)
  */
 static void s_start(duct_seal_engine_t *eng, duct_unseal_ctx_t *ctx)
 {
-    auto e = (noise_engine_t *)eng;
+    auto e = DUCT_CAST(noise_engine_t, base, eng);
     duct_do_if(!e->is_initiator, return);
     s_emit_opening(e, ctx);
     duct_discard (e->hc ? s_hc_offer(e, ctx) : s_offer_msg1(e, ctx));
@@ -644,7 +642,7 @@ static duct_result_t s_hs_step(noise_engine_t *e, duct_view_u8 body,
         s_hello_keep(e, payload, payload_len);
         /* The payload has gone into the peer's naming, so the answer's padding
          * reuses its room. */
-        ok = s_answer_msg1(e->hs, ctx, e->vt->pdu_hdr_size,
+        ok = s_answer_msg1(e->hs, ctx, e->base.vtbl->pdu_hdr_size,
                            s_answer_pad(duct_at(e->hs_payload), body.size),
                            duct_at(e->hs_frame), s_hs_frame_max(e->cfg->hello_len));
         duct_do_if(!ok, return rc_invalid_arg);
@@ -728,7 +726,7 @@ static hc_out_t s_resend(noise_engine_t *e, duct_unseal_ctx_t *ctx)
  *  send, and the call does nothing. */
 static void s_retry(duct_seal_engine_t *eng, duct_unseal_ctx_t *ctx)
 {
-    auto e = (noise_engine_t *)eng;
+    auto e = DUCT_CAST(noise_engine_t, base, eng);
     if (!e->hc)
         return;
     duct_discard s_resend(e, ctx);
@@ -768,7 +766,7 @@ static hc_out_t s_hc_initiator_m2(noise_engine_t *e, duct_view_u8 body, duct_uns
     duct_do_if(!ok, return hc_out_refused);
     s_remember(e, body);
     auto pad = duct_at(e->hs_payload);
-    size_t hdr = e->vt->pdu_hdr_size;
+    size_t hdr = e->base.vtbl->pdu_hdr_size;
     size_t framed_cap = s_hs_frame_max(e->cfg->hello_len);
     size_t len = 0u;
     ok = duct_noise_hs_write_msg3_xk(hc->hs, (duct_view_u8){ .data = pad, .size = s_hs_pad(pad, duct_noise_hs_pad_max, 0u) },
@@ -808,7 +806,7 @@ static hc_out_t s_hc_responder_m1(noise_engine_t *e, duct_view_u8 body, duct_uns
     s_hello_keep(e, payload, payload_len);
     s_remember(e, body);
     auto pad = duct_at(e->hs_payload);
-    size_t hdr = e->vt->pdu_hdr_size;
+    size_t hdr = e->base.vtbl->pdu_hdr_size;
     size_t framed_cap = s_hs_frame_max(cfg->hello_len);
     size_t len = 0u;
     ok = duct_noise_hs_write_msg2_xk(hc->hs, s_answer_pad(pad, body.size), duct_at(e->hs_frame) + hdr,
@@ -922,7 +920,7 @@ static duct_result_t s_rekey_msg1(noise_engine_t *e, duct_view_u8 body,
            && duct_ct_equal(remote, duct_at(e->peer_id), sizeof remote)
            && s_psk_for(e->cfg, hs, remote,
                         (duct_view_u8){ .data = payload, .size = payload_len })
-           && s_answer_msg1(hs, ctx, e->vt->pdu_hdr_size,
+           && s_answer_msg1(hs, ctx, e->base.vtbl->pdu_hdr_size,
                             s_answer_pad(payload, body.size),
                             duct_at(e->hs_frame), s_hs_frame_max(e->cfg->hello_len))
            && s_split(e, hs, &fresh);
@@ -975,7 +973,7 @@ static duct_result_t s_rekey_msg2(noise_engine_t *e, duct_view_u8 body)
  */
 static duct_result_t s_rekey(duct_seal_engine_t *eng, duct_unseal_ctx_t *ctx)
 {
-    auto e = (noise_engine_t *)eng;
+    auto e = DUCT_CAST(noise_engine_t, base, eng);
     e->rekey_fails = 0u;
     bool offerable = e->is_initiator
                   && (e->keys == key_settled || e->keys == key_offering);
@@ -1003,7 +1001,7 @@ static duct_result_t s_rekey(duct_seal_engine_t *eng, duct_unseal_ctx_t *ctx)
  *  it accepts has to carry this same key. */
 static duct_view_u8 s_peer_identity(duct_seal_engine_t *eng)
 {
-    auto e = (noise_engine_t *)eng;
+    auto e = DUCT_CAST(noise_engine_t, base, eng);
     if (e->keys == key_handshaking || e->keys == key_confirming)
         return (duct_view_u8){};
     return (duct_view_u8){ .data = duct_at(e->peer_id),
@@ -1014,7 +1012,7 @@ static duct_view_u8 s_peer_identity(duct_seal_engine_t *eng)
  *  is named. */
 static bool s_derive(duct_seal_engine_t *eng, const char *label, void *out, size_t len)
 {
-    auto e = (noise_engine_t *)eng;
+    auto e = DUCT_CAST(noise_engine_t, base, eng);
     if (s_peer_identity(eng).size == 0u)
         return false;
     return duct_noise_derive(e->exporter, label, (uint8_t *)out, len);
@@ -1031,8 +1029,8 @@ static size_t s_unseal_size(duct_seal_engine_t *eng, duct_view_u8 pdu)
 {
     if (s_peer_identity(eng).size == 0u)
         return 0u;
-    auto e = (const noise_engine_t *)eng;
-    size_t framed = e->vt->pdu_hdr_size + e->vt->pdu_overhead;
+    const noise_engine_t *e = DUCT_CAST(noise_engine_t, base, eng);
+    size_t framed = e->base.vtbl->pdu_hdr_size + e->base.vtbl->pdu_overhead;
     duct_do_if(pdu.size <= framed, return 0u);
     return pdu.size - framed;
 }
@@ -1058,8 +1056,8 @@ static size_t s_unseal_size(duct_seal_engine_t *eng, duct_view_u8 pdu)
 static duct_result_t
 s_unseal(duct_seal_engine_t *eng, duct_view_u8 pdu, duct_unseal_ctx_t *ctx)
 {
-    auto e = (noise_engine_t *)eng;
-    size_t hdr = e->vt->pdu_hdr_size;
+    auto e = DUCT_CAST(noise_engine_t, base, eng);
+    size_t hdr = e->base.vtbl->pdu_hdr_size;
     duct_do_if(pdu.size <= hdr, return rc_invalid_arg);
     duct_view_u8 body = { .data = (uint8_t *)pdu.data + hdr, .size = pdu.size - hdr };
     if (e->hc) {
@@ -1110,14 +1108,14 @@ s_unseal(duct_seal_engine_t *eng, duct_view_u8 pdu, duct_unseal_ctx_t *ctx)
  */
 static size_t s_seal_size(duct_seal_engine_t *eng, size_t ct_len)
 {
-    auto e = (noise_engine_t *)eng;
+    auto e = DUCT_CAST(noise_engine_t, base, eng);
     duct_do_if(e->keys == key_handshaking, return 0u);
     uint64_t sent = s_tx(e)->send_counter;
     duct_do_if(sent > duct_noise_seal_counter_max, return 0u);
     size_t n = ct_len / s_pdu_ct_max;
     if (ct_len % s_pdu_ct_max != 0u || n == 0u)
         ++n;
-    return ct_len + n * (e->vt->pdu_hdr_size + e->vt->pdu_overhead);
+    return ct_len + n * (e->base.vtbl->pdu_hdr_size + e->base.vtbl->pdu_overhead);
 }
 
 /** @brief Seal @p spans as one cleartext stream into @p dst.
@@ -1128,8 +1126,8 @@ static size_t s_seal_size(duct_seal_engine_t *eng, size_t ct_len)
 static void s_seal(duct_seal_engine_t *eng, const duct_view_u8 *spans,
                    size_t n_spans, void *dst)
 {
-    auto e = (noise_engine_t *)eng;
-    size_t hdr = e->vt->pdu_hdr_size;
+    auto e = DUCT_CAST(noise_engine_t, base, eng);
+    size_t hdr = e->base.vtbl->pdu_hdr_size;
     auto out = (uint8_t *)dst;
     size_t total = 0u;
     for (size_t i = 0u; i < n_spans; ++i)
@@ -1193,8 +1191,9 @@ static const duct_seal_engine_vtbl_t s_vtbl = {
 
 /** @brief The datagram-wire crypto engine, @c noise-dgram.
  *  Writes no length prefix: the record header already delimits a datagram's
- *  one PDU. Each PDU sends its sequence number as its low 4 bytes as well,
- *  the receiver rebuilding the rest from the highest it has accepted.
+ *  one PDU. Each PDU sends its sequence number covered down to its low 4
+ *  bytes, the receiver uncovering them and rebuilding the rest from the
+ *  highest it has accepted.
  */
 static const duct_seal_engine_vtbl_t s_vtbl_dgram = {
     s_vtbl_common,

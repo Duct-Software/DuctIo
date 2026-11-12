@@ -583,6 +583,15 @@ duct_io_dgram_shared_needs_lane_tx(duct_listener_t *listener);
 duct_nonnull(1) duct_x_slot_pool_t *
 duct_io_dgram_shared_tx_slots(duct_listener_t *listener);
 
+/** @brief Test whether @p listener's socket is registered for RIO sends.
+ *  True once its io backend armed the RIO send state: the socket then serves RIO
+ *  calls alone, a worker's direct grouped send on it would report the bytes taken
+ *  and lose them, and every entry stages into the lane for the io thread's
+ *  registered-slot send instead.
+ */
+duct_nonnull(1) bool
+duct_io_dgram_shared_rio_tx(duct_listener_t *listener);
+
 /** @} */
 
 /** @name Outbound connect entry point and calls

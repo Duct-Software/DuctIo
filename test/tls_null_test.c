@@ -491,6 +491,19 @@ static const char *sc_gate(duct_sock_t fd)
     if (g_records[before].stream_id != 1u || g_records[before].len != 9u
         || memcmp(g_records[before].data, "hello-tls", 9u) != 0)
         return "app-data content mismatch";
+
+    /* The context the unseal ran in names the conn's peer: this client's own
+     * endpoint, as its socket's local name states it. */
+    struct sockaddr_storage mine;
+    socklen_t mlen = sizeof mine;
+    if (getsockname(fd, (struct sockaddr *)&mine, &mlen) != 0)
+        return "the client's own endpoint cannot be read";
+    duct_peer_t seen;
+    tls_null_last_peer(&seen);
+    auto in4 = (const struct sockaddr_in *)&mine;
+    if (seen.family != AF_INET || seen.port != ntohs(in4->sin_port)
+        || memcmp(seen.addr.v4, &in4->sin_addr, 4u) != 0)
+        return "the unseal context does not name the conn's peer";
     return nullptr;
 }
 

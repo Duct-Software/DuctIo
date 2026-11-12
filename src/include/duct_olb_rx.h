@@ -123,6 +123,15 @@ duct_olb_decl(duct_olb_rx,
                                *  computes leaves them out. Io-thread only. */
 
     duct_x_sock_rx_fields
+
+    /** @brief The remote address this ring's socket names as its peer, the
+     *  address a recvfrom reports, @c family 0 for a conn that names none.
+     *  Io writes it at the conn's admission, accept and dial alike, before
+     *  the conn is live; the worker reads it into every engine context it
+     *  builds. A roaming leg's re-point is the io thread's and stays
+     *  unstored, the address of the admission trailing there. A shared leg
+     *  holds no ring at all, its address living in the shared ctx. */
+    duct_peer_t peer;
 #if DUCT_RUNTIME_STATS
     uint64_t    memmove_compacts, /**< Number of compactions that
                                     *  actually moved bytes, because some

@@ -112,7 +112,7 @@ static unsigned char *s_slot(unsigned c)
 
 void *duct_secret_adopt(void *obj)
 {
-    auto h = (duct_alloc_hdr_t *)((unsigned char *)obj - sizeof(duct_alloc_hdr_t));
+    auto h = duct_block_hdr(obj);
     /* Set ahead of every exit: a block left on the heap is wiped by its release. */
     h->secret = 1;
     /* A slot starts on a multiple of 64, so its object sits on 8 modulo 16: a block aligned wider stays. */
@@ -131,7 +131,7 @@ void *duct_secret_adopt(void *obj)
 
 bool duct_secret_release(void *obj)
 {
-    auto h = (duct_alloc_hdr_t *)((unsigned char *)obj - sizeof(duct_alloc_hdr_t));
+    auto h = duct_block_hdr(obj);
     unsigned c = h->arena;
     size_t size = h->size;
     if (!c) {

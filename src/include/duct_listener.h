@@ -98,14 +98,28 @@ typedef struct duct_listener_reg {
 #define DUCT_LISTENER_PEEK_DEFAULT 128u
 #endif
 
+/** @brief Largest stream probe read a listener takes, however large a @c peek_cap
+ *  names: the probe buffers size to it, so an explicit cap past it is clamped. */
+#ifndef DUCT_LISTENER_PEEK_MAX
+#define DUCT_LISTENER_PEEK_MAX 2048u
+#endif
+
+/** @brief Most probe-wait parks one listener holds at once.
+ *  A stranger spends nothing to occupy a park — an fd, a peek buffer and a
+ *  timer for @c probe_wait_ms — so the park count is bounded per listener: a
+ *  wait past the bound is refused and the bytes classify as they stand. */
+#ifndef DUCT_LISTENER_PROBE_PARK_MAX
+#define DUCT_LISTENER_PROBE_PARK_MAX 128u
+#endif
+
 /** @brief Largest stream probe read a listener offers, bytes: @p peek_cap, or
- *  @c DUCT_LISTENER_PEEK_DEFAULT when that is 0 or larger.
+ *  @c DUCT_LISTENER_PEEK_DEFAULT when that is 0, clamped to @c DUCT_LISTENER_PEEK_MAX.
  *  Bounds the accept-time read, the bytes a probe-wait pre_conn accumulates and
  *  the @c peek_min a bind accepts, so a pre-parse never sees more than it. */
 static inline size_t duct_listener_peek_span(size_t peek_cap)
 {
     size_t cap = peek_cap ? peek_cap : DUCT_LISTENER_PEEK_DEFAULT;
-    return duct_min(cap, (size_t)DUCT_LISTENER_PEEK_DEFAULT);
+    return duct_min(cap, (size_t)DUCT_LISTENER_PEEK_MAX);
 }
 
 /** @brief Default datagram classification buffer when @c peek_cap is 0 for a
@@ -158,7 +172,7 @@ typedef struct duct_listener {
                                *  probe payload. 0 = default for either. */
     uint32_t     probe_wait_ms; /**< Copied from the cfg at registration; 0 = disabled. */
     uint16_t     bound_port;    /**< Actual port, OS-assigned if @c addr used @c :0. */
-    uint8_t      peek_min;      /**< Copied from the cfg at registration: bytes a stream first read
+    uint16_t     peek_min;      /**< Copied from the cfg at registration: bytes a stream first read
                                   *  has to reach before a pre-parse is asked, 0 = none. A bind
                                   *  keeps it within the probe read span and refuses it without
                                   *  @c probe_wait_ms. */
@@ -218,6 +232,9 @@ typedef struct duct_listener {
                                    *  probe-wait @c duct_pre_conn_t holders, live
                                    *  @c x_udp_shared and @c x_local conns, and in-flight async
                                    *  pre-parse round trips. io-thread-private. */
+    unsigned    probe_parks;    /**< Probe-wait @c duct_pre_conn_t parks this node holds,
+                                   *  bounded by @c DUCT_LISTENER_PROBE_PARK_MAX because a
+                                   *  stranger spends nothing to occupy one. io-thread-private. */
     bool        closing;        /**< Close requested while @c pre_conn_refs was still
                                    *  nonzero — the node stays until the last ref drops, and
                                    *  @c listen_fd with it unless a path listener retired it

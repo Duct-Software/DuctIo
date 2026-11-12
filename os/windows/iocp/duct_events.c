@@ -251,6 +251,7 @@ typedef struct iocp_device {
 /** @brief A completion port, this thread's listener list, and its RIO
  *  completion queue. */
 typedef struct duct_events_env {
+    void (*cancel_io)(duct_sock_t fd);
     HANDLE          iocp;
     listener_ctx_t *listeners; /**< List head, threaded via ->next. */
     iocp_device_t  *devices;
@@ -336,13 +337,14 @@ static bool s_device_arm(iocp_device_t *d)
  *  device in dispatch, leave a dispatch still to finish or to run, so the record is marked
  *  @c device_closing and @ref s_on_device_completion frees it.
  */
-static void s_device_detach(iocp_device_t *d)
+static bool s_device_detach(iocp_device_t *d)
 {
     if (d->state == device_armed && pfnNtCancelWaitCompletionPacket(d->packet, TRUE) == events_status_success) {
         s_device_free(d);
-        return;
+        return false;
     }
     d->state = device_closing;
+    return true;
 }
 
 /** @brief Dispatch the completion of @p d's Event and bind the Event again.
@@ -377,10 +379,17 @@ bool duct_events_dgram_shared_rio_capable(void)
     return s_rio != nullptr;
 }
 
+static void s_cancel_io(duct_sock_t fd)
+{
+    if (fd != duct_sock_bad)
+        CancelIoEx((HANDLE)fd, nullptr); /* cancel all inflight ops on fd */
+}
+
 duct_events_env_t *duct_events_init(void)
 {
     auto env = duct_new(duct_events_env_t);
     duct_do_if(!env, return nullptr);
+    env->cancel_io = s_cancel_io;
     env->iocp = CreateIoCompletionPort(INVALID_HANDLE_VALUE, nullptr, 0, 1u);
     duct_do_if(!env->iocp, duct_del(env); return nullptr);
     if (s_rio) {
@@ -396,6 +405,11 @@ duct_events_env_t *duct_events_init(void)
     return env;
 }
 
+void (*duct_events_cancel_io_of(duct_events_env_t *env))(duct_sock_t fd)
+{
+    return env->cancel_io;
+}
+
 bool duct_events_rio_cq_ready(duct_events_env_t *env)
 {
     return env->rio_cq != nullptr;
@@ -408,11 +422,12 @@ bool duct_events_rio_cq_ready(duct_events_env_t *env)
  *  @todo 0.5s timeout is expected to be enough, but maybe better
  *  to use a strict overall op counter instead.
  */
-static void s_drain_completions(duct_events_env_t *env)
+static void s_drain_completions(duct_events_env_t *env, bool armed)
 {
     OVERLAPPED_ENTRY entries[events_max_batch];
-    DWORD timeout = 500u;
-    for (ULONG n = 0u; GetQueuedCompletionStatusEx(env->iocp, entries, events_max_batch, &n, timeout, FALSE); )
+    for (ULONG n = 0u; GetQueuedCompletionStatusEx(env->iocp, entries, events_max_batch, &n,
+                                                   armed ? 500u : 0u, FALSE); ) {
+        armed = false;
         for (ULONG i = 0u; i < n; ++i)
             if (entries[i].lpOverlapped) {
                 auto op = (iocp_op_t *)entries[i].lpOverlapped;
@@ -454,16 +469,19 @@ static void s_drain_completions(duct_events_env_t *env)
                     break;
                 }
             }
+    }
 }
 
 void duct_events_fini(duct_events_env_t *env)
 {
+    bool armed = false;
     for (auto ctx = env->listeners; ctx; ) {
         auto next = ctx->next;
         auto listener = ctx->listener;
         auto lfd = listener->listen_fd;
         bool idle = s_listener_ctx_idle(ctx);
         ctx->listener = nullptr;
+        armed |= !idle;
         if (idle)
             duct_del(ctx);
         else if (ctx->rio_rx) {
@@ -474,17 +492,17 @@ void duct_events_fini(duct_events_env_t *env)
             listener->listen_fd = duct_sock_bad; /* duct_listener_destroy closes a listen_fd still set */
             duct_discard duct_rio_rx_close(s_rio,ctx->rio_rx);
         } else
-            duct_discard duct_events_cancel_io(env, lfd);
+            s_cancel_io(lfd);
         ctx = next;
     }
     env->listeners = nullptr;
     for (auto d = env->devices; d; ) {
         auto next = d->next;
-        s_device_detach(d);
+        armed |= s_device_detach(d);
         d = next;
     }
     env->devices = nullptr;
-    s_drain_completions(env);
+    s_drain_completions(env, armed);
     CloseHandle(env->iocp);
     if (env->rio_cq)
         duct_rio_cq_close(s_rio, env->rio_cq);
@@ -742,7 +760,7 @@ static bool s_rio_dgram_init(duct_events_env_t *env, listener_ctx_t *ctx)
     duct_do_if(!rq, goto fail);
     duct_rio_rx_arm(ring, rq);
     duct_do_if(!ctx->listener->dgram_tx_outbox, return true);
-    bool ok = duct_rio_tx_create(rq, ctx->listener);
+    bool ok = duct_rio_tx_create(s_rio, rq, ctx->listener);
     duct_do_if(!ok, goto fail);
     return true;
 fail:
@@ -905,7 +923,7 @@ bool duct_events_watch(duct_events_env_t *env, duct_sock_t fd,
         }
         duct_unreachable();
     case io_tag_conn:
-        bool assoc = s_iocp_assoc(env, fd);
+        assoc = s_iocp_assoc(env, fd);
         duct_do_if(!assoc, return false);
         /* No Winsock SO_REUSEPORT equivalent demuxes a connected per-peer
          * dgram socket ahead of its shared listener, so xport_type narrows
@@ -991,7 +1009,7 @@ void duct_events_unwatch(duct_events_env_t *env, duct_sock_t fd,
             duct_del(ctx);
             return;
         }
-        duct_discard duct_events_cancel_io(env, fd);
+        s_cancel_io(fd);
         if (ctx->rio_rx)
             duct_discard duct_rio_rx_close(s_rio,ctx->rio_rx);
         return;
@@ -1003,14 +1021,7 @@ void duct_events_unwatch(duct_events_env_t *env, duct_sock_t fd,
      * nothing else forces it -- so cancel it here, same as the listener
      * case above; duct_olb_del / duct_olb_io_done at teardown still
      * settle the resulting completion. */
-    duct_discard duct_events_cancel_io(env, fd);
-}
-
-bool duct_events_cancel_io([[maybe_unused]] duct_events_env_t *env, duct_sock_t fd)
-{
-    if (fd != duct_sock_bad)
-        CancelIoEx((HANDLE)fd, nullptr); /* cancel all inflight ops on fd */
-    return false;
+    s_cancel_io(fd);
 }
 
 void duct_events_kick(duct_events_env_t *env)

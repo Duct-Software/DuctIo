@@ -3,11 +3,12 @@
 
 /** @file noise_compact_test.c
  *  @brief The compact sequence number of the datagram transport: a Noise
- *  transport pair whose counter crosses the wire as its low 4 bytes.
+ *  transport pair whose counter crosses the wire covered to its low 4 bytes.
  *
  *  Both ends are split from one handshake, driven in memory, and told to send the
  *  counter compact. `size` holds what a message costs: 4 counter bytes where the
- *  full one takes 8, the 4 bytes being the counter's low half. `order` takes ten
+ *  full one takes 8, the bytes covered by a draw of the message's own ciphertext,
+ *  which both ends rebuild. `order` takes ten
  *  messages in reverse and each once, and every replay refused. `loss` takes one
  *  message in seven from a long run. `wrap` carries the counter across 2^32 in
  *  order, and takes late messages from either side of the wrap behind a top
@@ -109,10 +110,10 @@ static const char *sc_size(void)
     else if (duct_noise_transport_seal_size_of(&compact.cli, 24u) != lc
              || duct_noise_transport_seal_size_of(&full.cli, 24u) != lf)
         err = "the sealed size a transport reports is not the one it writes";
-    else if (memcmp(a, b, 4u) != 0 || a[0] != 0x44u || a[3] != 0x11u)
-        err = "the 4 bytes on the wire are not the counter's low half, little-endian";
-    else if (b[4] != 0xDDu || b[7] != 0xAAu)
-        err = "the full counter did not keep its high half";
+    else if (a[0] == 0x44u && a[1] == 0x33u && a[2] == 0x22u && a[3] == 0x11u)
+        err = "the compact counter rode the wire uncovered";
+    else if (b[4] == 0xDDu && b[5] == 0xCCu && b[6] == 0xBBu && b[7] == 0xAAu)
+        err = "the full counter's high half rode the wire uncovered";
     uint8_t tiny[4 + duct_noise_tag_size];
     if (!err && duct_noise_transport_seal(&compact.cli, nullptr, 0u, tiny, sizeof tiny - 1u))
         err = "a compact seal wrote into a buffer a byte short of its own size";

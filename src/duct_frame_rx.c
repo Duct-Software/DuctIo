@@ -93,7 +93,7 @@ s_batch_push(const duct_wfq_route_t *route, unsigned lane, duct_conn_handle_t ha
     size_t payload_bytes = n * sizeof(duct_msg_frame_t);
     size_t msg_bytes = sizeof(duct_msg_frame_batch_t) + payload_bytes;
     auto m = (duct_msg_frame_batch_t *)buf;
-    m->conn = *(const duct_handle_t *)&handle;
+    m->conn = handle.word;
     m->n = n;
     /* When called with ctx->batch_buf as buf, frames == m->frames (same
      * address) — memcpy with overlapping src/dst is UB; skip explicitly. */
@@ -131,7 +131,7 @@ static void s_retry_maybe_clear(unsigned thread_id,
                                 unsigned worker_id)
 {
     for (auto m = kept_head; m; m = duct_msg_next(m)) {
-        auto node = (batch_retry_node_t *)m;
+        auto node = DUCT_CAST(batch_retry_node_t, msg, m);
         if (node->worker_id == worker_id)
             return;
     }
@@ -155,7 +155,7 @@ static void s_retry_maybe_clear(unsigned thread_id,
  */
 static uint32_t s_batch_retry_push(const duct_wfq_route_t *route, batch_retry_node_t *node, char *stage)
 {
-    auto h = *(const duct_conn_handle_t *)&node->batch.conn;
+    auto h = (duct_conn_handle_t){ .word = node->batch.conn };
     auto conn = duct_conn_by_handle(h);
     if (!conn)
         return node->from;
@@ -185,7 +185,7 @@ s_retry_save(const duct_wfq_route_t *route, duct_frame_rx_ctx_t *ctx,
         return false;
     node->worker_id = worker_id;
     node->from = 0u;
-    node->batch.conn = *(const duct_handle_t *)&handle;
+    node->batch.conn = handle.word;
     node->batch.n = n;
     memcpy(node->batch.frames, frames, (size_t)n * sizeof(duct_msg_frame_t));
     duct_msg_queue_push(&ctx->retry_q, &node->msg);
@@ -204,8 +204,8 @@ void duct_frame_rx_retry_drain(const duct_wfq_route_t *route, duct_frame_rx_ctx_
     uint64_t freed_workers = 0u;
     for (auto m = ctx->retry_q.head; m; ) {
         auto next = duct_msg_next(m);
-        auto node = (batch_retry_node_t *)m;
-        auto h = *(const duct_conn_handle_t *)&node->batch.conn;
+        auto node = DUCT_CAST(batch_retry_node_t, msg, m);
+        auto h = (duct_conn_handle_t){ .word = node->batch.conn };
         auto conn = duct_conn_by_handle(h);
         if (conn)
             node->from = s_batch_retry_push(route, node, ctx->batch_buf);
@@ -245,8 +245,8 @@ void duct_frame_rx_retry_drain(const duct_wfq_route_t *route, duct_frame_rx_ctx_
     }
     for (auto m = done; m; ) {
         auto next = duct_msg_next(m);
-        auto node = (batch_retry_node_t *)m;
-        auto conn = duct_conn_by_handle(*(const duct_conn_handle_t *)&node->batch.conn);
+        auto node = DUCT_CAST(batch_retry_node_t, msg, m);
+        auto conn = duct_conn_by_handle((duct_conn_handle_t){ .word = node->batch.conn });
         /* A conn whose input ended while this node held its frames posts that
          * end now, behind them; a node carrying the end is its conn's last
          * post. */
@@ -271,8 +271,8 @@ void duct_frame_rx_retry_discard(duct_frame_rx_ctx_t *ctx, const duct_conn_t *co
     bool freed = false;
     for (auto m = ctx->retry_q.head; m; ) {
         auto next = duct_msg_next(m);
-        auto node = (batch_retry_node_t *)m;
-        if (((const duct_conn_handle_t *)&node->batch.conn)->idx == idx) {
+        auto node = DUCT_CAST(batch_retry_node_t, msg, m);
+        if (((duct_conn_handle_t){ .word = node->batch.conn }).idx == idx) {
             freed = true;
             duct_bits_clear_plain(ctx->retry_pending, idx);
             duct_del(node);
@@ -335,7 +335,7 @@ s_frame_rx_post_wire(const duct_wfq_route_t *route, duct_frame_rx_ctx_t *ctx, du
     if (padded && batch_cap > 1u)
         --batch_cap;
     auto scratch = (duct_msg_frame_batch_t *)ctx->batch_buf;
-    scratch->conn = *(const duct_handle_t *)&handle;
+    scratch->conn = handle.word;
     scratch->n = 0u;
     size_t batch_bytes = 0u;
     /* Pinned once per batch, not re-read from conn->wire at worker dispatch
@@ -349,7 +349,7 @@ s_frame_rx_post_wire(const duct_wfq_route_t *route, duct_frame_rx_ctx_t *ctx, du
 
     for (size_t remain; 0 != (remain = tail > off ? tail - off : 0);) {
         uint32_t raw = padded && remain >= sizeof(duct_dgram_rec_hdr_t)
-                     ? (uint32_t)duct_dgram_rec_hdr_decode((const uint8_t *)rx->data + off) : 0u;
+                     ? (uint32_t)duct_dgram_rec_hdr_decode(rx->data + off) : 0u;
         /* The tail of a coalesced read: staged with no record prefix, so its
          * datagrams are cut directly by segment size;
          * header_size is zero because the only per-datagram header such a wire
@@ -378,7 +378,7 @@ s_frame_rx_post_wire(const duct_wfq_route_t *route, duct_frame_rx_ctx_t *ctx, du
              * so the next pass still finds the unit's remainder padded. */
             size_t unit_end = raw & duct_dgram_rec_padded ? off + rx->read_unit : 0u;
             if (unit_end)
-                duct_dgram_rec_hdr_encode((uint8_t *)rx->data + off, raw & ~duct_dgram_rec_padded);
+                duct_dgram_rec_hdr_encode(rx->data + off, raw & ~duct_dgram_rec_padded);
             duct_view_u8 input = {
                 .data = rx->data + off,
                 .size = remain,
@@ -445,7 +445,7 @@ s_frame_rx_post_wire(const duct_wfq_route_t *route, duct_frame_rx_ctx_t *ctx, du
             }
             if (stop) {
                 if (unit_end)
-                    duct_dgram_rec_hdr_encode((uint8_t *)rx->data + off, raw);
+                    duct_dgram_rec_hdr_encode(rx->data + off, raw);
                 break;
             }
         }

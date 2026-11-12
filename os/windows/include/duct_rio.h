@@ -391,12 +391,13 @@ typedef struct duct_rio_tx_op duct_rio_tx_op_t;
  *  staged, so @ref duct_rio_tx_drain commits an outbox entry as soon as it posts the send, never on
  *  completion.
  *
- *  @param rq  The listener's request queue, kept in the state.
+ *  @param rio  The backend's resolved table, kept in the state for the sends it posts.
+ *  @param rq   The listener's request queue, kept in the state.
  *  @return false with nothing allocated when the listener has no TX slot pools, when the pools lack
  *          the registering hooks or a lead that holds a peer address, or on an allocation failure.
  */
-duct_nonnull(2) bool
-duct_rio_tx_create(RIO_RQ rq, duct_listener_t *listener);
+duct_nonnull(1, 3) bool
+duct_rio_tx_create(const RIO_EXTENSION_FUNCTION_TABLE *rio, RIO_RQ rq, duct_listener_t *listener);
 
 /** @brief Give up @p listener's claim on its RIO send state.
  *  Frees the state with the TX slot pools outright when no send is in flight, otherwise marks it
@@ -413,6 +414,19 @@ duct_rio_tx_free(duct_listener_t *listener);
  */
 duct_nonnull(1, 2) void
 duct_rio_tx_drain(const RIO_EXTENSION_FUNCTION_TABLE *rio, duct_listener_t *listener);
+
+/** @brief Send @p payload to @p peer now, from a TX slot of @p listener's own send state.
+ *  The direct form a synchronous answer sends through: takes a free descriptor and slot, writes
+ *  @p peer into the slot's lead and @p payload into its registered span, and posts one
+ *  @c RIOSendEx at once — the slot and the descriptor return on the send's completion, the
+ *  same settle a drained outbox entry rides. A raw send on this listener's socket would be
+ *  lost: a socket registered for RIO serves RIO calls alone, so every send off it goes here.
+ *
+ *  @return false when the state is closing, no descriptor or no slot is free, or the post was
+ *          refused; the caller treats it as the send it never got.
+ */
+duct_nonnull(1, 2) bool
+duct_rio_tx_send(const duct_listener_t *listener, const duct_peer_t *peer, duct_view_u8 payload);
 
 /** @brief Settle the completed send @p op: return its descriptor and its slot.
  *  A live state re-drains its listener's outbox, so a backlog deeper than the send depth refills

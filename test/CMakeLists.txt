@@ -160,6 +160,12 @@ target_compile_features(ductio_log_test PRIVATE c_std_23)
 add_test(NAME log COMMAND ductio_log_test)
 set_tests_properties(log PROPERTIES TIMEOUT 20)
 
+add_executable(ductio_logfile_test logfile_test.c)
+target_link_libraries(ductio_logfile_test PRIVATE DuctIo::ductio)
+target_compile_features(ductio_logfile_test PRIVATE c_std_23)
+add_test(NAME logfile COMMAND ductio_logfile_test)
+set_tests_properties(logfile PROPERTIES TIMEOUT 20)
+
 add_executable(ductio_be_test be_test.c)
 target_link_libraries(ductio_be_test PRIVATE DuctIo::ductio)
 target_compile_features(ductio_be_test PRIVATE c_std_23)
@@ -764,6 +770,7 @@ add_test(NAME wire_change COMMAND ductio_wire_change_test)
 
 add_executable(ductio_probe_wait_test probe_wait_test.c)
 target_link_libraries(ductio_probe_wait_test PRIVATE DuctIo::ductio)
+target_include_directories(ductio_probe_wait_test PRIVATE ${DUCT_INTERNAL_INCLUDE_DIRS})
 target_compile_features(ductio_probe_wait_test PRIVATE c_std_23)
 add_test(NAME probe_wait COMMAND ductio_probe_wait_test)
 

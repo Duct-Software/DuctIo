@@ -102,7 +102,7 @@ void duct_log(FILE *out, const char *fmt, ...)
     line[log_stamp_len + len] = '\n';
     auto logger = duct_atomic_load(&s_logger, acquire);
     if (logger)
-        logger->write(logger->ctx, line, log_stamp_len + len + 1u);
+        logger->write(logger->ctx, out, line, log_stamp_len + len + 1u);
     else
         duct_discard fwrite(line, 1u, log_stamp_len + len + 1u, out);
 }

@@ -289,12 +289,21 @@ typedef duct_result_t
  */
 typedef enum duct_resolve_disposition : uint8_t {
     resolve_not_me,       /**< Peek does not match this protocol; try next. */
-    resolve_new,          /**< Match; create a new session with this proto. */
+    resolve_new,          /**< Match; create a new session with this proto. A stream
+                            *  listener writes @c preparse_reply's bytes, when the
+                            *  protocol offers them, ahead of the session's first
+                            *  byte. */
     resolve_join,         /**< Match; join an existing session. */
     resolve_reject,       /**< Match but invalid; close fd, stop dispatch. */
     resolve_retry,        /**< Match, not admissible yet; answer the peer once,
-                            *  then drop. Datagram listeners only — a stream one
-                            *  closes the fd, as for @c resolve_reject. */
+                            *  then drop. A datagram listener answers off its own
+                            *  socket, a stream one on the stranger's connection
+                            *  before the close. */
+    resolve_hold,         /**< Peek may match once more bytes are in; wait for
+                            *  them. A stream listener holds the fd under its
+                            *  @c probe_wait_ms with the bytes it already holds,
+                            *  re-classifying as they grow; anything else reads
+                            *  it as @c resolve_not_me. */
 
     /** @note Additional dispositions must be placed here. */
     resolve_count

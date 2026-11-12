@@ -5,10 +5,11 @@
  *  @brief The cookie gate on a driven clock: whom a cookie names, a flipped
  *  bit, the rotation of the secret and readers racing it.
  *
- *  @c sc_peer expects a cookie to validate for its peer from any port and for
- *  nobody else: not another address, not the same bytes under the other
- *  family, not zeros. @c sc_flip expects every single-bit change to a cookie
- *  to be refused. @c sc_rotate expects a cookie to outlive one rotation and not
+ *  @c sc_peer expects a cookie to validate for its peer's own endpoint and for
+ *  nobody else: not another port of the same address, not another address, not
+ *  the same bytes under the other family, not zeros. @c sc_flip expects every
+ *  single-bit change to a cookie to be refused. @c sc_rotate expects a cookie
+ *  to outlive one rotation and not
  *  two, a rotation to write only the secret no reader holds, and a time before
  *  the last rotation to rotate nothing. @c sc_race runs four threads minting and
  *  validating across twenty rotations and expects the epoch never to run ahead
@@ -57,7 +58,13 @@ static const char *sc_peer(void)
     duct_cookie_mint(&c, &a, ck);
     expect(duct_cookie_valid(&c, &a, ck, t0), "a cookie is refused for the peer it was minted for");
     auto other_port = s_v4(1u, 61000u);
-    expect(duct_cookie_valid(&c, &other_port, ck, t0), "a cookie is refused from another port of its peer");
+    expect(!duct_cookie_valid(&c, &other_port, ck, t0), "a cookie is accepted from another port of its peer");
+    uint8_t ck2[duct_cookie_size];
+    duct_cookie_mint(&c, &other_port, ck2);
+    unsigned diff = 0u;
+    for (unsigned i = 0u; i < duct_cookie_size; ++i)
+        diff |= (unsigned)(ck[i] ^ ck2[i]);
+    expect(diff, "another port of one peer minted the same cookie");
     auto other_host = s_v4(2u, 5000u);
     expect(!duct_cookie_valid(&c, &other_host, ck, t0), "a cookie is accepted for another address");
     auto same_bytes = s_v6(1u, 5000u);

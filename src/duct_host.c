@@ -86,7 +86,7 @@ bool duct_host_egress_fits(size_t max_response)
 
 static void s_egress_dispatch(duct_vmq_hdr_t *hdr, [[maybe_unused]] void *arg)
 {
-    auto p = (const egress_pkt_t *)hdr->payload;
+    auto p = (const egress_pkt_t *)&hdr->payload[0];
     s_host_cfg.on_packet_out(s_host_cfg.ctx, p->h, p->conn_id,
                              duct_view(duct_view_u8, (void *)p->data, p->len));
 }
@@ -176,7 +176,7 @@ duct_result_t duct_host_packet_out(const duct_session_handle_t *tok,
         duct_vmq_reserve_armed(&ln, s_egress_msg, 0u, need, &pos, &push_rc);
     if (!stage)
         return push_rc == vmq_push_too_large ? rc_invalid_arg : rc_again;
-    *stage = (egress_pkt_t){ .h = *(const duct_handle_t *)tok,
+    *stage = (egress_pkt_t){ .h = tok->word,
                                .conn_id = conn_id, .len = (uint32_t)pkt.size };
     memcpy(stage->data, pkt.data, pkt.size);
     duct_vmq_publish(&ln, &pos);
@@ -204,7 +204,7 @@ void *duct_host_egress_reserve(const duct_session_handle_t *tok,
     auto stage = (egress_pkt_t *)
         duct_vmq_reserve_held(&ln, s_egress_msg, 0u, need, &pos, &push_rc);
     duct_do_if(!stage, return nullptr);
-    *stage = (egress_pkt_t){ .h = *(const duct_handle_t *)tok,
+    *stage = (egress_pkt_t){ .h = tok->word,
                                .conn_id = conn_id };
     *out = (duct_host_egress_hold_t){ .ln = ln, .pos = pos, .pkt = stage,
                                       .worker_id = wid };
@@ -239,7 +239,7 @@ duct_result_t duct_io_inter_batch(duct_engine_t *e, duct_handle_t tok,
 {
     duct_do_if(!e || !batch, return rc_invalid_arg);
     duct_do_if(conn_id >= duct_session_max_legs, return rc_invalid_arg);
-    auto stok = *(const duct_session_handle_t *)&tok;
+    auto stok = (duct_session_handle_t){ .word = tok };
     auto s = duct_session_attached_by_handle(stok);
     duct_do_if(!s, return rc_closed);
     auto h = duct_session_conn_at(s, conn_id);
@@ -299,7 +299,7 @@ duct_result_t duct_io_inter_batch(duct_engine_t *e, duct_handle_t tok,
         duct_atomic_fetch(sub, &live->host_pins, 1u, release);
         return push_rc == vmq_push_too_large ? rc_invalid_arg : rc_defer;
     }
-    stage->conn = *(const duct_handle_t *)&h;
+    stage->conn = h.word;
     stage->n = batch->n;
     stage->peer = (duct_peer_t){}; /* x_udp_shared-only field; unused here */
     stage->rx_pool = nullptr;
@@ -335,7 +335,7 @@ duct_result_t duct_io_inter_packet(duct_engine_t *e, duct_handle_t tok,
                                    duct_conn_id_t conn_id, duct_view_u8 pkt)
 {
     alignas(8) char buf[duct_inter_batch_bytes(1u)];
-    auto b = (duct_inter_batch_t *)buf;
+    auto b = (duct_inter_batch_t *)&buf[0];
     b->n = 1u;
     *duct_inter_batch_pkt(b, 0u) = (duct_inter_pkt_t){
         .payload = pkt, .stream_id = duct_stream_id_default, .flags = fl_frame_none,

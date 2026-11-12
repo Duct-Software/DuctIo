@@ -431,7 +431,7 @@ typedef struct duct_conn {
          *  @ref duct_xport_t.
          */
         duct_xport_t xport_type;
-        
+
         /** @brief Wire-binding generation.
          *  Bumped by @ref duct_conn_bind_wire on rebind for any xport,
          *  regardless of sealed-ness; a stale sealed dispatch task's

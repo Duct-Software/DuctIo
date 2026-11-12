@@ -344,6 +344,7 @@ static_assert(alignof(duct_rio_tx_op_t) > duct_rio_ctx_send_bit,
  */
 struct duct_rio_tx {
     RIO_RQ              rq;        /**< Request queue the sends post on. */
+    const RIO_EXTENSION_FUNCTION_TABLE *rio; /**< The table every send posts through. */
     duct_listener_t    *listener;  /**< Listener whose outbox a completion drains again, read while @c closing is false. */
     duct_x_slot_pool_t *pools;     /**< The listener's pair of TX slot pools. */
     duct_ptr_t(duct_rio_tx_op_t) ops; /**< One descriptor per send in flight, @c duct_rio_tx_depth of them. */
@@ -368,7 +369,7 @@ static void s_tx_release(duct_rio_tx_t *tx)
     duct_del(tx);
 }
 
-bool duct_rio_tx_create(RIO_RQ rq, duct_listener_t *listener)
+bool duct_rio_tx_create(const RIO_EXTENSION_FUNCTION_TABLE *rio, RIO_RQ rq, duct_listener_t *listener)
 {
     auto pools = listener->tx_slots;
     duct_do_if(!pools, return false);
@@ -380,6 +381,7 @@ bool duct_rio_tx_create(RIO_RQ rq, duct_listener_t *listener)
     duct_do_if(!pools[0].hooks.up || !pools[1].hooks.up, return false);
     for (unsigned i = 0u; i < duct_rio_tx_depth; ++i)
         free_stack[i] = i;
+    tx->rio = rio;
     tx->rq = rq;
     tx->listener = listener;
     tx->pools = pools;
@@ -434,6 +436,33 @@ void duct_rio_tx_drain(const RIO_EXTENSION_FUNCTION_TABLE *rio, duct_listener_t 
 {
     tx_post_t post = { .rio = rio, .tx = (duct_rio_tx_t *)listener->dgram_tx_rio };
     duct_io_dgram_send_drain(listener, s_tx_post, &post);
+}
+
+bool duct_rio_tx_send(const duct_listener_t *listener, const duct_peer_t *peer, duct_view_u8 payload)
+{
+    auto tx = (duct_rio_tx_t *)listener->dgram_tx_rio;
+    duct_do_if(!tx || tx->closing || !tx->free_count, return false);
+    duct_do_if(!duct_x_slot_fits(tx->pools, payload.size), return false);
+    uint32_t ref = duct_x_slot_take(tx->pools, payload.size);
+    duct_do_if(ref == treiber_empty, return false);
+    uint32_t idx = ref & ~duct_x_slot_ref_large;
+    auto pool = duct_x_slot_ref_pool(tx->pools, ref);
+    duct_discard duct_io_sockaddr_from_peer(peer,
+                                            (struct sockaddr_storage *)duct_x_slot_data(pool, idx));
+    memcpy(duct_x_slot_payload(pool, idx), payload.data, payload.size);
+    RIO_BUF data_buf = s_slot_buf(pool, idx, pool->lead, (ULONG)payload.size),
+            addr_buf = s_slot_buf(pool, idx, 0u, sizeof(struct sockaddr_storage));
+    auto op = &duct_at(tx->ops)[tx->free_stack[tx->free_count - 1u]];
+    *op = (duct_rio_tx_op_t){ .tx = tx, .ref = ref };
+    BOOL rc = tx->rio->RIOSendEx(tx->rq, &data_buf, 1u, nullptr, &addr_buf,
+        nullptr, nullptr, 0u, duct_rio_ctx_send(op));
+    if (!rc) {
+        duct_x_slot_put(tx->pools, ref);
+        return false;
+    }
+    --tx->free_count;
+    ++tx->inflight;
+    return true;
 }
 
 /** @brief Settle a completed send: return its descriptor and its slot.

@@ -495,6 +495,29 @@ done:
     return err;
 }
 
+/** @brief The public lead pair: build through duct_session_lead_build, resolve
+ *  through duct_session_lead_resolve over the same served pair, spend once.
+ *  @return nullptr when each held, else what failed. */
+static const char *s_public_pair(void)
+{
+    const fake_engine_t ea = { .key_seed = 0x3cu, .name = 0x4321u };
+    auto a = s_keyed(&ea, &s_proto_a, 0x77u);
+    if (!a)
+        return "session acquire failed";
+    uint8_t lead[duct_session_lead_size];
+    duct_handle_t tok = {};
+    duct_conn_id_t cid = 0u;
+    if (!duct_session_lead_build(a, 2u, lead))
+        return "the public build refused a keyed session";
+    if (!duct_session_lead_resolve(lead, s_served, 2u, &tok, &cid)
+        || tok != duct_session_handle_from_live(a).word || cid != 2u)
+        return "the public resolve did not answer the public build's session and id";
+    if (duct_session_lead_resolve(lead, s_served, 2u, &tok, &cid))
+        return "a publicly built lead verified twice";
+    duct_session_release(a);
+    return nullptr;
+}
+
 int main(void)
 {
     setvbuf(stdout, nullptr, _IOLBF, 0);
@@ -503,6 +526,8 @@ int main(void)
         err = s_leads();
     if (!err)
         err = s_rekey();
+    if (!err)
+        err = s_public_pair();
     if (!err)
         err = s_dgram_leads(duct_seal_lead_size);
     if (!err)
@@ -513,6 +538,7 @@ int main(void)
     }
     printf("join_lead: OK (SipHash-2-4 reference vectors, a lead resolves once to its "
            "session, forged bytes and replays refused, window order, same-peer rule, "
-           "a datagram's own lead behind a prefix as wide as the lead and a wider one)\n");
+           "the public build-and-resolve pair, a datagram's own lead behind a prefix "
+           "as wide as the lead and a wider one)\n");
     return 0;
 }

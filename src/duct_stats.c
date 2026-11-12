@@ -27,13 +27,13 @@ static thread_local unsigned s_shard = stats_unbound;
 
 /** @brief One statistics section. */
 struct duct_stats {
-    duct_stats_t *_Atomic    next;     /**< Section that joined the list before this one. */
-    const char              *name;     /**< Section name, stored behind the fields. */
-    const duct_stat_field_t *fields;   /**< Copy of the table, stored behind this struct. */
-    uint8_t                 *shards;   /**< The shards, @c n_shards of @c stride bytes, in an allocation of their own. */
-    size_t                   stride;   /**< Bytes from one shard to the next: the shard size rounded up to a cache line. */
-    unsigned                 n_shards, /**< Shards, one for each I/O thread and each worker. */
-                             n_fields; /**< Rows in @c fields. */
+    duct_stats_t *_Atomic next;    /**< Section that joined the list before this one. */
+    const char           *name;    /**< Section name, stored behind the fields. */
+    uint8_t              *shards;  /**< The shards, @c n_shards of @c stride bytes, in an allocation of their own. */
+    size_t                stride;  /**< Bytes from one shard to the next: the shard size rounded up to a cache line. */
+    unsigned              n_shards, /**< Shards, one for each I/O thread and each worker. */
+                          n_fields; /**< Rows in @c fields. */
+    duct_stat_field_t     fields[]; /**< Copy of the table, stored behind this struct. */
 };
 
 void duct_stats_bind(unsigned index)
@@ -95,13 +95,12 @@ duct_stats_t *duct_stats_list_add(duct_stats_t *_Atomic *list, unsigned n_shards
     duct_do_if(!st, return nullptr);
     duct_auto_del auto shards = duct_at(duct_new(uint8_t, (size_t)n_shards * stride, duct_cacheline_size));
     duct_do_if(!shards, return nullptr);
-    auto fields = (duct_stat_field_t *)(st + 1);
+    auto fields = st->fields;
     char *at = (char *)fields + fields_size;
     st->name = s_text_copy(&at, cfg->name);
     for (unsigned i = 0u; i < cfg->n_fields; ++i)
         fields[i] = (duct_stat_field_t){ .name = s_text_copy(&at, cfg->fields[i].name),
                                          .offset = cfg->fields[i].offset };
-    st->fields = fields;
     st->shards = duct_move(shards);
     st->stride = stride;
     st->n_shards = n_shards;

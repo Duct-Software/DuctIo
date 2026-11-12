@@ -31,12 +31,10 @@ typedef enum : uint8_t {
 } duct_pre_conn_kind_t;
 
 /** @name Probe-wait read buffer
- *  The first bytes of an accepted stream in storage of its own, at most
- *  @c DUCT_LISTENER_PEEK_DEFAULT: @c duct_probe_peek_t with @c duct_probe_peek_set
- *  and @c duct_probe_peek_view.
+ *  The first bytes of an accepted stream in an allocation of the listener's
+ *  probe read span, at most @c DUCT_LISTENER_PEEK_MAX.
  *  @{
  */
-DUCT_OBUF_DECLARE(duct_probe_peek, DUCT_LISTENER_PEEK_DEFAULT)
 /** @} */
 
 /** @brief Where a dial connects, read by the dial's xport.
@@ -81,30 +79,32 @@ typedef struct duct_pre_conn {
         struct {
             duct_listener_t *listener;
             duct_peer_t      peer;
-            /** @brief First bytes of the connection read so far.
+            /** @brief First bytes of the connection read so far, in an allocation of
+             *  the listener's probe read span made at the wait's start.
              *
              *  The wait fills it by one read or several, each landing at the end of its
-             *  size, in the room @ref duct_pre_conn_probe_room names: the target of an
+             *  bytes, in the room @ref duct_pre_conn_probe_room names: the target of an
              *  iocp @c WSARecv and of the read in @c duct_io_on_pre_conn_readable. A
              *  resolution classifies these bytes.
              */
-            duct_probe_peek_t peek;
+            duct_ptr_t(uint8_t) peek;
+            uint16_t            peek_len; /**< Bytes @c peek holds. */
         }                   probe;    /**< kind == pre_conn_probe. */
     };
     struct duct_pre_conn   *next; /**< duct_io_t::pre_conns intrusive list. */
 } duct_pre_conn_t;
 
 /** @brief Free tail of @p pre_conn's probe buffer, the target of its next read.
- *  Starts past the bytes held and ends at the listener's probe read span, so a
- *  pre-parse never sees more than an accept-time read offers. A waiting pre_conn
- *  always has room: it holds fewer bytes than @c peek_min, or none, and the bind
- *  keeps @c peek_min within that span. */
+ *  Starts past the bytes held and ends at the buffer's own span, so a pre-parse
+ *  never sees more than an accept-time read offers. A waiting pre_conn always
+ *  has room: it holds fewer bytes than @c peek_min, or none, and the bind keeps
+ *  @c peek_min within that span. */
 static inline duct_view_u8 duct_pre_conn_probe_room(duct_pre_conn_t *pre_conn)
 {
-    auto peek = &pre_conn->probe.peek;
+    auto p = &pre_conn->probe;
     return (duct_view_u8){
-        .data = peek->data + peek->size,
-        .size = duct_listener_peek_span(pre_conn->probe.listener->peek_cap) - peek->size,
+        .data = duct_at(p->peek) + p->peek_len,
+        .size = duct_listener_peek_span(p->listener->peek_cap) - p->peek_len,
     };
 }
 

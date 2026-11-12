@@ -182,6 +182,14 @@ typedef struct duct_unseal_ctx {
     duct_wire_tx_t     *tx_buf;  /**< TX staging target;
                                   *   passed to @c tx_append. */
 
+    /** @brief The address the conn's socket names as its peer, copied at the
+     *  context's build; @c family 0 where the conn names none.
+     *  An engine answering what it refused — or announcing itself in any other
+     *  message whose own terms encode the other end's address — reads it here
+     *  rather than reaching for the socket. Plain data of the conn, filled at
+     *  every context build and never read back by the engine. */
+    duct_peer_t         peer;
+
     /** @brief Take the decrypt-in-place span and the room in it.
      *  @p out_cap is at least this engine's own @c pdu_ct_max, and is the
      *  bound one @c unseal call must keep to.

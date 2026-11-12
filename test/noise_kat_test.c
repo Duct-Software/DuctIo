@@ -290,7 +290,11 @@ static const char *s_transport(kat_t *k, const vector_t *v)
                plain_len = 0u;
         if (duct_noise_transport_seal(from, (duct_view_u8[]){ s_bytes(m->payload, m->payload_len) }, 1u, wire, sizeof wire) != sealed_len)
             return "a transport message sealed to another size";
-        s_expect("vector transport counter", wire, counter, sizeof counter);
+        uint8_t covered[duct_noise_counter_size];
+        memcpy(covered, counter, sizeof counter);
+        duct_noise_counter_cover(from->send_key, covered, wire + sizeof counter,
+                                 from->counter_size);
+        s_expect("vector transport counter", wire, covered, from->counter_size);
         s_expect("vector transport message", wire + sizeof counter, m->ct, m->ct_len);
         uint64_t used = from->send_counter - 1u;
         for (size_t cut = 0u; cut <= m->payload_len; ++cut) {
@@ -303,6 +307,8 @@ static const char *s_transport(kat_t *k, const vector_t *v)
         }
         from->send_counter = used + 1u;
         memcpy(wire, counter, sizeof counter);
+        duct_noise_counter_cover(to->recv_key, wire, wire + sizeof counter,
+                                 to->counter_size);
         memcpy(wire + sizeof counter, m->ct, m->ct_len);
         if (!duct_noise_transport_unseal(to, s_bytes(wire, sealed_len), plain, sizeof plain, &plain_len)
             || !s_same(plain, plain_len, s_bytes(m->payload, m->payload_len)))
@@ -379,8 +385,13 @@ int main(void)
         s_expect("k_initiator_send", k.ti.send_key, k_initiator_send, sizeof k_initiator_send);
         s_expect("k_initiator_recv", k.ti.recv_key, k_initiator_recv, sizeof k_initiator_recv);
         s_expect("k_exporter", k.exporter, k_exporter, sizeof k_exporter);
-        s_expect("k_sealed_i2r", k.sealed_i2r, k_sealed_i2r, sizeof k.sealed_i2r);
-        s_expect("k_sealed_r2i", k.sealed_r2i, k_sealed_r2i, sizeof k.sealed_r2i);
+        uint8_t want_i2r[sizeof k_sealed_i2r], want_r2i[sizeof k_sealed_r2i];
+        memcpy(want_i2r, k_sealed_i2r, sizeof want_i2r);
+        duct_noise_counter_cover(k.ti.send_key, want_i2r, want_i2r + 8u, k.ti.counter_size);
+        s_expect("k_sealed_i2r", k.sealed_i2r, want_i2r, sizeof k.sealed_i2r);
+        memcpy(want_r2i, k_sealed_r2i, sizeof want_r2i);
+        duct_noise_counter_cover(k.tr.send_key, want_r2i, want_r2i + 8u, k.tr.counter_size);
+        s_expect("k_sealed_r2i", k.sealed_r2i, want_r2i, sizeof k.sealed_r2i);
     }
     s_release(&k);
     if (failed || err || g_failed) {

@@ -349,7 +349,7 @@ duct_session_t *duct_session_open(const duct_proto_t *proto,
     if (cfg->on_session_open) {
         auto tok = duct_session_handle_from_live(s);
         cfg->on_session_open(s,
-                             *(const duct_handle_t *)&tok,
+                             tok.word,
                              user_ctx,
                              out ? out : &(duct_response_t){},
                              s->proto_state);

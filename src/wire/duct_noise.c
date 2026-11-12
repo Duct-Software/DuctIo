@@ -34,6 +34,7 @@
 #include "duct_noise_internal.h"
 #include "duct_core.h"
 #include "duct_crypto.h"
+#include "duct_hash.h"
 
 #include <openssl/crypto.h>
 #include <openssl/evp.h>
@@ -110,7 +111,7 @@ static void *s_ossl_realloc(void *old, size_t n, const char *file, int line)
         duct_del(old);
         return nullptr;
     }
-    auto h = (const duct_alloc_hdr_t *)((const unsigned char *)old - sizeof(duct_alloc_hdr_t));
+    const duct_alloc_hdr_t *h = duct_block_hdr(old);
     void *fresh = s_ossl_alloc(n, h->secret);
     duct_do_if(!fresh, return nullptr);
     memcpy(fresh, old, duct_min((size_t)h->size, n));
@@ -1160,6 +1161,26 @@ s_aead_ctx(void **slot, const uint8_t key[32], bool encrypt)
     return ctx;
 }
 
+/** @brief Exclusive-or @p counter's @c wide bytes with a SipHash draw of the
+ *  message's own first twelve ciphertext bytes under @p key.
+ *
+ *  The counter rides the wire in the clear and counts; the draw makes the four
+ *  (or eight) wire bytes pseudorandom per message while both ends rebuild it
+ *  from bytes the message itself carries, so loss and reordering touch
+ *  nothing. The seal runs it after the AEAD wrote the ciphertext and before
+ *  the message leaves, the read after the lead checked and before the counter
+ *  is read.
+ */
+void duct_noise_counter_cover(const uint8_t key[duct_noise_key_size], uint8_t *counter,
+                              const uint8_t *sample, size_t wide)
+{
+    uint8_t in[12], draw[8];
+    memcpy(in, sample, sizeof in);
+    duct_sip_put_le64(draw, sizeof draw, duct_siphash24(key, in, sizeof in));
+    for (size_t i = 0u; i < wide; ++i)
+        counter[i] ^= draw[i];
+}
+
 size_t
 duct_noise_transport_seal(duct_noise_transport_t *t, const duct_view_u8 *spans, size_t n,
                           uint8_t *out, size_t out_cap)
@@ -1194,6 +1215,7 @@ duct_noise_transport_seal(duct_noise_transport_t *t, const duct_view_u8 *spans, 
                                    (int)duct_noise_tag_size, out + wide + written) == 1;
     duct_do_if(!ok, return 0u);
 
+    duct_noise_counter_cover(t->send_key, out, out + wide, wide);
     t->send_counter = counter + 1u;
     return wide + (size_t)written + duct_noise_tag_size;
 }
@@ -1237,9 +1259,12 @@ duct_noise_transport_unseal(duct_noise_transport_t *t, duct_view_u8 sealed,
     duct_do_if(sealed.size < wide + duct_noise_tag_size, return false);
     auto p = (const uint8_t *)sealed.data;
 
+    uint8_t low[duct_noise_counter_size];
+    memcpy(low, p, wide);
+    duct_noise_counter_cover(t->recv_key, low, p + wide, wide);
     uint64_t counter = 0u;
     for (unsigned i = 0u; i < wide; ++i)
-        counter |= (uint64_t)p[i] << (8u * i);
+        counter |= (uint64_t)low[i] << (8u * i);
     if (wide == duct_noise_counter_compact_size) {
         counter = s_expand_counter(t, (uint32_t)counter);
         duct_do_if(counter == UINT64_MAX, return false);

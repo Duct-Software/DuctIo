@@ -67,11 +67,18 @@ typedef struct listener_ctx {
     duct_rio_rx_t        *rio_rx;
 } listener_ctx_t;
 
+typedef struct probe_park {
+    duct_sock_t        fd;
+    duct_pre_conn_t   *pre_conn;
+    struct probe_park *next;
+} probe_park_t;
+
 /** @brief Dense @c handles[0..n_entries) for WaitForMultipleObjects
  *  with parallel @c slots[] tag array; 0 is reserved for wake event.
  *  Removal swap-compacts with the last live entry.
  */
 typedef struct duct_events_env {
+    void (*cancel_io)(duct_sock_t fd);
     HANDLE handles[events_max_handles];
     duct_events_slot slots[events_max_handles];
     unsigned n_entries;
@@ -88,6 +95,9 @@ typedef struct duct_events_env {
     listener_ctx_t *rio_listeners; /**< Intrusive list of this env's own
                                      *  RIO-active listener ctxs, threaded
                                      *  via @c listener_ctx::next. */
+    probe_park_t *probe_parks;
+    WSAEVENT      probe_event;
+    unsigned      probe_slot;
 } duct_events_env_t;
 
 /** @brief Resolve the RIO extension function table. */
@@ -118,6 +128,10 @@ duct_events_env_t *duct_events_init(void)
     env->n_entries = 1u;
     env->rio_cq = nullptr;
     env->rio_listeners = nullptr;
+    env->probe_parks = nullptr;
+    env->probe_event = nullptr;
+    env->probe_slot = UINT_MAX;
+    env->cancel_io = nullptr;
     if (s_rio) {
         auto rio_ev = WSACreateEvent();
         if (rio_ev != WSA_INVALID_EVENT) {
@@ -142,6 +156,11 @@ duct_events_env_t *duct_events_init(void)
     return env;
 }
 
+void (*duct_events_cancel_io_of(duct_events_env_t *env))(duct_sock_t fd)
+{
+    return env->cancel_io;
+}
+
 bool duct_events_rio_cq_ready(duct_events_env_t *env)
 {
     return env->rio_cq != nullptr;
@@ -157,17 +176,19 @@ bool duct_events_rio_cq_ready(duct_events_env_t *env)
  *  @todo 500ms is expected to be enough, but maybe better to use a
  *  strict overall completion counter instead.
  */
-static void s_drain_rio_completions(duct_events_env_t *env)
+static void s_drain_rio_completions(duct_events_env_t *env, bool owed)
 {
     duct_do_if(!env->rio_cq, return);
+    duct_rio_cq_flush(s_rio,env->rio_cq);
+    duct_do_if(!owed, return);
     uint64_t deadline = duct_ticks_mono_ns() + 500'000'000u;
     for (;;) {
-        duct_rio_cq_flush(s_rio,env->rio_cq);
         uint64_t now = duct_ticks_mono_ns();
         if (now >= deadline
             || WaitForSingleObject(env->handles[1], (DWORD)((deadline - now + 999'999u) / 1'000'000u))
                    != WAIT_OBJECT_0)
             break;
+        duct_rio_cq_flush(s_rio,env->rio_cq);
     }
 }
 
@@ -176,6 +197,7 @@ void duct_events_fini(duct_events_env_t *env)
     /* Every conn/pre_conn is already unwatched by duct_io_cleanup's walk;
      * a leftover listener, RIO-active or not, can still sit here --
      * neither loop below goes through duct_events_unwatch for it. */
+    bool owed = env->rio_listeners != nullptr;
     for (auto ctx = env->rio_listeners; ctx; ) {
         auto next = ctx->next;
         auto listener = ctx->listener;
@@ -186,7 +208,7 @@ void duct_events_fini(duct_events_env_t *env)
         ctx = next;
     }
     env->rio_listeners = nullptr;
-    s_drain_rio_completions(env);
+    s_drain_rio_completions(env, owed);
     for (unsigned i = 1u; i < env->n_entries; ++i) {
         auto slot = &env->slots[i];
         if (slot->fd != duct_sock_bad)
@@ -229,6 +251,8 @@ static void s_slot_drop(duct_events_env_t *env, unsigned i)
     unsigned last = --env->n_entries;
     env->handles[i] = env->handles[last];
     env->slots[i] = env->slots[last];
+    if (env->probe_slot == last)
+        env->probe_slot = i;
     if (i != last && env->slots[i].fd != duct_sock_bad)
         duct_io_on_relocate(env->slots[i].kind, env->slots[i].tag, &env->slots[i]);
     if (last != events_max_handles - 1u)
@@ -343,7 +367,7 @@ static bool s_rio_dgram_init(duct_events_env_t *env, listener_ctx_t *ctx)
     duct_do_if(!rq, goto fail);
     duct_rio_rx_arm(ring, rq);
     duct_do_if(!ctx->listener->dgram_tx_outbox, return true);
-    bool ok = duct_rio_tx_create(rq, ctx->listener);
+    bool ok = duct_rio_tx_create(s_rio, rq, ctx->listener);
     duct_do_if(!ok, goto fail);
     return true;
 fail:
@@ -376,6 +400,65 @@ static bool s_listener_create_rio(duct_events_env_t *env, duct_listener_t *liste
     return true;
 }
 
+static bool s_probe_park_watch(duct_events_env_t *env, duct_sock_t fd, void *tag_ptr)
+{
+    bool armed = env->probe_slot != UINT_MAX;
+    duct_do_if(!armed && env->n_entries >= events_max_handles, return false);
+    auto ev = armed ? env->probe_event : WSACreateEvent();
+    duct_do_if(!armed && ev == WSA_INVALID_EVENT, return false);
+    auto park = duct_new(probe_park_t);
+    duct_do_if(!park, goto fail);
+    *park = (probe_park_t){ .fd = fd, .pre_conn = (duct_pre_conn_t *)tag_ptr };
+    int rc = WSAEventSelect(fd, ev, FD_READ | FD_CLOSE);
+    duct_do_if(rc == SOCKET_ERROR, duct_del(park); goto fail);
+    park->next = env->probe_parks;
+    env->probe_parks = park;
+    duct_do_if(armed, return true);
+    env->probe_event = ev;
+    env->probe_slot = env->n_entries++;
+    env->handles[env->probe_slot] = ev;
+    env->slots[env->probe_slot] = (duct_events_slot){ .kind = io_tag_pre_conn,
+                                                      .interest = FD_READ | FD_CLOSE,
+                                                      .handle = ev };
+    return true;
+fail:
+    if (!armed)
+        WSACloseEvent(ev);
+    return false;
+}
+
+static bool s_probe_park_detach(duct_events_env_t *env, duct_sock_t fd)
+{
+    for (probe_park_t **pp = &env->probe_parks; *pp; pp = &(*pp)->next) {
+        if ((*pp)->fd != fd)
+            continue;
+        auto park = *pp;
+        *pp = park->next;
+        duct_del(park);
+        duct_discard WSAEventSelect(fd, nullptr, 0);
+        if (!env->probe_parks && env->probe_slot != UINT_MAX) {
+            duct_discard WSACloseEvent(env->probe_event);
+            s_slot_drop(env, env->probe_slot);
+            env->probe_slot = UINT_MAX;
+            env->probe_event = nullptr;
+        }
+        return true;
+    }
+    return false;
+}
+
+static void s_probe_park_dispatch(duct_events_env_t *env)
+{
+    for (auto p = env->probe_parks; p; ) {
+        auto next = p->next;
+        WSANETWORKEVENTS ne;
+        if (WSAEnumNetworkEvents(p->fd, env->probe_event, &ne) != SOCKET_ERROR
+            && (ne.lNetworkEvents & (FD_READ | FD_CLOSE)))
+            duct_io_on_pre_conn_readable(p->pre_conn);
+        p = next;
+    }
+}
+
 bool duct_events_watch(duct_events_env_t *env, duct_sock_t fd,
                        duct_io_tag_t kind, void *tag_ptr,
                        duct_xport_t xport_type)
@@ -390,6 +473,8 @@ bool duct_events_watch(duct_events_env_t *env, duct_sock_t fd,
              * budget. */
             return s_listener_create_rio(env, listener);
     }
+    if (kind == io_tag_pre_conn && ((duct_pre_conn_t *)tag_ptr)->kind == pre_conn_probe)
+        return s_probe_park_watch(env, fd, tag_ptr);
     duct_do_if(env->n_entries >= events_max_handles, return false);
     long bits = 0;
     switch (kind) {
@@ -406,14 +491,11 @@ bool duct_events_watch(duct_events_env_t *env, duct_sock_t fd,
         break;
     case io_tag_pre_conn:
         switch (((duct_pre_conn_t *)tag_ptr)->kind) {
-        case pre_conn_probe:
-            /* A FIN with no bytes ahead of it raises FD_CLOSE alone, which a held
-             * read needs to end ahead of its deadline. */
-            bits = FD_READ | FD_CLOSE;
-            break;
         case pre_conn_dial:
             bits = FD_CONNECT | FD_READ | FD_WRITE | FD_CLOSE;
             break;
+        case pre_conn_probe:
+            duct_unreachable();
         }
         break;
     case io_tag_conn:
@@ -451,6 +533,8 @@ bool duct_events_watch(duct_events_env_t *env, duct_sock_t fd,
 void duct_events_unwatch(duct_events_env_t *env, duct_sock_t fd, void *rx_io_priv)
 {
     if (fd == duct_sock_bad)
+        return;
+    if (s_probe_park_detach(env, fd))
         return;
     for (listener_ctx_t **pp = &env->rio_listeners; *pp; pp = &(*pp)->next) {
         if ((*pp)->listener->listen_fd != fd)
@@ -526,12 +610,27 @@ void duct_events_unwatch_device(duct_events_env_t *env, void *handle)
 bool duct_events_promote(duct_events_env_t *env, duct_sock_t fd, void *tag_ptr)
 {
     unsigned i = s_find_slot(env, fd);
-    duct_do_if(i == UINT_MAX, return false);
+    if (i == UINT_MAX) {
+        duct_do_if(!s_probe_park_detach(env, fd), return false);
+        duct_do_if(env->n_entries >= events_max_handles, return false);
+        auto ev = WSACreateEvent();
+        duct_do_if(ev == WSA_INVALID_EVENT, return false);
+        int rc = WSAEventSelect(fd, ev, FD_READ | FD_WRITE | FD_CLOSE);
+        duct_do_if(rc == SOCKET_ERROR, WSACloseEvent(ev); return false);
+        i = env->n_entries++;
+        env->handles[i] = ev;
+        env->slots[i] = (duct_events_slot){ .fd = fd, .kind = io_tag_conn, .tag = tag_ptr,
+                                            .interest = FD_READ | FD_WRITE | FD_CLOSE,
+                                            .handle = ev };
+        duct_io_on_relocate(io_tag_conn, tag_ptr, &env->slots[i]);
+        return true;
+    }
     /* Full conn interest whatever the pre_conn carried -- pre_conn_probe
      * selects FD_READ and FD_CLOSE. No x_udp_peer narrowing either: a dialed
      * x_udp_peer conn holds a real unshared socket. */
     long bits = FD_READ | FD_WRITE | FD_CLOSE;
-    duct_do_if(WSAEventSelect(fd, env->handles[i], bits) == SOCKET_ERROR, return false);
+    int rc = WSAEventSelect(fd, env->handles[i], bits);
+    duct_do_if(rc == SOCKET_ERROR, return false);
     env->slots[i].kind = io_tag_conn;
     env->slots[i].tag = tag_ptr;
     env->slots[i].interest = bits;
@@ -539,12 +638,6 @@ bool duct_events_promote(duct_events_env_t *env, duct_sock_t fd, void *tag_ptr)
     return true;
 }
 
-bool duct_events_cancel_io([[maybe_unused]] duct_events_env_t *env,
-                           [[maybe_unused]] duct_sock_t fd)
-{
-    /* No-op on reactor-style backends. */
-    return true;
-}
 
 void duct_events_kick(duct_events_env_t *env)
 {
@@ -667,6 +760,10 @@ static inline void s_events_dispatch(duct_events_env_t *env, unsigned i)
     }
     if (slot->kind == io_tag_rio_cq) {
         duct_rio_cq_drain(s_rio,env->rio_cq);
+        return;
+    }
+    if (i == env->probe_slot) {
+        s_probe_park_dispatch(env);
         return;
     }
     /* Last of the three fd == duct_sock_bad slot kinds, so it comes after

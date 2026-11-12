@@ -22,8 +22,7 @@
  *  @c duct_wire_create_length_prefix and keeps its parser management; TX there
  *  stages one datagram per call already, the worker's record-length wrapper
  *  being the only framing a send() ever needs.
- *  Per-connection parser state, @c lp_parser_t, brand-casts to/from the opaque
- *  @c duct_wire_parser_t token — it needs
+ *  Per-connection parser state, @c duct_wire_parser_t, carries the
  *  replay-across-reads fields the wire object itself has no use for.
  */
 
@@ -91,17 +90,17 @@ typedef enum : uint8_t {
  *  across reads and @c hdr_buf holds what came so far. A unit whose header
  *  arrived whole leaves nothing behind.
  */
-typedef struct {
+struct duct_wire_parser {
     uint8_t   hdr_buf[mux_hdr_size];
     uint32_t  partial_len;
-} lp_parser_t;
+};
 
 /** @brief Parse one counted unit: a big-endian header, then the bytes it counts.
  *
  *  Every built-in @c on_parse is this function under one @p fmt, resolving to
  *  two widths. @b hdr holds the count — 4 for a length prefix or the io
  *  thread's record header, 8 where a stream id rides along — and is decoded
- *  where it lies, @c lp_parser_t::hdr_buf carrying it only when it arrived
+ *  where it lies, @c duct_wire_parser_t::hdr_buf carrying it only when it arrived
  *  across two reads. @b lead is the part of the counted unit belonging to wire
  *  framing, which a datagram spends on fields lacking a dedicated header.
  *
@@ -120,7 +119,6 @@ static duct_result_t s_lp_parse_unit(const duct_wire_t *self,
                                      duct_wire_parser_t *parser,
                                      size_t *consumed, size_t *needed, lp_unit_fmt_t fmt)
 {
-    auto lp = (lp_parser_t *)parser;
     *consumed = 0u;
     *needed = 0u;
 
@@ -135,29 +133,29 @@ static duct_result_t s_lp_parse_unit(const duct_wire_t *self,
             *end = p + input.size;
 
     const uint8_t *o;
-    if (lp->partial_len > 0u) {
-        p += lp->partial_len; /* skip replayed already-buffered bytes */
-        uint32_t want = (uint32_t)hdr - lp->partial_len,
+    if (parser->partial_len > 0u) {
+        p += parser->partial_len; /* skip replayed already-buffered bytes */
+        uint32_t want = (uint32_t)hdr - parser->partial_len,
                  copy = (uint32_t)(end - p) < want ? (uint32_t)(end - p) : want;
-        memcpy(lp->hdr_buf + lp->partial_len, p, copy);
-        lp->partial_len += copy;
+        memcpy(parser->hdr_buf + parser->partial_len, p, copy);
+        parser->partial_len += copy;
         p += copy;
-        if (lp->partial_len < (uint32_t)hdr) {
-            *needed = hdr - lp->partial_len;
+        if (parser->partial_len < (uint32_t)hdr) {
+            *needed = hdr - parser->partial_len;
             return rc_again;
         }
-        o = lp->hdr_buf;
+        o = parser->hdr_buf;
     } else if ((size_t)(end - p) >= hdr) {
         o = p;
         p += hdr;
     } else {
-        memcpy(lp->hdr_buf, p, (size_t)(end - p));
-        lp->partial_len = (uint32_t)(end - p);
-        *needed = hdr - lp->partial_len;
+        memcpy(parser->hdr_buf, p, (size_t)(end - p));
+        parser->partial_len = (uint32_t)(end - p);
+        *needed = hdr - parser->partial_len;
         return rc_again;
     }
 
-    lp->partial_len = 0u;
+    parser->partial_len = 0u;
 
     duct_frame_flags_t flags = fl_frame_none;
     duct_stream_id_t sid = duct_stream_id_default;
@@ -378,7 +376,7 @@ static size_t s_mux_dgram_pack_header([[maybe_unused]] const duct_wire_t *self,
 
 static duct_wire_parser_t *s_lp_create_parser([[maybe_unused]] const duct_wire_t *self)
 {
-    return (duct_wire_parser_t *)duct_new(lp_parser_t);
+    return duct_new(duct_wire_parser_t);
 }
 
 static void s_lp_destroy_parser([[maybe_unused]] const duct_wire_t *self, duct_wire_parser_t *parser)

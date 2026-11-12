@@ -1095,7 +1095,8 @@ static void test_frame_sealed_task_dropped_after_wire_switch(void)
 
 static int s_fake_engine_instance; /* dummy — no real per-conn state needed */
 
-static duct_seal_engine_t *s_fake_engine_create([[maybe_unused]] void *cfg,
+static duct_seal_engine_t *s_fake_engine_create([[maybe_unused]] const struct duct_seal_engine_vtbl *self,
+                                               [[maybe_unused]] void *cfg,
                                                [[maybe_unused]] duct_seal_role_t role)
 {
     return (duct_seal_engine_t *)&s_fake_engine_instance;
@@ -2656,7 +2657,7 @@ static void test_engine_egress_park_is_bounded_and_ordered(void)
     f.conn->seal.codec = wire->create_codec(wire, x_tcp);
     assert(f.conn->seal.codec);
     auto codec = f.conn->seal.codec;
-    size_t budget = codec->engine_vtbl->engine_hs_budget,
+    size_t budget = codec->engine->vtbl->engine_hs_budget,
            cap = s_engine_park_cap(f.conn, codec);
     auto tx = f.conn->tx_buf;
     size_t room = duct_olb_tx_space(tx);

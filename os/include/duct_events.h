@@ -161,14 +161,7 @@ duct_events_unwatch_device(duct_events_env_t *env, void *device);
 duct_nonnull(1, 2) void
 duct_events_device_rx_interest(duct_events_env_t *env, void *device, bool want);
 
-/** @brief Cancel every outstanding op on @p fd without closing it — the
- *  caller decides @p fd's fate relying on the return value.
- *
- *  @retval true   No expected arrivals for @p fd, safe to resolve.
- *  @retval false  The cancelled op still owes at least one completion.
- */
-[[nodiscard]] duct_nonnull(1) bool
-duct_events_cancel_io(duct_events_env_t *env, duct_sock_t fd);
+duct_nonnull(1) void (*duct_events_cancel_io_of(duct_events_env_t *env))(duct_sock_t fd);
 
 /** @brief Cross-thread wake for a parked event loop.
  *  Signals @p env's wake slot; @see duct_events_run_loop for the park side. */

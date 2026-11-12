@@ -12,17 +12,20 @@ static_assert(duct_cookie_secret_size == duct_siphash_key_size,
 static_assert(duct_cookie_size == sizeof(uint64_t),
     "a cookie is one SipHash tag");
 
-/** @brief Write the cookie of @p peer's address and family under @p secret.
+/** @brief Write the cookie of @p peer's address, family and port under @p secret.
  *  All sixteen address bytes go in whatever the family is: an IPv4 peer's tail
  *  is zero by construction, and the family is hashed beside them so the two
- *  families never share a cookie.
+ *  families never share a cookie. The port rides behind the family, so one
+ *  address's endpoints never share a mint.
  */
 static void s_mac(const uint8_t *secret, const duct_peer_t *peer, uint8_t *out)
 {
-    uint8_t msg[sizeof peer->addr.v6 + sizeof peer->family];
+    uint8_t msg[sizeof peer->addr.v6 + sizeof peer->family + sizeof peer->port];
     memcpy(msg, peer->addr.v6, sizeof peer->addr.v6);
     msg[sizeof peer->addr.v6] = (uint8_t)(peer->family >> 8u);
     msg[sizeof peer->addr.v6 + 1u] = (uint8_t)peer->family;
+    msg[sizeof peer->addr.v6 + 2u] = (uint8_t)(peer->port >> 8u);
+    msg[sizeof peer->addr.v6 + 3u] = (uint8_t)peer->port;
     uint64_t mac = duct_siphash24(secret, msg, sizeof msg);
     memcpy(out, &mac, sizeof mac);
 }

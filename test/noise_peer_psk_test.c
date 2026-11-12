@@ -185,8 +185,8 @@ static bool s_open(pair_t *p, const duct_seal_engine_vtbl_t *vt,
                    duct_noise_cfg_t *rsp, duct_noise_cfg_t *ini)
 {
     *p = (pair_t){ .vt = vt, .ip = &g_ini_port, .rp = &g_rsp_port };
-    p->rsp = vt->create(rsp, seal_role_responder);
-    p->ini = vt->create(ini, seal_role_initiator);
+    p->rsp = vt->create(vt,rsp, seal_role_responder);
+    p->ini = vt->create(vt,ini, seal_role_initiator);
     if (p->rsp && p->ini)
         return true;
     s_close(p);
@@ -414,7 +414,7 @@ static const char *s_short_hello(const duct_seal_engine_vtbl_t *vt, world_t *w)
             return "crafting message 1 failed";
         if (hdr)
             duct_store_be16(framed, (uint16_t)n);
-        auto rsp = vt->create(&w->server, seal_role_responder);
+        auto rsp = vt->create(vt,&w->server, seal_role_responder);
         if (!rsp)
             return "engine create failed";
         s_clear(&g_rsp_port);

@@ -114,13 +114,39 @@ static const char *sc_reserved(void)
     return nullptr;
 }
 
+static const char *sc_utf8_path(void)
+{
+#ifdef _WIN32
+    static constexpr char utf8_path[] = "ductio_file_test_" "\xD0\xBB\xD0\xBE\xD0\xB3" ".tmp";
+    wchar_t wide[128];
+    expect(MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, utf8_path, -1, wide, 128) > 0,
+           "the UTF-8 path does not convert");
+    if (!DeleteFileW(wide))
+        expect(GetLastError() == ERROR_FILE_NOT_FOUND, "a stale UTF-8 file cannot be removed");
+    auto f = duct_file_open(utf8_path, duct_file_app | duct_file_out);
+    expect(f, "the append open of a UTF-8 path was refused");
+    expect(duct_file_write(f, text, 5u) == rc_ok, "the write to the UTF-8 path was refused");
+    duct_file_close(f);
+    f = duct_file_open(utf8_path, duct_file_in);
+    expect(f, "the read open of the UTF-8 path was refused");
+    char buf[32] = {};
+    size_t n = 0u;
+    expect(duct_file_read(f, buf, sizeof buf, &n) == rc_ok && n == 5u && memcmp(buf, text, 5u) == 0,
+           "the read of the UTF-8 path did not take what the write put there");
+    duct_file_close(f);
+    expect(DeleteFileW(wide), "the UTF-8 file is not removed");
+#endif
+    return nullptr;
+}
+
 int main(void)
 {
     static const struct { const char *name; const char *(*fn)(void); } cases[] = {
-        { "buffered", sc_buffered },
-        { "append",   sc_append },
-        { "mapped",   sc_mapped },
-        { "reserved", sc_reserved },
+        { "buffered",  sc_buffered },
+        { "append",    sc_append },
+        { "mapped",    sc_mapped },
+        { "reserved",  sc_reserved },
+        { "utf8_path", sc_utf8_path },
     };
     int failed = 0;
     for (size_t i = 0u; i < sizeof cases / sizeof cases[0]; ++i) {

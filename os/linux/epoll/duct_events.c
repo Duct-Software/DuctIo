@@ -28,6 +28,7 @@ static constexpr unsigned events_max_batch = 64u;
  *  instance + wake @c eventfd, heap-allocated on the owning I/O thread.
  */
 typedef struct duct_events_env {
+    void (*cancel_io)(duct_sock_t fd);
     int epoll_fd,
         wake_fd;
 } duct_events_env_t;
@@ -133,13 +134,14 @@ duct_events_env_t *duct_events_init(void)
     auto env = duct_new(duct_events_env_t);
     duct_do_if(!env, goto fail);
 
+    env->cancel_io = nullptr;
     env->epoll_fd = epoll_create1(EPOLL_CLOEXEC);
     duct_do_if(env->epoll_fd < 0, goto fail);
     s_epoll_busy_poll_arm(env->epoll_fd);
 
     env->wake_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
     duct_do_if(env->wake_fd < 0, goto fail);
-    
+
     struct epoll_event kev = {
         .events = EPOLLIN,
         .data.u64 = s_tag_pack(io_tag_wake, nullptr),
@@ -154,6 +156,11 @@ fail:
         close(env->wake_fd);
     duct_del(env);
     return nullptr;
+}
+
+void (*duct_events_cancel_io_of(duct_events_env_t *env))(duct_sock_t fd)
+{
+    return env->cancel_io;
 }
 
 void duct_events_fini(duct_events_env_t *env)
@@ -308,13 +315,6 @@ void duct_events_unwatch(duct_events_env_t *env, duct_sock_t fd,
     if (fd == duct_sock_bad)
         return;
     duct_discard epoll_ctl(env->epoll_fd, EPOLL_CTL_DEL, fd, nullptr);
-}
-
-bool duct_events_cancel_io([[maybe_unused]] duct_events_env_t *env,
-                           [[maybe_unused]] duct_sock_t fd)
-{
-    /* No-op on reactive I/O — nothing to cancel. */
-    return true;
 }
 
 void duct_events_kick(duct_events_env_t *env)

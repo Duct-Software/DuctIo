@@ -371,6 +371,71 @@ static const char *sc_close_notify(SSL *ssl)
     return nullptr;
 }
 
+/* ── Initiator vtbl: start() emits a ClientHello carrying our SNI ─────── */
+
+static uint8_t g_client_hello[2048];
+static size_t g_client_hello_len;
+
+static bool s_capture_append([[maybe_unused]] duct_unseal_ctx_t *self, duct_view_u8 bytes)
+{
+    if (g_client_hello_len + bytes.size > sizeof g_client_hello)
+        return false;
+    memcpy(g_client_hello + g_client_hello_len, bytes.data, bytes.size);
+    g_client_hello_len += bytes.size;
+    return true;
+}
+
+static const char *sc_client_start(SSL_CTX *client_ctx)
+{
+    static const char sni[] = "a4f9m2v7qk3wdu7xh1e5c6duct90b8.duct.software";
+    duct_tls_client_cfg_t cfg = { .ctx = client_ctx, .sni = sni };
+    auto vt = duct_tls_openssl_client_vtbl();
+    auto e = vt->create(vt,&cfg, seal_role_initiator);
+    if (!e)
+        return "client engine create failed";
+    duct_unseal_ctx_t ctx = {};
+    ctx.tx_append = s_capture_append;
+    g_client_hello_len = 0u;
+    vt->start(e, &ctx);
+    vt->destroy(e);
+    if (g_client_hello_len < 76u)
+        return "start emitted no ClientHello";
+    if (g_client_hello[0] != 0x16 || g_client_hello[1] != 0x03 || g_client_hello[2] != 0x01)
+        return "the first flight is not a TLS handshake record";
+    if (g_client_hello[5] != 0x01)
+        return "the first flight is not a ClientHello";
+    size_t at = 44u + (size_t)g_client_hello[43];
+    at += 2u + (size_t)(g_client_hello[at] << 8u | g_client_hello[at + 1u]);
+    at += 1u + (size_t)g_client_hello[at];
+    if (at + 2u >= g_client_hello_len)
+        return "the ClientHello carries no extensions";
+    size_t ext_end = at + 2u + (size_t)(g_client_hello[at] << 8u | g_client_hello[at + 1u]);
+    if (ext_end > g_client_hello_len)
+        return "the captured ClientHello is cut short";
+    at += 2u;
+    const uint8_t *host = nullptr;
+    size_t host_len = 0u;
+    while (at + 4u <= ext_end) {
+        unsigned type = (unsigned)(g_client_hello[at] << 8u | g_client_hello[at + 1u]);
+        size_t len = (size_t)(g_client_hello[at + 2u] << 8u | g_client_hello[at + 3u]);
+        if (at + 4u + len > ext_end)
+            break;
+        if (type == 0u && len > 5u && g_client_hello[at + 4u + 2u] == 0u) {
+            size_t hl = (size_t)(g_client_hello[at + 4u + 3u] << 8u
+                               | g_client_hello[at + 4u + 4u]);
+            if (at + 4u + 5u + hl <= ext_end) {
+                host = g_client_hello + at + 4u + 5u;
+                host_len = hl;
+            }
+            break;
+        }
+        at += 4u + len;
+    }
+    if (!host || host_len != sizeof sni - 1u || memcmp(host, sni, host_len) != 0)
+        return "the ClientHello's server name is not the configured one";
+    return nullptr;
+}
+
 int main(void)
 {
     setvbuf(stdout, nullptr, _IOLBF, 0);
@@ -450,6 +515,7 @@ int main(void)
             if (!err) err = sc_close_notify(ssl);
         }
     }
+    if (!err) err = sc_client_start(client_ctx);
 
 cleanup:
     if (ssl) SSL_free(ssl);

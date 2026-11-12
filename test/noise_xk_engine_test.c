@@ -164,8 +164,8 @@ typedef struct {
 
 static bool pair_open(pair_t *p, const duct_seal_engine_vtbl_t *vt, setup_t *s)
 {
-    *p = (pair_t){ .vt = vt, .cli = vt->create(&s->cli, seal_role_initiator),
-                   .srv = vt->create(&s->srv, seal_role_responder) };
+    *p = (pair_t){ .vt = vt, .cli = vt->create(vt,&s->cli, seal_role_initiator),
+                   .srv = vt->create(vt,&s->srv, seal_role_responder) };
     return p->cli && p->srv;
 }
 
@@ -571,7 +571,7 @@ static const char *sc_create(const duct_seal_engine_vtbl_t *vt)
     if (!setup_open(&s))
         return "the setup did not open";
     s.cli.suite.pattern = noise_pattern_count;
-    if (vt->create(&s.cli, seal_role_initiator))
+    if (vt->create(vt,&s.cli, seal_role_initiator))
         return "an engine was made over a pattern past the last";
     s.cli.suite.pattern = noise_pattern_xkpsk3;
     if (!pair_open(&w.pair, vt, &s))

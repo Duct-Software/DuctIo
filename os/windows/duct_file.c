@@ -49,15 +49,27 @@ duct_file_t *duct_file_open(const char *path, unsigned flags)
     }
     /* Append wins over truncate, and out without in writes: the four flag shapes map
      * onto the CRT's own modes, read-write included for a file both read and written. */
-    const char *mode = duct_has(flags, duct_file_app) ? "ab"
-                     : duct_has(flags, duct_file_out) ? ((duct_has(flags, duct_file_in)) ? "r+b" : "wb")
-                     : duct_has(flags, duct_file_in)  ? "rb"
-                                                      : nullptr;
+    const wchar_t *mode = duct_has(flags, duct_file_app) ? L"ab"
+                        : duct_has(flags, duct_file_out) ? ((duct_has(flags, duct_file_in)) ? L"r+b" : L"wb")
+                        : duct_has(flags, duct_file_in)  ? L"rb"
+                                                         : nullptr;
     if (!mode) {
         duct_del(f);
         return nullptr;
     }
-    f->file = fopen(path, mode);
+    int wide_n = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, nullptr, 0);
+    if (wide_n <= 0) {
+        duct_del(f);
+        return nullptr;
+    }
+    auto wide = duct_new(wchar_t, (size_t)wide_n);
+    if (!wide) {
+        duct_del(f);
+        return nullptr;
+    }
+    MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, duct_at(wide), wide_n);
+    f->file = _wfopen(duct_at(wide), mode);
+    duct_del(wide);
     if (!f->file) {
         duct_del(f);
         return nullptr;

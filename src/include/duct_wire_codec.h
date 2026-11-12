@@ -26,7 +26,6 @@ extern "C" {
 #endif
 
 typedef struct duct_seal_engine duct_seal_engine_t;
-typedef struct duct_seal_engine_vtbl duct_seal_engine_vtbl_t;
 
 /** @brief Where a codec stands on leading its datagrams with a join lead. */
 typedef enum duct_lead_state : uint8_t {
@@ -49,8 +48,7 @@ static_assert(sizeof(duct_lead_state_t) == sizeof(uint8_t),
  *  held, and outlives @c destroy until the last hold is dropped.
  *
  *  Field order is load-bearing: the pointers and cursors the parse and
- *  unseal paths read fill the first cache line exactly, up to
- *  @c engine_vtbl.
+ *  unseal paths read fill the first cache line exactly.
  */
 typedef struct duct_wire_codec {
     /** @brief The inner wire framing unsealed cleartext.
@@ -86,9 +84,6 @@ typedef struct duct_wire_codec {
                              *  still unparsed. */
 
     duct_seal_engine_t *engine; /**< Seal-engine instance. */
-    
-    /** @brief Seal-engine vtbl bound to @c engine. */
-    const duct_seal_engine_vtbl_t *engine_vtbl;
 
     /** @brief Bytes this conn leads every PDU it sends with, the wire's
      *  @c tx_prefix until the protocol names the conn. Only the first

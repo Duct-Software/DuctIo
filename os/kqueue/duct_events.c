@@ -114,6 +114,7 @@ static inline void *s_tag_unpack(uintptr_t word, duct_io_tag_t *kind)
  *  issues a @c kevent of its own and never touches it.
  */
 typedef struct duct_events_env {
+    void (*cancel_io)(duct_sock_t fd);
     int           kq;
     unsigned      n_changes;
     struct kevent changes[kq_max_changes];
@@ -261,6 +262,7 @@ duct_events_env_t *duct_events_init(void)
     auto env = duct_new(duct_events_env_t);
     duct_do_if(!env, return nullptr);
 
+    env->cancel_io = nullptr;
     env->kq = kqueue();
     duct_do_if(env->kq < 0, duct_del(env); return nullptr);
     /* kqueue() predates O_CLOEXEC and has no flags argument on any dialect;
@@ -281,6 +283,11 @@ duct_events_env_t *duct_events_init(void)
     } while (rc < 0 && errno == EINTR);
     duct_do_if(rc < 0, duct_events_fini(env); return nullptr);
     return env;
+}
+
+void (*duct_events_cancel_io_of(duct_events_env_t *env))(duct_sock_t fd)
+{
+    return env->cancel_io;
 }
 
 void duct_events_fini(duct_events_env_t *env)
@@ -436,13 +443,6 @@ void duct_events_unwatch(duct_events_env_t *env, duct_sock_t fd,
      * the registrations by itself; unwatch's contract includes no close. */
     s_changes_push(env, ident, EVFILT_READ,  EV_DELETE, 0, kq_tag_none);
     s_changes_push(env, ident, EVFILT_WRITE, EV_DELETE, 0, kq_tag_none);
-}
-
-bool duct_events_cancel_io([[maybe_unused]] duct_events_env_t *env,
-                           [[maybe_unused]] duct_sock_t fd)
-{
-    /* No-op on reactive I/O — nothing to cancel. */
-    return true;
 }
 
 void duct_events_kick(duct_events_env_t *env)

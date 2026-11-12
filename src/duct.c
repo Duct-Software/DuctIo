@@ -455,7 +455,7 @@ static duct_result_t s_session_close_trampoline(duct_session_t *s, duct_response
 /** @brief Return the id of the worker that serves the session of @p tok, @c conn_worker_none when @p tok names no attached session. */
 static unsigned s_worker_of(duct_handle_t tok)
 {
-    auto s = duct_session_attached_by_handle(*(const duct_session_handle_t *)&tok);
+    auto s = duct_session_attached_by_handle((duct_session_handle_t){ .word = tok });
     return s ? duct_atomic_load(&s->worker_id, acquire) : conn_worker_none;
 }
 
@@ -465,8 +465,9 @@ duct_result_t duct_session_invoke(duct_engine_t *e, duct_handle_t tok,
     duct_do_if(!e || !fn, return rc_invalid_arg);
     auto worker_id = s_worker_of(tok);
     duct_do_if(worker_id == conn_worker_none, return rc_closed);
+    auto h = (duct_session_handle_t){ .word = tok };
     /* The async post can fail on message OOM like the sync form below. */
-    if (!duct_worker_post_session_invoke(worker_id, (const duct_session_handle_t *)&tok, fn, ctx, nullptr, nullptr))
+    if (!duct_worker_post_session_invoke(worker_id, &h, fn, ctx, nullptr, nullptr))
         return rc_no_memory;
     return rc_ok;
 }
@@ -522,8 +523,9 @@ duct_result_t duct_session_dispatch(duct_engine_t *e, duct_handle_t tok,
     auto call = duct_new(dispatch_t);
     duct_do_if(!call, return rc_no_memory);
     *call = (dispatch_t){ .fn = fn, .ctx = ctx };
+    auto h = (duct_session_handle_t){ .word = tok };
     /* A refused post has already run s_dispatch_done, which freed the carrier. */
-    return duct_worker_post_session_invoke(worker_id, (const duct_session_handle_t *)&tok, s_dispatch_run, call,
+    return duct_worker_post_session_invoke(worker_id, &h, s_dispatch_run, call,
                                            s_dispatch_done, call)
          ? rc_ok : rc_no_memory;
 }
@@ -564,9 +566,10 @@ duct_result_t duct_session_invoke_sync(duct_engine_t *e, duct_handle_t tok,
         return rc_no_memory;
     }
     sync->e = e;
+    auto h = (duct_session_handle_t){ .word = tok };
     /* A refused post has already run s_sync_invoke_done on this thread, which let go the
      * worker's holder and the inflight count: only the waiter's holder is left, for auto_del. */
-    if (!duct_worker_post_session_invoke(worker_id, (const duct_session_handle_t *)&tok, fn, ctx, s_sync_invoke_done, duct_share(sync)))
+    if (!duct_worker_post_session_invoke(worker_id, &h, fn, ctx, s_sync_invoke_done, duct_share(sync)))
         return rc_closed;
     auto deadline = duct_time_add(duct_time_now(),
                                   duct_time_from_us((uint64_t)duct_sync_bound_ms * 1000ull));

@@ -74,6 +74,11 @@ unsigned tls_null_destroy_calls(void);
 /** @brief Total @c close_notify calls across every engine instance so far. */
 unsigned tls_null_close_notify_calls(void);
 
+/** @brief The peer address the latest @c unseal's context carried. The caller
+ *  reads it once the frame that unseal committed has logged — that log is the
+ *  ordering point — and no later unseal runs. */
+void tls_null_last_peer(duct_peer_t *out);
+
 /** @brief The vtbl itself — one static instance, shared by every wire/conn
  *  a test builds (per-conn state lives in the @c duct_seal_engine_t @c
  *  create returns, not here). */

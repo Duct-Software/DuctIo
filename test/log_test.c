@@ -254,7 +254,7 @@ typedef struct {
     char         last[log_cap];
 } taken_t;
 
-static void taken_write(void *ctx, const char *line, size_t len)
+static void taken_write(void *ctx, FILE *, const char *line, size_t len)
 {
     auto taken = (taken_t *)ctx;
     duct_atomic_fetch(add, &taken->lines, 1u, relaxed);

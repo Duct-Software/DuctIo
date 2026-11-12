@@ -417,7 +417,7 @@ void duct_conn_sealed_codec_detach(duct_conn_t *conn)
 void duct_conn_inter_slot_release(duct_vmq_hdr_t *hdr, [[maybe_unused]] void *arg)
 {
     duct_do_if(hdr->type != inter_msg_batch, return);
-    auto b = (const duct_msg_inter_batch_t *)hdr->payload;
+    auto b = (const duct_msg_inter_batch_t *)&hdr->payload[0];
     if (b->rx_pool)
         duct_io_rx_slot_drop(b->rx_pool, b->rx_slot, false);
 }

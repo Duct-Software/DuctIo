@@ -566,7 +566,8 @@ duct_nonnull(1) static inline bool duct_olb_tx_rewind_idle(duct_olb_tx_t *tx)
     size_t prev = duct_atomic_load(&tx->pass_end, relaxed),
            keep = duct_max(end, duct_olb_tx_min_room_get(tx));
     duct_olb_tx_wrap(tx, h->buf_size);
-    char *from = (char *)duct_align_up((uintptr_t)(tx->data + keep), duct_page_size()),
+    size_t from_off = duct_align_up(offsetof(duct_olb_tx_t, data) + keep, duct_page_size());
+    char *from = (char *)tx + from_off,
          *last = (char *)tx + h->total_size;
     if (prev > keep * olb_tx_trim_div)
         duct_vm_discard(from, (size_t)(last - from));

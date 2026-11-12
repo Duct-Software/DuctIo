@@ -132,15 +132,6 @@ static size_t s_framed_len(const duct_seal_engine_vtbl_t *vt,
     return total <= avail ? total : 0u;
 }
 
-static uint64_t s_counter_of(const duct_seal_engine_vtbl_t *vt,
-                             const uint8_t *sealed)
-{
-    uint64_t counter = 0u;
-    for (unsigned i = 0u; i < 8u; ++i)
-        counter |= (uint64_t)sealed[vt->pdu_hdr_size + i] << (8u * i);
-    return counter;
-}
-
 /** @brief Seal a cleartext a little over one PDU long as three spans cut at, before and after the PDU bound,
  *  and read the PDUs back whole.
  *  @return the text of the first step that failed, nullptr when all passed. */
@@ -202,8 +193,8 @@ static const char *s_run(duct_noise_pattern_t pattern)
     srv_cfg.suite.pattern = cli_cfg.suite.pattern = pattern;
     memcpy(cli_cfg.remote_static_pub, srv_kp.pub, duct_noise_key_size);
 
-    auto srv = vt->create(&srv_cfg, seal_role_responder);
-    auto cli = vt->create(&cli_cfg, seal_role_initiator);
+    auto srv = vt->create(vt,&srv_cfg, seal_role_responder);
+    auto cli = vt->create(vt,&cli_cfg, seal_role_initiator);
     if (!srv || !cli)
         return "engine create failed";
 
@@ -213,8 +204,8 @@ static const char *s_run(duct_noise_pattern_t pattern)
     s_ctx_reset(&cctx);
 
     for (unsigned i = 0u; i < 64u; ++i) {
-        auto a = vt->create(&srv_cfg, seal_role_responder);
-        auto b = vt->create(&cli_cfg, seal_role_initiator);
+        auto a = vt->create(vt,&srv_cfg, seal_role_responder);
+        auto b = vt->create(vt,&cli_cfg, seal_role_initiator);
         if (!a || !b) {
             if (a)
                 vt->destroy(a);
@@ -293,7 +284,7 @@ static const char *s_run(duct_noise_pattern_t pattern)
         goto done;
     }
 
-    auto replayed = vt->create(&srv_cfg, seal_role_responder);
+    auto replayed = vt->create(vt,&srv_cfg, seal_role_responder);
     if (!replayed) {
         err = "engine create failed";
         goto done;
@@ -312,7 +303,7 @@ static const char *s_run(duct_noise_pattern_t pattern)
         goto done;
     }
 
-    auto hardy = vt->create(&srv_cfg, seal_role_responder);
+    auto hardy = vt->create(vt,&srv_cfg, seal_role_responder);
     if (!hardy) {
         err = "engine create failed";
         goto done;
@@ -364,8 +355,8 @@ static const char *s_run(duct_noise_pattern_t pattern)
         goto done;
     }
 
-    auto lost = vt->create(&srv_cfg, seal_role_responder);
-    auto dialer = vt->create(&cli_cfg, seal_role_initiator);
+    auto lost = vt->create(vt,&srv_cfg, seal_role_responder);
+    auto dialer = vt->create(vt,&cli_cfg, seal_role_initiator);
     if (!lost || !dialer) {
         if (lost)
             vt->destroy(lost);
@@ -481,12 +472,10 @@ static const char *s_run(duct_noise_pattern_t pattern)
     need = vt->seal_size(cli, pt_len);
     vt->seal(cli, &((duct_view_u8){ (void *)payload, pt_len }), 1u,
              sealed);
-    uint64_t counter_before = s_counter_of(vt, sealed);
     s_ctx_reset(&sctx);
-    if (counter_before == 0u
-        || vt->unseal(srv, duct_view(duct_view_u8, sealed, need),
-                      &sctx.base) != rc_ok) {
-        err = "the pre-rekey counter is not a usable witness";
+    if (vt->unseal(srv, duct_view(duct_view_u8, sealed, need),
+                   &sctx.base) != rc_ok) {
+        err = "the pre-rekey round trip is not a usable witness";
         goto done;
     }
 
@@ -582,15 +571,23 @@ static const char *s_run(duct_noise_pattern_t pattern)
     need = vt->seal_size(cli, pt_len);
     vt->seal(cli, &((duct_view_u8){ (void *)payload, pt_len }), 1u,
              sealed);
-    if (s_counter_of(vt, sealed) >= counter_before) {
-        err = "the initiator kept sealing under the keys it just replaced";
-        goto done;
-    }
     s_ctx_reset(&sctx);
     if (vt->unseal(srv, duct_view(duct_view_u8, sealed, need), &sctx.base)
         != rc_ok
         || sctx.ct_len != pt_len || memcmp(sctx.ct, payload, pt_len) != 0) {
         err = "the fresh keys did not carry the initiator's first message";
+        goto done;
+    }
+    /* A second message past the promotion: a peer still sealing under the keys
+     * it replaced reads only through the responder's prev window, which the
+     * first message closed — the second one must refuse for it. */
+    vt->seal(cli, &((duct_view_u8){ (void *)payload, pt_len }), 1u,
+             sealed);
+    s_ctx_reset(&sctx);
+    if (vt->unseal(srv, duct_view(duct_view_u8, sealed, need), &sctx.base)
+        != rc_ok
+        || sctx.ct_len != pt_len || memcmp(sctx.ct, payload, pt_len) != 0) {
+        err = "the initiator kept sealing under the keys it just replaced";
         goto done;
     }
 
@@ -622,7 +619,7 @@ static const char *s_run(duct_noise_pattern_t pattern)
     duct_noise_cfg_t evil_cfg = {};
     evil_cfg.local_static = evil_kp;
     memcpy(evil_cfg.remote_static_pub, srv_kp.pub, duct_noise_key_size);
-    auto evil = vt->create(&evil_cfg, seal_role_initiator);
+    auto evil = vt->create(vt,&evil_cfg, seal_role_initiator);
     if (!evil) {
         err = "engine create failed";
         goto done;
@@ -811,7 +808,7 @@ static const char *s_open_case(const duct_seal_engine_vtbl_t *vt, const duct_noi
     duct_noise_cfg_t use = *cfg;
     if (!c->callback)
         use.opening_next = nullptr;
-    auto e = vt->create(&use, c->role);
+    auto e = vt->create(vt,&use, c->role);
     if (!e)
         return "engine create failed";
     vt->start(e, &f.base);
@@ -921,8 +918,8 @@ static const char *s_allowed_case(const duct_seal_engine_vtbl_t *vt, duct_noise_
                                  .suite.pattern = pattern },
                      cli_cfg = { .local_static = *cli_kp, .suite.pattern = pattern };
     memcpy(cli_cfg.remote_static_pub, srv_kp->pub, duct_noise_key_size);
-    auto srv = vt->create(&srv_cfg, seal_role_responder);
-    auto cli = vt->create(&cli_cfg, seal_role_initiator);
+    auto srv = vt->create(vt,&srv_cfg, seal_role_responder);
+    auto cli = vt->create(vt,&cli_cfg, seal_role_initiator);
     if (!srv || !cli) {
         if (srv)
             vt->destroy(srv);

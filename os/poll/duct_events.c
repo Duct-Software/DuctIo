@@ -48,6 +48,7 @@ typedef struct duct_events_slot {
  *  arrays in lockstep and relocates what it moved, so each part stays dense.
  */
 typedef struct duct_events_env {
+    void (*cancel_io)(duct_sock_t fd);
     duct_pollfd_t      fds[events_max_handles];
     duct_events_slot_t slots[events_max_handles];
     unsigned    n_entries,
@@ -93,6 +94,7 @@ duct_events_env_t *duct_events_init(void)
 {
     auto env = duct_new(duct_events_env_t);
     duct_do_if(!env, return nullptr);
+    env->cancel_io = nullptr;
     duct_sock_t wake_sock = s_make_wake_sock();
     duct_do_if(wake_sock == duct_sock_bad, duct_del(env); return nullptr);
     env->wake_sock = wake_sock;
@@ -100,6 +102,11 @@ duct_events_env_t *duct_events_init(void)
     env->slots[0] = (duct_events_slot_t){ .kind = io_tag_wake, .tag = nullptr };
     env->n_entries = env->n_polled = 1u;
     return env;
+}
+
+void (*duct_events_cancel_io_of(duct_events_env_t *env))(duct_sock_t fd)
+{
+    return env->cancel_io;
 }
 
 void duct_events_fini(duct_events_env_t *env)
@@ -339,13 +346,6 @@ bool duct_events_promote(duct_events_env_t *env, duct_sock_t fd, void *tag_ptr)
     env->fds[i].events |= POLLIN;
     env->slots[i] = (duct_events_slot_t){ .kind = io_tag_conn, .tag = tag_ptr };
     duct_io_on_relocate(io_tag_conn, tag_ptr, &env->fds[i]);
-    return true;
-}
-
-bool duct_events_cancel_io([[maybe_unused]] duct_events_env_t *env,
-                           [[maybe_unused]] duct_sock_t fd)
-{
-    /* No-op on reactor-style backends. */
     return true;
 }
 

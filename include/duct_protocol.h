@@ -369,6 +369,30 @@ typedef duct_result_t (*duct_frame_fn)(duct_session_t *s,
 
 /* Session lifecycle callbacks */
 
+/** @brief Bytes of a stream join lead: name, counter, conn id and MAC. */
+static constexpr size_t duct_session_lead_size = 15u;
+
+/** @brief Build the next one-time join lead for @p conn_id of @p s.
+ *  The same lead the engine's own stream joins carry, for a protocol that
+ *  embeds it inside its own outer handshake instead. Counter and MAC as the
+ *  engine's stream leads spend them.
+ *  @return false for a session holding no join key, a spent counter space,
+ *          or @p conn_id past @c duct_session_max_legs.
+ */
+duct_nonnull(1, 3) bool
+duct_session_lead_build(duct_session_t *s, duct_conn_id_t conn_id,
+                        uint8_t out[duct_session_lead_size]);
+
+/** @brief Resolve a join lead over @p protos, as the runtime's own accept does.
+ *  For a preparse that digs a lead out of an outer handshake: the first
+ *  protocol whose key and index take it wins, its counter spent here.
+ *  @return false, nothing written, for any lead these protocols refuse.
+ */
+duct_nonnull(1, 2, 4, 5) bool
+duct_session_lead_resolve(const uint8_t lead[duct_session_lead_size],
+                          const duct_proto_t *const *protos, unsigned n_protos,
+                          duct_handle_t *tok, duct_conn_id_t *conn_id);
+
 /** @brief Session open — after the first transport binding.
  *
  *  Conn 0 is live; attach more via @ref duct_conn_attach_fd or declaratively
@@ -499,12 +523,16 @@ typedef duct_resolve_disposition_t (*duct_preparse_fn)(
     void **out_user_ctx,
     size_t *out_lead);
 
-/** @brief Bytes to answer @p peer with before a @c resolve_retry drops it.
+/** @brief Bytes to answer @p peer with before the engine acts on a resolve.
  *
  *  Runs on the io thread already holding the datagram, with no conn and no
  *  session behind it, which lets a stateless retry cost nothing. @p out
  *  takes storage the author owns; the engine sends it before this call returns,
- *  so a static or per-listener scratch is enough.
+ *  so a static or per-listener scratch is enough. A stream listener honors it
+ *  on @c resolve_retry — the reply, then the close — on @c resolve_new, where
+ *  the reply is written ahead of the session's first byte, and on a
+ *  @c resolve_hold, whose reply is written ahead of the wait, from the accept
+ *  path or a probe retry alike.
  *
  *  @return false to send nothing, which makes the retry a silent drop.
  */
@@ -1321,7 +1349,7 @@ typedef struct duct_proto_cfg {
     duct_preparse_fn      preparse;         /**< Identify + classify on accept; null = always new. */
     duct_resolve_mode_t   preparse_mode;    /**< sync / async; ignored when @c preparse is null. */
     void                 *preparse_ctx;     /**< Borrowed; passed to @c preparse (e.g. peer→token map). */
-    duct_preparse_reply_fn preparse_reply; /**< Answers a @c resolve_retry; null makes it a silent drop. */
+    duct_preparse_reply_fn preparse_reply; /**< Answers a @c resolve_retry, a stream's @c resolve_new ahead of the session's first byte, and a @c resolve_hold the engine waits on; null sends nothing. */
     duct_conn_join_fn     on_conn_join;     /**< New leg attached to an existing session; null = silent join. */
     duct_conn_lost_fn     on_conn_lost;     /**< Leg detached, any reason; null = silent loss. */
     duct_peer_auth_fn     on_peer_auth;     /**< Sealed leg's peer named; null = silent. */

@@ -266,7 +266,7 @@ typedef struct duct_listener_cfg {
                                               back to the has_async/fallback/reject dispatch — at
                                               most one wait per accepted fd. @c peek_min extends the
                                               wait to a first read that is short. 0 = disabled (default). */
-    uint8_t                    peek_min; /**< Stream only: bytes a first read has to reach before the
+    uint16_t                   peek_min; /**< Stream only: bytes a first read has to reach before the
                                               runtime asks anything of it, a pre-parse and the engine's
                                               join lead included. A shorter read is held and the wait
                                               goes on until the bytes are in, the peer closes or
@@ -274,7 +274,7 @@ typedef struct duct_listener_cfg {
                                               classified as it stands; arrivals leave that deadline
                                               where it was. Needs @c probe_wait_ms and is at most the
                                               stream read span: @c peek_cap, or the runtime's default
-                                              size when that is 0 or larger. 0 = off (default). */
+                                              clamped to its largest size. 0 = off (default). */
     const char                *local_path; /**< Socket file of an AF_UNIX stream listener, shorter
                                               than @c sockaddr_un's @c sun_path; @c nullptr = an
                                               address listener. Needs @c addr unset and

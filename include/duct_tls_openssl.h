@@ -27,6 +27,8 @@
 #include "duct_seal_engine.h"
 #include "duct_tls.h"
 
+#include <openssl/ssl.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -48,6 +50,22 @@ const duct_seal_engine_vtbl_t *duct_tls_openssl_vtbl(void);
  *  0 keeps the default. No-op on @c nullptr @p out.
  */
 void duct_tls_openssl_vtbl_make(duct_seal_engine_vtbl_t *out, size_t hs_budget);
+
+/** @brief Configuration of the initiator-side vtbl.
+ *  @c sni names a NUL-terminated server name the ClientHello carries, read and
+ *  copied at each conn's creation; null leaves the hello without one. The
+ *  storage is the caller's and may change between conns.
+ */
+typedef struct {
+    SSL_CTX *ctx;
+    const char *sni;
+} duct_tls_client_cfg_t;
+
+/** @brief The initiator-side vtbl: @c engine_cfg is a @c duct_tls_client_cfg_t
+ *  and @c start drives the first flight, ClientHello ahead, so a dial's first
+ *  bytes on the wire are a TLS 1.3 record without a hand outside the engine.
+ */
+const duct_seal_engine_vtbl_t *duct_tls_openssl_client_vtbl(void);
 
 #ifdef __cplusplus
 }

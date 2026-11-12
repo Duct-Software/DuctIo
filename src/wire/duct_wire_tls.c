@@ -95,7 +95,7 @@ s_tls_on_parse(const duct_wire_t *self, duct_view_u8 input, duct_frame_t *out,
               [[maybe_unused]] duct_wire_parser_t *parser,
               size_t *consumed, size_t *needed)
 {
-    auto tw = (const duct_wire_tls_t *)self;
+    auto tw = DUCT_CAST(duct_wire_tls_t, base, self);
     auto vt = tw->engine_vtbl;
     size_t hdr = self->header_size;
     size_t total = 0u;
@@ -132,7 +132,7 @@ static void s_tls_codec_destroy(duct_wire_codec_t *self)
 {
     if (self->inner)
         duct_wire_parser_destroy(self->inner, self->inner_parser);
-    self->engine_vtbl->destroy(self->engine);
+    self->engine->vtbl->destroy(self->engine);
     duct_del(self->engine_park);
     duct_del(self->ct_buf);
     duct_del(self);
@@ -167,7 +167,7 @@ static size_t s_tls_ct_cap(const duct_wire_t *inner, const duct_seal_engine_vtbl
  */
 static size_t s_tls_tx_bound(const duct_wire_t *self, size_t ct_len)
 {
-    auto tw = (const duct_wire_tls_t *)self;
+    auto tw = DUCT_CAST(duct_wire_tls_t, base, self);
     auto vt = tw->engine_vtbl;
     size_t ct_total = ct_len;
     if (self->inner && duct_ckd_add(&ct_total, ct_total, self->inner->header_size))
@@ -208,7 +208,7 @@ s_tls_on_pack(const duct_wire_t *self, [[maybe_unused]] duct_session_t *s,
 {
     if (!codec)
         return rc_again;
-    auto vt = codec->engine_vtbl;
+    auto vt = codec->engine->vtbl;
     /* The inner wire on_pack never runs here, only pack_header, so
      * its bound is enforced in its place: a length past it reaches the flag
      * bits a length-prefix inner keeps in its header. max_frame 0 is unset. */
@@ -248,9 +248,9 @@ s_tls_on_pack(const duct_wire_t *self, [[maybe_unused]] duct_session_t *s,
  *  @c s_tls_ct_cap bytes. */
 static duct_wire_codec_t *s_tls_create_codec(const duct_wire_t *self, duct_xport_t xport)
 {
-    auto tw = (const duct_wire_tls_t *)self;
+    auto tw = DUCT_CAST(duct_wire_tls_t, base, self);
     auto vt = tw->engine_vtbl;
-    auto engine = vt->create(tw->engine_cfg, tw->role);
+    auto engine = vt->create(vt, tw->engine_cfg, tw->role);
     if (!engine)
         return nullptr;
     auto ct_cap = xport == x_udp_shared ? 0u : s_tls_ct_cap(self->inner, vt);
@@ -275,7 +275,7 @@ static duct_wire_codec_t *s_tls_create_codec(const duct_wire_t *self, duct_xport
         .inner = self->inner,
         .inner_parser = inner_parser,
         .ct_buf = duct_move(ct_buf),
-        .engine = engine, .engine_vtbl = vt,
+        .engine = engine,
         .tx_prefix_len = tw->tx_prefix_len,
         .rx_prefix_len = self->rx_prefix_len,
         .lead_state = tw->lead_state,
@@ -290,7 +290,7 @@ static duct_wire_codec_t *s_tls_create_codec(const duct_wire_t *self, duct_xport
 void duct_wire_codec_lead_write(duct_wire_codec_t *c, uint8_t *dgram, size_t len)
 {
     if (c->lead_state == lead_state_unkeyed) {
-        if (!duct_join_derive(c->engine_vtbl, c->engine, c->lead.key, c->lead.name))
+        if (!duct_join_derive(c->engine->vtbl, c->engine, c->lead.key, c->lead.name))
             return;
         c->lead_state = lead_state_keyed;
     }
@@ -314,15 +314,15 @@ s_tls_unseal(const duct_wire_t *self, duct_wire_codec_t *codec,
      * reaches the AEAD like any PDU. The slice it answers goes out behind the
      * inner wire's header through the same reserve/commit the engine publishes
      * cleartext with, and the protocol sees one ordinary frame. */
-    auto tw = (const duct_wire_tls_t *)self;
+    auto tw = DUCT_CAST(duct_wire_tls_t, base, self);
     duct_view_u8 pv = pdu;
     duct_view_u8 ctl = {};
-    if (tw->rx_ctl && codec->engine_vtbl->seal_size(codec->engine, 0u) == 0u)
+    if (tw->rx_ctl && codec->engine->vtbl->seal_size(codec->engine, 0u) == 0u)
         ctl = tw->rx_ctl(tw->rx_ctl_ctx, pdu);
     if (!ctl.size) {
         bool carries = duct_wire_codec_rx_strip(codec, &pv);
         duct_do_if(!carries, return rc_invalid_arg);
-        return codec->engine_vtbl->unseal(codec->engine, pv, ctx);
+        return codec->engine->vtbl->unseal(codec->engine, pv, ctx);
     }
     assert((const uint8_t *)ctl.data >= (const uint8_t *)pv.data
            && (const uint8_t *)ctl.data + ctl.size <= (const uint8_t *)pv.data + pv.size);

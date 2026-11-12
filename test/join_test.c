@@ -9,9 +9,10 @@
  * @c on_session_open records the session token. A second client connects to
  * the data listener, whose sync @c preparse resolves the peer to the control
  * session token and returns @c resolve_join with @c conn_id=1. The framework
- * attaches the data leg to the control session and fires @c on_conn_join on
+ * attaches the data leg to the control session, answers the joined leg ahead of
+ * its first byte through @c preparse_reply, and fires @c on_conn_join on
  * the control session's worker. Asserts: exactly one @c on_session_open, one
- * @c on_conn_join with @c conn_id=1.
+ * @c on_conn_join with @c conn_id=1, the leg's answer its socket's first bytes.
  */
 
 #include "duct.h"
@@ -73,6 +74,14 @@ data_preparse([[maybe_unused]] void *ctx,
         return resolve_join;
     }
     return resolve_reject;
+}
+
+/** @brief The fixed answer a joined leg reads ahead of its first byte. */
+static bool data_reply([[maybe_unused]] void *ctx, [[maybe_unused]] const duct_peer_t *peer,
+                       duct_view_u8 *out)
+{
+    *out = (duct_view_u8){ .data = (uint8_t *)"join", .size = 4u };
+    return true;
 }
 
 static duct_result_t
@@ -140,6 +149,7 @@ int main(void)
         .name = "data",
         .on_frame = on_ctrl_frame,
         .preparse = data_preparse,
+        .preparse_reply = data_reply,
         .preparse_mode = resolve_sync,
         .max_response = 4096u,
     });
@@ -195,13 +205,24 @@ int main(void)
         goto stop;
     }
 
-    /* Data leg: preparse resolves join → on_conn_join fires on the ctrl worker. */
+    /* Data leg: preparse resolves join → the reply leaves ahead of the leg's
+     * first byte, then on_conn_join fires on the ctrl worker. */
     duct_sock_t dfd = s_client_connect(data_port);
     if (dfd == duct_sock_bad) {
         fprintf(stderr, "join: data connect failed\n");
         pass = 0;
         close(cfd);
         goto stop;
+    }
+    {
+        char head[4] = {};
+        struct pollfd pfd = { .fd = dfd, .events = POLLIN };
+        if (poll(&pfd, 1, echo_timeout_ms) <= 0
+            || read(dfd, head, sizeof head) != (ssize_t)sizeof head
+            || memcmp(head, "join", sizeof head) != 0) {
+            fprintf(stderr, "join: the joined leg read no answer ahead of its first byte\n");
+            pass = 0;
+        }
     }
     if (!s_wait_atomic_int(&s_join_count, 1, connect_retry_ms)) {
         fprintf(stderr, "join: on_conn_join did not fire\n");
@@ -235,7 +256,8 @@ cleanup:
     }
 
     if (pass) {
-        printf("join: OK (sync preparse + leg join, on_conn_join fired once at conn_id=1)\n");
+        printf("join: OK (sync preparse + leg join, the joined leg answered ahead of its first "
+               "byte, on_conn_join fired once at conn_id=1)\n");
         return 0;
     }
     return 1;

@@ -503,6 +503,16 @@ duct_nonnull(1, 4) size_t
 duct_noise_transport_seal(duct_noise_transport_t *t, const duct_view_u8 *spans, size_t n,
                           uint8_t *out, size_t out_cap);
 
+/** @brief Exclusive-or @p counter's first @p wide bytes with a SipHash draw of
+ *  the twelve bytes the sealed message keeps at @p sample under @p key — the
+ *  first twelve ciphertext bytes, or the tag's own where the plaintext is
+ *  empty; both sides read the same bytes. The cover the seal writes and the
+ *  read removes, exposed for the tests that drive the transport against
+ *  known-answer vectors. */
+duct_nonnull(1, 2, 3) void
+duct_noise_counter_cover(const uint8_t key[duct_noise_key_size], uint8_t *counter,
+                         const uint8_t *sample, size_t wide);
+
 /** @brief Unseal one transport-data message, checking the sliding anti-replay
  *  window before accepting.
  *

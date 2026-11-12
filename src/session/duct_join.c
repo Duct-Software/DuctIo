@@ -245,3 +245,23 @@ duct_session_handle_t duct_join_dgram_match(const uint8_t *dgram, size_t len,
     }
     return none;
 }
+
+bool duct_session_lead_build(duct_session_t *s, duct_conn_id_t conn_id,
+                             uint8_t out[duct_session_lead_size])
+{
+    static_assert(duct_session_lead_size == duct_join_lead_size,
+        "the public lead width is the engine's own");
+    return duct_join_lead(s, conn_id, out);
+}
+
+bool duct_session_lead_resolve(const uint8_t lead[duct_session_lead_size],
+                               const duct_proto_t *const *protos, unsigned n_protos,
+                               duct_handle_t *tok, duct_conn_id_t *conn_id)
+{
+    duct_session_handle_t h;
+    const duct_proto_t *proto;
+    if (!duct_join_match(lead, protos, n_protos, &h, conn_id, &proto))
+        return false;
+    *tok = h.word;
+    return true;
+}

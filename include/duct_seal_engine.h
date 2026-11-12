@@ -107,7 +107,7 @@ typedef struct duct_seal_engine_vtbl {
      *  @ref duct_wire_create_sealed; @p role is that same call's @c role,
      *  never @c seal_role_unset.
      */
-    duct_seal_engine_t *(*create)(void *cfg, duct_seal_role_t role);
+    duct_seal_engine_t *(*create)(const struct duct_seal_engine_vtbl *self, void *cfg, duct_seal_role_t role);
 
     /** @brief Release an instance created by @c create. */
     void (*destroy)(duct_seal_engine_t *e);
@@ -236,6 +236,10 @@ typedef struct duct_seal_engine_vtbl {
      */
     void (*retry)(duct_seal_engine_t *e, duct_unseal_ctx_t *ctx);
 } duct_seal_engine_vtbl_t;
+
+struct duct_seal_engine {
+    const duct_seal_engine_vtbl_t *vtbl;
+};
 
 /** @brief Classifier distinguishing cleartext control datagrams from sealed PDUs.
  *  Returns the payload view to forward to the protocol, or an empty view if the
