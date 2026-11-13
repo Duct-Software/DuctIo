@@ -51,15 +51,15 @@ static uint8_t s_out[duct_vnet_cut_max];
  *  record slot at @p out, the header stays apart, and the cut runs in place. The room past the
  *  packet is filled with a mark first, and a cut that leaves any of it changed past the bytes it
  *  returns, or past the packet it refuses, ends the test. */
-static size_t s_cut(const uint8_t *in, size_t n, size_t rec_max, uint8_t *out, size_t room,
-                    unsigned *pkts)
+static size_t s_cut_uso(const uint8_t *in, size_t n, size_t rec_max, bool uso,
+                        uint8_t *out, size_t room, unsigned *pkts)
 {
     size_t len = n - t_vnet,
            at = duct_dgram_record_hdr_size + len;
     memcpy(out + duct_dgram_record_hdr_size, in + t_vnet, len);
     if (room > at)
         memset(out + at, t_canary, room - at);
-    size_t cut = duct_vnet_cut(in, out, len, rec_max, room, pkts);
+    size_t cut = duct_vnet_cut(in, out, len, rec_max, uso, room, pkts);
     for (size_t i = cut > at ? cut : at; i < room; ++i)
         if (out[i] != t_canary) {
             fprintf(stderr, "FAIL: the cut wrote past its packets, at byte %zu of %zu\n", i, room);
@@ -70,6 +70,12 @@ static size_t s_cut(const uint8_t *in, size_t n, size_t rec_max, uint8_t *out, s
         exit(1);
     }
     return cut;
+}
+
+static size_t s_cut(const uint8_t *in, size_t n, size_t rec_max, uint8_t *out, size_t room,
+                    unsigned *pkts)
+{
+    return s_cut_uso(in, n, rec_max, false, out, room, pkts);
 }
 
 static uint16_t s_n16(const uint8_t *p) { return (uint16_t)(p[0] << 8u | p[1]); }
@@ -1181,6 +1187,31 @@ int main(void)
 
     if (s_check_sweep())
         return 1;
+
+    {
+        size_t n = s_build_udp(false, 10000u, 1400u);
+        unsigned pkts = 0u;
+        size_t cut_off = s_cut_uso(s_in, n, 16380u, false, s_out, sizeof s_out, &pkts);
+        CHECK(cut_off && pkts == 8u, "without uso confirmation a udp superpacket cuts into datagrams");
+
+        size_t cut_on = s_cut_uso(s_in, n, 16380u, true, s_out, sizeof s_out, &pkts);
+        CHECK(cut_on && pkts == 1u, "with uso confirmation a udp superpacket packs into one gso record");
+        uint32_t raw = (uint32_t)duct_dgram_rec_hdr_decode(s_out);
+        CHECK(raw & duct_dgram_rec_gso, "udp gso record carries gso bit");
+        duct_view_u8 rec = { .data = s_out + duct_dgram_record_hdr_size,
+                           .size = raw & ~duct_dgram_rec_gso };
+        uint8_t vh[duct_vnet_hdr_max];
+        size_t mss = duct_vnet_gso_open(&rec, vh);
+        CHECK(mss == 1400u && duct_vnet_gso_is_udp(vh), "udp gso record opens with udp vnet header");
+        s_gro = (duct_vnet_gro_t){};
+        CHECK(duct_vnet_gro_offer(&s_gro, rec.data, rec.size, mss, vnet_merge_tcp) == vnet_gro_alone,
+              "udp gso record is refused without vnet_merge_tcp_udp");
+        s_gro = (duct_vnet_gro_t){};
+        CHECK(duct_vnet_gro_offer(&s_gro, rec.data, rec.size, mss, vnet_merge_tcp_udp) == vnet_gro_taken_last,
+              "udp gso record with short tail completes train under vnet_merge_tcp_udp");
+        duct_vnet_gro_finish(&s_gro, vh);
+        CHECK(s_gro.nspans == 1u && duct_vnet_gso_is_udp(vh), "finished udp gso train produces udp vnet header");
+    }
 
     printf("vnet_cut_test OK\n");
     return 0;

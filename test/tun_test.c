@@ -111,6 +111,8 @@ typedef struct {
                   empty,  /**< Query of the slot after it, empty. */
                   past;   /**< Query of slot @c duct_session_max_legs, past the legs. */
     duct_result_t set;    /**< Setter on the joined leg with the bound the query gave. */
+    bool          has_uso;
+    duct_result_t set_uso;
 } gso_t;
 
 /** @brief Result of the packet-fd attach, -1 until it runs. */
@@ -156,7 +158,11 @@ static duct_result_t on_conn_join(duct_session_t *s, duct_conn_id_t conn_id,
         .empty = duct_conn_gso_max(s, packet_leg + 1u),
         .past = duct_conn_gso_max(s, duct_session_max_legs),
         .set = duct_conn_set_gso(s, conn_id, duct_conn_gso_max(s, conn_id)),
+        .has_uso = duct_conn_has_vnet_uso(s, conn_id),
+        .set_uso = duct_conn_set_uso(s, conn_id, duct_conn_has_vnet_uso(s, conn_id)),
     };
+    if (g_gso.set_uso == rc_ok)
+        g_gso.set_uso = duct_conn_set_uso(s, conn_id, false);
     duct_atomic_fetch(add, &g_joined, 1, release);
     return rc_ok;
 }
@@ -271,6 +277,8 @@ static const char *wire_client(uint16_t port)
              : !th_wait_int(&g_joined, 1, wait_ms) ? "the packet leg never joined the session"
              : g_gso.leg1 != 0u ? "duct_conn_gso_max answers for a packet fd that carries no vnet header"
              : g_gso.set != rc_not_supported ? "duct_conn_set_gso takes a packet fd that carries no vnet header"
+             : g_gso.has_uso ? "duct_conn_has_vnet_uso answers for a packet fd"
+             : g_gso.set_uso != rc_not_supported ? "duct_conn_set_uso takes a packet fd"
              : wire_traffic(g_peer_fd);
     duct_sock_close(fd);
     return err;
@@ -437,6 +445,8 @@ static const char *tun_client(uint16_t port)
               ? "duct_conn_gso_max answers for a leg that is no vnet tun"
         : g_gso.leg1 != duct_ipv4_len_max ? "duct_conn_gso_max does not answer the packet wire's size for the vnet tun"
         : g_gso.set != rc_ok ? "duct_conn_set_gso refuses what duct_conn_gso_max reports"
+        : g_gso.has_uso != (g_uso == 1) ? "duct_conn_has_vnet_uso disagrees with the kernel"
+        : g_gso.set_uso != rc_ok ? "duct_conn_set_uso failed on a vnet tun"
         : feature_of(tun_name, "tx-tcp-segmentation") != 1 ? "the attach did not set the tun's segmentation offload"
         : (feature_of(tun_name, "tx-udp-segmentation") == 1) != (g_uso == 1)
               ? "the attach did not set the tun's UDP segmentation offload to what the kernel takes"

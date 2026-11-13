@@ -72,13 +72,17 @@ duct_result_t duct_io_dgram_rx_units(void *tag, const duct_io_xfer_t *r)
 {
     duct_view_u8 bufs[duct_x_recv_batch_max];
     uint32_t   lens[duct_x_recv_batch_max],
+               segs[duct_x_recv_batch_max],
                got = 0u;
     size_t stride = r->size + duct_dgram_record_hdr_size;
     for (uint32_t i = 0u; i < r->units; ++i)
         bufs[i] = (duct_view_u8){ .data = r->buf + (size_t)i * stride, .size = r->size };
-    auto rc = duct_xrecv_peers(r->fd, bufs, r->units, nullptr, lens, nullptr, &got);
+    auto rc = duct_xrecv_peers(r->fd, bufs, r->units, nullptr, lens, segs, &got);
     if (rc != rc_ok)
         return rc;
+    for (uint32_t i = 0u; i < got; ++i)
+        if (segs[i])
+            lens[i] = duct_dgram_len_truncated;
     duct_io_rx_commit_units(tag, lens, got);
     return got < r->units ? rc_again : rc_ok;
 }

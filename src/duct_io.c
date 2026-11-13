@@ -2443,7 +2443,7 @@ static void s_req_do_peer_roam(duct_conn_t *conn)
         return;
     s_dgram_peer_drop_others(listener, node);
     node->candidate = false;
-    duct_conn_state_clear(conn, fl_conn_roaming);
+    duct_conn_state_clear(conn, fl_conn_roaming | fl_conn_gso_off);
 }
 
 /** @brief In-flight marker for @p peer's async pre-parse decision,
@@ -2972,6 +2972,7 @@ bool duct_io_rx_reserve(void *tag, duct_io_xfer_t *out)
         t->vnet_hdr_span = (duct_view_u8){ duct_at(t->vnet_hdr), conn->vnet_hdr_len };
         ctx = &t->vnet_hdr_span;
     } else if (conn->xport_type == x_udp_peer && conn->wire_parser && unit > rec
+               && duct_has(duct_conn_state(conn), fl_conn_dgram_gro)
                && t->frame_rx.frame_ceiling > 1u) {
         /* One datagram per read unit, a record header gap ahead of each span.
          * Only the wire parse walks that layout, and a frame posts together
@@ -3031,10 +3032,13 @@ static bool s_vnet_rx_commit(duct_conn_t *conn, size_t n)
 {
     auto h = &conn->rx_buf->h;
     unsigned pkts = 0u;
+    auto state = duct_conn_state(conn);
+    bool uso = duct_has(state, fl_conn_vnet_uso) && duct_has(state, fl_conn_vnet_uso_tx);
     size_t out = duct_vnet_cut(duct_at(s_io_this->vnet_hdr),
                                conn->rx_buf->data + h->stage,
                                n - conn->vnet_hdr_len,
                                duct_atomic_load(&conn->vnet_gso, relaxed),
+                               uso,
                                duct_olb_rx_room(conn->rx_buf), &pkts);
     if (!out) {
         duct_rtstat_obj_inc(s_io_this, rtstats.vnet_rx_drop, 1);
@@ -3368,9 +3372,12 @@ static bool s_tx_send_batch(duct_conn_t *conn, const duct_io_xfer_t *p,
     unsigned n = s_tx_peek_bufs(conn, bufs, duct_dgram_tx_batch);
     if (n < 2u)
         return false;
+    bool gso = !duct_has(duct_conn_state(conn), fl_conn_gso_off);
     unsigned sent = 0u;
     duct_x_gso_tally_t tally = {};
-    *out_rc = s_tx_send_grouped(p->fd, bufs, n, &sent, &tally);
+    *out_rc = s_tx_send_grouped(p->fd, bufs, n, &sent, &tally, &gso);
+    if (!gso)
+        duct_conn_state_set(conn, fl_conn_gso_off);
     s_rtstat_gso(tally);
     for (unsigned i = 0u; i < sent; ++i)
         duct_discard s_tx_advance(conn, bufs[i].size, bufs[i].size);
@@ -3411,7 +3418,9 @@ bool duct_io_tx_send(void *tag, const duct_io_xfer_t *p, duct_result_t *out_rc)
         bool gso = duct_dgram_rec_hdr_decode((const uint8_t *)p->buf - duct_dgram_record_hdr_size)
                  & duct_dgram_rec_gso;
         uint8_t vh[duct_vnet_hdr_max];
-        bool bad = gso && !duct_vnet_gso_open(&pkt, vh);
+        bool bad = gso && (!duct_vnet_gso_open(&pkt, vh)
+                           || (duct_vnet_gso_is_udp(vh)
+                               && !duct_has(duct_conn_state(conn), fl_conn_vnet_uso)));
         duct_view_u8 spans[2] = {
             { .data = gso ? vh : (uint8_t *)&duct_vnet_zero[0], .size = conn->vnet_hdr_len },
             pkt,
@@ -3855,8 +3864,11 @@ uint32_t duct_io_dgram_shared_send_batch(duct_listener_t *listener,
      * that conn's own pre_conn_refs contribution alone keeps this listener
      * from ever reaching duct_listener_destroy while it is. */
     assert(listener->listen_fd != duct_sock_bad);
+    bool gso = !duct_atomic_load(&listener->dgram_tx_gso_off, relaxed);
     unsigned sent = 0u;
-    duct_discard s_peer_send_grouped(listener->listen_fd, msgs, n, &sent, tally);
+    duct_discard s_peer_send_grouped(listener->listen_fd, msgs, n, &sent, tally, &gso);
+    if (!gso)
+        duct_atomic_store(&listener->dgram_tx_gso_off, 1u, relaxed);
     return sent;
 }
 
@@ -3911,8 +3923,12 @@ duct_result_t duct_io_udp_peer_send_staged(duct_conn_t *conn, size_t *out_sent,
             size_t written = 0u;
             rc = duct_xwrite(conn->fd, x_udp_peer, bufs[0], &written, nullptr, 0);
             sent = rc == rc_ok;
-        } else
-            rc = s_tx_send_grouped(conn->fd, bufs, n, &sent, tally);
+        } else {
+            bool gso = !duct_has(duct_conn_state(conn), fl_conn_gso_off);
+            rc = s_tx_send_grouped(conn->fd, bufs, n, &sent, tally, &gso);
+            if (!gso)
+                duct_conn_state_set(conn, fl_conn_gso_off);
+        }
         /* rc_drop names the first record, too large for the path: step over it. */
         if (rc == rc_drop)
             sent = 1u;
@@ -4041,8 +4057,11 @@ static bool s_dgram_tx_lane_drain_batch(duct_vmq_lane_t *ln, duct_listener_t *li
             break;
         *out_peeked += n;
         offered += n;
+        bool gso = !duct_atomic_load(&listener->dgram_tx_gso_off, relaxed);
         unsigned sent = 0u;
-        auto rc = s_peer_send_grouped(listener->listen_fd, outs, n, &sent, &tally);
+        auto rc = s_peer_send_grouped(listener->listen_fd, outs, n, &sent, &tally, &gso);
+        if (!gso)
+            duct_atomic_store(&listener->dgram_tx_gso_off, 1u, relaxed);
         resolved += sent;
         if (sent)
             head = heads[sent - 1u];

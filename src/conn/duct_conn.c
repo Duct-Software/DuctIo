@@ -526,6 +526,10 @@ duct_result_t duct_conn_bind_wire(duct_conn_t *conn, const duct_proto_t *proto,
     size_t coalesced = 0u;
     if (conn->xport_type == x_udp_peer && duct_wire_records(wire))
         coalesced = duct_xset_dgram_gro(conn->fd, duct_x_gro_max);
+    if (coalesced > 0u)
+        duct_conn_state_set(conn, fl_conn_dgram_gro);
+    else
+        duct_conn_state_clear(conn, fl_conn_dgram_gro);
     auto rx = duct_conn_rx_olb(conn);
     if (rx)
         /* One argument fixes both the span a reserve demands and the threshold

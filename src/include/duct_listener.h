@@ -243,6 +243,7 @@ typedef struct duct_listener {
     bool        rx_parked;      /**< Read interest withdrawn on a dry @c rx_slots,
                                    *  until that pool's resume puts it back.
                                    *  io-thread-private. */
+    uint8_t _Atomic dgram_tx_gso_off;
     duct_x_slot_pool_t *rx_slots; /**< RX slot pool of this node's worker, held
                                      *  and freed by the engine; null on a
                                      *  stream node. */

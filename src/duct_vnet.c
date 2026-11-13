@@ -272,8 +272,8 @@ static size_t s_segments(uint8_t *rec, size_t len, bool v6, size_t mss,
  *  @p mss payload bytes from @p rec.
  *  A datagram is a plain record with its UDP length set and its checksum
  *  computed in full. */
-static size_t s_datagrams(uint8_t *rec, size_t len, size_t mss, size_t l4, size_t room,
-                          unsigned *pkts)
+static size_t s_datagrams(uint8_t *rec, size_t len, size_t mss, size_t l4,
+                          size_t rec_max, bool uso, size_t room, unsigned *pkts)
 {
     uint8_t *pkt = rec + duct_dgram_record_hdr_size;
     bool v6 = (pkt[0] >> 4u) == 6u;
@@ -282,37 +282,50 @@ static size_t s_datagrams(uint8_t *rec, size_t len, size_t mss, size_t l4, size_
         return 0u;
     size_t payload = len - hdr,
            ndg = (payload + mss - 1u) / mss,
-           stride = duct_dgram_record_hdr_size + hdr + mss;
-    /* Where the last datagram ends from rec. */
-    if (ndg * (duct_dgram_record_hdr_size + hdr) + payload > room)
+           k = uso && l4 == s_gro_l4(v6) && rec_max >= duct_vnet_gso_lead + hdr + 2u * mss
+             ? duct_min(duct_min((rec_max - duct_vnet_gso_lead - hdr) / mss,
+                                 (0xffffu - hdr) / mss),
+                        (size_t)duct_vnet_udp_segs_max)
+             : 1u,
+           nrec = (ndg + k - 1u) / k,
+           lead_k = k > 1u ? duct_vnet_gso_lead : 0u,
+           stride = duct_dgram_record_hdr_size + lead_k + hdr + k * mss;
+    if (nrec * (duct_dgram_record_hdr_size + hdr + lead_k) + payload > room)
         return 0u;
     uint16_t id = v6 ? 0u : duct_load_be16(pkt + 4u),
              seed = s_host16(pkt + l4 + 6u);
     size_t total = 0u;
-    /* The layout of s_segments with no lead: datagram r starts r * stride in and
-     * its payload moves forward by r * (prefix + hdr). */
-    for (size_t r = ndg; r-- > 0u; ) {
-        size_t first = r * mss,
-               chunk = duct_min(mss, payload - first),
-               plen = hdr + chunk;
+    for (size_t r = nrec; r-- > 0u; ) {
+        size_t first = r * k,
+               take = duct_min(k, ndg - first),
+               chunk = first + take < ndg ? take * mss : payload - first * mss,
+               plen = hdr + chunk,
+               lead = take > 1u ? duct_vnet_gso_lead : 0u;
         uint8_t *o = rec + r * stride,
-                *p = o + duct_dgram_record_hdr_size,
+                *p = o + duct_dgram_record_hdr_size + lead,
                 *u = p + l4;
-        s_place(p, pkt, hdr, first, chunk);
-        if (r + 1u == ndg)
+        s_place(p, pkt, hdr, first * mss, chunk);
+        if (r + 1u == nrec)
             total = (size_t)(p + plen - rec);
         if (!v6)
-            duct_store_be16(p + 4u, (uint16_t)(id + r));
+            duct_store_be16(p + 4u, (uint16_t)(id + first));
         s_l3_fix(p, v6, plen, l4);
         duct_store_be16(u + 4u, (uint16_t)(plen - l4));
         u[6] = u[7] = 0u;
-        uint16_t c = s_csum(s_sum(s_swap_len(seed, plen - l4, len - l4), u, plen - l4));
-        /* A checksum of 0 means none was sent, so a sum that comes to 0 goes out as 0xffff. */
-        c = c ? c : 0xffffu;
-        memcpy(u + 6u, &c, sizeof c);
-        duct_dgram_rec_hdr_encode(o, plen);
+        uint64_t sum = s_swap_len(seed, plen - l4, len - l4);
+        uint16_t uc;
+        if (lead) {
+            uc = (uint16_t)~s_csum(sum);
+        } else {
+            uc = s_csum(s_sum(sum, u, plen - l4));
+            uc = uc ? uc : 0xffffu;
+        }
+        memcpy(u + 6u, &uc, sizeof uc);
+        duct_dgram_rec_hdr_encode(o, (lead + plen) | (lead ? duct_dgram_rec_gso : 0u));
+        if (lead)
+            duct_store_be16(o + duct_dgram_record_hdr_size, (uint16_t)mss);
     }
-    *pkts = (unsigned)ndg;
+    *pkts = (unsigned)nrec;
     return total;
 }
 
@@ -354,7 +367,7 @@ static bool s_is_udp(size_t hdr, size_t l4)
 static size_t s_gro_parse(const uint8_t *p, size_t len, size_t mss, duct_vnet_merge_t merge)
 {
     size_t hdr = s_l4_hdr(p, len, s_proto_tcp);
-    if (!hdr && !mss && merge == vnet_merge_tcp_udp)
+    if (!hdr && merge == vnet_merge_tcp_udp)
         hdr = s_l4_hdr(p, len, s_proto_udp);
     if (!hdr)
         return 0u;
@@ -402,8 +415,10 @@ static bool s_gro_fits(const duct_vnet_gro_t *g, const uint8_t *p, size_t hdr, b
                        && duct_load_be16(p + 4u) == (uint16_t)(duct_load_be16(q + 4u) + g->segs);
     if (!l3 || memcmp(th, qh, 4u))
         return false;
-    if (s_is_udp(hdr, l4))
-        return true;
+    if (s_is_udp(hdr, l4)) {
+        size_t seg = mss ? mss : pay;
+        return g->segs + (pay + seg - 1u) / seg <= duct_vnet_udp_segs_max;
+    }
     return !memcmp(th + 8u, qh + 8u, 4u)
         && !memcmp(th + 14u, qh + 14u, 2u)
         && !memcmp(th + duct_tcp_hdr_min, qh + duct_tcp_hdr_min, hdr - l4 - duct_tcp_hdr_min)
@@ -443,7 +458,7 @@ duct_vnet_gro_rc_t duct_vnet_gro_offer(duct_vnet_gro_t *g, const uint8_t *pkt, s
     ++g->nspans;
     g->segs += (unsigned)((pay + seg - 1u) / seg);
     return psh || pay % g->mss || g->len + g->mss > 0xffffu
-           || g->nspans == (udp ? duct_vnet_udp_segs_max : duct_vnet_gro_span_max)
+           || (udp ? g->segs == duct_vnet_udp_segs_max : g->nspans == duct_vnet_gro_span_max)
          ? vnet_gro_taken_last : vnet_gro_taken;
 }
 
@@ -503,11 +518,18 @@ size_t duct_vnet_gso_open(duct_view_u8 *rec, uint8_t vnet[duct_vnet_hdr_max])
     size_t mss = duct_load_be16(lead),
            len = rec->size - duct_vnet_gso_lead,
            hdr = s_l4_hdr(pkt, len, s_proto_tcp);
+    if (!hdr)
+        hdr = s_l4_hdr(pkt, len, s_proto_udp);
     if (!hdr || !mss || len - hdr <= mss)
         return 0u;
     s_gso_hdr(pkt, hdr, mss, vnet);
     *rec = (duct_view_u8){ .data = (void *)pkt, .size = len };
     return mss;
+}
+
+bool duct_vnet_gso_is_udp(const uint8_t vnet[duct_vnet_hdr_max])
+{
+    return (vnet[1] & (uint8_t)~s_gso_ecn) == s_gso_udp_l4;
 }
 
 size_t duct_gso_trim(duct_view_u8 rec)
@@ -624,10 +646,20 @@ duct_frame_volume_t duct_frame_volume(const duct_frame_ip_t *ip)
 {
     size_t lead = ip->gso ? duct_vnet_gso_lead : 0u;
     duct_frame_volume_t volume = { .bytes = ip->total > lead ? ip->total - lead : 0u, .packets = 1u };
-    if (!ip->gso || !ip->seg || ip->size < ip->hdr + duct_tcp_hdr_min)
+    if (!ip->gso || !ip->seg || !ip->packet || ip->hdr >= ip->size)
         return volume;
-    size_t hdr = ip->hdr + (size_t)(ip->packet[ip->hdr + 12u] >> 4u) * 4u;
-    if (hdr < ip->hdr + duct_tcp_hdr_min || hdr >= ip->size)
+    uint8_t proto = (ip->packet[0] >> 4u) == 4u ? ip->packet[9] : ip->packet[6];
+    size_t hdr;
+    if (proto == s_proto_udp) {
+        hdr = ip->hdr + duct_udp_hdr_size;
+    } else {
+        if (ip->size < ip->hdr + duct_tcp_hdr_min)
+            return volume;
+        hdr = ip->hdr + (size_t)(ip->packet[ip->hdr + 12u] >> 4u) * 4u;
+        if (hdr < ip->hdr + duct_tcp_hdr_min)
+            return volume;
+    }
+    if (hdr >= ip->size)
         return volume;
     volume.packets = (unsigned)((ip->size - hdr + ip->seg - 1u) / ip->seg);
     return volume;
@@ -678,7 +710,7 @@ uint64_t duct_frame_flow_key(const duct_frame_ip_t *ip)
 }
 
 size_t duct_vnet_cut(const uint8_t *vh, uint8_t *rec, size_t len, size_t rec_max,
-                     size_t room, unsigned *pkts)
+                     bool uso, size_t room, unsigned *pkts)
 {
     *pkts = 0u;
     if (!len)
@@ -691,7 +723,7 @@ size_t duct_vnet_cut(const uint8_t *vh, uint8_t *rec, size_t len, size_t rec_max
     if (type == s_gso_none)
         return s_whole(rec, len, flags, start, off, pkts);
     if (type == s_gso_udp_l4 && mss)
-        return s_datagrams(rec, len, mss, start, room, pkts);
+        return s_datagrams(rec, len, mss, start, rec_max, uso, room, pkts);
     if ((type != s_gso_tcpv4 && type != s_gso_tcpv6) || !mss)
         return 0u;
     return s_segments(rec, len, type == s_gso_tcpv6, mss, start, rec_max, room, pkts);

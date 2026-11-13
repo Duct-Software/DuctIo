@@ -158,6 +158,9 @@ typedef enum duct_conn_flags : uint16_t {
                                       *  datagrams for a conn that carries it.
                                       *  Cleared only by the next
                                       *  @ref duct_conn_acquire's state reset. */
+    fl_conn_dgram_gro   = 1u << 11,
+    fl_conn_gso_off     = 1u << 12,
+    fl_conn_vnet_uso_tx = 1u << 13,
 } duct_conn_flags_t;
 
 static_assert(sizeof(duct_conn_flags_t) == sizeof(uint16_t),

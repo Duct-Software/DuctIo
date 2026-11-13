@@ -949,6 +949,9 @@ duct_nonnull(1) duct_result_t duct_conn_set_gso(duct_session_t *s,
  */
 duct_nonnull(1) uint16_t duct_conn_gso_max(const duct_session_t *s, duct_conn_id_t conn_id);
 
+duct_nonnull(1) bool duct_conn_has_vnet_uso(const duct_session_t *s, duct_conn_id_t conn_id);
+duct_nonnull(1) duct_result_t duct_conn_set_uso(duct_session_t *s, duct_conn_id_t conn_id, bool on);
+
 /** @brief Point in one leg's byte stream.
  *  @ref duct_conn_tx_end reads it and @ref duct_conn_tx_sent compares it; two
  *  points read on one leg differ by the bytes between them. */

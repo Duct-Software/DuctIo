@@ -5084,6 +5084,24 @@ s_worker_dgram_flush(void)
     uint32_t resolved = 0u;
     if (!w->dgram_parked && !duct_io_dgram_shared_rio_tx(listener)
         && duct_vmq_room(&ln) == ln.capacity) {
+        if (n >= 3u) {
+            for (uint32_t i = 0u; i + 2u < n; ++i) {
+                uint32_t put = i + 1u;
+                for (uint32_t j = put; j < n; ++j) {
+                    if (!duct_x_same_peer(&pass->entries[j].peer, &pass->entries[i].peer))
+                        continue;
+                    if (j != put) {
+                        auto tmp = pass->entries[j];
+                        memmove(&pass->entries[put + 1u], &pass->entries[put],
+                                (j - put) * sizeof pass->entries[0]);
+                        pass->entries[put] = tmp;
+                    }
+                    ++put;
+                }
+                if (put > i + 1u)
+                    i = put - 1u;
+            }
+        }
         duct_dgram_out_t msgs[n];
         for (uint32_t i = 0u; i < n; ++i)
             msgs[i] = (duct_dgram_out_t){
@@ -5815,7 +5833,8 @@ s_commit_packet_fd(const commit_ctx_t *ctx)
     bool gso = conn->vnet_hdr_len && duct_has(wire_frame.flags, fl_frame_gso);
     uint8_t vh[duct_vnet_hdr_max];
     size_t mss = gso ? duct_vnet_gso_open(&pkt, vh) : 0u;
-    duct_do_if(gso && !mss, return s_commit_ctx_fail(ctx, rc_invalid_arg, commit_invalid));
+    bool bad = gso && (!mss || (duct_vnet_gso_is_udp(vh) && !duct_has(duct_conn_state(conn), fl_conn_vnet_uso)));
+    duct_do_if(bad, return s_commit_ctx_fail(ctx, rc_invalid_arg, commit_invalid));
 #if !DUCT_EVENTS_MODEL_IOCP
     if (duct_olb_tx_rewind_idle(conn->tx_buf)
         && (!conn->wire || duct_has(conn->wire->flags, fl_wire_gather))) {
@@ -7346,6 +7365,26 @@ uint16_t duct_conn_gso_max(const duct_session_t *s, duct_conn_id_t conn_id)
     auto conn = conn_id < duct_session_max_legs ? duct_conn_by_handle(duct_session_conn_at(s, conn_id))
                                                 : nullptr;
     return conn && conn->vnet_hdr_len ? s_gso_ceiling(conn) : 0u;
+}
+
+bool duct_conn_has_vnet_uso(const duct_session_t *s, duct_conn_id_t conn_id)
+{
+    auto conn = conn_id < duct_session_max_legs ? duct_conn_by_handle(duct_session_conn_at(s, conn_id))
+                                                : nullptr;
+    return conn && conn->vnet_hdr_len && duct_has(duct_conn_state(conn), fl_conn_vnet_uso);
+}
+
+duct_result_t duct_conn_set_uso(duct_session_t *s, duct_conn_id_t conn_id, bool on)
+{
+    duct_do_if(conn_id >= duct_session_max_legs, return rc_invalid_arg);
+    auto conn = duct_conn_by_handle(duct_session_conn_at(s, conn_id));
+    duct_do_if(!conn, return rc_invalid_order);
+    duct_do_if(!conn->vnet_hdr_len, return rc_not_supported);
+    if (on)
+        duct_conn_state_set(conn, fl_conn_vnet_uso_tx);
+    else
+        duct_conn_state_clear(conn, fl_conn_vnet_uso_tx);
+    return rc_ok;
 }
 
 duct_result_t duct_conn_tx_end(duct_session_t *s, duct_conn_id_t conn_id,

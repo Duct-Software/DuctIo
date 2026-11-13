@@ -331,6 +331,10 @@ static const char *sc_volume(void)
     expect(volume.bytes == 0u && volume.packets == 1u, "a record of the lead alone is not one packet of no bytes");
     volume = s_volume(0u);
     expect(volume.bytes == 0u && volume.packets == 1u, "a record of no bytes is not one packet of no bytes");
+    s_make(4u, 20u, 8u, 0u, 1400u);
+    s_pkt[2u + 9u] = 17u;
+    volume = s_volume(2u + 28u + 3u * 1400u + 100u);
+    expect(volume.bytes == 28u + 4300u && volume.packets == 4u, "four IPv4 UDP segments do not count four packets");
     return nullptr;
 }
 

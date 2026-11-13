@@ -92,7 +92,7 @@ static constexpr size_t duct_vnet_gso_lead = 2u;
  *          read, another segmentation type, or a cut over @p room.
  */
 size_t duct_vnet_cut(const uint8_t *vh, uint8_t *rec, size_t len, size_t rec_max,
-                     size_t room, unsigned *pkts);
+                     bool uso, size_t room, unsigned *pkts);
 
 /** @brief Outcome of offering one packet to a train. */
 typedef enum duct_vnet_gro_rc : uint8_t {
@@ -191,6 +191,7 @@ void duct_vnet_gro_finish(duct_vnet_gro_t *g, uint8_t vnet[duct_vnet_hdr_max]);
  *          with the packet.
  */
 size_t duct_vnet_gso_open(duct_view_u8 *rec, uint8_t vnet[duct_vnet_hdr_max]);
+bool duct_vnet_gso_is_udp(const uint8_t vnet[duct_vnet_hdr_max]);
 
 /** @brief Cut the last segment off GSO record @p rec where it lies.
  *

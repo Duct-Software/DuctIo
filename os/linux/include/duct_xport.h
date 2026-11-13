@@ -93,6 +93,8 @@ static constexpr size_t duct_x_gro_max = 0u;
 static inline size_t duct_xset_dgram_gro([[maybe_unused]] int fd, [[maybe_unused]] size_t max)
 {
 #ifdef UDP_GRO
+    if (max < duct_udp4_payload_max)
+        return 0u;
     int rc = setsockopt(fd, SOL_UDP, UDP_GRO, &(int){ 1 }, sizeof(int));
     duct_do_if(rc != 0, return 0u);
     return duct_x_gro_max;
@@ -144,8 +146,10 @@ static inline void duct_xset_dgram_bufs(int fd, [[maybe_unused]] int family)
     }
     duct_discard setsockopt(fd, SOL_SOCKET, SO_RCVBUF,
                             &(int){ rcvbuf_env > 0 ? rcvbuf_env : (int)duct_dgram_sock_rcvbuf }, sizeof(int));
-    duct_discard setsockopt(fd, SOL_SOCKET, SO_SNDBUF,
-                            &(int){ (int)duct_dgram_tx_batch * duct_x_dgram_truesize }, sizeof(int));
+    int sndbuf = (int)duct_dgram_tx_batch * duct_x_dgram_truesize;
+    if (duct_x_has_gso() && sndbuf < 131072)
+        sndbuf = 131072;
+    duct_discard setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(int));
 #if defined(IP_MTU_DISCOVER) && defined(IP_PMTUDISC_DO)
     /* Never let IP fragment a datagram. A protocol that sizes its
      * datagrams to the path already treats fragmentation as a bug --

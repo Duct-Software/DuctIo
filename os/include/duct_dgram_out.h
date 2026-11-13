@@ -198,10 +198,10 @@ typedef struct duct_x_gso_tally {
 #define DUCT_XSEND_GROUPED_DECLARE(fn, elem_type)                             \
     static duct_result_t                                                      \
     fn(duct_sock_t fd, const elem_type *m, unsigned n, unsigned *out_sent,    \
-       duct_x_gso_tally_t *tally)                                             \
+       duct_x_gso_tally_t *tally, bool *gso_ok)                               \
     {                                                                         \
         *out_sent = 0u;                                                       \
-        bool gso = duct_x_has_gso();                                          \
+        bool gso = (!gso_ok || *gso_ok) && duct_x_has_gso();                  \
         for (unsigned i = 0u; i < n;) {                                       \
             unsigned end = i,                                                 \
                      group = 1u;                                              \
@@ -238,6 +238,8 @@ typedef struct duct_x_gso_tally {
                 break;                                                        \
             case rc_not_supported:                                            \
                 gso = false;                                                  \
+                if (gso_ok)                                                   \
+                    *gso_ok = false;                                          \
                 break;                                                        \
             default:                                                          \
                 return rc;                                                    \
