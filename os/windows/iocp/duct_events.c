@@ -188,6 +188,7 @@ typedef struct listener_ctx {
     duct_x_slot_pool_t   *rx_pool;
     uint8_t              *rx_priv;
     uint32_t              rx_slot;
+    uint32_t              spare_slot;
     union {                         /**< Variant tail — strictly last member. */
         uint8_t addr_buf[2u * (sizeof(struct sockaddr_storage) + 16u)]; /**< TCP. */
         struct {                                                        /**< UDP. */
@@ -212,6 +213,7 @@ static listener_ctx_t *s_listener_ctx_new(duct_listener_t *listener)
     ctx->accept_fd = duct_sock_bad;
     ctx->rx_pool = listener->rx_slots;
     ctx->rx_slot = treiber_empty;
+    ctx->spare_slot = treiber_empty;
     return ctx;
 }
 
@@ -219,6 +221,8 @@ static void s_listener_ctx_del(listener_ctx_t *ctx)
 {
     if (ctx->rx_slot != treiber_empty)
         duct_x_slot_release(ctx->rx_pool, ctx->rx_slot);
+    if (ctx->spare_slot != treiber_empty)
+        duct_x_slot_release(ctx->rx_pool, ctx->spare_slot);
     duct_del(ctx->rx_priv);
     duct_del(ctx);
 }
@@ -1280,13 +1284,14 @@ static void s_on_dgram_completion(listener_ctx_t *ctx, DWORD bytes, ULONG_PTR st
         if (ctx->rx_slot == treiber_empty)
             duct_io_on_dgram(lst, &peer, &(duct_view_u8){ .data = ctx->rx_priv, .size = bytes }, seg);
         else {
-            uint32_t next = duct_x_slot_acquire(ctx->rx_pool);
+            if (ctx->spare_slot == treiber_empty)
+                ctx->spare_slot = duct_x_slot_acquire(ctx->rx_pool);
             bool lent = duct_io_on_dgram_slot(lst, &peer, ctx->rx_slot, bytes, seg,
-                                              next != treiber_empty);
-            if (lent)
-                ctx->rx_slot = next;
-            else if (next != treiber_empty)
-                duct_x_slot_release(ctx->rx_pool, next);
+                                              ctx->spare_slot != treiber_empty);
+            if (lent) {
+                ctx->rx_slot = ctx->spare_slot;
+                ctx->spare_slot = treiber_empty;
+            }
         }
     }
     s_post_dgram(ctx); /* re-arm after dispatch to avoid mid-read overwrite */

@@ -61,9 +61,18 @@ static bool s_grow(duct_x_slot_pool_t *pool)
         duct_atomic_store(&chunks[c].state, chunk_live, release);
         duct_atomic_store(&pool->grow_at, c + 1u, relaxed);
         duct_atomic_fetch(add, &pool->live, 1u, relaxed);
-        for (uint32_t k = s_chunk_count(pool, c); k-- > 0u;)
-            duct_x_slot_free_push(&pool->free_head, duct_at(pool->slots), c * pool->chunk_slots + k);
-        return true;
+        uint32_t base = c * pool->chunk_slots,
+                 cnt = s_chunk_count(pool, c);
+        auto links = duct_at(pool->slots);
+        for (uint32_t k = 1u; k < cnt; ++k)
+            duct_atomic_store(&links[base + k - 1u].next, base + k, relaxed);
+        uint64_t head = duct_atomic_load(&pool->free_head, relaxed);
+        for (;; duct_cpu_relax()) {
+            duct_atomic_store(&links[base + cnt - 1u].next, treiber_head_idx(head), relaxed);
+            uint64_t next = treiber_head_pack(treiber_head_ver(head) + 1u, base);
+            if (duct_atomic_cas(weak, &pool->free_head, &head, next, seq_cst, relaxed))
+                return true;
+        }
     }
     return false;
 }
@@ -94,9 +103,11 @@ static void s_retire(duct_x_slot_pool_t *pool, uint32_t chunk)
 
 uint32_t duct_x_slot_refill(duct_x_slot_pool_t *pool)
 {
+    if (duct_atomic_load(&pool->sweeping, acquire))
+        return treiber_empty;
     duct_atomic_fetch(add, &pool->pressure, 1u, relaxed);
     uint32_t idx = duct_x_slot_free_pop(&pool->free_head, duct_at(pool->slots));
-    if (idx == treiber_empty && s_grow(pool))
+    if (idx == treiber_empty && !duct_atomic_load(&pool->sweeping, acquire) && s_grow(pool))
         idx = duct_x_slot_free_pop(&pool->free_head, duct_at(pool->slots));
     return idx;
 }

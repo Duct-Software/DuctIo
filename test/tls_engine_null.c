@@ -23,7 +23,8 @@ static atomic_uint s_close_notify_calls = 0u;
 static duct_peer_t  s_last_peer = {};
 
 typedef struct {
-    bool handshook;
+    duct_seal_engine_t base;
+    bool               handshook;
 } s_null_engine_t;
 
 static uint8_t s_checksum(const uint8_t *ct, size_t len)
@@ -76,7 +77,7 @@ unsigned tls_null_create_calls(void) { return atomic_load(&s_create_calls); }
 unsigned tls_null_destroy_calls(void) { return atomic_load(&s_destroy_calls); }
 unsigned tls_null_close_notify_calls(void) { return atomic_load(&s_close_notify_calls); }
 
-static duct_seal_engine_t *s_create([[maybe_unused]] const struct duct_seal_engine_vtbl *self,
+static duct_seal_engine_t *s_create(const struct duct_seal_engine_vtbl *self,
                                     [[maybe_unused]] void *cfg,
                                     [[maybe_unused]] duct_seal_role_t role)
 {
@@ -84,8 +85,8 @@ static duct_seal_engine_t *s_create([[maybe_unused]] const struct duct_seal_engi
     auto e = (s_null_engine_t *)malloc(sizeof(s_null_engine_t));
     if (!e)
         return nullptr;
-    *e = (s_null_engine_t){ .handshook = false };
-    return (duct_seal_engine_t *)e;
+    *e = (s_null_engine_t){ .base = { .vtbl = self }, .handshook = false };
+    return &e->base;
 }
 
 static void s_destroy(duct_seal_engine_t *e)

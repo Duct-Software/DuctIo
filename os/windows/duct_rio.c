@@ -73,6 +73,7 @@ struct duct_rio_rx {
     unsigned            first_pooled, /**< Index of the first pooled descriptor. */
                         read_bytes,   /**< Bytes one receive reads, the listener's datagram span. */
                         free_count;   /**< Descriptors on @c free_stack. */
+    uint32_t            spare_slot;
     bool                closing;  /**< The owner let go: nothing is delivered or re-posted. */
 };
 
@@ -169,8 +170,19 @@ static void s_rx_unregister(const RIO_EXTENSION_FUNCTION_TABLE *rio, duct_rio_rx
 /** @brief Return the pool slots of the @p pooled descriptors from @p slots on to @p pool. */
 static void s_rx_unpool(duct_x_slot_pool_t *pool, const duct_rio_rx_slot_t *slots, unsigned pooled)
 {
-    for (unsigned i = 0u; i < pooled; ++i)
-        duct_x_slot_release(pool, slots[i].pool_idx);
+    uint32_t buf[64];
+    unsigned n = 0u;
+    for (unsigned i = 0u; i < pooled; ++i) {
+        if (slots[i].pool_idx == treiber_empty)
+            continue;
+        buf[n++] = slots[i].pool_idx;
+        if (n == sizeof buf / sizeof buf[0]) {
+            duct_x_slot_release_n(pool, buf, n);
+            n = 0u;
+        }
+    }
+    if (n)
+        duct_x_slot_release_n(pool, buf, n);
 }
 
 duct_rio_rx_t *duct_rio_rx_create(const RIO_EXTENSION_FUNCTION_TABLE *rio,
@@ -221,6 +233,7 @@ duct_rio_rx_t *duct_rio_rx_create(const RIO_EXTENSION_FUNCTION_TABLE *rio,
     ring->first_pooled = first;
     ring->read_bytes = span;
     ring->free_count = want;
+    ring->spare_slot = treiber_empty;
     ring->slots = duct_move(slots);
     ring->free_stack = duct_move(free_stack);
     ring->block = duct_move(block);
@@ -231,6 +244,8 @@ duct_rio_rx_t *duct_rio_rx_create(const RIO_EXTENSION_FUNCTION_TABLE *rio,
 void duct_rio_rx_destroy(const RIO_EXTENSION_FUNCTION_TABLE *rio, duct_rio_rx_t *ring)
 {
     s_rx_unregister(rio, ring);
+    if (ring->spare_slot != treiber_empty)
+        duct_x_slot_release(ring->pool, ring->spare_slot);
     s_rx_unpool(ring->pool, duct_at(ring->slots) + ring->first_pooled,
                 (unsigned)duct_len(ring->slots) - ring->first_pooled);
     duct_del(ring->priv);
@@ -306,13 +321,15 @@ void duct_rio_rx_dispatch(const RIO_EXTENSION_FUNCTION_TABLE *rio,
                                  (uint32_t)s_rx_seg(ring, i));
                 break;
             }
-            uint32_t next = duct_x_slot_acquire(ring->pool);
+            if (ring->spare_slot == treiber_empty)
+                ring->spare_slot = duct_x_slot_acquire(ring->pool);
             bool lent = duct_io_on_dgram_slot(ring->listener, &peer, slot->pool_idx, bytes,
-                                              (uint32_t)s_rx_seg(ring, i), next != treiber_empty);
-            if (lent)
-                slot->pool_idx = next;
-            else if (next != treiber_empty)
-                duct_x_slot_release(ring->pool, next);
+                                              (uint32_t)s_rx_seg(ring, i),
+                                              ring->spare_slot != treiber_empty);
+            if (lent) {
+                slot->pool_idx = ring->spare_slot;
+                ring->spare_slot = treiber_empty;
+            }
             break;
         }
         default:

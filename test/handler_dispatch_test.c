@@ -1093,20 +1093,23 @@ static void test_frame_sealed_task_dropped_after_wire_switch(void)
  * T18 can prove a stale task never reaches *either* one across a
  * sealed-to-sealed switch. */
 
-static int s_fake_engine_instance; /* dummy — no real per-conn state needed */
-
-static duct_seal_engine_t *s_fake_engine_create([[maybe_unused]] const struct duct_seal_engine_vtbl *self,
+static duct_seal_engine_t *s_fake_engine_create(const struct duct_seal_engine_vtbl *self,
                                                [[maybe_unused]] void *cfg,
                                                [[maybe_unused]] duct_seal_role_t role)
 {
-    return (duct_seal_engine_t *)&s_fake_engine_instance;
+    auto e = duct_new(duct_seal_engine_t);
+    if (!e)
+        return nullptr;
+    *e = (duct_seal_engine_t){ .vtbl = self };
+    return e;
 }
 
 static unsigned s_fake_engine_destroy_calls;
 
-static void s_fake_engine_destroy([[maybe_unused]] duct_seal_engine_t *e)
+static void s_fake_engine_destroy(duct_seal_engine_t *e)
 {
     ++s_fake_engine_destroy_calls;
+    duct_del(e);
 }
 
 static unsigned s_fake_engine_a_unseal_calls;
