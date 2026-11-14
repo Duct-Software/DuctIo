@@ -78,6 +78,9 @@ int duct_worker_thread_cpu(unsigned worker_id);
 /** @brief Check if the conn has TX room for @p need bytes. */
 bool duct_worker_admit_leg(duct_conn_handle_t conn, size_t need);
 
+bool duct_proto_hold_root(duct_proto_t *p);
+void duct_proto_release(duct_proto_t *p);
+
 /** @brief How many encoded-response slots a callback transaction needs. */
 typedef enum duct_admit_reserve : uint8_t {
     admit_reserve_response  = 1u, /**< Just the data response. */

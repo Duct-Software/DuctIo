@@ -422,6 +422,10 @@ duct_result_t duct_listener_route_bind(duct_listener_route_t *route, const duct_
     duct_do_if(cfg->peek_min && (cfg->peek_min > span || !cfg->probe_wait_ms || cfg->kind == listener_dgram),
                return rc_invalid_arg);
 
+    for (unsigned i = 0u; i < cfg->n_protos; ++i)
+        if (!cfg->protos[i] || !cfg->protos[i]->cfg.on_frame)
+            return rc_invalid_arg;
+
     /* fl_proto_dgram_shared is meaningless outside
      * listener_dgram: it says "never open a per-peer connected socket," and
      * listener_stream has no per-peer socket. A sealed

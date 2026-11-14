@@ -580,7 +580,7 @@ void *duct_session_user_ctx(const duct_session_t *s)
 duct_result_t duct_proto_switch(duct_session_t *s, const duct_proto_t *next,
                                 void *migration_ctx)
 {
-    duct_do_if(!s || !next, return rc_invalid_arg);
+    duct_do_if(!s || !next || !next->cfg.on_frame, return rc_invalid_arg);
     /* Already pending: either the synchronous record window (pending_switch_next,
      * cleared by duct_session_apply_switch before it returns) or a wire-changing
      * switch's rebind fan-out still draining (wire_rebind_next, cleared only once

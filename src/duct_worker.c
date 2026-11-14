@@ -1320,10 +1320,12 @@ unsigned duct_worker_egress_self(void)
     return w && w->host_egress ? w->worker_id : conn_worker_none;
 }
 
+static_assert(conn_worker_none == duct_worker_none, "worker none sentinels must match");
+
 unsigned duct_worker_self(void)
 {
     auto w = s_this_worker;
-    return w ? w->worker_id : conn_worker_none;
+    return w ? w->worker_id : duct_worker_none;
 }
 
 void duct_worker_egress_abandon(unsigned worker_id)
@@ -7047,6 +7049,70 @@ duct_result_t duct_worker_post_timer_start(unsigned worker_id, const duct_proto_
     m->proto = proto;
     m->user_ctx = user_ctx;
     m->delay_us = delay_us;
+    m->arg = arg;
+    if (duct_worker_post_ctrl(worker_id, m))
+        return rc_ok;
+    duct_msg_done(m);
+    return rc_invalid_order;
+}
+
+duct_msg_chain_decl(duct_msg_worker_post,
+    duct_engine_t *e;
+    duct_worker_fn fn;
+    void          *ctx;
+);
+
+static duct_exec_rc_t s_msg_exec_worker_post(void *self)
+{
+    auto m = (duct_msg_worker_post *)self;
+    m->fn(m->e, s_this_worker->worker_id, m->ctx);
+    return duct_msg_done(m);
+}
+
+duct_result_t duct_worker_post_work(unsigned worker_id, duct_engine_t *e,
+                                    duct_worker_fn fn, void *ctx)
+{
+    auto m = duct_msg_new(duct_msg_worker_post, s_msg_exec_worker_post, nullptr);
+    duct_do_if(!m, return rc_no_memory);
+    m->e = e;
+    m->fn = fn;
+    m->ctx = ctx;
+    if (duct_worker_post_ctrl(worker_id, m))
+        return rc_ok;
+    duct_msg_done(m);
+    return rc_invalid_order;
+}
+
+duct_msg_chain_decl(duct_msg_proto_post,
+    duct_engine_t *e;
+    duct_proto_t  *proto;
+    void          *user_ctx;
+    uintptr_t      arg;
+);
+
+static duct_exec_rc_t s_msg_exec_proto_post(void *self)
+{
+    auto m = (duct_msg_proto_post *)self;
+    auto cfg = duct_proto_cfg_of(m->proto);
+    cfg->on_work(m->e, s_this_worker->worker_id,
+                 m->user_ctx ? m->user_ctx : cfg->user_ctx, m->arg);
+    duct_proto_release(m->proto);
+    return duct_msg_done(m);
+}
+
+static void s_ctrl_abandon_proto_post(duct_msg_proto_post *m)
+{
+    duct_proto_release(m->proto);
+}
+
+duct_result_t duct_worker_post_proto(unsigned worker_id, duct_engine_t *e,
+                                     duct_proto_t *proto, void *user_ctx, uintptr_t arg)
+{
+    auto m = duct_msg_new_kind(proto_post, s_msg_exec_proto_post);
+    duct_do_if(!m, return rc_no_memory);
+    m->e = e;
+    m->proto = proto;
+    m->user_ctx = user_ctx;
     m->arg = arg;
     if (duct_worker_post_ctrl(worker_id, m))
         return rc_ok;

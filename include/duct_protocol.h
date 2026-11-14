@@ -1206,6 +1206,12 @@ typedef duct_result_t (*duct_timer_fn)(duct_session_t *s,
                                         void *proto_state,
                                         uint64_t arg);
 
+/** @brief One @c on_work tour: runs on the addressed worker, outside any
+ *  session; @c arg is the tag supplied at @c duct_proto_post.
+ */
+typedef void (*duct_proto_work_fn)(duct_engine_t *e, unsigned worker,
+                                   void *user_ctx, uintptr_t arg);
+
 /** @brief Outcome passed to @c on_send_done. */
 typedef struct duct_send_done_info {
     duct_conn_id_t   conn_id;     /**< Conn the send targeted. */
@@ -1346,6 +1352,7 @@ typedef struct duct_proto_cfg {
     duct_error_fn         on_error;         /**< Transport or runtime error. */
     duct_send_done_fn     on_send_done;     /**< Pack/enqueue completion for @c fl_send_done responses. */
     duct_timer_fn         on_timer;         /**< Timer fire (keepalive / idle / re-arm); null = no timers. */
+    duct_proto_work_fn    on_work;          /**< Worker tour outside a session; null = none. */
 
     /* Listener resolve — optional; @c preparse == NULL means always-new fast
      * path / fallback. */
@@ -1437,6 +1444,10 @@ struct duct_proto {
      *  runtime state the author never sets.
      */
     size_t admit_need[2];
+    /** Hold word owned by the runtime: the top byte is the proto state, the low
+     *  bits count outstanding @c duct_proto_post holds. Never written by
+     *  callers; a protocol with outstanding holds must not be destroyed. */
+    uint64_t _Atomic life;
 };
 
 /** @brief Borrow the live config off a protocol handle. */
@@ -1450,7 +1461,8 @@ duct_proto_cfg_of(const duct_proto_t *p)
  *
  *  The runtime borrows the protocol from @c duct_io_listen, @c duct_io_connect,
  *  or @c duct_listener_bind until @c duct_engine_destroy; keep it alive that long, then
- *  release it with @ref duct_proto_destroy. @c cfg.on_frame is required.
+ *  release it with @ref duct_proto_destroy. @c cfg must set at least one of @c on_frame,
+ *  @c on_work, or @c on_timer.
  *
  *  @param cfg  Configuration read during the call only.
  *  @return Protocol handle, or @c nullptr on invalid config or allocation failure.

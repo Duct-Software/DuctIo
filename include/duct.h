@@ -211,6 +211,9 @@ typedef enum duct_thread_role : uint8_t {
  */
 int duct_engine_thread_cpu(const duct_engine_t *e, duct_thread_role_t role, unsigned index);
 
+/** @brief The engine's actual worker count; 0 for a null @p e. */
+unsigned duct_engine_workers(const duct_engine_t *e);
+
 /* Network binding */
 
 /** @brief Listen for inbound stream connections; one session per accepted conn.
@@ -412,6 +415,67 @@ duct_result_t duct_io_attach_packet_fd(duct_engine_t *e, duct_sock_t fd, duct_pr
 duct_result_t duct_timer_start(duct_engine_t *e, duct_proto_t *proto, void *user_ctx,
                                uint64_t delay_ms, uintptr_t arg);
 
+/** @brief Worker index wildcards. @c duct_worker_any picks a worker round-robin;
+ *  @c duct_worker_none is what @ref duct_worker_self answers off a worker thread.
+ */
+static constexpr unsigned duct_worker_any  = UINT32_MAX;
+static constexpr unsigned duct_worker_none = UINT32_MAX;
+
+/** @brief The calling thread's worker id, or @c duct_worker_none off a worker. */
+unsigned duct_worker_self(void);
+
+/** @brief Out-of-session work: runs on the addressed worker, outside any session. */
+typedef void (*duct_worker_fn)(duct_engine_t *e, unsigned worker, void *ctx);
+
+/** @brief Post @p fn onto one worker's ctrl stack and return immediately.
+ *
+ *  The worker runs @c fn(e, its id, ctx) during its next drain. @p ctx stays
+ *  the caller's: a node still queued at engine stop is freed without execution
+ *  and the runtime runs no callback for it. @p fn must not block — a blocking
+ *  @p fn stalls every machine parked on that worker; work that waits unbounded
+ *  or on events unrelated to @p fn runs on its own context and posts its
+ *  completion back with @ref duct_worker_post. A host machine keeps one home
+ *  worker for its whole life and re-posts when it finds itself elsewhere.
+ *
+ *  @param e       Runtime instance.
+ *  @param worker  Worker index, or @c duct_worker_any for round-robin.
+ *  @param fn      Work to run on the worker.
+ *  @param ctx     Argument forwarded to @p fn.
+ *  @retval rc_ok             Posted.
+ *  @retval rc_invalid_arg    Null @p e or @p fn, or an index past the worker
+ *                            count other than @c duct_worker_any.
+ *  @retval rc_invalid_order  The engine is not running.
+ */
+duct_result_t duct_worker_post(duct_engine_t *e, unsigned worker,
+                               duct_worker_fn fn, void *ctx);
+
+/** @brief Post one @c on_work tour of @p proto onto a worker's ctrl stack.
+ *
+ *  The worker runs @c cfg.on_work with @c user_ctx falling back to
+ *  @c cfg.user_ctx when null; the message carries a root hold on @p proto from
+ *  post to execution or cleanup, so a tour cannot outlive its protocol. A tour
+ *  may call the OS boundary synchronously — adapter close, netlink, a guard
+ *  transaction — when the result gates the tour's own next state and the call
+ *  is bounded; it suspends instead, a coroutine wait or a machine state, when
+ *  the wait is unbounded, when other cargo on that worker would actually
+ *  progress meanwhile, or when it waits on work unrelated to the tour's next
+ *  state.
+ *
+ *  @param e         Runtime instance.
+ *  @param worker    Worker index, or @c duct_worker_any for round-robin.
+ *  @param proto     Protocol whose @c on_work runs; must stay alive until the
+ *                   engine is destroyed.
+ *  @param user_ctx  Argument for the tour; null falls back to @c cfg.user_ctx.
+ *  @param arg       Tag forwarded to @c on_work.
+ *  @retval rc_ok             Posted.
+ *  @retval rc_invalid_arg    Null @p e or @p proto, a protocol without
+ *                            @c on_work, or an index past the worker count.
+ *  @retval rc_invalid_order  The engine is not running, or the hold count on
+ *                            @p proto is exhausted.
+ */
+duct_result_t duct_proto_post(duct_engine_t *e, unsigned worker,
+                              duct_proto_t *proto, void *user_ctx, uintptr_t arg);
+
 /** @brief Revoke one listener by its socket, from any thread.
  *
  *  Deregisters exactly the node whose listening socket equals @p fd — one of
@@ -452,6 +516,39 @@ duct_result_t duct_session_invoke(duct_engine_t *e,
                                    duct_handle_t tok,
                                    duct_session_fn fn,
                                    void *ctx);
+
+/** @brief Invoke completion; runs exactly once per accepted call — see
+ *  @ref duct_session_invoke_done.
+ */
+typedef void (*duct_session_invoke_done_fn)(duct_result_t rc, void *done_ctx);
+
+/** @brief Post @p fn to the session's worker and report its outcome to
+ *  @p on_done exactly once.
+ *
+ *  @p on_done runs with @p fn's return code on the worker after a normal
+ *  commit, with @c rc_closed on the worker when @p tok no longer resolves by
+ *  the time the message executes, with @c rc_no_memory synchronously on this
+ *  thread when the message allocation fails, and with @c rc_closed
+ *  synchronously when the engine is not running or @p tok is already stale.
+ *  Releasing @p done_ctx is @p on_done's job — the runtime never frees it.
+ *
+ *  @param e         Runtime instance.
+ *  @param tok       Session token.
+ *  @param fn        Work to run on the worker.
+ *  @param ctx       Argument forwarded to @p fn.
+ *  @param on_done   Completion callback; runs exactly once.
+ *  @param done_ctx  Argument forwarded to @p on_done.
+ *  @retval rc_ok           Posted; @p on_done still runs exactly once.
+ *  @retval rc_invalid_arg  Null @p e or @p fn; @p on_done does not run.
+ *  @retval rc_closed       The engine is not running or @p tok is stale;
+ *                          @p on_done has run with @c rc_closed.
+ */
+duct_result_t duct_session_invoke_done(duct_engine_t *e,
+                                        duct_handle_t tok,
+                                        duct_session_fn fn,
+                                        void *ctx,
+                                        duct_session_invoke_done_fn on_done,
+                                        void *done_ctx);
 
 /** @brief Post @p fn and block the caller until @c fn and its flush complete,
  *  or a 5-second timeout elapses first.

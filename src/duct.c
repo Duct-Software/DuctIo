@@ -400,6 +400,11 @@ int duct_engine_thread_cpu(const duct_engine_t *e, duct_thread_role_t role, unsi
     return -1;
 }
 
+unsigned duct_engine_workers(const duct_engine_t *e)
+{
+    return e ? e->n_workers : 0u;
+}
+
 duct_result_t duct_io_listen(duct_engine_t *e, const char *host, uint16_t *port,
                               duct_proto_t *proto)
 {
@@ -459,17 +464,38 @@ static unsigned s_worker_of(duct_handle_t tok)
     return s ? duct_atomic_load(&s->worker_id, acquire) : conn_worker_none;
 }
 
+static duct_result_t s_session_invoke(duct_engine_t *e, duct_handle_t tok,
+                                      duct_session_fn fn, void *ctx,
+                                      duct_session_invoke_done_fn on_done, void *done_ctx)
+{
+    duct_do_if(!e || !fn, return rc_invalid_arg);
+    if (s_sync_inflight_acquire(e)) {
+        auto worker_id = s_worker_of(tok);
+        if (worker_id != conn_worker_none) {
+            auto h = (duct_session_handle_t){ .word = tok };
+            bool posted = duct_worker_post_session_invoke(worker_id, &h, fn, ctx,
+                                                          on_done, done_ctx);
+            s_sync_inflight_release(e);
+            return posted ? rc_ok : rc_no_memory;
+        }
+        s_sync_inflight_release(e);
+    }
+    if (on_done)
+        on_done(rc_closed, done_ctx);
+    return rc_closed;
+}
+
 duct_result_t duct_session_invoke(duct_engine_t *e, duct_handle_t tok,
                                   duct_session_fn fn, void *ctx)
 {
-    duct_do_if(!e || !fn, return rc_invalid_arg);
-    auto worker_id = s_worker_of(tok);
-    duct_do_if(worker_id == conn_worker_none, return rc_closed);
-    auto h = (duct_session_handle_t){ .word = tok };
-    /* The async post can fail on message OOM like the sync form below. */
-    if (!duct_worker_post_session_invoke(worker_id, &h, fn, ctx, nullptr, nullptr))
-        return rc_no_memory;
-    return rc_ok;
+    return s_session_invoke(e, tok, fn, ctx, nullptr, nullptr);
+}
+
+duct_result_t duct_session_invoke_done(duct_engine_t *e, duct_handle_t tok,
+                                       duct_session_fn fn, void *ctx,
+                                       duct_session_invoke_done_fn on_done, void *done_ctx)
+{
+    return s_session_invoke(e, tok, fn, ctx, on_done, done_ctx);
 }
 
 duct_result_t duct_session_close(duct_engine_t *e, duct_handle_t tok,
@@ -595,7 +621,7 @@ duct_result_t duct_io_connect_via(duct_engine_t *e, const char *addr, duct_proto
                                   void *user_ctx, duct_xport_t xport, uint32_t egress_if,
                                   duct_view_u8 tx_prefix)
 {
-    duct_do_if(!e || !addr || !*addr || !proto, return rc_invalid_arg);
+    duct_do_if(!e || !addr || !*addr || !proto || !proto->cfg.on_frame, return rc_invalid_arg);
     auto seed = (duct_conn_intent_t){
         .kind = intent_session, .proto = proto, .xport = xport, .egress_if = egress_if,
         .user_ctx = user_ctx,
@@ -612,7 +638,7 @@ duct_result_t duct_io_connect_via(duct_engine_t *e, const char *addr, duct_proto
 /** @brief Judge an attach over a packet fd: @c rc_ok, or the refusal the entry returns. */
 static duct_result_t s_packet_fd_refusal(duct_engine_t *e, duct_sock_t fd, const duct_proto_t *proto)
 {
-    duct_do_if(!e || !proto || fd == duct_sock_bad, return rc_invalid_arg);
+    duct_do_if(!e || !proto || !proto->cfg.on_frame || fd == duct_sock_bad, return rc_invalid_arg);
     duct_do_if(!duct_x_packet_fd_session, return rc_not_supported);
     auto state = duct_atomic_load(&e->state, acquire);
     duct_do_if(state != engine_state_running, return rc_invalid_order);
@@ -632,6 +658,19 @@ duct_result_t duct_io_attach_packet_fd(duct_engine_t *e, duct_sock_t fd, duct_pr
     return duct_io_post_open_packet_fd(io_id, fd, proto, user_ctx) ? rc_ok : rc_no_memory;
 }
 
+static bool s_pick_worker(duct_engine_t *e, unsigned worker, unsigned *out)
+{
+    if (worker == duct_worker_any) {
+        *out = duct_atomic_fetch(add, &e->timer_rr, 1u, relaxed) % e->n_workers;
+        return true;
+    }
+    if (worker < e->n_workers) {
+        *out = worker;
+        return true;
+    }
+    return false;
+}
+
 duct_result_t duct_timer_start(duct_engine_t *e, duct_proto_t *proto, void *user_ctx,
                                uint64_t delay_ms, uintptr_t arg)
 {
@@ -643,8 +682,44 @@ duct_result_t duct_timer_start(duct_engine_t *e, duct_proto_t *proto, void *user
     if (duct_atomic_load(&e->state, acquire) != engine_state_running)
         return rc_invalid_order;
     /* No session ties the timer to a worker, so workers take them in turn. */
-    unsigned worker_id = duct_atomic_fetch(add, &e->timer_rr, 1u, relaxed) % e->n_workers;
+    unsigned worker_id = 0u;
+    s_pick_worker(e, duct_worker_any, &worker_id);
     return duct_worker_post_timer_start(worker_id, proto, user_ctx, delay_us, arg);
+}
+
+duct_result_t duct_worker_post(duct_engine_t *e, unsigned worker,
+                               duct_worker_fn fn, void *ctx)
+{
+    duct_do_if(!e || !fn, return rc_invalid_arg);
+    if (!s_sync_inflight_acquire(e))
+        return rc_invalid_order;
+    unsigned target = 0u;
+    duct_result_t rc = rc_invalid_arg;
+    if (s_pick_worker(e, worker, &target))
+        rc = duct_worker_post_work(target, e, fn, ctx);
+    s_sync_inflight_release(e);
+    return rc;
+}
+
+duct_result_t duct_proto_post(duct_engine_t *e, unsigned worker,
+                              duct_proto_t *proto, void *user_ctx, uintptr_t arg)
+{
+    duct_do_if(!e || !proto || !proto->cfg.on_work, return rc_invalid_arg);
+    if (!s_sync_inflight_acquire(e))
+        return rc_invalid_order;
+    unsigned target = 0u;
+    duct_result_t rc = rc_invalid_arg;
+    if (s_pick_worker(e, worker, &target)) {
+        if (!duct_proto_hold_root(proto)) {
+            rc = rc_invalid_order;
+        } else {
+            rc = duct_worker_post_proto(target, e, proto, user_ctx, arg);
+            if (rc != rc_ok)
+                duct_proto_release(proto);
+        }
+    }
+    s_sync_inflight_release(e);
+    return rc;
 }
 
 bool duct_engine_stats(duct_engine_t *e, duct_rt_stats_t *out)

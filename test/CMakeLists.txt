@@ -897,6 +897,12 @@ target_compile_features(ductio_stats_sections_test PRIVATE c_std_23)
 add_test(NAME stats_sections COMMAND ductio_stats_sections_test)
 set_tests_properties(stats_sections PROPERTIES TIMEOUT 60)
 
+add_executable(ductio_worker_post_test worker_post_test.c)
+target_link_libraries(ductio_worker_post_test PRIVATE DuctIo::ductio)
+target_compile_features(ductio_worker_post_test PRIVATE c_std_23)
+add_test(NAME worker_post COMMAND ductio_worker_post_test)
+set_tests_properties(worker_post PROPERTIES TIMEOUT 30)
+
 add_executable(ductio_dgram_spoof_migration_test
     dgram_spoof_migration_test.c tls_engine_null.c)
 target_link_libraries(ductio_dgram_spoof_migration_test PRIVATE DuctIo::ductio)

@@ -392,7 +392,7 @@ int main(void)
 {
     setvbuf(stdout, nullptr, _IOLBF, 0);
     g_timers = duct_proto_create(&(duct_proto_cfg_t){
-        .name = "stats-timers", .on_frame = on_frame, .on_timer = on_timer, .max_response = 64u });
+        .name = "stats-timers", .on_timer = on_timer });
     g_e = g_timers ? duct_engine_launch(&(duct_engine_cfg_t){ .io_threads = io_threads, .workers = workers })
                    : nullptr;
     if (!g_e) {

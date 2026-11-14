@@ -13,6 +13,7 @@
 #ifndef DUCT_RELAY_H
 #define DUCT_RELAY_H
 
+#include "duct.h"
 #include "duct_types.h"
 #include "duct_msg.h"
 #include "duct_seal_engine.h"
@@ -46,7 +47,7 @@ typedef struct duct_x_slot_pool   duct_x_slot_pool_t;
     X(pre_parse) X(listener_register) X(listener_close)
 
 /** @brief Kinds the worker sweep gives back, each also the kind @c msg_kind_NAME. */
-#define duct_msg_sweep_ctrl(X) X(session_open) X(session_invoke)
+#define duct_msg_sweep_ctrl(X) X(session_open) X(session_invoke) X(proto_post)
 
 /** @brief Types an io trunk accepts: its sweep kinds, the plain @c attach_inter and the embedded
  *  @c dgram_tx_kick and @c rx_resume.
@@ -58,7 +59,7 @@ typedef struct duct_x_slot_pool   duct_x_slot_pool_t;
  */
 #define duct_msg_post_ctrl(X)                                             \
     duct_msg_sweep_ctrl(X) X(pre_parse) X(conn_join) X(connect_error)     \
-    X(connect_leg_error) X(timer_start)
+    X(connect_leg_error) X(timer_start) X(worker_post)
 /** @} */
 
 /** @brief Kind of a message on an io trunk or worker ctrl stack, stored in @c duct_msg_t::arg.
@@ -161,6 +162,13 @@ duct_nonnull(2) duct_result_t
 duct_worker_post_timer_start(unsigned worker_id, const duct_proto_t *proto, void *user_ctx,
                              uint64_t delay_us, uintptr_t arg);
 
+duct_nonnull(2, 3) duct_result_t
+duct_worker_post_work(unsigned worker_id, duct_engine_t *e, duct_worker_fn fn, void *ctx);
+
+duct_nonnull(2, 3) duct_result_t
+duct_worker_post_proto(unsigned worker_id, duct_engine_t *e, duct_proto_t *proto,
+                       void *user_ctx, uintptr_t arg);
+
 /** @brief Post a leg-dial failure on an already-live session —
  *  @c control.open_leg == @c leg_kind_connect.
  *
@@ -171,14 +179,6 @@ duct_nonnull(2) void
 duct_worker_post_connect_leg_error(unsigned worker_id,
                                    const duct_session_handle_t *h,
                                    duct_result_t err);
-
-/** @brief Invoke-completion callback.
- *  Runs on whichever thread learns the invoke is finished —
- *  worker after a normal commit or the posting thread itself when
- *  @ref duct_worker_post_session_invoke fails before reaching the
- *  worker. @p rc is @p fn's return value or the post failure code.
- */
-typedef void (*duct_session_invoke_done_fn)(duct_result_t rc, void *done_ctx);
 
 /** @brief Post a host-driven invoke onto the owning worker.
  *  Backs @ref duct_session_invoke and @ref duct_session_invoke_sync.
@@ -204,9 +204,6 @@ duct_worker_post_session_invoke(unsigned worker_id,
                                 duct_session_fn fn, void *ctx,
                                 duct_session_invoke_done_fn on_done,
                                 void *done_ctx);
-
-/** @brief Return the calling worker's id, or @c conn_worker_none off a worker thread. */
-unsigned duct_worker_self(void);
 
 /** @brief Subscribe I/O thread @p io_id to a wake after its push to
  *  @p worker_id's normal WFQ lane hit lane-full.
