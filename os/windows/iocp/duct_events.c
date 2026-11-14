@@ -150,11 +150,9 @@ typedef struct iocp_dgram_tx iocp_dgram_tx_t;
 typedef struct {
     OVERLAPPED         ov;
     uint64_t           packed;
-    WSAMSG             wsamsg;
-    WSABUF             buf;
-    INT                addrlen;
-    uint32_t           ref;
     iocp_dgram_tx_t   *st;
+    uint32_t           refs[duct_x_gso_segs_max];
+    uint8_t            nrefs;
 } iocp_dgram_tx_ctl_t;
 
 static constexpr unsigned iocp_dgram_tx_pool_depth = 64u;
@@ -1117,49 +1115,63 @@ void duct_events_dgram_tx_pool_free(duct_listener_t *listener)
         s_dgram_tx_release(st);
 }
 
-static bool s_dgram_tx_post(void *arg, const duct_dgram_tx_entry_t *entry)
+static unsigned s_dgram_tx_post(void *arg, const duct_dgram_tx_entry_t *const *entries, unsigned n)
 {
     auto st = (iocp_dgram_tx_t *)arg;
-    duct_do_if(!st->free_count, return false);
+    duct_do_if(!st->free_count, return 0u);
     auto pools = st->pools;
+    bool gso_ok = duct_x_has_gso()
+        && !atomic_load_explicit(&st->listener->dgram_tx_gso_off, memory_order_relaxed);
+    duct_dgram_out_t msgs[duct_x_gso_segs_max];
+    unsigned scan = gso_ok ? n : 1u;
+    for (unsigned i = 0u; i < scan; ++i) {
+        auto data = duct_x_slot_span(pools, entries[i]->slot);
+        msgs[i] = (duct_dgram_out_t){
+            .peer = entries[i]->peer,
+            .body = { .data = data.data, .size = entries[i]->len },
+        };
+    }
+    unsigned group = gso_ok && scan > 1u ? duct_x_gso_group(msgs, scan) : 1u;
     unsigned at = st->free_stack[--st->free_count];
     auto ctl = &duct_at(st->ctls)[at];
-    uint32_t ref = entry->slot;
-    auto addr = (struct sockaddr_storage *)duct_x_slot_data(duct_x_slot_ref_pool(pools, ref),
-                                                            ref & ~duct_x_slot_ref_large);
-    auto data = duct_x_slot_span(pools, ref);
-    *ctl = (iocp_dgram_tx_ctl_t){
-        .packed = s_tag_pack(iocp_op_dgram_tx, nullptr),
-        .buf = { entry->len, data.data },
-        .addrlen = duct_io_sockaddr_from_peer(&entry->peer, addr),
-        .ref = ref, .st = st,
-    };
-    ctl->wsamsg = (WSAMSG){
-        .name = (LPSOCKADDR)addr,
-        .namelen = ctl->addrlen,
-        .lpBuffers = &ctl->buf,
-        .dwBufferCount = 1u,
-    };
-    int rc = WSASendMsg(st->listener->listen_fd, &ctl->wsamsg, 0u, &(DWORD){0u}, &ctl->ov, nullptr);
-    if (rc != 0 && WSAGetLastError() != WSA_IO_PENDING) {
-        st->free_stack[st->free_count++] = at;
-        duct_x_slot_put(pools, ref);
-        return true;
+    *ctl = (iocp_dgram_tx_ctl_t){ .packed = s_tag_pack(iocp_op_dgram_tx, nullptr), .st = st };
+
+    duct_x_gso_msg_t msg;
+    int err = s_tx_post_err(WSASendMsg(st->listener->listen_fd,
+                                       duct_x_gso_msg_peers(&msg, msgs, group),
+                                       0u, &(DWORD){0u}, &ctl->ov, nullptr));
+    if (err != NO_ERROR && group > 1u) {
+        if (err != WSAEWOULDBLOCK && err != WSAENOBUFS)
+            atomic_store_explicit(&st->listener->dgram_tx_gso_off, 1u, memory_order_relaxed);
+        group = 1u;
+        ctl->ov = (OVERLAPPED){};
+        err = s_tx_post_err(WSASendMsg(st->listener->listen_fd,
+                                       duct_x_gso_msg_peers(&msg, msgs, 1u),
+                                       0u, &(DWORD){0u}, &ctl->ov, nullptr));
     }
+    if (err != NO_ERROR) {
+        st->free_stack[st->free_count++] = at;
+        duct_x_slot_put(pools, entries[0]->slot);
+        return 1u;
+    }
+    ctl->nrefs = (uint8_t)group;
+    for (unsigned i = 0u; i < group; ++i)
+        ctl->refs[i] = entries[i]->slot;
     ++st->inflight;
-    return true;
+    return group;
 }
 
 static void s_dgram_tx_drain(iocp_dgram_tx_t *st)
 {
-    duct_io_dgram_send_drain(st->listener, s_dgram_tx_post, st);
+    duct_io_dgram_send_drain(st->listener, s_dgram_tx_post, st, (unsigned)duct_x_gso_segs_max);
 }
 
 static void s_dgram_tx_settle(iocp_dgram_tx_ctl_t *ctl, bool redrain)
 {
     auto st = ctl->st;
     st->free_stack[st->free_count++] = (unsigned)(ctl - duct_at(st->ctls));
-    duct_x_slot_put(st->pools, ctl->ref);
+    for (unsigned i = 0u; i < ctl->nrefs; ++i)
+        duct_x_slot_put(st->pools, ctl->refs[i]);
     if (--st->inflight == 0u && st->closing)
         s_dgram_tx_release(st);
     else if (redrain && !st->closing)

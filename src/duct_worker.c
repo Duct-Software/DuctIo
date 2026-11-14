@@ -2173,6 +2173,9 @@ static duct_exec_rc_t s_dispatch_frame_body(duct_worker_t *w, duct_conn_t *conn,
         uint64_t at = duct_atomic_load(&rx->acked, relaxed);
         if (at >= duct_atomic_load(&rx->roam_at, acquire)) {
             duct_atomic_store(&rx->accept_at, at, release);
+            auto sc = duct_conn_sealed_ctx(conn);
+            if (sc && sc->codec)
+                duct_wire_codec_owd_reset(sc->codec);
             auto rh = duct_conn_handle_get(conn);
             /* io re-points the socket on this post: records committed ahead
              * of it leave through the current peer. */
@@ -2636,6 +2639,7 @@ static void s_rekey_take(duct_conn_t *conn, duct_wire_codec_t *codec, duct_unsea
     if (rc == rc_again || rc == rc_no_memory)
         return;
     codec->rekey_due = false;
+    duct_wire_codec_owd_reset(codec);
     if (rc != rc_fatal)
         s_rekey_arm(conn, codec);
 }
@@ -3342,8 +3346,15 @@ static void s_inter_pkt(duct_conn_handle_t handle,
      * engine carries the replay window @c fl_wire_dgram_ok stands for: without
      * one, a captured datagram replayed from a foreign address moves the
      * endpoint. */
-    if (sealed && shared)
-        ((duct_dgram_shared_ctx_t *)conn->ctx)->peer = b->peer;
+    if (sealed && shared) {
+        auto ctx = (duct_dgram_shared_ctx_t *)conn->ctx;
+        if (memcmp(&ctx->peer, &b->peer, sizeof ctx->peer) != 0) {
+            ctx->peer = b->peer;
+            auto sc = duct_conn_sealed_ctx(conn);
+            if (sc && sc->codec)
+                duct_wire_codec_owd_reset(sc->codec);
+        }
+    }
     if (duct_has(cfg->flags, fl_proto_multiplexed) && frame.stream_id != 0u
         && cfg->handler_kind != handler_none) {
         /* Claim-eligible: the VMQ batch this frame lives in commits — frees
@@ -7451,6 +7462,36 @@ duct_result_t duct_conn_set_uso(duct_session_t *s, duct_conn_id_t conn_id, bool 
     else
         duct_conn_state_clear(conn, fl_conn_vnet_uso_tx);
     return rc_ok;
+}
+
+duct_result_t duct_conn_set_dgram_env(duct_session_t *s, duct_conn_id_t conn_id, bool on)
+{
+    duct_do_if(conn_id >= duct_session_max_legs, return rc_invalid_arg);
+    auto conn = duct_conn_by_handle(duct_session_conn_at(s, conn_id));
+    duct_do_if(!conn, return rc_invalid_order);
+    auto codec = conn->wire && conn->wire->unseal ? s_tls_codec(conn) : nullptr;
+    duct_do_if(!codec || !codec->env_capable, return rc_not_supported);
+    codec->env_on = on;
+    return rc_ok;
+}
+
+uint64_t duct_conn_dgram_remote_q(const duct_session_t *s, duct_conn_id_t conn_id, uint64_t now,
+                                  bool *out_active)
+{
+    if (out_active)
+        *out_active = false;
+    if (conn_id >= duct_session_max_legs)
+        return 0u;
+    auto conn = duct_conn_by_handle(duct_session_conn_at(s, conn_id));
+    auto sc = conn ? duct_conn_sealed_ctx(conn) : nullptr;
+    auto codec = sc ? sc->codec : nullptr;
+    if (!codec || (!codec->env_on && !codec->owd.remote_q_have))
+        return 0u;
+    if (out_active)
+        *out_active = true;
+    if (!codec->owd.remote_q_have || now - codec->owd.remote_q_at > duct_owd_stale_ns)
+        return 0u;
+    return codec->owd.remote_q_ns;
 }
 
 duct_result_t duct_conn_tx_end(duct_session_t *s, duct_conn_id_t conn_id,

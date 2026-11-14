@@ -270,6 +270,14 @@ target_compile_features(ductio_wire_frame_flags_test PRIVATE c_std_23)
 add_test(NAME wire_frame_flags COMMAND ductio_wire_frame_flags_test)
 set_tests_properties(wire_frame_flags PROPERTIES TIMEOUT 30)
 
+add_executable(ductio_dgram_env_test dgram_env_test.c tls_engine_null.c)
+target_link_libraries(ductio_dgram_env_test PRIVATE DuctIo::ductio)
+target_include_directories(ductio_dgram_env_test PRIVATE
+    ${DUCT_INTERNAL_INCLUDE_DIRS})
+target_compile_features(ductio_dgram_env_test PRIVATE c_std_23)
+add_test(NAME dgram_env COMMAND ductio_dgram_env_test)
+set_tests_properties(dgram_env PROPERTIES TIMEOUT 30)
+
 add_executable(ductio_mux_wire_test mux_wire_test.c)
 target_link_libraries(ductio_mux_wire_test PRIVATE DuctIo::ductio)
 target_include_directories(ductio_mux_wire_test PRIVATE

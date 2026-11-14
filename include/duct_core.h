@@ -500,6 +500,22 @@ duct_nonnull(1) static inline void duct_store_be32(void *p, uint32_t v)
     b[2] = (uint8_t)(v >> 8u);
     b[3] = (uint8_t)v;
 }
+
+duct_nonnull(1) static inline uint32_t duct_load_le32(const void *p)
+{
+    auto b = (const uint8_t *)p;
+    return (uint32_t)b[0] | ((uint32_t)b[1] << 8u)
+         | ((uint32_t)b[2] << 16u) | ((uint32_t)b[3] << 24u);
+}
+
+duct_nonnull(1) static inline void duct_store_le32(void *p, uint32_t v)
+{
+    auto b = (uint8_t *)p;
+    b[0] = (uint8_t)v;
+    b[1] = (uint8_t)(v >> 8u);
+    b[2] = (uint8_t)(v >> 16u);
+    b[3] = (uint8_t)(v >> 24u);
+}
 /** @} */
 
 enum : unsigned { alloc_back_bits = 10 /**< Width of @c duct_alloc_hdr_t::back, bits. */ };

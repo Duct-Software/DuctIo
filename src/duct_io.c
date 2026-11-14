@@ -4112,24 +4112,44 @@ static bool s_dgram_tx_outbox_drain(duct_listener_t *listener, size_t *out_peeke
     return all_drained;
 }
 
-void duct_io_dgram_send_drain(duct_listener_t *listener, duct_dgram_send_fn send, void *arg)
+void duct_io_dgram_send_drain(duct_listener_t *listener, duct_dgram_send_fn send, void *arg,
+                              unsigned max_batch)
 {
     auto outbox = (duct_vmq_mpsc_t *)listener->dgram_tx_outbox;
+    unsigned cap = max_batch ? (unsigned)duct_min((size_t)max_batch, duct_x_gso_segs_max) : 1u;
+    const duct_dgram_tx_entry_t *entries[duct_x_gso_segs_max];
+    size_t next_heads[duct_x_gso_segs_max];
     bool full = false;
     for (unsigned k = 0u; k < outbox->n_lanes; ++k) {
         unsigned i = (listener->tx_lane + k) % outbox->n_lanes;
         auto ln = duct_mpsc_lane(outbox, i);
         auto pos = duct_vmq_drain_begin(&ln);
-        duct_vmq_hdr_t *hdr;
+        size_t commit_head = pos.head;
         bool any = false;
-        while (!full && (hdr = duct_vmq_drain_peek(&ln, &pos)) != nullptr) {
-            full = !send(arg, (const duct_dgram_tx_entry_t *)&hdr->payload[0]);
-            duct_do_if(full, break);
-            pos.head += pos.step;
+        while (!full) {
+            unsigned n = 0u;
+            auto scan = pos;
+            duct_vmq_hdr_t *hdr;
+            while (n < cap && (hdr = duct_vmq_drain_peek(&ln, &scan)) != nullptr) {
+                scan.head += scan.step;
+                entries[n] = (const duct_dgram_tx_entry_t *)&hdr->payload[0];
+                next_heads[n] = scan.head;
+                ++n;
+            }
+            if (!n)
+                break;
+            unsigned took = send(arg, entries, n);
+            if (!took) {
+                full = true;
+                break;
+            }
+            assert(took <= n);
+            commit_head = next_heads[took - 1u];
+            pos.head = commit_head;
             any = true;
         }
         if (any)
-            duct_vmq_commit_head(&ln, pos.gen, pos.head);
+            duct_vmq_commit_head(&ln, pos.gen, commit_head);
         if (duct_vmq_ack_waiter(ln.ctrl))
             duct_worker_wake_id(i);
     }

@@ -120,10 +120,24 @@ typedef struct duct_wire_codec {
      *  every datagram sealed, so it sits with the prefix the lead replaces.
      */
     duct_lead_state_t lead_state;
+    bool env_capable;
+    bool env_on;
 
     uint64_t rekey_timer; /**< Handle of this codec's last lifetime timer;
                             *  a fire carrying another belongs to a codec this
                             *  one replaced and marks nothing. */
+
+    struct {
+        uint64_t half_at,
+                 rx_q_at,
+                 remote_q_at,
+                 remote_q_ns;
+        uint32_t mins[2],
+                 rx_q_us;
+        uint8_t  slot;
+        bool     have,
+                 remote_q_have;
+    } owd;
 
     uint16_t opening_ceiling; /**< Largest opening packet, bytes: the wire's
                                 *  @c opening_ceiling, 0 for a wire with none. */
@@ -193,6 +207,34 @@ static inline bool duct_wire_codec_rx_strip(const duct_wire_codec_t *c,
     pdu->size -= c->rx_prefix_len;
     return true;
 }
+
+static constexpr uint64_t duct_owd_window_ns = 15000000000ull; /**< One OWD minimum half-window. */
+static constexpr uint64_t duct_owd_stale_ns  =  1000000000ull; /**< Queue estimates older than this read 0. */
+static constexpr uint64_t duct_owd_gap_ns    =   200000000ull; /**< A receive pause this long resets the decay. */
+
+/** @brief The 8-byte datagram trailer: the sender's TX stamp in µs (low 32 of
+ *  the monotonic clock) and its last receive-queue estimate in µs.
+ */
+typedef struct duct_dgram_env {
+    uint32_t tx_us;
+    uint32_t peer_q_us;
+} duct_dgram_env_t;
+
+static_assert(sizeof(duct_dgram_env_t) == 8u, "duct_dgram_env_t must be 8 bytes");
+
+/** @brief Drop the OWD estimate: a new path — roam, rekey, peer change — starts fresh. */
+duct_nonnull(1) void duct_wire_codec_owd_reset(duct_wire_codec_t *c);
+/** @brief Fill @p out for the next datagram: the TX stamp and our latest
+ *  receive-queue estimate when younger than @c duct_owd_stale_ns, 0 otherwise.
+ */
+duct_nonnull(1, 2) void duct_wire_codec_owd_tx(const duct_wire_codec_t *c,
+                                               duct_dgram_env_t *out, uint64_t now_ns);
+/** @brief Account a received trailer: the two-half-window OWD minimum feeds the
+ *  excess-queue estimate — fast rise, 3/4 decay, reset after a pause — and the
+ *  peer's reported queue is recorded for @c duct_conn_dgram_remote_q.
+ */
+duct_nonnull(1, 2) void duct_wire_codec_owd_rx(duct_wire_codec_t *c,
+                                               const duct_dgram_env_t *env, uint64_t now_ns);
 
 #ifdef __cplusplus
 }

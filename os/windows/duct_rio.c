@@ -425,11 +425,14 @@ void duct_rio_tx_free(duct_listener_t *listener)
  *  the slot at once, and the entry is spent either way.
  *  @return false when no descriptor is free, which leaves the entry queued.
  */
-static bool s_tx_post(void *arg, const duct_dgram_tx_entry_t *entry)
+static unsigned s_tx_post(void *arg, const duct_dgram_tx_entry_t *const *entries,
+                          [[maybe_unused]] unsigned n)
 {
+    assert(n == 1u);
+    auto entry = entries[0];
     auto post = (tx_post_t *)arg;
     auto tx = post->tx;
-    duct_do_if(!tx->free_count, return false);
+    duct_do_if(!tx->free_count, return 0u);
     uint32_t ref = entry->slot,
              idx = ref & ~duct_x_slot_ref_large;
     auto pool = duct_x_slot_ref_pool(tx->pools, ref);
@@ -446,13 +449,13 @@ static bool s_tx_post(void *arg, const duct_dgram_tx_entry_t *entry)
         ++tx->inflight;
     } else
         duct_x_slot_put(tx->pools, ref);
-    return true;
+    return 1u;
 }
 
 void duct_rio_tx_drain(const RIO_EXTENSION_FUNCTION_TABLE *rio, duct_listener_t *listener)
 {
     tx_post_t post = { .rio = rio, .tx = (duct_rio_tx_t *)listener->dgram_tx_rio };
-    duct_io_dgram_send_drain(listener, s_tx_post, &post);
+    duct_io_dgram_send_drain(listener, s_tx_post, &post, 1u);
 }
 
 bool duct_rio_tx_send(const duct_listener_t *listener, const duct_peer_t *peer, duct_view_u8 payload)

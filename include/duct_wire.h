@@ -166,6 +166,12 @@ duct_nonnull(1) duct_frame_volume_t duct_frame_volume(const duct_frame_ip_t *ip)
  */
 duct_nonnull(1) uint64_t duct_frame_flow_key(const duct_frame_ip_t *ip);
 
+/** @brief True when the frame carries no payload data: a missing or
+ *  truncated/malformed IP packet, ICMP, or a first-fragment TCP pure ACK.
+ *  GSO bundles are data.
+ */
+duct_nonnull(1) bool duct_frame_is_control(const duct_frame_ip_t *ip);
+
 /** @brief Ephemeral wire context.
  *
  *  Passed into @c unseal, @c start, @c rekey, @c retry and @c close_notify, so the

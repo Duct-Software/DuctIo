@@ -665,6 +665,25 @@ duct_frame_volume_t duct_frame_volume(const duct_frame_ip_t *ip)
     return volume;
 }
 
+typedef struct {
+    uint8_t proto;
+    bool    v4;
+    bool    first;
+    bool    whole;
+} s_frame_proto_t;
+
+static s_frame_proto_t s_frame_proto(const uint8_t *p)
+{
+    bool v4 = (p[0] >> 4u) == 4u;
+    bool first = !v4 || (!(p[6] & 0x1fu) && !p[7]);
+    return (s_frame_proto_t){
+        .proto = v4 ? p[9] : p[6],
+        .v4 = v4,
+        .first = first,
+        .whole = first && (!v4 || !(p[6] & 0x20u)),
+    };
+}
+
 /** @brief Test whether the TCP segment behind the @p hdr IP header bytes of @p p is an ACK that carries no data.
  *  FIN, SYN and RST are clear, and the IP length, which must fit the @p n bytes at hand, ends where
  *  the TCP header does.
@@ -687,26 +706,38 @@ uint64_t duct_frame_flow_key(const duct_frame_ip_t *ip)
         return 0u;
     size_t n = ip->size,
            hdr = ip->hdr;
-    bool v4 = (p[0] >> 4u) == 4u;
-    uint8_t proto = v4 ? p[9] : p[6];
-    bool first = !v4 || (!(p[6] & 0x1fu) && !p[7]),
-         whole = first && (!v4 || !(p[6] & 0x20u));
-    if (proto == s_proto_icmp4 || proto == s_proto_icmp6
-        || (proto == s_proto_tcp && whole && s_pure_ack(p, n, hdr)))
+    auto info = s_frame_proto(p);
+    if (info.proto == s_proto_icmp4 || info.proto == s_proto_icmp6
+        || (info.proto == s_proto_tcp && info.whole && s_pure_ack(p, n, hdr)))
         return 0u;
-    uint64_t key = duct_splitmix64(proto);
-    const uint8_t *addrs = p + (v4 ? 12u : 8u);
-    for (size_t at = 0u; at < (v4 ? 8u : 32u); at += 8u) {
+    uint64_t key = duct_splitmix64(info.proto);
+    const uint8_t *addrs = p + (info.v4 ? 12u : 8u);
+    for (size_t at = 0u; at < (info.v4 ? 8u : 32u); at += 8u) {
         uint64_t word;
         memcpy(&word, addrs + at, sizeof word);
         key = duct_splitmix64(key ^ word);
     }
-    if (first && (proto == s_proto_tcp || proto == s_proto_udp) && hdr + 4u <= n) {
+    if (info.first && (info.proto == s_proto_tcp || info.proto == s_proto_udp) && hdr + 4u <= n) {
         uint32_t ports;
         memcpy(&ports, p + hdr, sizeof ports);
         key = duct_splitmix64(key ^ ports);
     }
     return key | 1u;
+}
+
+bool duct_frame_is_control(const duct_frame_ip_t *ip)
+{
+    auto p = ip->packet;
+    if (!p)
+        return true;
+    if (ip->gso)
+        return false;
+    size_t len = duct_ip_len(p);
+    if (len < ip->hdr || len > ip->size)
+        return true;
+    auto info = s_frame_proto(p);
+    return info.proto == s_proto_icmp4 || info.proto == s_proto_icmp6
+        || (info.proto == s_proto_tcp && info.first && s_pure_ack(p, ip->size, ip->hdr));
 }
 
 size_t duct_vnet_cut(const uint8_t *vh, uint8_t *rec, size_t len, size_t rec_max,

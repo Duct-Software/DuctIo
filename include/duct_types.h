@@ -238,6 +238,10 @@ typedef enum duct_frame_flags : uint8_t {
                                 *  writes it, a wire with @c fl_wire_frame_flags
                                 *  carries it, and every other leg refuses it
                                 *  with @c rc_not_supported. */
+    fl_frame_env  = 1u << 3,  /**< An 8-byte @c duct_dgram_env_t trailer rides
+                                *  the frame's tail; the codec strips it and
+                                *  clears the bit before @c on_frame sees the
+                                *  frame. */
 } duct_frame_flags_t;
 
 static_assert(sizeof(duct_frame_flags_t) == sizeof(uint8_t),
