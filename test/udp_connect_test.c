@@ -19,16 +19,20 @@
  * test_helpers.h's own copy of this declaration for the rationale. */
 duct_wire_t *duct_wire_create_dgram_batch(size_t max_dgram, bool framed);
 
-static atomic_int      g_srv_open      = 0;
-static atomic_int      g_cli_open      = 0;
-static atomic_int      g_cli_frame_ok  = 0;
-static _Atomic(void *) g_cli_open_ctx  = nullptr;
+static atomic_int      g_srv_open         = 0;
+static atomic_int      g_cli_open         = 0;
+static atomic_int      g_cli_frame_ok     = 0;
+static atomic_int      g_cli_closed       = 0;
+static atomic_int      g_cli_close_reason = -1;
+static _Atomic(void *) g_cli_open_ctx     = nullptr;
 
 static void s_reset(void)
 {
     duct_atomic_store(&g_srv_open, 0, relaxed);
     duct_atomic_store(&g_cli_open, 0, relaxed);
     duct_atomic_store(&g_cli_frame_ok, 0, relaxed);
+    duct_atomic_store(&g_cli_closed, 0, relaxed);
+    duct_atomic_store(&g_cli_close_reason, -1, relaxed);
     duct_atomic_store(&g_cli_open_ctx, nullptr, relaxed);
 }
 
@@ -75,6 +79,14 @@ cli_on_frame([[maybe_unused]] duct_session_t *s, [[maybe_unused]] duct_conn_id_t
     return rc_ok;
 }
 
+static void
+cli_on_close([[maybe_unused]] duct_session_t *s, duct_close_reason_t reason,
+             [[maybe_unused]] void *proto_state)
+{
+    duct_atomic_store(&g_cli_close_reason, (int)reason, release);
+    duct_atomic_store(&g_cli_closed, 1, release);
+}
+
 /** @brief duct_io_connect requires engine_state_running; retry past the
  *  short window right after pthread_create instead of racing it — same
  *  pattern as connect_test.c's own s_connect_retry, x_udp_peer fixed.
@@ -94,11 +106,11 @@ s_connect_retry(duct_engine_t *io, const char *addr, duct_proto_t *proto,
     return rc;
 }
 
-static bool sc_dial(const char *addr_fmt)
+static duct_result_t sc_dial(const char *addr_fmt)
 {
     s_reset();
     auto io = duct_engine_launch(&(duct_engine_cfg_t){ .io_threads = 1, .workers = 1 });
-    if (!io) return false;
+    if (!io) return rc_fatal;
 
     auto srv_wire = duct_wire_create_dgram_batch(0u, false);
     auto cli_wire = duct_wire_create_dgram_batch(0u, false);
@@ -114,7 +126,7 @@ static bool sc_dial(const char *addr_fmt)
     if (cli) cli->owned_wire = cli_wire; else duct_wire_destroy(cli_wire);
     if (!srv || !cli) {
         duct_proto_destroy(srv); duct_proto_destroy(cli); duct_engine_destroy(io);
-        return false;
+        return rc_fatal;
     }
 
     uint16_t port = 0u;
@@ -148,7 +160,66 @@ static bool sc_dial(const char *addr_fmt)
     duct_engine_destroy(io);
     duct_proto_destroy(srv);
     duct_proto_destroy(cli);
-    return ok;
+    return ok ? rc_ok : rc_fatal;
+}
+
+static uint16_t s_closed_udp_port(void)
+{
+    duct_sock_t fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd == duct_sock_bad)
+        return 0u;
+    struct sockaddr_in sa = {
+        .sin_family = AF_INET,
+        .sin_addr   = { .s_addr = htonl(INADDR_LOOPBACK) },
+    };
+    socklen_t len = (socklen_t)sizeof sa;
+    uint16_t port = 0u;
+    if (bind(fd, (struct sockaddr *)&sa, len) == 0
+        && getsockname(fd, (struct sockaddr *)&sa, &len) == 0)
+        port = ntohs(sa.sin_port);
+    close(fd);
+    return port;
+}
+
+/** @brief Sending on x_udp_peer to a closed loopback UDP port surfaces ICMP
+ *  port unreachable as close_io_error across IOCP, wepoll and epoll alike. */
+static duct_result_t sc_refused(void)
+{
+    s_reset();
+    uint16_t port = s_closed_udp_port();
+    if (!port)
+        return rc_fatal;
+    auto io = duct_engine_launch(&(duct_engine_cfg_t){ .io_threads = 1, .workers = 1 });
+    if (!io)
+        return rc_fatal;
+
+    auto cli_wire = duct_wire_create_dgram_batch(0u, false);
+    auto cli = duct_proto_create(&(duct_proto_cfg_t){
+        .name = "udp-refused-cli", .wire = cli_wire,
+        .on_frame = cli_on_frame, .on_session_open = cli_on_open,
+        .on_session_close = cli_on_close,
+    });
+    if (cli) cli->owned_wire = cli_wire; else duct_wire_destroy(cli_wire);
+    if (!cli) {
+        duct_engine_destroy(io);
+        return rc_fatal;
+    }
+
+    bool ok = false;
+    pthread_t th;
+    if (pthread_create(&th, nullptr, th_run, io) == 0) {
+        char addr[64];
+        snprintf(addr, sizeof addr, "127.0.0.1:%u", (unsigned)port);
+        ok = s_connect_retry(io, addr, cli, nullptr, 3000u) == rc_ok;
+        ok = ok && th_wait_int(&g_cli_closed, 1, 2000u);
+        ok = ok && duct_atomic_load(&g_cli_close_reason, acquire) == (int)close_io_error;
+        duct_engine_stop(io);
+        pthread_join(th, nullptr);
+    }
+
+    duct_engine_destroy(io);
+    duct_proto_destroy(cli);
+    return ok ? rc_ok : rc_fatal;
 }
 
 int main(void)
@@ -156,14 +227,16 @@ int main(void)
     setvbuf(stdout, nullptr, _IOLBF, 0);
     int pass = 1;
 
-    if (!sc_dial("127.0.0.1:%u"))
+    if (sc_dial("127.0.0.1:%u") != rc_ok)
         { fprintf(stderr, "udp_connect: literal-address dial failed\n"); pass = 0; }
-    if (!sc_dial("localhost:%u"))
+    if (sc_dial("localhost:%u") != rc_ok)
         { fprintf(stderr, "udp_connect: hostname (resolver) dial failed\n"); pass = 0; }
+    if (sc_refused() != rc_ok)
+        { fprintf(stderr, "udp_connect: closed-port ICMP refusal failed\n"); pass = 0; }
 
     if (pass) {
         printf("udp_connect: OK (literal + hostname x_udp_peer dial, on_session_open "
-               "both ends, echo round-trip)\n");
+               "both ends, echo round-trip, closed-port close_io_error)\n");
         return 0;
     }
     return 1;

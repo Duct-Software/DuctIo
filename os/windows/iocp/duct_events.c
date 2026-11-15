@@ -1205,23 +1205,20 @@ static inline duct_result_t s_empty_read_rc(ULONG_PTR status, duct_result_t canc
          : status == events_status_cancelled ? cancelled : rc_fatal;
 }
 
-/** @brief RX completion handler for a conn's @c WSARecv or @c WSARecvMsg read of kind @p kind.
+/** @brief RX completion handler for a conn's @c WSARecv or @c WSARecvMsg read.
  *  @p status is the completion's @c Internal NTSTATUS: @ref
- *  events_status_buffer_overflow means Winsock already discarded a datagram too
- *  large for the posted buffer, nothing to commit. @p seg is the segment size a
- *  coalesced @c WSARecvMsg read reported, 0 otherwise. A zero-byte @c iocp_op_rx read ends
- *  a stream's input, or closes the conn with an error under a failed status other than a
- *  cancel, as a reset peer leaves; a zero-byte @c iocp_op_rx_msg read is an empty datagram.
- *  Every completion chains the next read, which the reserve refuses once the input has ended
- *  or the conn is closed.
+ *  events_status_buffer_overflow drops an oversized datagram with nothing to
+ *  commit; @p bytes == 0u reduces @p status through @ref s_empty_read_rc, so a
+ *  clean EOF or cancel passes @c rc_closed (no-op on UDP, EOF on stream) while
+ *  a failed status such as ICMP port unreachable closes the conn with @c rc_fatal.
+ *  Every completion chains the next read.
  */
-static inline void s_on_rx_completion(iocp_op_kind_t kind, void *tag, DWORD bytes,
-                                      ULONG_PTR status, size_t seg)
+static inline void s_on_rx_completion(void *tag, DWORD bytes, ULONG_PTR status, size_t seg)
 {
     if (status == events_status_buffer_overflow)
         duct_io_rx_done(tag, rc_drop);
     else if (bytes == 0u)
-        duct_io_rx_done(tag, kind == iocp_op_rx ? s_empty_read_rc(status, rc_closed) : rc_closed);
+        duct_io_rx_done(tag, s_empty_read_rc(status, rc_closed));
     else {
         duct_io_rx_commit(tag, (size_t)bytes, seg);
         duct_io_rx_done(tag, rc_again);
@@ -1319,11 +1316,11 @@ static inline void s_on_completion(duct_events_env_t *env, OVERLAPPED_ENTRY *ent
     switch (kind) {
     case iocp_op_rx:
         if (!duct_olb_io_done(s_op_hdr(op)))
-            s_on_rx_completion(kind, tag, entries[i].dwNumberOfBytesTransferred, entries[i].Internal, 0u);
+            s_on_rx_completion(tag, entries[i].dwNumberOfBytesTransferred, entries[i].Internal, 0u);
         break;
     case iocp_op_rx_msg:
         if (!duct_olb_io_done(s_op_hdr(op)))
-            s_on_rx_completion(kind, tag, entries[i].dwNumberOfBytesTransferred, entries[i].Internal,
+            s_on_rx_completion(tag, entries[i].dwNumberOfBytesTransferred, entries[i].Internal,
                                duct_x_gro_seg(op->rx_msg->Control));
         break;
     case iocp_op_rx_failed:
