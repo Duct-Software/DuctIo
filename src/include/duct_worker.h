@@ -79,8 +79,7 @@ int duct_worker_thread_cpu(unsigned worker_id);
 bool duct_worker_admit_leg(duct_conn_handle_t conn, size_t need);
 
 duct_nonnull(1) uint64_t
-duct_conn_dgram_remote_q(const duct_session_t *s, duct_conn_id_t conn_id, uint64_t now,
-                         bool *out_active);
+duct_conn_dgram_remote_q(const duct_session_t *s, duct_conn_id_t conn_id, uint64_t now);
 
 bool duct_proto_hold_root(duct_proto_t *p);
 void duct_proto_release(duct_proto_t *p);

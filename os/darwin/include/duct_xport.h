@@ -259,22 +259,39 @@ typedef enum duct_x_follow : uint8_t {
     x_follow_set,
 } duct_x_follow_t;
 
+/** @brief The send buffer a new conn's TCP socket asks the stack for, bytes.
+ *  The kernel's @c sendspace default stays small and nothing grows it: a
+ *  single flow stops at the bytes it may leave unacknowledged, which caps
+ *  every bulk leg on a long-fat path. The @c DUCT_TCP_SNDBUF environment
+ *  variable takes another figure for a bench. */
+static constexpr uint32_t duct_x_tcp_sndbuf = 4u << 20;
+
 /** @brief Apply a new conn's send options to its socket @p fd and record in @p x
  *  the bound it was created with.
  *  A connected UDP socket records its granted send buffer, a TCP socket the
  *  @c TCP_NOTSENT_LOWAT it took, 0 where none was asked or the stack refused
- *  it. The lowat stays fixed and the congestion control is the stack's, so
- *  @p lowat_us and @p congestion go unused. */
+ *  it, and takes @ref duct_x_tcp_sndbuf as its send buffer. The lowat stays
+ *  fixed and the congestion control is the stack's, so @p lowat_us and
+ *  @p congestion go unused. */
 duct_nonnull(1) static inline void
 duct_xset_sock_tx(duct_x_sock_tx_t *x, int fd, duct_xport_t xport,
                   uint32_t notsent_lowat,
                   [[maybe_unused]] uint32_t lowat_us,
                   [[maybe_unused]] const char *congestion)
 {
-    if (xport == x_udp_peer)
+    if (xport == x_udp_peer) {
         x->lowat_max = duct_xget_sndbuf(fd);
-    else if (xport == x_tcp)
+    } else if (xport == x_tcp) {
+        static thread_local int sndbuf_env = -1; /* per-thread resolve: no shared write */
+        if (sndbuf_env < 0) {
+            const char *s = getenv("DUCT_TCP_SNDBUF");
+            sndbuf_env = s ? atoi(s) : 0;
+        }
+        duct_discard setsockopt(fd, SOL_SOCKET, SO_SNDBUF,
+                                &(int){ sndbuf_env > 0 ? sndbuf_env : (int)duct_x_tcp_sndbuf },
+                                sizeof(int));
         x->lowat_max = duct_xset_tcp_lowat(fd, notsent_lowat);
+    }
 }
 
 duct_nonnull(1) static inline duct_x_follow_t

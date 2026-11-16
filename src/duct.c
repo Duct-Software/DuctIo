@@ -621,10 +621,20 @@ duct_result_t duct_io_connect_via(duct_engine_t *e, const char *addr, duct_proto
                                   void *user_ctx, duct_xport_t xport, uint32_t egress_if,
                                   duct_view_u8 tx_prefix)
 {
+    return duct_io_connect_worker(e, addr, proto, user_ctx, xport, egress_if, tx_prefix,
+                                  duct_worker_none);
+}
+
+duct_result_t duct_io_connect_worker(duct_engine_t *e, const char *addr, duct_proto_t *proto,
+                                     void *user_ctx, duct_xport_t xport, uint32_t egress_if,
+                                     duct_view_u8 tx_prefix, unsigned worker)
+{
     duct_do_if(!e || !addr || !*addr || !proto || !proto->cfg.on_frame, return rc_invalid_arg);
     auto seed = (duct_conn_intent_t){
         .kind = intent_session, .proto = proto, .xport = xport, .egress_if = egress_if,
         .user_ctx = user_ctx,
+        .worker = worker == duct_worker_none ? conn_worker_none
+                 : (worker >= e->n_workers ? 0u : worker),
     };
     if (!duct_seal_prefix_set(&seed.tx_prefix, tx_prefix))
         return rc_invalid_arg;

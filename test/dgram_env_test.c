@@ -155,6 +155,52 @@ static const char *sc_owd(void)
     return nullptr;
 }
 
+static const char *sc_owd_clock(void)
+{
+    duct_wire_codec_t c = { .env_capable = true, .env_on = true };
+    duct_dgram_env_t out = {};
+    uint64_t t = 200'000'000'000ull;
+
+    duct_wire_codec_owd_rx(&c, &(duct_dgram_env_t){ .tx_us = (uint32_t)(t / 1000ull - 5'000u) }, t);
+    t += 100'000'000ull;
+    duct_wire_codec_owd_rx(&c, &(duct_dgram_env_t){ .tx_us = (uint32_t)(t / 1000ull - 5'000u) }, t);
+    t += 100'000'000ull;
+    duct_wire_codec_owd_rx(&c,
+        &(duct_dgram_env_t){ .tx_us = (uint32_t)(t / 1000ull - 1'005'000u) }, t);
+    duct_wire_codec_owd_tx(&c, &out, t);
+    expect(out.peer_q_us == 0u, "a one-second clock step was reported as queue");
+
+    duct_wire_codec_owd_reset(&c);
+    t += 100'000'000ull;
+    duct_wire_codec_owd_rx(&c, &(duct_dgram_env_t){ .tx_us = (uint32_t)(t / 1000ull - 5'000u) }, t);
+    t += 200'000'000ull;
+    duct_wire_codec_owd_rx(&c, &(duct_dgram_env_t){ .tx_us = (uint32_t)(t / 1000ull - 35'000u) }, t);
+    duct_wire_codec_owd_tx(&c, &out, t);
+    expect(out.peer_q_us == 30'000u, "a sustained shift did not rise");
+    for (unsigned i = 0u; i < 6u; ++i) {
+        t += 200'000'000ull;
+        duct_wire_codec_owd_rx(&c, &(duct_dgram_env_t){ .tx_us = (uint32_t)(t / 1000ull - 35'000u) },
+                               t);
+    }
+    duct_wire_codec_owd_tx(&c, &out, t);
+    expect(out.peer_q_us == 0u, "the baseline did not follow a sustained shift");
+
+    duct_wire_codec_owd_reset(&c);
+    t += 100'000'000ull;
+    duct_wire_codec_owd_rx(&c, &(duct_dgram_env_t){ .tx_us = (uint32_t)(t / 1000ull - 5'000u) }, t);
+    t += 100'000'000ull;
+    duct_wire_codec_owd_rx(&c, &(duct_dgram_env_t){ .tx_us = (uint32_t)(t / 1000ull - 15'000u) }, t);
+    duct_wire_codec_owd_tx(&c, &out, t);
+    expect(out.peer_q_us == 10'000u, "a transient rise was not reported");
+
+    t += duct_owd_hold_ns + duct_owd_gap_ns;
+    duct_wire_codec_owd_rx(&c, &(duct_dgram_env_t){ .tx_us = (uint32_t)(t / 1000ull - 15'000u) }, t);
+    duct_wire_codec_owd_tx(&c, &out, t);
+    expect(out.peer_q_us == 10'000u,
+           "a queue behind a receive pause was lifted away as a shift");
+    return nullptr;
+}
+
 static constexpr uint64_t s_cid = 0xD6E4E471u;
 static _Atomic(duct_handle_t) g_srv_tok;
 static atomic_int g_srv_open = 0;
@@ -205,15 +251,12 @@ static duct_result_t s_on_frame(duct_session_t *s, duct_conn_id_t conn_id,
     if (frame->payload.size == 4u && memcmp(frame->payload.data, "PING", 4u) == 0) {
         uint64_t now = duct_ticks_mono_ns();
         uint64_t delay = duct_conn_codel_delay(s, conn_id, &g_codel, &g_law, now);
-        auto v1 = duct_conn_codel(s, conn_id, &g_codel, &g_law, 4u, now);
-        auto v_stale = duct_conn_codel(s, conn_id, &g_codel, &g_law, 4u,
-                                       now + duct_owd_stale_ns + 10'000ull);
+        auto verdict = duct_conn_codel(s, conn_id, &g_codel, &g_law, 4u, now);
         if (delay != 25'000'000ull)
             duct_atomic_store(&g_srv_err, "codel_delay missed 25ms remote queue", release);
-        else if (v1 != codel_signal)
-            duct_atomic_store(&g_srv_err, "codel failed to signal >= at_once remote queue", release);
-        else if (v_stale != codel_pass)
-            duct_atomic_store(&g_srv_err, "stale remote queue did not return codel_pass", release);
+        else if (verdict != codel_pass)
+            duct_atomic_store(&g_srv_err, "codel trimmed an empty ring on a remote report",
+                              release);
         static uint8_t pong[4] = { 'P', 'O', 'N', 'G' };
         duct_response_same(out, (duct_view_u8){ pong, 4u }, fl_send_copy, fl_frame_none);
     } else if (frame->payload.size == 4u && memcmp(frame->payload.data, "ZERO", 4u) == 0) {
@@ -374,6 +417,7 @@ int main(void)
     static const struct { const char *name; const char *(*fn)(void); } cases[] = {
         { "cfg_and_bound",      sc_cfg_and_bound },
         { "owd",                sc_owd },
+        { "owd_clock",          sc_owd_clock },
         { "e2e_shared_codel",   sc_e2e_shared_and_codel },
     };
     for (size_t i = 0u; i < sizeof cases / sizeof cases[0]; ++i) {
@@ -383,6 +427,6 @@ int main(void)
             return 1;
         }
     }
-    printf("dgram_env: OK (cfg/tx_bound, OWD 32-bit wrap & decay, e2e trailer & CoDel)\n");
+    printf("dgram_env: OK (cfg/tx_bound, OWD wrap & decay & clock moves, e2e trailer & CoDel)\n");
     return 0;
 }

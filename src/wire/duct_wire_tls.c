@@ -337,6 +337,8 @@ void duct_wire_codec_owd_rx(duct_wire_codec_t *c, const duct_dgram_env_t *env, u
         c->owd.half_at = now_ns;
         c->owd.rx_q_us = 0u;
         c->owd.rx_q_at = now_ns;
+        c->owd.floor_us = UINT32_MAX;
+        c->owd.floor_at = now_ns;
         return;
     }
     if (now_ns - c->owd.half_at >= duct_owd_window_ns) {
@@ -349,6 +351,24 @@ void duct_wire_codec_owd_rx(duct_wire_codec_t *c, const duct_dgram_env_t *env, u
     uint32_t base_us = (int32_t)(c->owd.mins[1] - c->owd.mins[0]) < 0
                      ? c->owd.mins[1] : c->owd.mins[0];
     int32_t diff_us = (int32_t)(raw_us - base_us);
+    if (diff_us <= 0) {
+        c->owd.floor_us = UINT32_MAX;
+        c->owd.floor_at = now_ns;
+    } else {
+        if (c->owd.floor_us == UINT32_MAX || (int32_t)(raw_us - c->owd.floor_us) < 0)
+            c->owd.floor_us = raw_us;
+        if ((uint32_t)diff_us > (uint32_t)(duct_owd_step_ns / 1000u)
+            || (now_ns - c->owd.floor_at >= duct_owd_hold_ns
+                && now_ns - c->owd.rx_q_at < duct_owd_hold_ns)) {
+            c->owd.mins[0] = c->owd.floor_us;
+            c->owd.mins[1] = c->owd.floor_us;
+            c->owd.rx_q_us = 0u;
+            c->owd.rx_q_at = now_ns;
+            c->owd.floor_us = UINT32_MAX;
+            c->owd.floor_at = now_ns;
+            return;
+        }
+    }
     uint32_t excess_us = diff_us > 0 ? (uint32_t)diff_us : 0u;
     if (now_ns - c->owd.rx_q_at > duct_owd_gap_ns || excess_us >= c->owd.rx_q_us)
         c->owd.rx_q_us = excess_us;

@@ -286,13 +286,62 @@ static void s_on_stop_signal([[maybe_unused]] int signo)
     errno = saved;
 }
 
+#ifndef SA_RESTORER
+#define SA_RESTORER 0x04000000u
+#endif
+
+/** @brief The kernel's own signal action, the shape a raw @c rt_sigaction
+ *  takes. x86-64 walks a user restorer on the handler's return; arm64 returns
+ *  through a trampoline the kernel keeps and names no restorer.
+ */
+struct duct_ksig {
+    void         *handler;
+    unsigned long flags;
+#ifdef __x86_64__
+    void         *restorer;
+#endif
+    unsigned long mask;
+};
+
+#if defined(__x86_64__) || defined(__aarch64__)
+/** @brief Set @p signum's kernel action to @p handler by the raw syscall.
+ *  The libc @c sigaction may leave the kernel's action holding an interposer's
+ *  trampoline while the handler asked sits in the interposer's own table, out
+ *  of the kernel's reach: the raw call writes the handler where delivery
+ *  reads it. The restorer comes from the action in place, the one the libc
+ *  call just installed.
+ */
+static void s_raw_sigaction(int signum, void *handler)
+{
+    struct duct_ksig cur = {};
+    if (syscall(SYS_rt_sigaction, signum, nullptr, &cur, sizeof(unsigned long)) != 0)
+        return;
+    struct duct_ksig act = {
+        .handler = handler,
+        .flags   = SA_RESTART | SA_RESTORER,
+        .mask    = 0u,
+    };
+#ifdef __x86_64__
+    act.restorer = cur.restorer;
+    duct_do_if(!act.restorer, return);
+#else
+    act.flags = SA_RESTART;
+#endif
+    duct_discard syscall(SYS_rt_sigaction, signum, &act, nullptr, sizeof(unsigned long));
+}
+#endif
+
 void duct_stop_hook_arm(void)
 {
     /* SA_RESTART: restartable system calls the signal interrupts resume. */
     struct sigaction act = { .sa_handler = s_on_stop_signal, .sa_flags = SA_RESTART };
     sigemptyset(&act.sa_mask);
-    for (unsigned i = 0u; i < s_stop_count; ++i)
+    for (unsigned i = 0u; i < s_stop_count; ++i) {
         duct_discard sigaction(s_stop_signals[i], &act, &s_stop_previous[i]);
+#if defined(__x86_64__) || defined(__aarch64__)
+        s_raw_sigaction(s_stop_signals[i], s_on_stop_signal);
+#endif
+    }
 }
 
 void duct_stop_hook_disarm(void)

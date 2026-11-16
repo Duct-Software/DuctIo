@@ -618,6 +618,7 @@ typedef struct {
     uint32_t                 egress_if; /**< Index of the interface the dial's
                                         *  socket is bound to before it
                                         *  connects, 0 for none. */
+    uint32_t                 worker;
     duct_seal_prefix_t       tx_prefix; /**< Leading bytes of the opened conn's first
                                         *  send: a session dial's @c duct_io_connect_via
                                         *  prefix, a leg's @c open_leg.tx_prefix. The

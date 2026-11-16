@@ -2547,6 +2547,8 @@ static bool s_dial_promote(duct_io_t *t, duct_sock_t fd, duct_conn_intent_t seed
     auto conn = s_conn_new(fd, seed.xport, seed.proto, s_dial_cc(&seed));
     if (!conn)
         return false;
+    if (seed.worker != conn_worker_none)
+        conn->worker_id = seed.worker;
     auto rx = duct_conn_rx_olb(conn);
     if (rx)
         rx->peer = *peer;

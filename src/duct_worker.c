@@ -7475,21 +7475,15 @@ duct_result_t duct_conn_set_dgram_env(duct_session_t *s, duct_conn_id_t conn_id,
     return rc_ok;
 }
 
-uint64_t duct_conn_dgram_remote_q(const duct_session_t *s, duct_conn_id_t conn_id, uint64_t now,
-                                  bool *out_active)
+uint64_t duct_conn_dgram_remote_q(const duct_session_t *s, duct_conn_id_t conn_id, uint64_t now)
 {
-    if (out_active)
-        *out_active = false;
     if (conn_id >= duct_session_max_legs)
         return 0u;
     auto conn = duct_conn_by_handle(duct_session_conn_at(s, conn_id));
     auto sc = conn ? duct_conn_sealed_ctx(conn) : nullptr;
     auto codec = sc ? sc->codec : nullptr;
-    if (!codec || (!codec->env_on && !codec->owd.remote_q_have))
-        return 0u;
-    if (out_active)
-        *out_active = true;
-    if (!codec->owd.remote_q_have || now - codec->owd.remote_q_at > duct_owd_stale_ns)
+    if (!codec || !codec->owd.remote_q_have
+        || now - codec->owd.remote_q_at > duct_owd_stale_ns)
         return 0u;
     return codec->owd.remote_q_ns;
 }
@@ -7608,6 +7602,7 @@ duct_result_t duct_conn_attach_connect(duct_session_t *s, duct_conn_id_t conn_id
     auto live = duct_session_handle_from_live(s);
     auto seed = (duct_conn_intent_t){
         .kind = intent_leg, .proto = s->proto, .xport = xport, .egress_if = egress_if,
+        .worker = conn_worker_none,
         .leg = { .hsession = live.word, .conn_id = conn_id },
     };
     size_t cc_len = tcp_congestion ? strnlen(tcp_congestion, sizeof seed.leg.tcp_congestion) : 0u;

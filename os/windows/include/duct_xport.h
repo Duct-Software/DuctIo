@@ -232,14 +232,33 @@ duct_xset_tcp_ack_timeout(SOCKET fd, uint32_t ms)
                       (const char *)&(DWORD){ ms }, sizeof(DWORD)) == 0;
 }
 
-/** @brief Leave a new conn's socket send options as Winsock set them.
- *  Winsock takes @c TCP_CONGESTION_ALGORITHM only before connect, which a dial
- *  sets in @ref duct_xconnect. */
+/** @brief The send buffer a new conn's TCP socket asks Winsock for, bytes.
+ *  Winsock grants a small buffer by default and has no send autotuning: a
+ *  single flow stops at the bytes it may leave unacknowledged, which caps
+ *  every bulk leg on a long-fat path. The @c DUCT_TCP_SNDBUF environment
+ *  variable takes another figure for a bench. */
+static constexpr uint32_t duct_x_tcp_sndbuf = 4u << 20;
+
+/** @brief Grow a new conn's TCP send buffer; leave the rest as Winsock set it.
+ *  The receive side goes untaken on purpose: an explicit @c SO_RCVBUF would
+ *  turn Winsock's receive-window autotuning off. Winsock takes
+ *  @c TCP_CONGESTION_ALGORITHM only before connect, which a dial sets in
+ *  @ref duct_xconnect. */
 static inline void
-duct_xset_sock_tx([[maybe_unused]] duct_x_sock_tx_t *x, [[maybe_unused]] SOCKET fd,
-                  [[maybe_unused]] duct_xport_t xport, [[maybe_unused]] uint32_t notsent_lowat,
+duct_xset_sock_tx([[maybe_unused]] duct_x_sock_tx_t *x, SOCKET fd, duct_xport_t xport,
+                  [[maybe_unused]] uint32_t notsent_lowat,
                   [[maybe_unused]] uint32_t lowat_us, [[maybe_unused]] const char *congestion)
 {
+    if (xport != x_tcp)
+        return;
+    static thread_local int sndbuf_env = -1; /* per-thread resolve: no shared write */
+    if (sndbuf_env < 0) {
+        const char *s = getenv("DUCT_TCP_SNDBUF");
+        sndbuf_env = s ? atoi(s) : 0;
+    }
+    duct_discard setsockopt(fd, SOL_SOCKET, SO_SNDBUF,
+                            (const char *)&(int){ sndbuf_env > 0 ? sndbuf_env : (int)duct_x_tcp_sndbuf },
+                            sizeof(int));
 }
 
 /** @brief Outcome of one follow step, a lowat's or a receive buffer's. */

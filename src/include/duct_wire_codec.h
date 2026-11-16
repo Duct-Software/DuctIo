@@ -130,9 +130,11 @@ typedef struct duct_wire_codec {
     struct {
         uint64_t half_at,
                  rx_q_at,
+                 floor_at,
                  remote_q_at,
                  remote_q_ns;
         uint32_t mins[2],
+                 floor_us,
                  rx_q_us;
         uint8_t  slot;
         bool     have,
@@ -210,6 +212,8 @@ static inline bool duct_wire_codec_rx_strip(const duct_wire_codec_t *c,
 
 static constexpr uint64_t duct_owd_window_ns = 15000000000ull; /**< One OWD minimum half-window. */
 static constexpr uint64_t duct_owd_stale_ns  =  1000000000ull; /**< Queue estimates older than this read 0. */
+static constexpr uint64_t duct_owd_hold_ns   =  1000000000ull;
+static constexpr uint64_t duct_owd_step_ns   =   250000000ull;
 static constexpr uint64_t duct_owd_gap_ns    =   200000000ull; /**< A receive pause this long resets the decay. */
 
 /** @brief The 8-byte datagram trailer: the sender's TX stamp in µs (low 32 of

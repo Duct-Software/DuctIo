@@ -373,6 +373,12 @@ duct_result_t duct_io_connect_via(duct_engine_t *e, const char *addr,
                                    void *user_ctx, duct_xport_t xport,
                                    uint32_t egress_if, duct_view_u8 tx_prefix);
 
+duct_result_t duct_io_connect_worker(duct_engine_t *e, const char *addr,
+                                     duct_proto_t *proto,
+                                     void *user_ctx, duct_xport_t xport,
+                                     uint32_t egress_if, duct_view_u8 tx_prefix,
+                                     unsigned worker);
+
 /** @brief Open a session whose leg 0 is the caller's packet-delimited fd.
  *
  *  The session-opening sibling of @ref duct_conn_attach_packet_fd, callable from

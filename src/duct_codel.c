@@ -164,44 +164,29 @@ uint64_t duct_codel_left(duct_codel_t *q, const duct_codel_law_t *law, duct_tx_p
     return duct_max(x, q->tracer_at);
 }
 
-static duct_codel_sample_t s_delay_sample(const duct_codel_law_t *law, uint64_t delay)
-{
-    if (delay < law->target)
-        return codel_below;
-    return delay >= law->at_once ? codel_far : codel_above;
-}
-
 duct_codel_verdict_t duct_conn_codel(duct_session_t *s, duct_conn_id_t conn_id, duct_codel_t *q,
                                      const duct_codel_law_t *law, size_t size, uint64_t now)
 {
-    bool remote_active = false;
-    uint64_t remote_q = duct_conn_dgram_remote_q(s, conn_id, now, &remote_active);
     duct_tx_pos_t end;
     size_t ring = 0u;
-    duct_codel_sample_t sample;
-    if (duct_conn_tx_end(s, conn_id, &end, &ring) != rc_ok) {
-        if (!remote_active)
-            return codel_pass;
-        sample = s_delay_sample(law, remote_q);
-    } else {
-        size_t least = duct_conn_tx_quantum(s, conn_id) + size;
-        uint64_t left_at = duct_codel_left(q, law, end, ring, least, duct_conn_tx_unsent, s,
-                                           conn_id, now);
-        q->queued = ring + (size_t)q->unsent;
-        sample = duct_codel_sample(q, law, end, q->queued, least,
-                                   duct_conn_tx_cap(s, conn_id) / 2u, left_at, now);
-        auto remote = s_delay_sample(law, remote_q);
-        if (remote > sample)
-            sample = remote;
-    }
-    auto verdict = duct_codel_step(q, law, sample, now);
+    if (duct_conn_tx_end(s, conn_id, &end, &ring) != rc_ok)
+        return codel_pass;
+    size_t least = duct_conn_tx_quantum(s, conn_id) + size;
+    uint64_t left_at = duct_codel_left(q, law, end, ring, least, duct_conn_tx_unsent, s, conn_id,
+                                       now);
+    q->queued = ring + (size_t)q->unsent;
+    auto verdict = duct_codel_step(q, law,
+                                   duct_codel_sample(q, law, end, q->queued, least,
+                                                     duct_conn_tx_cap(s, conn_id) / 2u, left_at,
+                                                     now),
+                                   now);
     return duct_conn_tx_fits(s, conn_id, size) ? verdict : codel_full;
 }
 
 uint64_t duct_conn_codel_delay(duct_session_t *s, duct_conn_id_t conn_id, duct_codel_t *q,
                                const duct_codel_law_t *law, uint64_t now)
 {
-    uint64_t remote_q = duct_conn_dgram_remote_q(s, conn_id, now, nullptr);
+    uint64_t remote_q = duct_conn_dgram_remote_q(s, conn_id, now);
     duct_tx_pos_t end;
     size_t ring = 0u;
     if (duct_conn_tx_end(s, conn_id, &end, &ring) != rc_ok)
