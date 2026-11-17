@@ -1421,9 +1421,9 @@ duct_platform_configure(ductio_bench_echo)
 target_compile_features(ductio_bench_echo PRIVATE c_std_23)
 
 if(DUCT_ENABLE_RUNTIME_STATS)
-    target_compile_definitions(ductio_bench_echo PRIVATE DUCT_BENCH=1 DUCT_RUNTIME_STATS=1)
+    target_compile_definitions(ductio_bench_echo PRIVATE DUCT_RUNTIME_STATS=1)
 else()
-    target_compile_definitions(ductio_bench_echo PRIVATE DUCT_BENCH=1 DUCT_RUNTIME_STATS=0)
+    target_compile_definitions(ductio_bench_echo PRIVATE DUCT_RUNTIME_STATS=0)
 endif()
 
 add_executable(ductio_bench_hops bench_hops.c)
