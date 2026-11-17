@@ -23,7 +23,7 @@
 static constexpr unsigned wait_ms     = 5000u;
 static constexpr uint64_t still_for_ns = 200'000'000u;
 static constexpr uint64_t idle_ms     = 60'000u;
-static constexpr size_t   ring_cap    = (size_t)1u << 20u;
+static constexpr size_t   ring_cap    = duct_conn_tx_olb_cap;
 static constexpr size_t   top_up      = 4096u;
 
 static uint8_t          g_chunk[65536];

@@ -42,6 +42,8 @@ bool duct_worker_module_init(unsigned n_workers, unsigned n_io,
                              duct_vmq_mpsc_t *wfq,
                              uint64_t seal_key_lifetime_ms);
 
+bool duct_worker_module_alive(void);
+
 /** @brief Spawn worker threads + rendezvous on @c started flag. */
 bool duct_worker_module_start_threads(void);
 
@@ -166,12 +168,21 @@ duct_admit_slots(const duct_proto_cfg_t *cfg)
 
 /** @brief Session timer cancellation.
  *
- *  Cancels every timer owned by @p h's session. Called from last-detach
- *  session teardown before @c destroy_state. No-op off the worker
- *  thread.
+ *  Cancels every timer owned by @p h's session and drops every retry node
+ *  its parked timer fires hold, ahead of the session block's return. Called
+ *  from last-detach session teardown before @c destroy_state. No-op off the
+ *  worker thread.
  */
 duct_nonnull(1) void
 duct_worker_session_timers_cancel(const duct_session_handle_t *h);
+
+duct_nonnull(1) bool duct_worker_session_tx_parked(const duct_session_t *s);
+
+duct_nonnull(1) void duct_worker_session_defer_discard(const duct_session_t *s);
+
+duct_nonnull(1) void duct_worker_reclaim_add(duct_session_t *s);
+
+void duct_worker_reclaim_reset_all(void);
 
 /** @brief Deferred-frame discard for one conn.
  *

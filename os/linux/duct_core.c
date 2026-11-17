@@ -196,27 +196,32 @@ static void duct_ctor(void)
     s_probe_udp();
 }
 
-/** @brief Map @p size bytes, rounded up to the page size, with protection @p prot.
+/** @brief Map @p size bytes, rounded up to the page size, with protection @p prot and @p flags.
  *  @return Zeroed handle on failure.
  */
-static duct_vm_handle_t s_vm_map(size_t size, int prot)
+static duct_vm_handle_t s_vm_map(size_t size, int prot, int flags)
 {
     duct_do_if(size == 0, return (duct_vm_handle_t){});
     auto aligned_size = duct_align_up(size, pg_size);
     duct_do_if(aligned_size == 0, return (duct_vm_handle_t){});
-    auto p = mmap(nullptr, aligned_size, prot, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    auto p = mmap(nullptr, aligned_size, prot, MAP_PRIVATE | MAP_ANONYMOUS | flags, -1, 0);
     return p == MAP_FAILED ? (duct_vm_handle_t){}
                            : (duct_vm_handle_t){ .base = p, .size = aligned_size };
 }
 
 duct_vm_handle_t duct_vm_new(size_t size)
 {
-    return s_vm_map(size, PROT_READ | PROT_WRITE);
+    return s_vm_map(size, PROT_READ | PROT_WRITE, 0);
 }
 
 duct_vm_handle_t duct_vm_reserve(size_t size)
 {
-    return s_vm_map(size, PROT_NONE);
+    return s_vm_map(size, PROT_NONE, 0);
+}
+
+duct_vm_handle_t duct_vm_reserve_lazy(size_t size)
+{
+    return s_vm_map(size, PROT_READ | PROT_WRITE, MAP_NORESERVE);
 }
 
 /* mprotect read-write, mlock, then MADV_DONTDUMP to keep the pages out of core files. All three
@@ -242,6 +247,15 @@ void duct_vm_discard(void *base, size_t size)
 {
     if (size)
         duct_discard madvise(base, size, MADV_DONTNEED);
+}
+
+duct_result_t duct_vm_commit([[maybe_unused]] void *base, [[maybe_unused]] size_t size)
+{
+    return rc_ok;
+}
+
+void duct_vm_reuse([[maybe_unused]] void *base, [[maybe_unused]] size_t size)
+{
 }
 
 int duct_thread_bind_cpu(unsigned cpu_index)

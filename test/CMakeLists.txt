@@ -133,6 +133,44 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     set_tests_properties(secret_arena_nolock PROPERTIES TIMEOUT 60)
 endif()
 
+add_executable(ductio_block_pool_test block_pool_test.c)
+target_link_libraries(ductio_block_pool_test PRIVATE DuctIo::ductio)
+target_include_directories(ductio_block_pool_test PRIVATE
+    ${DUCT_INTERNAL_INCLUDE_DIRS})
+target_compile_features(ductio_block_pool_test PRIVATE c_std_23)
+add_test(NAME block_pool COMMAND ductio_block_pool_test)
+set_tests_properties(block_pool PROPERTIES TIMEOUT 60)
+
+add_executable(ductio_conn_block_test conn_block_test.c)
+target_link_libraries(ductio_conn_block_test PRIVATE DuctIo::ductio)
+target_include_directories(ductio_conn_block_test PRIVATE
+    ${DUCT_INTERNAL_INCLUDE_DIRS})
+target_compile_features(ductio_conn_block_test PRIVATE c_std_23)
+add_test(NAME conn_block COMMAND ductio_conn_block_test)
+set_tests_properties(conn_block PROPERTIES TIMEOUT 60)
+
+add_executable(ductio_session_block_test session_block_test.c)
+target_link_libraries(ductio_session_block_test PRIVATE DuctIo::ductio)
+target_include_directories(ductio_session_block_test PRIVATE
+    ${DUCT_INTERNAL_INCLUDE_DIRS})
+target_compile_features(ductio_session_block_test PRIVATE c_std_23)
+add_test(NAME session_block COMMAND ductio_session_block_test)
+set_tests_properties(session_block PROPERTIES TIMEOUT 60)
+
+add_executable(ductio_session_timer_test session_timer_test.c)
+target_link_libraries(ductio_session_timer_test PRIVATE DuctIo::ductio)
+target_include_directories(ductio_session_timer_test PRIVATE
+    ${DUCT_INTERNAL_INCLUDE_DIRS})
+target_compile_features(ductio_session_timer_test PRIVATE c_std_23)
+add_test(NAME session_timer COMMAND ductio_session_timer_test)
+set_tests_properties(session_timer PROPERTIES TIMEOUT 60)
+
+add_test(NAME conn_block_audit
+    COMMAND ${CMAKE_COMMAND}
+        -DSRCDIR=${PROJECT_SOURCE_DIR}/src
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/CheckConnBlockAudit.cmake)
+set_tests_properties(conn_block_audit PROPERTIES TIMEOUT 30)
+
 add_executable(ductio_crypto_test crypto_test.c)
 target_link_libraries(ductio_crypto_test PRIVATE DuctIo::ductio)
 target_compile_features(ductio_crypto_test PRIVATE c_std_23)
@@ -446,6 +484,8 @@ add_test(NAME dgram_join COMMAND ductio_dgram_join_test)
 
 add_executable(ductio_dgram_shared_test dgram_shared_test.c)
 target_link_libraries(ductio_dgram_shared_test PRIVATE DuctIo::ductio)
+target_include_directories(ductio_dgram_shared_test PRIVATE
+    ${DUCT_INTERNAL_INCLUDE_DIRS})
 target_compile_features(ductio_dgram_shared_test PRIVATE c_std_23)
 add_test(NAME dgram_shared COMMAND ductio_dgram_shared_test)
 
@@ -907,6 +947,8 @@ set_tests_properties(stats_sections PROPERTIES TIMEOUT 60)
 
 add_executable(ductio_worker_post_test worker_post_test.c)
 target_link_libraries(ductio_worker_post_test PRIVATE DuctIo::ductio)
+target_include_directories(ductio_worker_post_test PRIVATE
+    ${DUCT_INTERNAL_INCLUDE_DIRS})
 target_compile_features(ductio_worker_post_test PRIVATE c_std_23)
 add_test(NAME worker_post COMMAND ductio_worker_post_test)
 set_tests_properties(worker_post PROPERTIES TIMEOUT 30)

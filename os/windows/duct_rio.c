@@ -270,7 +270,7 @@ static bool s_rx_post(const RIO_EXTENSION_FUNCTION_TABLE *rio, duct_rio_rx_t *ri
         (ULONG)((char *)ctl - (char *)ring->block),
         (ULONG)s_rx_ctl_cell };
     RIO_BUF data_buf = i >= ring->first_pooled
-        ? s_slot_buf(ring->pool, desc->pool_idx, ring->pool->lead, ring->read_bytes)
+        ? s_slot_buf(ring->pool, desc->pool_idx, ring->pool->payload_off, ring->read_bytes)
         : (RIO_BUF){ ring->priv_id, (ULONG)((size_t)i * ring->read_bytes), ring->read_bytes };
     return rio->RIOReceiveEx(ring->rq, &data_buf, 1u, nullptr, &addr_buf,
         &ctl_buf, nullptr, 0u, desc);
@@ -438,7 +438,7 @@ static unsigned s_tx_post(void *arg, const duct_dgram_tx_entry_t *const *entries
     auto pool = duct_x_slot_ref_pool(tx->pools, ref);
     duct_discard duct_io_sockaddr_from_peer(&entry->peer,
                                             (struct sockaddr_storage *)duct_x_slot_data(pool, idx));
-    RIO_BUF data_buf = s_slot_buf(pool, idx, pool->lead, entry->len);
+    RIO_BUF data_buf = s_slot_buf(pool, idx, pool->payload_off, entry->len);
     RIO_BUF addr_buf = s_slot_buf(pool, idx, 0u, sizeof(struct sockaddr_storage));
     auto op = &duct_at(tx->ops)[tx->free_stack[tx->free_count - 1u]];
     *op = (duct_rio_tx_op_t){ .tx = tx, .ref = ref };
@@ -470,7 +470,7 @@ bool duct_rio_tx_send(const duct_listener_t *listener, const duct_peer_t *peer, 
     duct_discard duct_io_sockaddr_from_peer(peer,
                                             (struct sockaddr_storage *)duct_x_slot_data(pool, idx));
     memcpy(duct_x_slot_payload(pool, idx), payload.data, payload.size);
-    RIO_BUF data_buf = s_slot_buf(pool, idx, pool->lead, (ULONG)payload.size),
+    RIO_BUF data_buf = s_slot_buf(pool, idx, pool->payload_off, (ULONG)payload.size),
             addr_buf = s_slot_buf(pool, idx, 0u, sizeof(struct sockaddr_storage));
     auto op = &duct_at(tx->ops)[tx->free_stack[tx->free_count - 1u]];
     *op = (duct_rio_tx_op_t){ .tx = tx, .ref = ref };

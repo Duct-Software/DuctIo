@@ -14,6 +14,7 @@
 
 #include "duct_io.h"
 #include "duct_xport.h"
+#include "duct_conn_block.h"
 #include "duct_conn_fence.h"
 #include "duct_dgram_rec.h"
 #include "duct_events.h"
@@ -83,6 +84,21 @@ typedef struct duct_io_trunk {
  */
 duct_msg_chain_decl(duct_msg_rx_resume, uint32_t _Atomic latch);
 
+/** @brief One io thread's fixed pre-conn slab: every pending dial and parked
+ *  probe of the thread, a record and a probe-peek tail each, outside any conn
+ *  block so the admission stage never spends a @c duct_max_conns slot.
+ *  The owning thread alone takes and frees records — the whole-engine teardown
+ *  walk runs with the threads joined — so the free stack carries no atomic.
+ */
+typedef struct duct_pre_conn_slab {
+    duct_ptr_t(duct_pre_conn_t) slots;      /**< The records, @c n of them. */
+    duct_ptr_t(uint8_t)         peeks;      /**< Probe-peek tails, @c duct_preconn_peek_max
+                                             *  each, slot i's at its @c i * the tail. */
+    duct_ptr_t(uint32_t)        free_stack; /**< Indices of the records not taken. */
+    uint32_t                    free_n,     /**< Records the stack still holds. */
+                                n;          /**< Records the slab was made with. */
+} duct_pre_conn_slab_t;
+
 /** @brief Transport executor state. */
 typedef struct duct_io {
     bool _Atomic           shutdown;
@@ -102,10 +118,20 @@ typedef struct duct_io {
     duct_timers_t          timers;
     duct_pre_conn_t       *pre_conns;       /**< Pending dial and
                                               *  probe-wait admissions. */
+    duct_pre_conn_slab_t  pre_conn_slab;    /**< The records those admissions
+                                              *  come from, a fixed per-thread
+                                              *  slab outside any conn block. */
     duct_listener_t        *listeners;
-    struct device_leg      *devices;      /**< Device legs this thread carries,
+    struct duct_device_leg *devices;      /**< Device legs this thread carries,
+                                           *  carved in their conns' blocks and
                                            *  linked through their @c prev and
                                            *  @c next. */
+    duct_x_slot_pool_t     device_rx;     /**< The thread's one device rx pool,
+                                           *  every leg's reads landing in it;
+                                           *  live between the first spanning
+                                           *  device it carries and the engine's
+                                           *  cleanup. */
+    bool                   device_rx_live;
     duct_x_slot_pool_t    *held_pool;    /**< Pool the slots in @c held come
                                            *  from, the drained listener's; null
                                            *  while none are held. */
@@ -146,7 +172,7 @@ typedef struct duct_io {
 /** @brief State of the io module, one per process. */
 typedef struct {
     duct_io_t *xports; /**< The io objects, one for each io thread; nullptr before the engine's init and after its cleanup. */
-    unsigned   n_io;   /**< Entries in @c xports; 0 outside an engine's life. */
+    unsigned   n_io;   /**< Entries of @c xports; 0 outside an engine's life. */
     unsigned _Atomic accept_parked; /**< Count of stream listeners parked for want of a
                                       *  descriptor, across io threads. A closing socket
                                       *  posts the resume while it is not 0. */
@@ -229,8 +255,9 @@ static inline uint64_t s_conn_tag_word(duct_conn_t *conn)
 static inline duct_conn_t *s_conn_from_tag(void *tag)
 {
     uint64_t word = (uint64_t)(uintptr_t)tag;
-    auto conn = duct_conn_by_idx(
-        (unsigned)((word >> xport_conn_tag_shift) & xport_conn_idx_mask));
+    unsigned idx = (unsigned)((word >> xport_conn_tag_shift) & xport_conn_idx_mask);
+    auto conn = duct_conn_by_idx(idx);
+    duct_do_if(!conn, return nullptr);
     uint64_t gen = (word >> (hconn_idx_bits + xport_conn_tag_shift)) & xport_conn_gen_mask;
     uint64_t cur = duct_gen_req_gen(duct_atomic_load(duct_conn_gen_req(conn), acquire));
     return (cur & xport_conn_gen_mask) == gen ? conn : nullptr;
@@ -247,6 +274,8 @@ s_conn_prepare(duct_listener_t *listener, const duct_peer_t *peer,
 static void s_rx_start(duct_conn_t *conn);
 static void s_tx_start(duct_conn_t *conn);
 static void s_pre_conn_free(duct_io_t *t, duct_pre_conn_t *pre_conn);
+static duct_pre_conn_t *s_pre_conn_take(duct_io_t *t);
+static uint8_t *s_pre_conn_peek_tail(duct_io_t *t, duct_pre_conn_t *pre_conn);
 static duct_exec_rc_t s_pre_conn_timeout_fire(void *arg);
 static bool s_dgram_peer_find(duct_listener_t *listener, const duct_peer_t *peer,
                               duct_conn_t **out_conn, bool *out_candidate);
@@ -273,8 +302,8 @@ static inline void s_msg_push(unsigned io_id, duct_msg_t *msg);
 static void s_req_do_tx_drain(duct_conn_t *conn);
 static void s_req_do_rx_read(duct_conn_t *conn);
 static void s_device_drive(duct_conn_t *conn);
-static duct_device_ops_t *s_device_leg_new(const duct_device_ops_t *ops);
-static struct device_leg *s_device_find(const duct_io_t *t, const void *handle);
+static duct_x_slot_pool_t *s_device_rx_pool(duct_io_t *t);
+static struct duct_device_leg *s_device_find(const duct_io_t *t, const void *handle);
 static void s_device_link(duct_io_t *t, duct_conn_t *conn);
 static void s_device_unlink(duct_io_t *t, duct_conn_t *conn);
 static bool s_req_do_close(duct_io_t *t, duct_conn_t *conn);
@@ -370,10 +399,10 @@ static duct_conn_t *s_conn_new(duct_sock_t fd, duct_xport_t xport, const duct_pr
         duct_conn_release(conn);
         return nullptr;
     }
-    duct_xset_sock_tx(duct_x_sock_tx_of(conn->tx_buf), fd, xport,
+    duct_xset_sock_tx(duct_x_sock_tx_of(duct_conn_tx_olb(conn)), fd, xport,
                       cfg ? cfg->tcp_notsent_lowat : 0u,
                       cfg ? cfg->tcp_notsent_lowat_us : 0u, tcp_congestion);
-    duct_xset_sock_rx(duct_x_sock_rx_of(conn->rx_buf), fd, xport);
+    duct_xset_sock_rx(duct_x_sock_rx_of(duct_conn_rx_olb(conn)), fd, xport);
     conn->worker_id = duct_conn_idx_get(conn) % t->route.n_workers;
     return conn;
 }
@@ -439,7 +468,7 @@ static void s_connect_error(const duct_wfq_route_t *route,
         auto target = duct_session_by_handle(leg_tok);
         if (!target)
             return;
-        auto worker_id = duct_atomic_load(&target->worker_id, acquire);
+        auto worker_id = (unsigned)target->worker_id;
         duct_worker_post_connect_leg_error(worker_id, DUCT_CAST(duct_session_handle_t, word, &seed.leg.hsession), err);
         return;
     }
@@ -454,7 +483,6 @@ static void s_connect_error(const duct_wfq_route_t *route,
  */
 static bool s_connect_ok(duct_conn_t *conn, duct_conn_intent_t seed)
 {
-    conn->ctx = nullptr;
     if (duct_conn_bind_wire(conn, seed.proto, nullptr) != rc_ok) {
         duct_io_conn_close(conn, close_internal_error);
         return false;
@@ -466,7 +494,7 @@ static bool s_connect_ok(duct_conn_t *conn, duct_conn_intent_t seed)
             duct_io_conn_close(conn, close_internal_error);
             return false;
         }
-        conn->worker_id = duct_atomic_load(&target->worker_id, acquire);
+        conn->worker_id = (uint32_t)target->worker_id;
         if (duct_sessions_post_conn_join(conn, leg_tok, seed.leg.conn_id, &(duct_peer_t){},
                                          seed.tx_prefix))
             return true;
@@ -482,20 +510,16 @@ static bool s_connect_ok(duct_conn_t *conn, duct_conn_intent_t seed)
 /* Ingress lane capacity for one x_inter or x_udp_shared conn. A reservation
  * this refuses drops the datagram outright, counted as dgram_shared_rx_drop,
  * so the size bounds how far the io thread may run ahead of its worker. */
-static constexpr size_t inter_lane_cap = kbytes(144u);
+static constexpr size_t inter_lane_cap = duct_inter_lane_cap;
 
 /** @brief Give @p conn its ingress lane, bound to its worker's wake latch.
  *  @c conn->worker_id is read here, so it must already be final.
- *  @return @c false with the lane left null and nothing else touched.
  */
-static bool s_inter_lane_attach(duct_conn_t *conn)
+static void s_inter_lane_attach(duct_conn_t *conn)
 {
-    conn->inter_lane = duct_vmq_mpsc_new(1u, (size_t[]){ inter_lane_cap });
-    if (!conn->inter_lane)
-        return false;
-    duct_vmq_bind_wake(duct_mpsc_ctrl(conn->inter_lane, 0u),
+    duct_conn_carve_lane(conn);
+    duct_vmq_bind_wake(duct_mpsc_ctrl(duct_conn_lane(conn), 0u),
                        duct_worker_wake_latch(conn->worker_id));
-    return true;
 }
 
 /** @brief Acquire an @c x_inter conn and give it the lane its worker wakes on.
@@ -515,11 +539,8 @@ s_inter_conn_create(const duct_wfq_route_t *route, duct_session_t *target)
     duct_do_if(!conn, return nullptr);
     conn->xport_type = x_inter;
     conn->io_id = route->thread_id;
-    conn->worker_id = duct_atomic_load(&target->worker_id, acquire);
-    if (!s_inter_lane_attach(conn)) {
-        duct_conn_release(conn);
-        return nullptr;
-    }
+    conn->worker_id = (uint32_t)target->worker_id;
+    s_inter_lane_attach(conn);
     return conn;
 }
 
@@ -543,9 +564,9 @@ static void s_attach_inter(const duct_wfq_route_t *route, const duct_session_han
  *
  *  A handle one of this thread's device legs already holds is refused before
  *  any conn exists. Releases @p ops's ctx on every failure that leaves no conn
- *  behind, and hands it to @c conn->ctx otherwise — from there
+ *  behind, and hands it to the conn's ctx region otherwise — from there
  *  duct_conn_teardown is the one release site, which is why the watch failure
- *  reclaims without releasing. @c conn->ctx doubles as the device
+ *  reclaims without releasing. The ctx region doubles as the device
  *  discriminator: a host-driven x_inter conn leaves it null.
  */
 static void s_attach_device(const duct_wfq_route_t *route,
@@ -561,11 +582,17 @@ static void s_attach_device(const duct_wfq_route_t *route,
     duct_do_if(occupied, ops->release(ops->ctx); return);
     auto dup = s_device_find(s_io_this, ops->wait_handle);
     duct_do_if(dup, ops->release(ops->ctx); return);
+    if (ops->rx_span && !s_device_rx_pool(s_io_this)) {
+        ops->release(ops->ctx);
+        return;
+    }
     auto conn = s_inter_conn_create(route, target);
     duct_do_if(!conn, ops->release(ops->ctx); return);
-    conn->ctx = s_device_leg_new(ops);
-    duct_do_if(!conn->ctx,
-               duct_conn_reclaim(conn); ops->release(ops->ctx); return);
+    auto leg = duct_conn_device_leg(conn);
+    leg->ops = *ops;
+    leg->prev = leg->next = nullptr;
+    leg->n_held = 0u;
+    duct_conn_ctx(conn)->link = &leg->ops;
     if (!duct_events_watch_device(s_io_this->trunk.events, ops->wait_handle,
                                   (void *)(uintptr_t)s_conn_tag_word(conn))) {
         duct_conn_reclaim(conn);
@@ -597,21 +624,12 @@ s_dgram_shared_conn_new(const duct_wfq_route_t *route, duct_listener_t *listener
     conn->worker_id = worker_id != conn_worker_none ? worker_id
                     : duct_x_port_sharing == x_port_share_spread ? listener->worker
                     : duct_conn_idx_get(conn) % route->n_workers;
-    if (!s_inter_lane_attach(conn)) {
-        duct_conn_release(conn);
-        return nullptr;
-    }
+    s_inter_lane_attach(conn);
     if (duct_conn_bind_wire(conn, proto, nullptr) != rc_ok) {
         duct_conn_reclaim(conn);
         return nullptr;
     }
-    conn->ctx = duct_new(duct_dgram_shared_ctx_t);
-    if (!conn->ctx) {
-        duct_conn_reclaim(conn);
-        return nullptr;
-    }
-    auto dctx = (duct_dgram_shared_ctx_t *)conn->ctx;
-    *dctx = (duct_dgram_shared_ctx_t){
+    *duct_conn_dgram_ctx(conn) = (duct_dgram_shared_ctx_t){
         .listener = listener, .peer = *peer,
     };
     ++listener->pre_conn_refs;
@@ -685,6 +703,7 @@ static void s_dgram_shared_publish(duct_conn_t *conn, const duct_peer_t *peer,
             .stream_id = frames[i].stream_id, .flags = frames[i].flags,
         };
     duct_vmq_publish(ln, pos);
+    duct_conn_lane_staged(conn, pos->aligned);
     duct_worker_inter_arm(conn->worker_id, duct_conn_idx_get(conn));
     duct_vmq_notify(ln->ctrl);
 }
@@ -766,19 +785,20 @@ s_dgram_shared_route_slot(duct_conn_t *conn, const duct_peer_t *peer, const duct
     if (slot == treiber_empty)
         return false;
     auto base = (uint8_t *)duct_x_slot_data(t->held_pool, slot);
+    auto rec = duct_x_slot_payload(t->held_pool, slot) - duct_dgram_record_hdr_size;
 
-    duct_dgram_rec_hdr_encode(base, data->size);
+    duct_dgram_rec_hdr_encode(rec, data->size);
     size_t scratch_bytes = duct_dgram_record_hdr_size + data->size;
 
     dgram_shared_frame_t frames[s_dgram_shared_frame_cap];
-    unsigned n_frames = s_dgram_shared_parse(conn, base, scratch_bytes, frames);
+    unsigned n_frames = s_dgram_shared_parse(conn, rec, scratch_bytes, frames);
     duct_do_if(!n_frames, return true);
 
     size_t desc_bytes;
     bool of = s_inter_desc_bytes(n_frames, &desc_bytes);
     duct_do_if(of, duct_rtstat_obj_inc(t, rtstats.dgram_shared_rx_drop, 1); return true);
 
-    auto ln = duct_mpsc_lane(conn->inter_lane, 0u);
+    auto ln = duct_mpsc_lane(duct_conn_lane(conn), 0u);
     duct_vmq_reserve_pos_t pos;
     auto stage = s_dgram_shared_reserve(&ln, desc_bytes, &pos);
     duct_do_if(!stage, return true);
@@ -848,7 +868,7 @@ static void s_dgram_shared_route(duct_conn_t *conn, const duct_peer_t *peer, con
     bool total_of = duct_ckd_add(&total_1, desc_off, sizeof(duct_msg_inter_pkt_t));
     duct_do_if(total_of, return);
 
-    auto ln = duct_mpsc_lane(conn->inter_lane, 0u);
+    auto ln = duct_mpsc_lane(duct_conn_lane(conn), 0u);
     duct_vmq_reserve_pos_t pos;
     auto stage = s_dgram_shared_reserve(&ln, total_1, &pos);
     /* A refused reservation drops the datagram: this path carries the loss
@@ -937,7 +957,7 @@ s_dgram_shared_route_group(duct_listener_t *listener, const duct_peer_t *peer,
     bool of = s_inter_desc_bytes(n_frames, &desc_bytes);
     duct_do_if(of, return false);
 
-    auto ln = duct_mpsc_lane(conn->inter_lane, 0u);
+    auto ln = duct_mpsc_lane(duct_conn_lane(conn), 0u);
     duct_vmq_reserve_pos_t pos;
     auto stage = s_dgram_shared_reserve(&ln, desc_bytes, &pos);
     /* One reservation carries the whole read, so a refusal loses every datagram
@@ -1027,7 +1047,7 @@ static void s_attach_fd(const duct_session_handle_t *tok,
     duct_peer_t none = {};
     auto conn = s_conn_prepare(nullptr, &none, (duct_view_u8){}, proto,
                                xport, fd, false,
-                               duct_atomic_load(&target->worker_id, acquire),
+                               (uint32_t)target->worker_id,
                                leg_wire);
     duct_do_if(!conn, return);
     if (!duct_sessions_post_conn_join(conn, stok, conn_id, &none, (duct_seal_prefix_t){}))
@@ -1333,34 +1353,31 @@ static bool s_probe_wait_begin(duct_listener_t *listener, duct_sock_t fd, const 
     auto t = s_io_this;
     if (listener->probe_parks >= DUCT_LISTENER_PROBE_PARK_MAX)
         return false;
-    auto pre_conn = duct_new(duct_pre_conn_t);
-    if (pre_conn) {
-        *pre_conn = (duct_pre_conn_t){
-            .fd = fd, .kind = pre_conn_probe,
-            .probe = { .listener = listener, .peer = *peer },
-        };
-        pre_conn->probe.peek = duct_new(uint8_t, duct_listener_peek_span(listener->peek_cap));
-        if (pre_conn->probe.peek) {
-            pre_conn->probe.peek_len = (uint16_t)held.size;
-            if (held.size)
-                memcpy(duct_at(pre_conn->probe.peek), held.data, held.size);
-            pre_conn->next = t->pre_conns;
-            t->pre_conns = pre_conn;
-            if (duct_events_watch(t->trunk.events, fd, io_tag_pre_conn, pre_conn,
-                                  x_tcp /* unused for io_tag_pre_conn */)) {
-                ++listener->pre_conn_refs;
-                ++listener->probe_parks;
-                auto h = duct_timer_add(&t->timers, (uint8_t)t->route.thread_id, 0u,
-                                        (uint64_t)listener->probe_wait_ms * 1000u, 0u, 1u,
-                                        s_pre_conn_timeout_fire, pre_conn, nullptr);
-                if (h != timer_handle_null)
-                    pre_conn->timeout = h;
-                return true;
-            }
-            s_pre_conn_free(t, pre_conn);
-        } else
-            duct_del(pre_conn);
+    auto pre_conn = s_pre_conn_take(t);
+    if (!pre_conn)
+        return false;
+    *pre_conn = (duct_pre_conn_t){
+        .fd = fd, .kind = pre_conn_probe,
+        .probe = { .listener = listener, .peer = *peer },
+    };
+    pre_conn->probe.peek = (duct_ptr_t(uint8_t))s_pre_conn_peek_tail(t, pre_conn);
+    pre_conn->probe.peek_len = (uint16_t)held.size;
+    if (held.size)
+        memcpy(duct_at(pre_conn->probe.peek), held.data, held.size);
+    pre_conn->next = t->pre_conns;
+    t->pre_conns = pre_conn;
+    if (duct_events_watch(t->trunk.events, fd, io_tag_pre_conn, pre_conn,
+                          x_tcp /* unused for io_tag_pre_conn */)) {
+        ++listener->pre_conn_refs;
+        ++listener->probe_parks;
+        auto h = duct_timer_add(&t->timers, (uint8_t)t->route.thread_id, 0u,
+                                (uint64_t)listener->probe_wait_ms * 1000u, 0u, 1u,
+                                s_pre_conn_timeout_fire, pre_conn, nullptr);
+        if (h != timer_handle_null)
+            pre_conn->timeout = h;
+        return true;
     }
+    s_pre_conn_free(t, pre_conn);
     return false;
 }
 
@@ -1500,7 +1517,7 @@ static bool s_classify_stream(const duct_wfq_route_t *route, duct_listener_t *li
          * !allow_wait hands over as the promotion. */
         auto conn = s_conn_prepare(listener, peer, peek_buf, r.proto, listener->xport_type, fd,
                                    !allow_wait,
-                                   duct_atomic_load(&target->worker_id, acquire),
+                                   (uint32_t)target->worker_id,
                                    nullptr);
         if (!conn)
             return true;
@@ -1668,9 +1685,10 @@ s_conn_prepare(duct_listener_t *listener, const duct_peer_t *peer,
     }
     if (payload.data) {
         if (!duct_conn_record_framed(conn))
-            duct_olb_rx_append_raw(conn->rx_buf, payload.data, payload.size);
+            duct_olb_rx_append_raw(duct_conn_rx_olb(conn), payload.data, payload.size);
         else if (s_dgram_rx_admits(conn, payload.size))
-            duct_dgram_rx_append(conn->rx_buf, payload.data, payload.size);
+            duct_dgram_rx_append(duct_conn_rx_olb(conn), payload.data, payload.size);
+        duct_conn_rx_staged(conn, payload.size);
     }
     if (!s_conn_register(s_io_this, conn, promote)) {
         s_conn_unwatch_reclaim(s_io_this, conn);
@@ -1713,6 +1731,7 @@ static bool s_dgram_rx_append_checked(duct_conn_t *conn, const duct_view_u8 *dat
                                  &(uint8_t *){nullptr}, &avail) == olb_rx_full)
         return false;
     duct_dgram_rx_append(rx, data->data, data->size);
+    duct_conn_rx_staged(conn, data->size);
     return true;
 }
 
@@ -1813,9 +1832,9 @@ static void s_classify_dgram(const duct_wfq_route_t *route, duct_listener_t *lis
              * under preparse's own CID map. Routes to the existing conn and
              * aliases the new address, a conn-join post here being what
              * refuses an occupied slot. Empty slot: a genuine new leg,
-             * light-attach and join as usual. conn->ctx->peer is written
-             * only by the owning worker, off the inter_lane message this
-             * route carries, to avoid racing a read here. */
+             * light-attach and join as usual. The conn's dgram ctx @c peer
+             * is written only by the owning worker, off the inter_lane
+             * message this route carries, to avoid racing a read here. */
             auto slot = duct_session_conn_at(target, r.conn_id);
             if (slot.word) {
                 auto conn = duct_conn_by_handle(slot);
@@ -1826,7 +1845,7 @@ static void s_classify_dgram(const duct_wfq_route_t *route, duct_listener_t *lis
                 return;
             }
             s_dgram_shared_admit_join(route, listener, peer, data, r.proto,
-                                      duct_atomic_load(&target->worker_id, acquire), tok, r.conn_id);
+                                      (uint32_t)target->worker_id, tok, r.conn_id);
             return;
         }
         auto held = duct_session_conn_at(target, r.conn_id);
@@ -1849,7 +1868,7 @@ static void s_classify_dgram(const duct_wfq_route_t *route, duct_listener_t *lis
              * the leg the candidate it already had. */
             if (!s_dgram_rx_append_checked(roamed, data))
                 return;
-            auto rx = roamed->rx_buf;
+            auto rx = duct_conn_rx_olb(roamed);
             s_dgram_peer_candidate_clear(roamed);
             s_dgram_peer_add_at(listener, peer, roamed, true);
             duct_atomic_store(&rx->roam_at, duct_olb_rx_total_at(rx, rx->h.stage), release);
@@ -1859,7 +1878,7 @@ static void s_classify_dgram(const duct_wfq_route_t *route, duct_listener_t *lis
         }
         auto conn = s_conn_prepare(listener, peer, *data, r.proto, x_udp_peer,
                                       duct_sock_bad, false,
-                                      duct_atomic_load(&target->worker_id, acquire),
+                                      (uint32_t)target->worker_id,
                                       nullptr);
         if (!conn)
             return;
@@ -1974,20 +1993,18 @@ static void s_listener_rx_park(duct_io_t *t, duct_listener_t *listener, bool par
 }
 
 /* The re-check runs past a seq_cst fence that pairs with the seq_cst step ahead of
- * s_rx_unstall, the slot return of duct_io_rx_slot_drop or the pin of
- * duct_io_rx_pin: either it sees their slot or pin, or they see stalled and post
- * the resume. */
+ * s_rx_unstall and the slot return of duct_io_rx_slot_drop: either it sees their
+ * slot, or they see stalled and post the resume. */
 bool duct_io_dgram_rx_stall(duct_listener_t *listener)
 {
     auto t = s_io_this;
     auto pool = listener->rx_slots;
-    if (!pool->range.base || !duct_atomic_load(&pool->live, acquire)
-        || duct_atomic_load(&pool->pins, acquire))
+    if (!pool->range.base || !duct_atomic_load(&pool->live, acquire))
         return false;
     s_listener_rx_park(t, listener, true);
     duct_atomic_store(&pool->stalled, true, relaxed);
     atomic_thread_fence(memory_order_seq_cst);
-    if ((!duct_x_slot_pool_dry(pool) || duct_atomic_load(&pool->pins, relaxed))
+    if (!duct_x_slot_pool_dry(pool)
         && duct_atomic_exchange(&pool->stalled, false, acq_rel)) {
         s_listener_rx_park(t, listener, false);
         return false;
@@ -2033,7 +2050,7 @@ static void s_rx_resume_post(unsigned io_id)
 
 /** @brief Take @p pool's stall back, where it is stalled, and post its reader
  *  the resume.
- *  The caller's seq_cst return or pin ahead of the test pairs with the fence
+ *  The caller's seq_cst return ahead of the test pairs with the fence
  *  @ref duct_io_dgram_rx_stall takes between setting @c stalled and its re-check. */
 static void s_rx_unstall(duct_x_slot_pool_t *pool)
 {
@@ -2047,6 +2064,7 @@ void duct_io_rx_slot_drop(duct_x_slot_pool_t *pool, uint32_t idx, bool claim)
     duct_do_if(!last, return);
     duct_x_slot_release(pool, idx);
     s_rx_unstall(pool);
+    duct_x_slot_pool_reap(pool);
 }
 
 void duct_io_accept_park(duct_listener_t *listener)
@@ -2083,17 +2101,6 @@ void duct_io_accept_resume(void)
         return;
     for (unsigned i = 0u; i < s_imod.n_io; ++i)
         s_rx_resume_post(i);
-}
-
-void duct_io_rx_pin(duct_x_slot_pool_t *pool)
-{
-    duct_atomic_fetch(add, &pool->pins, 1u, seq_cst);
-    s_rx_unstall(pool);
-}
-
-void duct_io_rx_unpin(duct_x_slot_pool_t *pool)
-{
-    duct_atomic_fetch(sub, &pool->pins, 1u, release);
 }
 
 /** @brief Scope-exit end of the async pre-parse message @p r points at.
@@ -2167,7 +2174,7 @@ static duct_exec_rc_t s_preparse_exec_result(void *self)
             return exec_done;
         }
         s_dgram_shared_admit_join(route, result->listener, &result->peer, &payload,
-                                  result->proto, duct_atomic_load(&target->worker_id, acquire),
+                                  result->proto, (uint32_t)target->worker_id,
                                   join_tok, result->join_conn_id);
         return exec_done;
     }
@@ -2184,7 +2191,7 @@ static duct_exec_rc_t s_preparse_exec_result(void *self)
                                is_dgram ? x_udp_peer : result->listener->xport_type,
                                is_dgram ? duct_sock_bad : result->fd,
                                result->fd_registered,
-                               target ? duct_atomic_load(&target->worker_id, acquire)
+                               target ? (uint32_t)target->worker_id
                                       : conn_worker_none,
                                nullptr);
     if (!conn)
@@ -2434,7 +2441,7 @@ static void s_req_do_peer_roam(duct_conn_t *conn)
         duct_conn_state_clear(conn, fl_conn_roaming);
         return;
     }
-    auto rx = conn->rx_buf;
+    auto rx = duct_conn_rx_olb(conn);
     if (duct_atomic_load(&rx->accept_at, acquire) < duct_atomic_load(&rx->roam_at, relaxed))
         return;
     struct sockaddr_storage ss;
@@ -2592,7 +2599,7 @@ static void s_dial_begin(duct_io_t *t, const duct_dial_target_t *target,
         s_connect_error(&t->route, seed, err);
         return;
     }
-    auto pre_conn = duct_new(duct_pre_conn_t);
+    auto pre_conn = s_pre_conn_take(t);
     if (!pre_conn) {
         duct_sock_close(fd);
         s_connect_error(&t->route, seed, rc_no_memory);
@@ -2622,9 +2629,29 @@ static void s_dial_begin(duct_io_t *t, const duct_dial_target_t *target,
         pre_conn->timeout = h;
 }
 
+/** @brief Take one record off @p t's pre-conn slab.
+ *  @return the record, @c nullptr when the slab is spent — the caller refuses
+ *          the admission exactly as its allocation failing once did.
+ */
+static duct_pre_conn_t *s_pre_conn_take(duct_io_t *t)
+{
+    auto s = &t->pre_conn_slab;
+    if (!s->free_n)
+        return nullptr;
+    return &duct_at(s->slots)[duct_at(s->free_stack)[--s->free_n]];
+}
+
+/** @brief The probe-peek tail of @p pre_conn's slot in @p t's slab. */
+static uint8_t *s_pre_conn_peek_tail(duct_io_t *t, duct_pre_conn_t *pre_conn)
+{
+    auto s = &t->pre_conn_slab;
+    return duct_at(s->peeks)
+         + (size_t)(pre_conn - duct_at(s->slots)) * duct_preconn_peek_max;
+}
+
 /** @brief Releases @p pre_conn: cancels armed timer, unlinks from
- *  @p t->pre_conns, and deallocates memory. Does not modify descriptor
- *  lifecycle.
+ *  @p t->pre_conns, and releases its record back to the slab. Does not modify
+ *  descriptor lifecycle.
  */
 static void s_pre_conn_free(duct_io_t *t, duct_pre_conn_t *pre_conn)
 {
@@ -2636,9 +2663,8 @@ static void s_pre_conn_free(duct_io_t *t, duct_pre_conn_t *pre_conn)
         *pp = pre_conn->next;
         break;
     }
-    if (pre_conn->kind == pre_conn_probe)
-        duct_del(pre_conn->probe.peek);
-    duct_del(pre_conn);
+    auto s = &t->pre_conn_slab;
+    duct_at(s->free_stack)[s->free_n++] = (uint32_t)(pre_conn - duct_at(s->slots));
 }
 
 /** @brief @p pre_conn timeout report to its caller, then free. Sole
@@ -2805,7 +2831,7 @@ static void s_rx_start(duct_conn_t *conn)
     if (!conn || !duct_conn_rx_olb(conn))
         return;
     if (duct_conn_state(conn) & (fl_conn_closed | fl_conn_suspended | fl_conn_rx_full | fl_conn_rx_eof)) {
-        duct_events_rx_stall(conn->fd, conn->rx_buf->h.ext_ptr);
+        duct_events_rx_stall(conn->fd, duct_conn_rx_olb(conn)->h.ext_ptr);
         return;
     }
     /* A protocol error leaves the wire's parser state untrustworthy, so
@@ -2816,7 +2842,7 @@ static void s_rx_start(duct_conn_t *conn)
      * resets this field per generation, so a stale value cannot leak
      * into a reused slot. */
     if (duct_gen_req_reason(duct_atomic_load(duct_conn_gen_req(conn), relaxed)) == close_protocol_error) {
-        duct_events_rx_stall(conn->fd, conn->rx_buf->h.ext_ptr);
+        duct_events_rx_stall(conn->fd, duct_conn_rx_olb(conn)->h.ext_ptr);
         return;
     }
     duct_events_drive_rx((void *)(uintptr_t)s_conn_tag_word(conn));
@@ -2833,8 +2859,8 @@ static void s_rx_start(duct_conn_t *conn)
 static void s_rx_latch([[maybe_unused]] duct_io_t *t, duct_conn_t *conn,
                        size_t min_avail, bool restart)
 {
-    duct_atomic_store(&conn->rx_buf->resume_at,
-                      duct_olb_rx_resume_total(conn->rx_buf, min_avail, restart), relaxed);
+    auto rx = duct_conn_rx_olb(conn);
+    duct_atomic_store(&rx->resume_at, duct_olb_rx_resume_total(rx, min_avail, restart), relaxed);
     duct_conn_state_set(conn, fl_conn_rx_full);
     atomic_thread_fence(memory_order_seq_cst);
     duct_rtstat_obj_inc(t, rtstats.rx_full_latch, 1);
@@ -2847,8 +2873,9 @@ static void s_rx_latch([[maybe_unused]] duct_io_t *t, duct_conn_t *conn,
  */
 static void s_rx_latch_repost(duct_conn_t *conn)
 {
-    uint64_t head = duct_atomic_load(&conn->rx_buf->h.head, relaxed);
-    if (head < duct_olb_rx_posted_total(conn->rx_buf))
+    auto rx = duct_conn_rx_olb(conn);
+    uint64_t head = duct_atomic_load(&rx->h.head, relaxed);
+    if (head < duct_olb_rx_posted_total(rx))
         return;
     auto ch = duct_conn_handle_get(conn);
     duct_io_post_rx_read(&ch);
@@ -2873,13 +2900,14 @@ static bool s_rx_reserve_space([[maybe_unused]] duct_io_t *t, duct_conn_t *conn,
                                uint8_t **out_ptr, size_t *out_avail)
 {
     bool restart = duct_conn_record_framed(conn);
-    auto space = duct_olb_rx_try_space(conn->rx_buf, min_avail, restart, out_ptr, out_avail);
+    auto rx = duct_conn_rx_olb(conn);
+    auto space = duct_olb_rx_try_space(rx, min_avail, restart, out_ptr, out_avail);
     if (space != olb_rx_full)
         return true;
     /* A stalled reactive backend will not re-fire for backlog already
      * signaled, so a worker ack reposts against the latch. */
     s_rx_latch(t, conn, min_avail, restart);
-    space = duct_olb_rx_try_space(conn->rx_buf, min_avail, restart, out_ptr, out_avail);
+    space = duct_olb_rx_try_space(rx, min_avail, restart, out_ptr, out_avail);
     if (space == olb_rx_full) {
         s_rx_latch_repost(conn);
         return false;
@@ -2896,9 +2924,10 @@ static bool s_rx_reserve_space([[maybe_unused]] duct_io_t *t, duct_conn_t *conn,
 static bool s_rx_reserve_stall(const duct_conn_t *conn, duct_io_xfer_t *out)
 {
     assert(duct_conn_has_olb(conn));
+    auto rx = duct_conn_rx_olb(conn);
     out->fd = conn->fd;
-    out->io_priv = conn->rx_buf->h.ext_ptr;
-    out->olb_hdr = &conn->rx_buf->h;
+    out->io_priv = rx->h.ext_ptr;
+    out->olb_hdr = &rx->h;
     return false;
 }
 
@@ -2928,6 +2957,7 @@ bool duct_io_rx_reserve(void *tag, duct_io_xfer_t *out)
     if (duct_conn_state(conn) & (fl_conn_closed | fl_conn_suspended | fl_conn_rx_eof))
         return s_rx_reserve_stall(conn, out);
     auto t = s_io_this;
+    auto rx = duct_conn_rx_olb(conn);
     uint8_t *ptr = nullptr;
     size_t avail = 0u;
     size_t rec = duct_conn_record_framed(conn) ? sizeof(duct_dgram_rec_hdr_t) : 0u,
@@ -2940,12 +2970,12 @@ bool duct_io_rx_reserve(void *tag, duct_io_xfer_t *out)
          * Refusing the read leaves those datagrams in the kernel socket buffer,
          * and the group is described without a read at all — by the post
          * duct_frame_rx_retry_drain makes once the node blocking it drains. */
-        if (conn->rx_buf->group_bytes) {
+        if (rx->group_bytes) {
             s_rx_latch(t, conn, 1u, false);
             s_rx_latch_repost(conn);
             return s_rx_reserve_stall(conn, out);
         }
-        duct_olb_rx_rewind(conn->rx_buf);
+        duct_olb_rx_rewind(rx);
         /* Demands room for the largest span one read can answer with, so recv()
          * is never offered less: a token minimum lets a nearly-full OLB hand it
          * a smaller one, and MSG_TRUNC then costs the whole arriving datagram,
@@ -2954,9 +2984,9 @@ bool duct_io_rx_reserve(void *tag, duct_io_xfer_t *out)
          * declaring max_frame past the whole OLB, and a read span no larger
          * than the record header, which a conn carrying no wire keeps for
          * its whole life. */
-        min_avail = conn->rx_buf->read_unit + scratch;
-        if (min_avail <= rec + scratch || min_avail > conn->rx_buf->h.buf_size)
-            min_avail = conn->rx_buf->h.buf_size;
+        min_avail = rx->read_unit + scratch;
+        if (min_avail <= rec + scratch || min_avail > rx->h.buf_size)
+            min_avail = rx->h.buf_size;
         /* A vnet read lands in the ring and is cut there, so the room to demand
          * is the largest cut, which keeps the span above duct_vnet_gso_max: a
          * tun clips a longer read to its span with no sign. */
@@ -2967,7 +2997,7 @@ bool duct_io_rx_reserve(void *tag, duct_io_xfer_t *out)
         return s_rx_reserve_stall(conn, out);
     uint8_t *buf = ptr + rec;
     size_t size = avail - rec - scratch,
-           unit = conn->rx_buf->read_unit;
+           unit = rx->read_unit;
     uint16_t units = 1u;
     void *ctx = nullptr;
     if (conn->vnet_hdr_len) {
@@ -2988,12 +3018,12 @@ bool duct_io_rx_reserve(void *tag, duct_io_xfer_t *out)
     }
     /* ctx is the read argument duct_xread takes on x_raw_packet, the vnet
      * header span, and null on every other xport that has a ring. It is never
-     * conn->ctx, which holds the xport's own conn state. */
+     * the conn's ctx region, which holds the xport's own conn state. */
     *out = (duct_io_xfer_t){
         .buf = buf, .size = size,
         .fd = conn->fd, .xport_type = conn->xport_type,
         .ctx = ctx,
-        .io_priv = conn->rx_buf->h.ext_ptr, .olb_hdr = &conn->rx_buf->h,
+        .io_priv = rx->h.ext_ptr, .olb_hdr = &rx->h,
         .units = units,
     };
     return true;
@@ -3032,16 +3062,17 @@ static bool s_dgram_rx_commit_group(duct_olb_rx_t *rx, size_t n, size_t seg)
  *  @return false when the cut refused the read, which is then lost. */
 static bool s_vnet_rx_commit(duct_conn_t *conn, size_t n)
 {
-    auto h = &conn->rx_buf->h;
+    auto rx = duct_conn_rx_olb(conn);
+    auto h = &rx->h;
     unsigned pkts = 0u;
     auto state = duct_conn_state(conn);
     bool uso = duct_has(state, fl_conn_vnet_uso) && duct_has(state, fl_conn_vnet_uso_tx);
     size_t out = duct_vnet_cut(duct_at(s_io_this->vnet_hdr),
-                               conn->rx_buf->data + h->stage,
+                               duct_conn_rx_data(conn) + h->stage,
                                n - conn->vnet_hdr_len,
                                duct_atomic_load(&conn->vnet_gso, relaxed),
                                uso,
-                               duct_olb_rx_room(conn->rx_buf), &pkts);
+                               duct_olb_rx_room(rx), &pkts);
     if (!out) {
         duct_rtstat_obj_inc(s_io_this, rtstats.vnet_rx_drop, 1);
         return false;
@@ -3058,6 +3089,7 @@ void duct_io_rx_commit(void *tag, size_t n, size_t seg)
 {
     auto conn = s_conn_from_tag(tag);
     duct_do_if(!conn, return);
+    duct_conn_rx_staged(conn, n);
     if (duct_conn_record_framed(conn)) {
         /* A datagram outside its wire's bounds is dropped whole, nothing
          * committed, a coalesced read held to max_frame by its segment. A vnet
@@ -3084,10 +3116,10 @@ void duct_io_rx_commit(void *tag, size_t n, size_t seg)
                 return;
         } else if (seg && seg < n) {
             s_rtstat_gro(n, seg);
-            if (!s_dgram_rx_commit_group(conn->rx_buf, n, seg))
+            if (!s_dgram_rx_commit_group(duct_conn_rx_olb(conn), n, seg))
                 return;
         } else {
-            auto rx = conn->rx_buf;
+            auto rx = duct_conn_rx_olb(conn);
             duct_dgram_rx_header_commit(rx, n);
             if (rx->h.stage - rx->posted_off < rx->read_unit)
                 return;
@@ -3096,7 +3128,7 @@ void duct_io_rx_commit(void *tag, size_t n, size_t seg)
         duct_frame_rx_post(&t->route, &t->frame_rx, conn);
         return;
     }
-    auto h = &conn->rx_buf->h;
+    auto h = &duct_conn_rx_olb(conn)->h;
     duct_atomic_store(&h->tail, h->stage += n, release);
 }
 
@@ -3104,10 +3136,10 @@ void duct_io_rx_commit_units(void *tag, const uint32_t *lens, uint32_t n)
 {
     auto conn = s_conn_from_tag(tag);
     duct_do_if(!conn, return);
-    auto rx = conn->rx_buf;
+    auto rx = duct_conn_rx_olb(conn);
     size_t rec = sizeof(duct_dgram_rec_hdr_t),
            unit = rx->read_unit;
-    auto base = rx->data + rx->h.stage;
+    auto base = duct_olb_rx_data(rx) + rx->h.stage;
     uint32_t last = n;
     for (uint32_t i = 0u; i < n; ++i) {
         uint32_t hdr = duct_dgram_rec_void;
@@ -3122,6 +3154,7 @@ void duct_io_rx_commit_units(void *tag, const uint32_t *lens, uint32_t n)
     /* The ring stops at the last datagram's end, so its record carries no
      * padded bit: every pad acks staged bytes only. */
     duct_dgram_rec_hdr_encode(base + (size_t)last * unit, lens[last]);
+    duct_conn_rx_staged(conn, (size_t)last * unit + rec + lens[last]);
     s_dgram_peer_candidate_clear(conn);
     auto h = &rx->h;
     duct_atomic_store(&h->tail, h->stage += (size_t)last * unit + rec + lens[last], release);
@@ -3143,9 +3176,10 @@ void duct_io_rx_done(void *tag, duct_result_t rc)
      * its kernel queue still full, and a buffer shrunk under that queue has the
      * kernel prune it. */
     if (rc == rc_again && conn->xport_type == x_tcp
-        && !(duct_conn_state(conn) & (fl_conn_rx_full | fl_conn_suspended | fl_conn_closed)))
-        switch (duct_x_sock_rx_follow(duct_x_sock_rx_of(conn->rx_buf), conn->fd,
-                                      duct_atomic_load(&conn->rx_buf->acked, relaxed))) {
+        && !(duct_conn_state(conn) & (fl_conn_rx_full | fl_conn_suspended | fl_conn_closed))) {
+        auto rx = duct_conn_rx_olb(conn);
+        switch (duct_x_sock_rx_follow(duct_x_sock_rx_of(rx), conn->fd,
+                                      duct_atomic_load(&rx->acked, relaxed))) {
         case x_follow_set:
             duct_rtstat_obj_inc(t, rtstats.tcp_rcvbuf_sets, 1);
             [[fallthrough]];
@@ -3155,6 +3189,7 @@ void duct_io_rx_done(void *tag, duct_result_t rc)
         case x_follow_none:
             break;
         }
+    }
     if (rc == rc_closed && duct_conn_reads_eof(conn)) {
         /* The input ends once: a parse error in this same drive ends it first. */
         if (!duct_has(duct_conn_state(conn), fl_conn_rx_eof)) {
@@ -3194,8 +3229,8 @@ static bool s_tx_peek_idle(duct_conn_t *conn, size_t readable, duct_io_xfer_t *o
 {
     assert(duct_conn_has_olb(conn));
     out->fd = conn->fd;
-    out->io_priv = conn->tx_buf->h.ext_ptr;
-    out->olb_hdr = &conn->tx_buf->h;
+    out->io_priv = duct_conn_tx_olb(conn)->h.ext_ptr;
+    out->olb_hdr = &duct_conn_tx_olb(conn)->h;
     if (readable == 0u && duct_has(duct_conn_state(conn), fl_conn_closing)
         && s_conn_close(s_io_this, conn,
                         duct_gen_req_reason(duct_atomic_load(duct_conn_gen_req(conn), relaxed))))
@@ -3216,14 +3251,15 @@ bool duct_io_tx_peek(void *tag, duct_io_xfer_t *out)
     auto conn = s_conn_from_tag(tag);
     duct_do_if(!conn, return false);
     size_t rec = duct_conn_record_framed(conn) ? sizeof(duct_dgram_rec_hdr_t) : 0u;
+    auto tx = duct_conn_tx_olb(conn);
     uint64_t head = 0u;
-    size_t n = duct_olb_tx_readable(conn->tx_buf, &head);
+    size_t n = duct_olb_tx_readable(tx, &head);
     /* n == rec is a record header with no payload, which a zero-length
      * datagram legitimately stages: only a short header or an empty ring
      * is idle. */
     if (n == 0u || n < rec)
         return s_tx_peek_idle(conn, n, out);
-    auto base = conn->tx_buf->data + (size_t)head;
+    auto base = duct_conn_tx_data(conn) + (size_t)head;
     size_t len = n;
     if (rec) {
         len = duct_dgram_rec_hdr_decode((const uint8_t *)base) & ~duct_dgram_rec_gso;
@@ -3231,7 +3267,7 @@ bool duct_io_tx_peek(void *tag, duct_io_xfer_t *out)
     }
     /* The bound lives here because iocp posts this span as it stands. */
     if (conn->xport_type == x_tcp) {
-        size_t piece = duct_x_sock_tx_piece(duct_x_sock_tx_of(conn->tx_buf));
+        size_t piece = duct_x_sock_tx_piece(duct_x_sock_tx_of(tx));
         len = piece && piece < len ? piece : len;
     }
     /* No .ctx: only a shared, unconnected socket needs the peer
@@ -3239,7 +3275,7 @@ bool duct_io_tx_peek(void *tag, duct_io_xfer_t *out)
     *out = (duct_io_xfer_t){
         .buf = base + rec, .size = len,
         .fd = conn->fd, .xport_type = conn->xport_type,
-        .io_priv = conn->tx_buf->h.ext_ptr, .olb_hdr = &conn->tx_buf->h,
+        .io_priv = tx->h.ext_ptr, .olb_hdr = &tx->h,
     };
     return true;
 }
@@ -3272,14 +3308,14 @@ static bool s_tx_advance(duct_conn_t *conn, size_t offered, size_t n)
         assert(n == offered || n == 0u); /* a record-framed transport ships a
                                            * packet whole or not at all, with
                                            * no short-write retry concept. */
-        duct_olb_tx_advance(conn->tx_buf, sizeof(duct_dgram_rec_hdr_t) + offered);
+        duct_olb_tx_advance(duct_conn_tx_olb(conn), sizeof(duct_dgram_rec_hdr_t) + offered);
         s_tx_wake_waiter(conn);
         return true;
     }
-    duct_olb_tx_advance(conn->tx_buf, n);
+    duct_olb_tx_advance(duct_conn_tx_olb(conn), n);
     /* Counted here, where an iocp completion lands as well as a write's return. */
     if (conn->xport_type == x_tcp)
-        duct_x_sock_tx_sent(duct_x_sock_tx_of(conn->tx_buf), n);
+        duct_x_sock_tx_sent(duct_x_sock_tx_of(duct_conn_tx_olb(conn)), n);
     s_tx_wake_waiter(conn);
     return n == offered; /* short write: socket buffer full, caller stops */
 }
@@ -3320,8 +3356,8 @@ static unsigned s_tx_peek_bufs(duct_conn_t *conn, duct_view_u8 *bufs, unsigned m
     if (!duct_conn_record_framed(conn))
         return 0u;
     uint64_t head = 0u;
-    size_t n = duct_olb_tx_readable(conn->tx_buf, &head);
-    return s_tx_rec_bufs(conn->tx_buf->data + (size_t)head, n, bufs, max);
+    size_t n = duct_olb_tx_readable(duct_conn_tx_olb(conn), &head);
+    return s_tx_rec_bufs(duct_conn_tx_data(conn) + (size_t)head, n, bufs, max);
 }
 
 unsigned duct_io_tx_peek_bufs(void *tag, duct_view_u8 *bufs, unsigned max)
@@ -3436,7 +3472,7 @@ bool duct_io_tx_send(void *tag, const duct_io_xfer_t *p, duct_result_t *out_rc)
          * on until the socket refuses. */
         int flags = 0;
         if (p->xport_type == x_tcp) {
-            size_t cap = duct_x_sock_tx_cap(duct_x_sock_tx_of(conn->tx_buf), &flags);
+            size_t cap = duct_x_sock_tx_cap(duct_x_sock_tx_of(duct_conn_tx_olb(conn)), &flags);
             duct_rtstat_obj_inc(s_io_this, rtstats.tcp_writes, 1);
             duct_rtstat_obj_inc(s_io_this, rtstats.tcp_eor_writes, cap != 0u);
             if (cap)
@@ -3479,7 +3515,7 @@ void duct_io_tx_write_armed_set(void *tag, bool armed)
      * platform's lowat follow: a leg that never backs up keeps the bound it
      * was created with. */
     if (armed && conn->xport_type == x_tcp)
-        switch (duct_x_sock_tx_follow(duct_x_sock_tx_of(conn->tx_buf), conn->fd)) {
+        switch (duct_x_sock_tx_follow(duct_x_sock_tx_of(duct_conn_tx_olb(conn)), conn->fd)) {
         case x_follow_set:
             duct_rtstat_obj_inc(s_io_this, rtstats.tcp_lowat_sets, 1);
             [[fallthrough]];
@@ -3507,10 +3543,10 @@ static void s_req_do_rx_read(duct_conn_t *conn)
 {
     /* Clear fl_conn_rx_full to enable buffer space re-check in s_rx_start. */
     duct_conn_state_clear(conn, fl_conn_rx_full);
-    /* conn->ctx, not the xport alone: a host-driven x_inter leg has no device
-     * to read and belongs on the socket path below. Clearing the latch first
-     * lets this drive get past s_device_drive's own entry guard. */
-    if (conn->xport_type == x_inter && conn->ctx) {
+    /* The ctx region, not the xport alone: a host-driven x_inter leg has no
+     * device to read and belongs on the socket path below. Clearing the latch
+     * first lets this drive get past s_device_drive's own entry guard. */
+    if (conn->xport_type == x_inter && duct_conn_device_ops(conn)) {
         s_device_drive(conn);
         return;
     }
@@ -3532,7 +3568,7 @@ static bool s_req_do_close(duct_io_t *t, duct_conn_t *conn)
     auto reason = duct_gen_req_reason(duct_atomic_load(duct_conn_gen_req(conn), relaxed));
     if (reason != close_timeout && duct_conn_tx_olb(conn)) {
         uint64_t head = 0u;
-        if (duct_olb_tx_readable(conn->tx_buf, &head) != 0u)
+        if (duct_olb_tx_readable(duct_conn_tx_olb(conn), &head) != 0u)
             return false;
     }
     return s_conn_close(t, conn, reason);
@@ -3636,7 +3672,10 @@ static bool
 s_req_post_ex(duct_io_trunk_t *trunk, duct_conn_handle_t handle,
                          duct_conn_req_flags_t bit, bool set_reason, duct_close_reason_t reason)
 {
-    auto conn = duct_conn_by_idx(handle.idx);
+    /* The raw page-0 address, not the active-guarded resolver: a posted
+     * request races the slot's retire by design, and the generation word
+     * below is page 0, resident for any slot that was ever live. */
+    auto conn = duct_conn_block_at(handle.idx);
     uint64_t old = duct_atomic_load(duct_conn_gen_req(conn), relaxed);
     for (;; duct_cpu_relax()) {
         if (duct_gen_req_gen(old) != handle.gen)
@@ -3755,7 +3794,7 @@ duct_result_t duct_io_addrs(const duct_conn_t *conn, duct_peer_t *local, duct_pe
     if (duct_has(duct_conn_state(conn), fl_conn_closed))
         return rc_invalid_order;
     auto shared = conn->xport_type == x_udp_shared
-                ? (const duct_dgram_shared_ctx_t *)conn->ctx : nullptr;
+                ? duct_conn_dgram_ctx(conn) : nullptr;
     struct sockaddr_storage mine, theirs;
     socklen_t len = sizeof mine;
     if (local && getsockname(shared ? shared->listener->listen_fd : conn->fd,
@@ -3782,7 +3821,7 @@ duct_result_t duct_io_tcp_stats(const duct_conn_t *conn, duct_tcp_stats_t *out)
 {
     if (duct_has(duct_conn_state(conn), fl_conn_closed))
         return rc_invalid_order;
-    return duct_xget_tcp_stats(duct_x_sock_stats_of(conn->tx_buf), conn->fd, out)
+    return duct_xget_tcp_stats(duct_x_sock_stats_of(duct_conn_tx_olb(conn)), conn->fd, out)
          ? rc_ok : rc_not_supported;
 }
 
@@ -3910,13 +3949,14 @@ duct_result_t duct_io_udp_peer_send_staged(duct_conn_t *conn, size_t *out_sent,
         return rc_again;
     }
     assert(conn->fd != duct_sock_bad);
-    auto tx = conn->tx_buf;
+    auto tx = duct_conn_tx_olb(conn);
     size_t base = olb_off(duct_atomic_load(&tx->h.tail, relaxed)),
            off = base,
            end = tx->h.stage;
     while (off < end) {
         duct_view_u8 bufs[duct_dgram_tx_batch];
-        unsigned n = s_tx_rec_bufs(tx->data + off, end - off, bufs, duct_dgram_tx_batch),
+        unsigned n = s_tx_rec_bufs(duct_olb_tx_data(tx) + off, end - off, bufs,
+                                   duct_dgram_tx_batch),
                  sent = 0u;
         assert(n);
         duct_result_t rc;
@@ -3970,7 +4010,7 @@ bool duct_io_stream_send_fast(duct_conn_t *conn, const duct_view_u8 *bufs,
     int flags = 0;
     size_t cap = 0u;
     if (conn->xport_type == x_tcp) {
-        cap = duct_x_sock_tx_cap(duct_x_sock_tx_of(conn->tx_buf), &flags);
+        cap = duct_x_sock_tx_cap(duct_x_sock_tx_of(duct_conn_tx_olb(conn)), &flags);
 #if DUCT_RUNTIME_STATS
         duct_worker_rtstat_tcp_write(cap, total);
 #endif
@@ -3991,7 +4031,7 @@ bool duct_io_stream_send_fast(duct_conn_t *conn, const duct_view_u8 *bufs,
     /* Every byte the socket took counts toward the opening's packets, a short
      * write's too. */
     if (conn->xport_type == x_tcp)
-        duct_x_sock_tx_sent(duct_x_sock_tx_of(conn->tx_buf), *out_written);
+        duct_x_sock_tx_sent(duct_x_sock_tx_of(duct_conn_tx_olb(conn)), *out_written);
     bool took = rc == rc_ok && *out_written == offered;
 #if DUCT_RUNTIME_STATS
     if (!took)
@@ -4522,90 +4562,48 @@ void duct_io_on_wake(void)
         duct_frame_rx_retry_drain(&t->route, &t->frame_rx);
 }
 
-/** @brief Packets one @c ops.read call may hand back. */
-static constexpr unsigned device_rx_batch = 32u;
-
 static_assert(sizeof(duct_msg_inter_batch_t)
-              + device_rx_batch * sizeof(duct_msg_inter_pkt_t) < inter_lane_cap,
+              + (size_t)duct_device_rx_batch * sizeof(duct_msg_inter_pkt_t) < inter_lane_cap,
               "a descriptor-only device batch must always fit its lane");
 
-/** @brief Packets a lending device leg may have out on the lane at once.
- *
- *  One drive's worth, which is also the most that can ever be outstanding:
- *  @ref s_device_drive reads only on a lane @c duct_vmq_room reports whole, so
- *  its first pass hands back everything held from before, and each of its
- *  @c duct_dgram_rx_max_passes passes adds at most one clamped batch. Sized to
- *  that, the capacity test in the drive never refuses a lending device, and
- *  only what @ref s_device_split cannot address still copies. The test
- *  stays as the guard: a drive that reads more falls back to copying rather
- *  than running past @c held[].
- *
- *  The bound comes from the engine's own two RX constants, so raising
- *  @c duct_dgram_rx_max_passes grows every lending leg's array with it. The
- *  size of that array is all this decides: a device left holding none of its
- *  own read memory is still read again, since the resume comes from the
- *  worker emptying the lane.
- */
-static constexpr unsigned device_hold_cap =
-    device_rx_batch * duct_dgram_rx_max_passes;
-
 /** @brief Packets a leg driving @p ops may hold lent at once.
- *  @c device_hold_cap for a device that answers @c release_read, none for one that does not. It sizes the
- *  leg's @c held[] and bounds the lending gate of @ref s_device_drive, so the two agree.
+ *  @c duct_device_hold_cap for a device that answers @c release_read, none for one that does not.
+ *  It bounds the lending gate of @ref s_device_drive, which the conn block's
+ *  fixed @c held region sizes.
  */
 static unsigned s_device_hold_cap(const duct_device_ops_t *ops)
 {
-    return ops->release_read ? device_hold_cap : 0u;
+    return ops->release_read ? duct_device_hold_cap : 0u;
 }
 
-/** @brief A device leg's @c conn->ctx: the caller's op table, the RX slots its
- *  reads land in and what the engine holds lent from that device.
- *  @c ops leads the struct, so a reader wanting the table alone casts
- *  @c conn->ctx straight to @ref duct_device_ops_t.
+/** @brief The io thread's one device rx pool, made on the first spanning
+ *  device it carries.
+ *  Every leg of the thread reads into it: a leg reads only on a lane
+ *  @c duct_vmq_room reports whole, which has handed every earlier slot of its
+ *  own back, so a compliant reader never finds a shared pool dry. A slot
+ *  serves one read of @c duct_device_rx_batch buffers of
+ *  @c duct_device_rx_span_max bytes, grown by the slot and trimmed by the
+ *  tick's sweep.
+ *  @return the pool, @c nullptr when its range cannot be made.
  */
-typedef struct device_leg {
-    duct_device_ops_t ops;
-    struct device_leg *prev,   /**< Previous leg on the io thread's device list. */
-                      *next;   /**< Next leg on the io thread's device list. */
-    unsigned          n_held;  /**< Entries of @c held in use, at most @c device_hold_cap. */
-    duct_x_slot_pool_t  rx_slots; /**< Slots this leg's reads land in,
-                                    *  @c duct_dgram_rx_max_passes of them, one
-                                    *  per drive pass, and none for a device
-                                    *  whose @c ops.rx_span is 0. A slot is a
-                                    *  chunk, so the tick's sweep gives idle ones
-                                    *  back. A drive reads only on a drained lane,
-                                    *  which has handed every earlier slot back,
-                                    *  so the pool never runs dry. */
-    duct_view_u8        held[];  /**< Packets read out of the device and not yet
-                                 *  handed back through @c ops.release_read. */
-} device_leg_t;
-
-/** @brief Allocate a device leg's @c conn->ctx around a copy of @p ops.
- *  Room for @c device_hold_cap packets trails it when @p ops answers
- *  @c release_read, and none when it does not; its RX pool, whose slots each hold
- *  @c device_rx_batch buffers of @c rx_span bytes, is set up beside it with no
- *  chunk live, and has no slot for an @c rx_span of 0.
- *  @return the copy, @c nullptr when an allocation fails.
- */
-static duct_device_ops_t *s_device_leg_new(const duct_device_ops_t *ops)
+static duct_x_slot_pool_t *s_device_rx_pool(duct_io_t *t)
 {
-    duct_auto_del auto leg = (device_leg_t *)duct_at(
-        duct_new(uint8_t, sizeof(device_leg_t) + (size_t)s_device_hold_cap(ops) * sizeof(duct_view_u8),
-                 alignof(device_leg_t)));
-    duct_do_if(!leg, return nullptr);
-    uint32_t passes = ops->rx_span ? duct_dgram_rx_max_passes : 0u;
-    bool pooled = duct_x_slot_pool_init(&leg->rx_slots, passes,
-                                        (uint32_t)(ops->rx_span * device_rx_batch
-                                                   + duct_dgram_record_hdr_size),
-                                        duct_dgram_record_hdr_size, 1u, (duct_x_slot_hooks_t){});
-    duct_do_if(!pooled, return nullptr);
-    leg->ops = *ops;
-    leg->n_held = 0u;
-    return &duct_move(leg)->ops;
+    if (t->device_rx_live)
+        return &t->device_rx;
+    bool ok = duct_x_slot_pool_init(
+                  &t->device_rx, duct_device_hold_cap,
+                  duct_x_slot_span_bytes(0u, duct_dgram_record_hdr_size,
+                                         (uint32_t)duct_device_rx_span_max * duct_device_rx_batch),
+                  0u, duct_dgram_record_hdr_size, 1u, (duct_x_slot_hooks_t){})
+           && duct_x_slot_pool_engage(&t->device_rx);
+    duct_do_if(!ok, duct_x_slot_pool_free(&t->device_rx); return nullptr);
+    t->device_rx.reader = t->route.thread_id;
+    t->device_rx_live = true;
+    return &t->device_rx;
 }
 
 /** @brief Find the device leg of @p t holding @p handle, @c nullptr when none does. */
-static device_leg_t *s_device_find(const duct_io_t *t, const void *handle)
+static duct_device_leg_t *s_device_find(const duct_io_t *t, const void *handle)
 {
     auto leg = t->devices;
     while (leg && leg->ops.wait_handle != handle)
@@ -4616,7 +4614,7 @@ static device_leg_t *s_device_find(const duct_io_t *t, const void *handle)
 /** @brief Put @p conn's device leg at the head of @p t's device list. */
 static void s_device_link(duct_io_t *t, duct_conn_t *conn)
 {
-    auto leg = (device_leg_t *)conn->ctx;
+    auto leg = duct_conn_device_leg(conn);
     leg->next = t->devices;
     if (t->devices)
         t->devices->prev = leg;
@@ -4626,7 +4624,7 @@ static void s_device_link(duct_io_t *t, duct_conn_t *conn)
 /** @brief Take @p conn's device leg off @p t's device list. */
 static void s_device_unlink(duct_io_t *t, duct_conn_t *conn)
 {
-    auto leg = (device_leg_t *)conn->ctx;
+    auto leg = duct_conn_device_leg(conn);
     if (leg->prev)
         leg->prev->next = leg->next;
     else
@@ -4637,7 +4635,7 @@ static void s_device_unlink(duct_io_t *t, duct_conn_t *conn)
 }
 
 /** @brief Hand every held packet back to @p leg's device. */
-static void s_device_holds_release(device_leg_t *leg)
+static void s_device_holds_release(duct_device_leg_t *leg)
 {
     for (unsigned i = 0u; i < leg->n_held; ++i)
         leg->ops.release_read(leg->ops.ctx, leg->held[i]);
@@ -4646,10 +4644,8 @@ static void s_device_holds_release(device_leg_t *leg)
 
 void duct_io_device_teardown(duct_conn_t *conn)
 {
-    duct_do_if(conn->xport_type != x_inter || !conn->ctx, return);
-    auto leg = (device_leg_t *)conn->ctx;
-    s_device_holds_release(leg);
-    duct_x_slot_pool_free(&leg->rx_slots);
+    duct_do_if(conn->xport_type != x_inter || !duct_conn_device_ops(conn), return);
+    s_device_holds_release(duct_conn_device_leg(conn));
 }
 
 /** @brief Copy @p n packets from @p bufs onto @p conn's inter lane and arm
@@ -4671,7 +4667,7 @@ static duct_result_t
 s_device_push(duct_conn_t *conn, const duct_view_u8 *bufs, unsigned n)
 {
     assert(n);
-    auto ln = duct_mpsc_lane(conn->inter_lane, 0u);
+    auto ln = duct_mpsc_lane(duct_conn_lane(conn), 0u);
     size_t room = duct_vmq_room(&ln);
 
     size_t need = sizeof(duct_msg_inter_batch_t);
@@ -4717,6 +4713,7 @@ s_device_push(duct_conn_t *conn, const duct_view_u8 *bufs, unsigned n)
         cursor += bufs[i].size;
     }
     duct_vmq_publish(&ln, &pos);
+    duct_conn_lane_staged(conn, pos.aligned);
     duct_worker_inter_arm(conn->worker_id, duct_conn_idx_get(conn));
     duct_vmq_notify(ln.ctrl);
     if (fit < n)
@@ -4725,7 +4722,7 @@ s_device_push(duct_conn_t *conn, const duct_view_u8 *bufs, unsigned n)
 }
 
 /** @brief Offer @p slot's payload area to one device read, cut into
- *  @c device_rx_batch buffers of @p span bytes.
+ *  @c duct_device_rx_batch buffers of @p span bytes.
  *
  *  Carves slot payload into descriptor spans. For @c treiber_empty,
  *  buffers are initialized to empty.
@@ -4734,16 +4731,16 @@ static void s_device_carve(const duct_x_slot_pool_t *pool, uint32_t slot, size_t
                            duct_view_u8 *bufs)
 {
     if (slot == treiber_empty) {
-        for (unsigned i = 0u; i < device_rx_batch; ++i)
+        for (unsigned i = 0u; i < duct_device_rx_batch; ++i)
             bufs[i] = (duct_view_u8){};
         return;
     }
     auto base = duct_x_slot_payload(pool, slot);
-    for (unsigned i = 0u; i < device_rx_batch; ++i)
+    for (unsigned i = 0u; i < duct_device_rx_batch; ++i)
         bufs[i] = (duct_view_u8){ .data = base + i * span, .size = span };
 }
 
-static_assert(device_rx_batch <= 32u,
+static_assert(duct_device_rx_batch <= 32u,
               "one buffer per bit of the mask s_device_split fills");
 
 /** @brief Sort the @p n buffers a device returned into the two kinds a
@@ -4807,12 +4804,12 @@ static bool s_device_split(const duct_x_slot_pool_t *pool, uint32_t slot,
  *          @c rc_invalid_arg the descriptor block overflowed @c size_t.
  */
 static duct_result_t
-s_device_push_desc(duct_conn_t *conn, device_leg_t *leg,
+s_device_push_desc(duct_conn_t *conn, duct_device_leg_t *leg,
                    duct_x_slot_pool_t *pool, uint32_t slot,
                    const duct_view_u8 *bufs, unsigned n,
                    uint32_t slot_mask, unsigned lent)
 {
-    auto ln = duct_mpsc_lane(conn->inter_lane, 0u);
+    auto ln = duct_mpsc_lane(duct_conn_lane(conn), 0u);
     size_t need = 0u, holds = 0u;
     bool of = s_inter_desc_bytes(n, &need);
     if (lent)
@@ -4855,6 +4852,7 @@ s_device_push_desc(duct_conn_t *conn, device_leg_t *leg,
             leg->held[leg->n_held++] = bufs[i];
     }
     duct_vmq_publish(&ln, &pos);
+    duct_conn_lane_staged(conn, pos.aligned);
     duct_worker_inter_arm(conn->worker_id, duct_conn_idx_get(conn));
     duct_vmq_notify(ln.ctrl);
     return rc_ok;
@@ -4865,7 +4863,7 @@ static void s_device_stall(duct_conn_t *conn)
 {
     duct_conn_state_set(conn, fl_conn_rx_full);
     duct_events_device_rx_interest(s_io_this->trunk.events,
-        ((const duct_device_ops_t *)conn->ctx)->wait_handle, false);
+        duct_conn_device_ops(conn)->wait_handle, false);
 }
 
 /** @brief Read @p conn's device until it runs dry, the lane stops taking a
@@ -4879,7 +4877,7 @@ static void s_device_stall(duct_conn_t *conn)
  *  that buys splits by how the batch is addressed. Reaching
  *  @ref s_device_push_desc it is descriptors alone and lands whole whatever
  *  the packets hold. Falling to @ref s_device_push it lands whole only while
- *  @c device_rx_batch packets at the device's MTU stay under
+ *  @c duct_device_rx_batch packets at the device's MTU stay under
  *  @c inter_lane_cap — 32 at an Ethernet 1500 against 144 KB — that copy
  *  dropping the tail a jumbo frame leaves no room for.
  *  Releases lent packets on fully drained lanes. If unread bytes remain,
@@ -4889,15 +4887,15 @@ static void s_device_drive(duct_conn_t *conn)
 {
     if (duct_conn_state(conn) & (fl_conn_closed | fl_conn_suspended | fl_conn_rx_full))
         return;
-    auto ln = duct_mpsc_lane(conn->inter_lane, 0u);
+    auto ln = duct_mpsc_lane(duct_conn_lane(conn), 0u);
     if (duct_vmq_room(&ln) != ln.capacity) {
         s_device_stall(conn);
         return;
     }
     auto t = s_io_this;
-    auto leg = (device_leg_t *)conn->ctx;
+    auto leg = duct_conn_device_leg(conn);
     auto dev = &leg->ops;
-    auto pool = &leg->rx_slots;
+    auto pool = &t->device_rx;
     /* A device signals one handle, and a device whose send ring just freed
      * room raises it too. Answering every wake with the TX nudge makes such
      * a device prompt without a second handle or a capability
@@ -4908,11 +4906,11 @@ static void s_device_drive(duct_conn_t *conn)
     for (unsigned pass = 0u; pass < duct_dgram_rx_max_passes; ++pass) {
         if (leg->n_held && duct_vmq_room(&ln) == ln.capacity)
             s_device_holds_release(leg);
-        duct_view_u8 views[device_rx_batch];
-        uint32_t slot = duct_x_slot_acquire(pool);
+        duct_view_u8 views[duct_device_rx_batch];
+        uint32_t slot = dev->rx_span ? duct_x_slot_acquire(pool) : treiber_empty;
         s_device_carve(pool, slot, dev->rx_span, views);
         unsigned n = 0u;
-        auto rc = dev->read(dev->ctx, views, device_rx_batch, &n);
+        auto rc = dev->read(dev->ctx, views, duct_device_rx_batch, &n);
         duct_do_if(rc == rc_closed,
                    duct_x_slot_release(pool, slot);
                    duct_io_conn_close(conn, close_io_error); return);
@@ -4921,8 +4919,8 @@ static void s_device_drive(duct_conn_t *conn)
             return;
         }
         /* Clamped, not trusted: bufs holds exactly this many. */
-        if (n > device_rx_batch)
-            n = device_rx_batch;
+        if (n > duct_device_rx_batch)
+            n = duct_device_rx_batch;
         uint32_t slot_mask = 0u;
         unsigned lent = 0u;
         bool desc = s_device_split(pool, slot, views, n, &slot_mask, &lent)
@@ -4943,7 +4941,7 @@ static void s_device_drive(duct_conn_t *conn)
             s_device_stall(conn);
             return;
         }
-        if (n < device_rx_batch)
+        if (n < duct_device_rx_batch)
             return;
     }
     auto ch = duct_conn_handle_get(conn);
@@ -4953,7 +4951,7 @@ static void s_device_drive(duct_conn_t *conn)
 void duct_io_on_device(void *tag)
 {
     auto conn = s_conn_from_tag(tag);
-    duct_do_if(!conn || !conn->ctx, return);
+    duct_do_if(!conn || !duct_conn_device_ops(conn), return);
     s_device_drive(conn);
 }
 
@@ -4966,7 +4964,7 @@ void duct_io_on_event(duct_io_event_t *ev)
         s_conn_close(t, conn, close_io_error);
         return;
     }
-    if (conn->xport_type == x_inter && conn->ctx) {
+    if (conn->xport_type == x_inter && duct_conn_device_ops(conn)) {
         s_device_drive(conn);
         return;
     }
@@ -4989,7 +4987,7 @@ void duct_io_on_relocate(duct_io_tag_t kind, void *tag, void *io_priv)
     duct_do_if(!conn, return);
     if (!duct_conn_rx_olb(conn))
         return;
-    conn->rx_buf->h.ext_ptr = conn->tx_buf->h.ext_ptr = io_priv;
+    duct_conn_rx_olb(conn)->h.ext_ptr = duct_conn_tx_olb(conn)->h.ext_ptr = io_priv;
 }
 
 /** @brief Test whether a listener of @p t ahead of @p upto reads into RX pool @p pool.
@@ -5013,7 +5011,7 @@ static bool s_pool_listed_before(const duct_io_t *t, const duct_listener_t *upto
 static constexpr uint64_t s_slot_sweep_ns = 1'000'000'000u;
 
 /** @brief Sweep every slot pool @p t holds: the RX pool of each listener, the two TX pools of each
- *  listener and the read slots of each device leg.
+ *  listener and the thread's one device rx pool.
  *  A swept RX pool resumes its stalled reader, and swept TX pools drain their listener's lanes
  *  again, since the sweep leaves a pool dry for a moment.
  */
@@ -5032,9 +5030,13 @@ static void s_pools_sweep(duct_io_t *t)
         if (taken)
             duct_discard duct_events_dgram_tx_kick(t->trunk.events, l);
     }
-    for (auto leg = t->devices; leg; leg = leg->next)
-        duct_discard duct_x_slot_pool_sweep(&leg->rx_slots);
+    if (t->device_rx_live)
+        duct_discard duct_x_slot_pool_sweep(&t->device_rx);
 }
+
+/** @brief Conn-pool sweep work one io tick may take — a run word or a dirty
+ *  block — bounding the stepper's syscall spike on the io pass. */
+static constexpr uint32_t conn_sweep_quota = 1u;
 
 uint32_t duct_io_on_tick(void)
 {
@@ -5043,6 +5045,8 @@ uint32_t duct_io_on_tick(void)
     duct_atomic_store(&t->trunk.parked, false, relaxed);
     if (duct_atomic_load(&t->trunk.stack.top, relaxed))
         duct_io_on_wake();
+    if (!t->route.thread_id)
+        duct_conn_pool_sweep(conn_sweep_quota);
     auto now = duct_time_from_ns(duct_ticks_mono_ns());
     duct_timers_drain_at(&t->timers, now);
     duct_timers_maybe_trim(&t->timers);
@@ -5082,10 +5086,10 @@ static duct_nonnull(1) void s_request_shutdown(duct_io_t *t)
  *  A device leg leaves its thread's device list first. */
 static void s_conn_deregister(duct_io_t *t, duct_conn_t *conn)
 {
-    if (conn->xport_type == x_inter && conn->ctx) {
+    if (conn->xport_type == x_inter && duct_conn_device_ops(conn)) {
         s_device_unlink(t, conn);
         duct_events_unwatch_device(t->trunk.events,
-            ((const duct_device_ops_t *)conn->ctx)->wait_handle);
+            duct_conn_device_ops(conn)->wait_handle);
         return;
     }
     auto rx = duct_conn_rx_olb(conn);
@@ -5199,10 +5203,20 @@ bool duct_io_init(unsigned n_io, duct_vmq_mpsc_t *wfq, unsigned n_workers)
             return false;
         t->rx_resume.msg = duct_msg_init_embedded(s_msg_exec_rx_resume);
         /* A cache line of its own: the kernel writes this block on every vnet read of
-         * its thread, and the threads' blocks are allocated back to back. */
+         *  its thread, and the threads' blocks are allocated back to back. */
         t->vnet_hdr = duct_new(uint8_t, duct_vnet_hdr_max, duct_cacheline_size);
         if (!t->vnet_hdr)
             return false;
+        auto slab = &t->pre_conn_slab;
+        slab->slots = duct_new(duct_pre_conn_t, duct_preconn_slots);
+        slab->peeks = duct_new(uint8_t,
+                               (size_t)duct_preconn_slots * duct_preconn_peek_max);
+        slab->free_stack = duct_new(uint32_t, duct_preconn_slots);
+        if (!duct_at(slab->slots) || !duct_at(slab->peeks) || !duct_at(slab->free_stack))
+            return false;
+        slab->n = slab->free_n = duct_preconn_slots;
+        for (uint32_t s = 0u; s < duct_preconn_slots; ++s)
+            duct_at(slab->free_stack)[s] = duct_preconn_slots - 1u - s;
     }
     return true;
 }
@@ -5461,6 +5475,14 @@ void duct_io_cleanup(void)
          * also frees batch_buf — belt-and-suspenders for anything the
          * loop missed. */
         duct_frame_rx_ctx_destroy(&t->frame_rx);
+        duct_del(t->pre_conn_slab.slots);
+        duct_del(t->pre_conn_slab.peeks);
+        duct_del(t->pre_conn_slab.free_stack);
+        t->pre_conn_slab = (duct_pre_conn_slab_t){};
+        if (t->device_rx_live) {
+            duct_x_slot_pool_free(&t->device_rx);
+            t->device_rx_live = false;
+        }
         duct_del(t->vnet_hdr);
         duct_del(t->dgram_scratch);
         duct_timers_destroy(&t->timers);

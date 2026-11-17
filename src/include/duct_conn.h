@@ -278,9 +278,9 @@ typedef struct duct_sealed_conn_ctx {
 
     /** @brief Worker codec instance.
      *  Nullptr until the first sealed-wire task on this conn
-     *  creates it via @c wire->create_codec; destroyed via
-     *  @c codec->destroy at conn-lost consume, wire-rebind fence
-     *  or final teardown.
+     *  builds it via @c wire->init_codec in the conn block's codec
+     *  slot; released via @c codec->release at conn-lost consume,
+     *  wire-rebind fence or final teardown.
      */
     duct_wire_codec_t *codec;
 
@@ -338,9 +338,7 @@ typedef struct duct_conn {
          *  io thread that wins the acquire-CAS to @c fence_quiescing
          *  observes it complete.
          */
-        duct_handle_t   session_token;
-
-        uint32_t _Atomic  next_free; /**< Free-list link for Treiber stack. */
+        duct_handle_t _Atomic session_token;
 
         /** @brief Host-thread readers currently pinning this conn.
          *  Unregistered readers, e.g. @ref duct_io_inter_batch,
@@ -367,37 +365,11 @@ typedef struct duct_conn {
     );  /* CL0 — lifecycle + io thread registry */
 
     duct_cacheline_struct(
-        duct_sock_t fd; /**< Conn socket descriptor. */
-        union {
-            struct {
-                duct_olb_rx_t *rx_buf; /**< Receive buffer. */
-                duct_olb_tx_t *tx_buf; /**< Transmit buffer. */
-            };
-
-            /** @brief What a leg with no OLB pair carries in their place.
-             *  Live exactly when @c rx_buf / @c tx_buf are not, decided by
-             *  @c xport.
-             */
-            struct {
-                /** @brief Dedicated MPSC ingress queue.
-                 *  A single lane carrying @c x_inter packets — pushed by a
-                 *  host thread, or by the io thread draining a device leg —
-                 *  and @c x_udp_shared classified datagrams.
-                 */
-                duct_vmq_mpsc_t *inter_lane;
-
-                /** @brief Commit ordering for a leg with no TX OLB to hold
-                 *  it, over @c tx_buf's word.
-                 *  @c duct_olb_tx_t keeps the same pair for the legs that do
-                 *  have one, so which word a ticket lives in follows the
-                 *  xport and nothing reads either as the other. Zeroed by
-                 *  @ref duct_conn_acquire @c tx_buf reset, enabling immediate
-                 *  ticket issuance on newly acquired slots.
-                 */
-                struct { uint32_t next,
-                                  serve; } tx_seq;
-            };
-        };
+        duct_sock_t fd; /**< Conn socket descriptor. The rx and tx rings, an
+                          *  inter lane and the small ctx live at fixed
+                          *  page-0 offsets of the conn's block, addressed
+                          *  through @ref duct_conn_block.h; the xport alone
+                          *  decides which of them is live. */
 
         const duct_wire_t  *wire; /**< Bound wire for RX parse + TX pack.
                                     *  Set by @ref duct_conn_bind_wire at
@@ -418,16 +390,6 @@ typedef struct duct_conn {
          *  which has no other synchronization with the worker's write.
          */
         const duct_proto_t * _Atomic wire_rebind_next;
-        
-        /** @brief Xport-specific context, keyed by @c xport_type.
-         *  @ref duct_dgram_shared_ctx_t on @c x_udp_shared and
-         *  @ref duct_device_ops_t on a device-backed @c x_inter, each
-         *  allocated at attach and freed with the conn; the borrowed
-         *  @c duct_listener_t of an accepted @c x_local conn, set by
-         *  @ref duct_local_listener_take and cleared by its drop. Nullptr
-         *  for every other xport.
-         */
-        void *ctx;
 
         /** @brief Transport kind of @c fd.
          *  Drives per-conn I/O dispatch across the OS backends;
@@ -501,10 +463,6 @@ typedef struct duct_dgram_shared_ctx {
     duct_listener_t *listener; /**< Listener back-reference. */
     duct_peer_t      peer;     /**< This leg's current peer address,
                                  *  updated on every migration. */
-    struct duct_x_slot_pool *rx_pin; /**< Pool whose @c pins count this conn's
-                                 *  lane as held behind a parked answer, null
-                                 *  for none. Written by the conn's worker;
-                                 *  teardown takes a standing pin back. */
 } duct_dgram_shared_ctx_t;
 
 /** @brief True when @p conn's live union arm is @c rx_buf / @c tx_buf.
@@ -574,24 +532,6 @@ duct_nonnull(1) static inline bool duct_conn_peer_socket(const duct_conn_t *conn
         return false;
     }
     return false;
-}
-
-/** @brief @p conn's RX ring; nullptr on an xport without one. */
-duct_nonnull(1) static inline duct_olb_rx_t *duct_conn_rx_olb(const duct_conn_t *conn)
-{
-    return duct_conn_has_olb(conn) ? conn->rx_buf : nullptr;
-}
-
-/** @brief @p conn's TX ring; nullptr on an xport without one. */
-duct_nonnull(1) static inline duct_olb_tx_t *duct_conn_tx_olb(const duct_conn_t *conn)
-{
-    return duct_conn_has_olb(conn) ? conn->tx_buf : nullptr;
-}
-
-/** @brief @p conn's inter lane; nullptr on an xport without one. */
-duct_nonnull(1) static inline duct_vmq_mpsc_t *duct_conn_lane(const duct_conn_t *conn)
-{
-    return duct_conn_has_olb(conn) ? nullptr : conn->inter_lane;
 }
 
 /** @brief Resolve @p conn's sealed-wire state.
@@ -683,14 +623,14 @@ duct_gen_req_reason_set(duct_conn_t *conn,
 duct_nonnull(1) static inline bool
 duct_conn_session_bind(duct_conn_t *conn, duct_handle_t tok)
 {
-    conn->session_token = tok;
+    duct_atomic_store(&conn->session_token, tok, release);
     duct_conn_fence_t expected = fence_unbound;
     if (duct_atomic_cas(strong, &conn->conn_fence, &expected,
                         fence_open, release, acquire)) {
         duct_atomic_store(&conn->bound_worker, conn->worker_id + 1u, relaxed);
         return true;
     }
-    conn->session_token = handle_null;
+    duct_atomic_store(&conn->session_token, handle_null, release);
     return false;
 }
 
@@ -701,7 +641,7 @@ duct_conn_session_bind(duct_conn_t *conn, duct_handle_t tok)
 duct_nonnull(1) static inline void
 duct_conn_session_unbind(duct_conn_t *conn)
 {
-    conn->session_token = handle_null;
+    duct_atomic_store(&conn->session_token, handle_null, release);
     duct_atomic_store(&conn->bound_worker, 0u, relaxed);
 }
 

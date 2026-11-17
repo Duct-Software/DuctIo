@@ -57,21 +57,26 @@ typedef enum : uint8_t { scope_leg, scope_session, scope_peer, scope_malformed }
 static atomic_int    g_opened;
 static atomic_int    g_lost;
 static duct_handle_t g_tok;
-static uint8_t       g_scratch[frame_size];
+/* One frame buffer per frame of the run, so a parked answer can carry its
+ * bytes as fl_send_static: the conn block's TX retry copy region parks a
+ * bounded number of copy-mode payloads per conn (DUCT_CONN_RETRY_TX_COPIES),
+ * and this scenario's point is the close's order behind dozens of parked
+ * frames, not the copy itself. Each buffer is written once and read until its
+ * frame leaves, exactly what fl_send_static promises. */
+static uint8_t       g_frames[frame_count][frame_size];
 
 static uint8_t s_fill_byte(uint32_t i)
 {
     return (uint8_t)(i * 13u + 5u);
 }
 
-/** @brief Frame @p i of the run into @p out; the commit copies the shared
- *  scratch before the next frame is built. */
+/** @brief Frame @p i of the run into @p out, on its own static buffer. */
 static void s_frame(duct_response_t *out, uint32_t i)
 {
-    memcpy(g_scratch, &i, sizeof i);
-    memset(g_scratch + sizeof i, s_fill_byte(i), frame_size - sizeof i);
-    duct_response_same(out, duct_view(duct_view_u8, g_scratch, frame_size),
-                       fl_send_copy, 0);
+    memcpy(g_frames[i], &i, sizeof i);
+    memset(g_frames[i] + sizeof i, s_fill_byte(i), frame_size - sizeof i);
+    duct_response_same(out, duct_view(duct_view_u8, g_frames[i], frame_size),
+                       fl_send_static, 0);
 }
 
 static duct_result_t

@@ -404,17 +404,6 @@ duct_nonnull(1) void duct_io_dgram_tx_kick_init(duct_listener_t *listener);
  */
 duct_nonnull(1) void duct_io_rx_slot_drop(duct_x_slot_pool_t *pool, uint32_t idx, bool claim);
 
-/** @brief Count one conn whose lane its worker holds behind a parked answer
- *  into @p pool's pins.
- *  While pinned, the pool reader copies unslotted datagrams directly and
- *  resumes an active stall. A conn counts into one pool at most, tracked
- *  on the worker.
- */
-duct_nonnull(1) void duct_io_rx_pin(duct_x_slot_pool_t *pool);
-
-/** @brief Take one count back out of @p pool's pins. */
-duct_nonnull(1) void duct_io_rx_unpin(duct_x_slot_pool_t *pool);
-
 /** @brief The request-exec function a conn pool slot binds to.
  *  The I/O request executor bound across each slot's embedded @c req_msg
  *  in @c duct_conn_pool_ctor.

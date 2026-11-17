@@ -117,46 +117,18 @@ static_assert(sizeof(duct_olb_hdr_t) % duct_cacheline_size == 0u,
 /** @brief Declare one OLB variant. @p tag is the struct name.
  *
  *  The struct starts with @ref duct_olb_hdr_t, then the variant's own
- *  fields from @c __VA_ARGS__, then a flexible array member @c data[] for
- *  the buffer itself. @c __VA_ARGS__ gets one cache line by default; nest
- *  @ref duct_cacheline_struct, or @ref duct_cacheline_struct_ext for a
+ *  fields from @c __VA_ARGS__; the buffer region lives outside the struct,
+ *  a carved region of the owning conn block, whose fixed page-0 placement
+ *  lets the writing entries of @c duct_conn_block.h resolve its base from
+ *  the header's own address. @c __VA_ARGS__ gets one cache line by default;
+ *  nest @ref duct_cacheline_struct, or @ref duct_cacheline_struct_ext for a
  *  named remainder, around each group if the variant needs more than one.
  */
 #define duct_olb_decl(tag, ...)                         \
     typedef struct tag {                                \
         duct_olb_hdr_t h;                               \
         duct_cacheline_struct(__VA_ARGS__);             \
-        uint8_t data[];                                    \
     } tag##_t
-
-/** @brief Allocate one variant in a single mapping and run @p initializer.
- *
- *  The mapping covers the header declared by @ref duct_olb_decl, the variant's
- *  own fields, and the flexible array member. @p capacity is the logical byte
- *  capacity; 0 defaults to 1 MiB, and the mapping is rounded up to a whole
- *  page. The ceiling is 4 GiB, set by @c duct_olb_hdr_t::stage being a 32-bit
- *  cursor.
- */
-#define duct_olb_new(type, capacity, initializer)                   \
-    ((type *)({                                                     \
-        uint32_t _cap = (uint32_t)(capacity),                       \
-                 _total = 0u;                                       \
-        if (!_cap)                                                  \
-            _cap = mbytes(1u);                                      \
-        type *_out = nullptr;                                       \
-        if (!duct_ckd_add(&_total, sizeof(type), _cap)) {           \
-            duct_vm_handle_t _vm = duct_vm_new(_total);             \
-            if (_vm.base) {                                         \
-                auto _o = (type *)_vm.base;                         \
-                *_o = (type){};                                     \
-                _o->h.total_size = _vm.size;                        \
-                _o->h.buf_size = _vm.size - offsetof(type, data);   \
-                initializer(_o);                                    \
-                _out = _o;                                          \
-            }                                                       \
-        }                                                           \
-        _out;                                                       \
-    }))
 
 /** @brief Mark @p hdr as having a live in-flight io operation.
  *
@@ -186,7 +158,8 @@ duct_olb_io_done(duct_olb_hdr_t *hdr)
     auto prev = duct_atomic_fetch(and, &hdr->lifecycle, duct_not(fl_olb_io_busy), acq_rel);
     if (!duct_has(prev, fl_olb_delete_req))
         return false;
-    duct_vm_del(&(duct_vm_handle_t){ .base = hdr, .size = hdr->total_size });
+    if (hdr->total_size)
+        duct_vm_del(&(duct_vm_handle_t){ .base = hdr, .size = hdr->total_size });
     return true;
 }
 
@@ -203,7 +176,8 @@ duct_nonnull(1) static inline bool duct_olb_del(duct_olb_hdr_t *hdr)
     auto prev = duct_atomic_fetch(or, &hdr->lifecycle, fl_olb_delete_req, acq_rel);
     if (duct_has(prev, fl_olb_io_busy))
         return false;
-    duct_vm_del(&(duct_vm_handle_t){ .base = hdr, .size = hdr->total_size });
+    if (hdr->total_size)
+        duct_vm_del(&(duct_vm_handle_t){ .base = hdr, .size = hdr->total_size });
     return true;
 }
 

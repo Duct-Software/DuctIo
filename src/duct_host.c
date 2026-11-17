@@ -16,6 +16,7 @@
 
 #include "duct_relay.h"
 #include "duct_host.h"
+#include "duct_conn_block.h"
 #include "duct_ticks.h"
 #include "duct_session.h"
 #include "duct_vmq.h"
@@ -247,7 +248,7 @@ duct_result_t duct_io_inter_batch(duct_engine_t *e, duct_handle_t tok,
      * id, never unmapped, so a full close and reuse by a brand-new session
      * between the resolve above and this conns[] read silently repoints
      * conn_id at the new session's leg. generation advances only on that
-     * exact closing -> quarantine -> free -> re-acquire transition, so
+     * exact closing -> dead -> free -> re-acquire transition, so
      * re-checking it against the token's snapshot proves the read did not
      * race a reuse; a mismatch means it did, and h must be discarded. */
     duct_do_if(duct_atomic_load(&s->generation, acquire) != stok.gen, return rc_closed);
@@ -287,8 +288,7 @@ duct_result_t duct_io_inter_batch(duct_engine_t *e, duct_handle_t tok,
         duct_atomic_fetch(sub, &live->host_pins, 1u, release);
         return rc_closed;
     }
-    auto lane = live->inter_lane;
-    auto ln = duct_mpsc_lane(lane, 0u);
+    auto ln = duct_mpsc_lane(duct_conn_lane(live), 0u);
     duct_vmq_reserve_pos_t pos;
     duct_vmq_push_rc_t push_rc;
     /* Reserve space directly in the lane: payload bytes copy once from host
@@ -320,6 +320,7 @@ duct_result_t duct_io_inter_batch(duct_engine_t *e, duct_handle_t tok,
         cursor += pkt->payload.size;
     }
     duct_vmq_publish(&ln, &pos);
+    duct_conn_lane_staged(live, pos.aligned);
     /* Mark then notify, both still pinned: duct_vmq_notify derefs ln.ctrl,
      * which lives inside the inter_lane allocation, and duct_conn_reclaim
      * frees that once host_pins hits zero. Bit before wake, and

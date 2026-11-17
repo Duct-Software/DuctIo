@@ -43,15 +43,30 @@
 
 /** @brief Longest wait for an event, milliseconds. */
 static constexpr unsigned wait_ms = 5000u;
+/** @brief Longest wait for the fill replies to saturate the kernel windows and
+ *  park, milliseconds: a loaded engine's worker can take well past the plain
+ *  event budget to stage ten-plus mebibytes of them. */
+static constexpr unsigned park_wait_ms = 15000u;
 /** @brief Token bit asking @c on_timer to arm the next step of a chain. */
 static constexpr uint32_t chain   = 1u << 16;
 /** @brief Token bit asking @c on_timer to send the chunk. */
 static constexpr uint32_t sends   = 1u << 17;
-/** @brief Fill commands a parked scenario sends ahead of its timers: their
- *  replies outgrow the ring and a 4 MB kernel send buffer together, so one parks. */
-static constexpr unsigned fills   = 128u;
-/** @brief TX ring capacity the protocol asks of a conn, bytes. */
-static constexpr size_t   ring_cap = (size_t)1u << 20u;
+/** @brief TX ring capacity the protocol asks of a conn, bytes: the build's
+ *  per-conn ceiling, which a carved tx region can never exceed. */
+static constexpr size_t   ring_cap = duct_conn_tx_olb_cap;
+/** @brief Reply payload an 'f' command sends back, bytes. */
+static constexpr size_t   chunk    = 65536u;
+/** @brief Kernel window the fill run must outgrow: the autotune maxima a
+ *  Linux peer that reads nothing reaches on both ends of the loopback — six
+ *  mebibytes of receive plus four of send, read off the runner's own sysctl —
+ *  and the four-mebibyte send buffer the engine's Windows and darwin legs
+ *  pin. */
+static constexpr size_t   kernel_window = (size_t)10u << 20u;
+/** @brief Ceiling on the fill commands adaptive filling may send: the ring
+ *  plus four times the kernel window, past which the runner's window is not
+ *  the documented one and the scenario fails by name. */
+static constexpr unsigned fills_max =
+    (unsigned)((ring_cap + 4u * kernel_window) / chunk) + 8u;
 
 /** @brief One command, the payload of a client frame. */
 typedef struct {
@@ -79,7 +94,7 @@ static atomic_uint   g_log[64];
 /** @brief Handle of the session the scenario runs on. */
 static duct_handle_t g_tok;
 /** @brief Payload of the reply an 'f' command asks for. */
-static uint8_t       g_chunk[65536];
+static uint8_t       g_chunk[chunk];
 /** @brief Id of the timer the last 'n' command started; the worker writes and reads it. */
 static duct_timer_id_t g_id;
 
@@ -217,9 +232,9 @@ typedef const char *(*scenario_t)(link_t *link);
  */
 static const char *sc_replace(link_t *link)
 {
-    expect(s_send(link->fd, 'a', 1u, 300u, 0u, 11u) && s_send(link->fd, 'a', 1u, 100u, 0u, 22u), "send failed");
+    expect(s_send(link->fd, 'a', 1u, 3000u, 0u, 11u) && s_send(link->fd, 'a', 1u, 100u, 0u, 22u), "send failed");
     expect(th_wait_int(&g_fires, 1, wait_ms), "the replacing timer never fired");
-    th_sleep_ms(500u);
+    th_sleep_ms(3300u);
     expect(duct_atomic_load(&g_fires, acquire) == 1 && s_count(22u) == 1u,
            "a timer replaced under its key fired, or the replacing one fired twice");
     return nullptr;
@@ -243,10 +258,10 @@ static const char *sc_keys(link_t *link)
  */
 static const char *sc_cancel(link_t *link)
 {
-    expect(s_send(link->fd, 'a', 3u, 300u, 0u, 3u) && s_send(link->fd, 'c', 3u, 0u, 0u, 0u)
+    expect(s_send(link->fd, 'a', 3u, 3000u, 0u, 3u) && s_send(link->fd, 'c', 3u, 0u, 0u, 0u)
                && s_send(link->fd, 'c', 99u, 0u, 0u, 0u),
            "send failed");
-    th_sleep_ms(700u);
+    th_sleep_ms(3300u);
     expect(duct_atomic_load(&g_fires, acquire) == 0, "a timer cancelled under its key fired");
     expect(s_send(link->fd, 'a', 3u, 50u, 0u, 4u) && th_wait_int(&g_fires, 1, wait_ms),
            "a key cancelled and armed again never fired");
@@ -258,12 +273,12 @@ static const char *sc_cancel(link_t *link)
  */
 static const char *sc_cancel_id(link_t *link)
 {
-    expect(s_send(link->fd, 'n', 1u, 300u, 0u, 1u), "send failed");
+    expect(s_send(link->fd, 'n', 1u, 3000u, 0u, 1u), "send failed");
     for (uint32_t k = 2u; k < 9u; ++k)
         expect(s_send(link->fd, 'a', k, 60'000u, 0u, k), "send failed");
     expect(s_send(link->fd, 'x', 0u, 0u, 0u, 0u) && s_send(link->fd, 'a', 9u, 50u, 0u, 9u), "send failed");
     expect(th_wait_int(&g_fires, 1, wait_ms), "a key was refused once the timer holding a slot was cancelled by its id");
-    th_sleep_ms(500u);
+    th_sleep_ms(3300u);
     expect(duct_atomic_load(&g_fires, acquire) == 1 && s_count(9u) == 1u,
            "the timer cancelled by its id fired, or the ninth key fired twice");
     return nullptr;
@@ -347,21 +362,41 @@ static const char *sc_interval(link_t *link)
     return nullptr;
 }
 
-/** @brief Wait until the primary leg's ring has stayed over half full, unmoved, for 100 ms.
- *  @return false when the session cannot be reached or the ring does not hold within the wait.
+/** @brief Fill the ring behind a peer that reads nothing: send 'f' commands
+ *  in batches until the ring has held a frozen residue, unmoved, for 100 ms,
+ *  then report the last read and the fills that went. A frozen residue is
+ *  the mark of a saturated kernel window: the residue leaves the ring no
+ *  room for a whole reply frame, wherever between zero and a full chunk the
+ *  window cut the stream, which a half-full probe cannot promise.
+ *  @return false when a send fails, the session cannot be reached, or the
+ *  ring does not hold within the wait.
  */
-static bool s_ring_holds(duct_engine_t *io)
+/* AI-generated test code. */
+static bool s_ring_fill_hold(duct_engine_t *io, duct_sock_t fd, ring_t *out_last,
+                             unsigned *out_sent)
 {
     ring_t r = {};
     size_t last = SIZE_MAX;
-    unsigned still = 0u;
-    for (unsigned waited = 0u; waited < wait_ms && still < 100u; waited += 10u) {
+    unsigned still = 0u, sent = 0u;
+    unsigned batch = (unsigned)(kernel_window / chunk / 4u);
+    for (unsigned waited = 0u; waited < park_wait_ms && still < 100u; waited += 10u) {
+        if (sent < fills_max && r.queued == 0u) {
+            unsigned n = batch < fills_max - sent ? batch : fills_max - sent;
+            for (unsigned i = 0u; i < n; ++i)
+                if (!s_send(fd, 'f', 0u, 0u, 0u, 0u))
+                    return false;
+            sent += n;
+        }
         if (duct_session_invoke_sync(io, g_tok, ring_fn, &r) != rc_ok)
             return false;
-        still = r.queued == last && r.queued > r.cap / 2u ? still + 10u : 0u;
+        still = r.queued == last && r.queued > 0u ? still + 10u : 0u;
         last = r.queued;
         th_sleep_ms(10u);
     }
+    if (out_last)
+        *out_last = r;
+    if (out_sent)
+        *out_sent = sent;
     return still >= 100u;
 }
 
@@ -383,15 +418,19 @@ static bool s_drain(duct_sock_t fd, unsigned n)
 }
 
 /** @brief Fill the ring and let a key-20 fire park its chunk behind the fill replies.
- *  Its ticket comes after the fill reply that parked, so the chunk parks however
- *  much room the ring has left.
+ *  Filling adapts to the kernel window the runner actually grants: fills go
+ *  out in batches until the ring observably holds, and @p sent reports how
+ *  many went. The key-20 chunk's ticket comes after the fill reply that
+ *  parked, so the chunk parks however much room the ring has left.
  *  @return the text of the first failed check, nullptr when all hold.
  */
-static const char *s_park_timer_chunk(link_t *link)
+static const char *s_park_timer_chunk(link_t *link, unsigned *sent)
 {
-    for (unsigned i = 0u; i < fills; ++i)
-        expect(s_send(link->fd, 'f', 0u, 0u, 0u, 0u), "send failed");
-    expect(s_ring_holds(link->io), "the ring never filled behind a peer that reads nothing");
+    ring_t last = {};
+    if (!s_ring_fill_hold(link->io, link->fd, &last, sent))
+        return last.queued > 0u
+            ? "the ring filled behind a peer that reads nothing but never held still"
+            : "the ring never filled behind a peer that reads nothing";
     cmd_t chunk = { .op = 'a', .key = 20u, .delay = 50u, .arg = sends | 20u };
     expect(duct_session_invoke_sync(link->io, g_tok, apply_fn, &chunk) == rc_ok, "the timer was not armed");
     expect(th_wait_int(&g_fires, 1, wait_ms), "a timer waited for room in a full ring");
@@ -403,7 +442,8 @@ static const char *s_park_timer_chunk(link_t *link)
  */
 static const char *sc_parked(link_t *link)
 {
-    auto err = s_park_timer_chunk(link);
+    unsigned sent = 0u;
+    auto err = s_park_timer_chunk(link, &sent);
     if (err)
         return err;
     cmd_t armed[2] = { { .op = 'a', .key = 21u, .delay = 50u, .arg = 21u },
@@ -416,7 +456,7 @@ static const char *sc_parked(link_t *link)
            "a timer fired while the session's last timer chunk waited parked");
     cmd_t cancel = { .op = 'c', .key = 21u };
     expect(duct_session_invoke_sync(link->io, g_tok, apply_fn, &cancel) == rc_ok, "the timer was not cancelled");
-    expect(s_drain(link->fd, fills + 1u), "the chunks did not all drain");
+    expect(s_drain(link->fd, sent + 1u), "the chunks did not all drain");
     for (unsigned waited = 0u; waited < wait_ms && !s_count(22u); waited += 10u)
         th_sleep_ms(10u);
     expect(s_count(22u) == 1u, "a waiting timer did not fire once the parked chunk left");
@@ -432,7 +472,8 @@ static const char *sc_parked(link_t *link)
  */
 static const char *sc_pinned(link_t *link)
 {
-    auto err = s_park_timer_chunk(link);
+    unsigned sent = 0u;
+    auto err = s_park_timer_chunk(link, &sent);
     if (err)
         return err;
     cmd_t held = { .op = 'a', .key = 21u, .delay = 50u, .arg = 21u };
@@ -447,7 +488,7 @@ static const char *sc_pinned(link_t *link)
     }
     cmd_t extra = { .op = 'a', .key = 40u, .delay = 50u, .arg = 40u };
     expect(duct_session_invoke_sync(link->io, g_tok, apply_fn, &extra) == rc_ok, "the ninth timer was not armed");
-    expect(s_drain(link->fd, fills + 1u), "the chunks did not all drain");
+    expect(s_drain(link->fd, sent + 1u), "the chunks did not all drain");
     for (unsigned waited = 0u; waited < wait_ms && !s_count(21u); waited += 10u)
         th_sleep_ms(10u);
     th_sleep_ms(300u);
@@ -474,7 +515,7 @@ int main(void)
     auto wire = duct_wire_create_length_prefix(0u);
     auto proto = wire ? duct_proto_create(&(duct_proto_cfg_t){
         .name = "timer-key", .wire = wire, .on_frame = on_frame, .on_timer = on_timer,
-        .on_session_open = on_session_open, .max_response = ring_cap / 2u, .tx_olb_cap = ring_cap,
+        .on_session_open = on_session_open, .max_response = chunk, .tx_olb_cap = ring_cap,
     }) : nullptr;
     if (!proto) {
         fprintf(stderr, "timer_key: proto create failed\n");

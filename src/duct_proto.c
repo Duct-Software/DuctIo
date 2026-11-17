@@ -93,6 +93,7 @@ duct_proto_t *duct_proto_create(const duct_proto_cfg_t *cfg)
 {
     duct_do_if(!cfg, return nullptr);
     duct_do_if(!cfg->on_frame && !cfg->on_work && !cfg->on_timer, return nullptr);
+    duct_fatal(cfg->tx_olb_cap > duct_conn_tx_olb_cap);
     if (cfg->on_frame) {
         /* preparse without a mode is a config error; mode without preparse is ignored. */
         duct_do_if(cfg->preparse && cfg->preparse_mode == resolve_none, return nullptr);

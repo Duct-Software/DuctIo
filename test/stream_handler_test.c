@@ -296,7 +296,7 @@ static void test_handler_ctx_lifecycle(void)
     auto s = duct_session_open(proto, duct_conn_id_primary,
                                handle, nullptr, 0u, &out);
     CHECK(s, "s");
-    CHECK(s->streams, "s->streams");
+    CHECK(duct_has(s->flags, fl_session_multiplexed), "streams region initialized");
 
     /* Claim stream 5. */
     duct_stream_t *st = duct_session_stream_claim(s, 5u, &out, nullptr);

@@ -64,6 +64,9 @@ static bool s_grow(duct_x_slot_pool_t *pool)
         uint32_t base = c * pool->chunk_slots,
                  cnt = s_chunk_count(pool, c);
         auto links = duct_at(pool->slots);
+        if (pool->pool_id != alloc_pool_none)
+            for (uint32_t k = 0u; k < cnt; ++k)
+                duct_slot_stamp(duct_x_slot_obj(pool, base + k), pool->pool_id, base + k);
         for (uint32_t k = 1u; k < cnt; ++k)
             duct_atomic_store(&links[base + k - 1u].next, base + k, relaxed);
         uint64_t head = duct_atomic_load(&pool->free_head, relaxed);
@@ -153,12 +156,16 @@ bool duct_x_slot_pool_sweep(duct_x_slot_pool_t *pool)
 }
 
 bool duct_x_slot_pool_init(duct_x_slot_pool_t *pool, uint32_t n, uint32_t slot_bytes,
-                           uint32_t lead, uint32_t chunk_slots, duct_x_slot_hooks_t hooks)
+                           uint32_t lead, uint32_t rec, uint32_t chunk_slots,
+                           duct_x_slot_hooks_t hooks)
 {
     *pool = (duct_x_slot_pool_t){};
     atomic_init(&pool->free_head, treiber_head_pack(0u, treiber_empty));
+    pool->pool_id = alloc_pool_none;
     duct_do_if(!n || !slot_bytes, return true);
-    duct_do_if(lead > slot_bytes, return false);
+    size_t word_off = duct_align_up((size_t)lead + duct_x_slot_word + rec, 8u);
+    duct_do_if(lead % 8u || slot_bytes % 8u, return false);
+    duct_do_if(word_off > slot_bytes, return false);
     size_t bytes = 0u;
     bool of = duct_ckd_mul(&bytes, (size_t)n, (size_t)slot_bytes);
     duct_do_if(of, return false);
@@ -177,9 +184,45 @@ bool duct_x_slot_pool_init(duct_x_slot_pool_t *pool, uint32_t n, uint32_t slot_b
     pool->hooks = hooks;
     pool->slot_bytes = slot_bytes;
     pool->lead = lead;
+    pool->payload_off = (uint32_t)word_off;
     pool->chunk_slots = per;
     pool->n_chunks = chunks;
     return true;
+}
+
+bool duct_x_slot_pool_engage(duct_x_slot_pool_t *pool)
+{
+    duct_do_if(!pool->range.base, return true);
+    duct_do_if(duct_len(pool->slots) > 1u << alloc_slot_bits, return false);
+    unsigned id = duct_slot_pool_register(pool);
+    duct_do_if(id == alloc_pool_none, return false);
+    pool->pool_id = id;
+    return true;
+}
+
+void duct_x_slot_pool_reap(duct_x_slot_pool_t *pool)
+{
+    uint32_t state = duct_atomic_load(&pool->retire_state, acquire);
+    while (state == pool_retire_retired) {
+        if (duct_atomic_load(&pool->outstanding, acquire) != 0u)
+            return;
+        uint32_t retired = pool_retire_retired;
+        if (duct_atomic_cas(weak, &pool->retire_state, &retired, pool_retire_reaped,
+                            acq_rel, relaxed)) {
+            pool->on_reap(pool);
+            return;
+        }
+        state = retired;
+    }
+}
+
+void duct_x_slot_pool_retire(duct_x_slot_pool_t *pool, void (*on_reap)(duct_x_slot_pool_t *))
+{
+    pool->on_reap = on_reap;
+    uint32_t live = pool_retire_live;
+    if (duct_atomic_cas(strong, &pool->retire_state, &live, pool_retire_retired,
+                        acq_rel, relaxed))
+        duct_x_slot_pool_reap(pool);
 }
 
 duct_x_slot_pool_t *
@@ -195,6 +238,10 @@ duct_x_slot_pool_publish(duct_x_slot_pool_t *_Atomic *slot, duct_x_slot_pool_t *
 
 void duct_x_slot_pool_free(duct_x_slot_pool_t *pool)
 {
+    if (pool->range.base && pool->pool_id != alloc_pool_none) {
+        duct_slot_pool_unregister(pool->pool_id);
+        pool->pool_id = alloc_pool_none;
+    }
     if (pool->range.base && pool->hooks.down)
         for (uint32_t c = 0u; c < pool->n_chunks; ++c)
             if (duct_at(pool->chunks)[c].cookie)
@@ -203,4 +250,5 @@ void duct_x_slot_pool_free(duct_x_slot_pool_t *pool)
     duct_del(pool->chunks);
     duct_del(pool->slots);
     *pool = (duct_x_slot_pool_t){};
+    pool->pool_id = alloc_pool_none;
 }

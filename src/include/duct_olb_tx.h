@@ -151,12 +151,6 @@ duct_olb_tx_cold_init(duct_olb_tx_t *tx)
     tx->pass_free = (uint32_t)tx->h.buf_size;
 }
 
-/** @brief Allocate a new transmit buffer with the given byte capacity. */
-static inline duct_olb_tx_t *duct_olb_tx_new(size_t capacity)
-{
-    return duct_olb_new(duct_olb_tx_t, capacity, duct_olb_tx_cold_init);
-}
-
 /** @brief Current @c min_room, bytes. */
 duct_nonnull(1) static inline size_t
 duct_olb_tx_min_room_get(const duct_olb_tx_t *tx)
@@ -422,58 +416,6 @@ duct_olb_tx_room_contig(const duct_olb_tx_t *tx, size_t need)
         || need <= duct_olb_tx_wrap_room(tx, head_g);
 }
 
-/** @brief Stage bytes, opening the next pass first when this one is out of
- *  room.
- *
- *  Copies @p hdr (if non-null) immediately followed by @p data (if
- *  @p len is nonzero) as one all-or-nothing span.
- */
-duct_nonnull(1) static inline duct_olb_tx_result_t
-duct_olb_tx_stage(duct_olb_tx_t *tx, const uint8_t *hdr,
-                  size_t hdr_size, const void *data, size_t len)
-{
-    auto h = &tx->h;
-    size_t total = (hdr ? hdr_size : 0u) + len;
-    if (total > h->buf_size)
-        return olb_tx_too_large;
-    if (!duct_olb_tx_align(tx, total))
-        return olb_tx_full;
-    auto off = tx->data + h->stage;
-    if (hdr) {
-        memcpy(off, hdr, hdr_size);
-        off += hdr_size;
-    }
-    if (len)
-        memcpy(off, data, len);
-    h->stage += total;
-    return olb_tx_ok;
-}
-
-/** @brief Reserve writable space at the staging cursor.
- *
- *  The caller writes directly into the returned span. Space must fit within
- *  the current pass without advancing past boundaries (@ref duct_olb_tx_align
- *  handles pass rollover).
- *
- *  @return Pointer to the reserved space;
- *          nullptr if @p len does not fit.
- */
-duct_nonnull(1) static inline void *
-duct_olb_tx_span_open(duct_olb_tx_t *tx, size_t len)
-{
-    auto h = &tx->h;
-    if (len > h->buf_size)
-        return nullptr;
-    if (h->stage + len > tx->pass_free) {
-        tx->pass_free = (uint32_t)duct_olb_tx_lim(tx, duct_atomic_load(&h->head, acquire));
-        if (h->stage + len > tx->pass_free)
-            return nullptr;
-    }
-    auto ptr = tx->data + h->stage;
-    h->stage += len;
-    return ptr;
-}
-
 /** @brief Publish the staging cursor into tail.
  *  Makes staged bytes visible to io and moves @c stream_end past them.
  */
@@ -521,21 +463,6 @@ duct_olb_tx_staged_since(const duct_olb_tx_t *tx, duct_olb_tx_mark_t mark)
          : olb_off(now);
 }
 
-/** @brief Overwrite @p size bytes ending at @p mark's position with
- *  @p data.
- *
- *  For writing a value that is only known after more data has already
- *  been staged, such as a length prefix: stage a placeholder, take a
- *  mark right after it, stage the payload, then call this once
- *  @ref duct_olb_tx_staged_since reports the payload's length.
- */
-duct_nonnull(1, 3) static inline void
-duct_olb_tx_backfill(duct_olb_tx_t *tx, duct_olb_tx_mark_t mark,
-                     const void *data, size_t size)
-{
-    memcpy(tx->data + olb_off(mark.staged) - size, data, size);
-}
-
 /** @brief Account for the worker sending its whole staged, unpublished span
  *  itself, and rewind staging onto tail.
  *  @c stream_end moves past the span; the buffer's bytes stay as they are. */
@@ -551,9 +478,9 @@ duct_olb_tx_sent_staged(duct_olb_tx_t *tx)
 
 /** @brief Report whether io has drained every published byte, and start a
  *  drained ring's next pass at offset 0.
- *  Bytes staged but not published keep their pass. A drained pass the one
- *  before outran by more than @c olb_tx_trim_div times gives the pages past
- *  its end, or past @c min_room where that lies further, back to the system.
+ *  Bytes staged but not published keep their pass. A carved region's pages
+ *  belong to its conn block: residency is the block pool's call, taken from
+ *  the touched counters at release, never the ring's own trim.
  *  Staging worker only. */
 duct_nonnull(1) static inline bool duct_olb_tx_rewind_idle(duct_olb_tx_t *tx)
 {
@@ -563,14 +490,7 @@ duct_nonnull(1) static inline bool duct_olb_tx_rewind_idle(duct_olb_tx_t *tx)
     size_t end = h->stage;
     if (!end || end != olb_off(duct_atomic_load(&h->tail, relaxed)))
         return true;
-    size_t prev = duct_atomic_load(&tx->pass_end, relaxed),
-           keep = duct_max(end, duct_olb_tx_min_room_get(tx));
     duct_olb_tx_wrap(tx, h->buf_size);
-    size_t from_off = duct_align_up(offsetof(duct_olb_tx_t, data) + keep, duct_page_size());
-    char *from = (char *)tx + from_off,
-         *last = (char *)tx + h->total_size;
-    if (prev > keep * olb_tx_trim_div)
-        duct_vm_discard(from, (size_t)(last - from));
     return true;
 }
 

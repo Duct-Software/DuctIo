@@ -28,6 +28,7 @@
 
 #include "duct_wire.h"
 #include "duct_wire_tx.h"
+#include "duct_conn_block.h"
 #include "duct_dgram_rec.h"
 #include "duct_olb_rx.h"
 #include "duct_olb_tx.h"
@@ -374,14 +375,12 @@ static size_t s_mux_dgram_pack_header([[maybe_unused]] const duct_wire_t *self,
 }
 
 
-static duct_wire_parser_t *s_lp_create_parser([[maybe_unused]] const duct_wire_t *self)
-{
-    return duct_new(duct_wire_parser_t);
-}
+static_assert(sizeof(duct_wire_parser_t) <= duct_wire_parser_slot,
+              "the length-prefix parser exceeds the conn block's parser slot");
 
-static void s_lp_destroy_parser([[maybe_unused]] const duct_wire_t *self, duct_wire_parser_t *parser)
+static void s_lp_init_parser([[maybe_unused]] const duct_wire_t *self,
+                             [[maybe_unused]] duct_wire_parser_t *storage)
 {
-    duct_del(parser);
 }
 
 static void s_lp_destroy(duct_wire_t *self)
@@ -400,12 +399,12 @@ duct_wire_t *duct_wire_create_length_prefix(size_t max_frame)
         .header_size      = sizeof(lp_hdr_t),
         .max_frame        = max_frame ? max_frame : lp_max_frame,
         .max_batch_frames = duct_conn_rx_olb_cap / sizeof(lp_hdr_t),
+        .parser_max       = sizeof(duct_wire_parser_t),
         .destroy          = s_lp_destroy,
         .on_parse         = s_lp_parse,
         .on_pack          = s_pack_frame,
         .pack_header      = s_lp_pack_header,
-        .create_parser    = s_lp_create_parser,
-        .destroy_parser   = s_lp_destroy_parser,
+        .init_parser      = s_lp_init_parser,
     };
     return w;
 }

@@ -140,40 +140,6 @@ static inline size_t duct_wire_dgram_min(const duct_wire_t *wire)
          ? wire->header_size - duct_dgram_record_hdr_size : 0u;
 }
 
-/** @brief Write the record header for a payload already in place at @p rx's
- *  tail (caller recv()s straight past the header gap), then advance past
- *  both. Caller has verified the space.
- */
-duct_nonnull(1) static inline void
-duct_dgram_rx_header_commit(duct_olb_rx_t *rx, size_t len)
-{
-    auto h = &rx->h;
-    auto dst = rx->data + h->stage;
-    duct_dgram_rec_hdr_t rhdr;
-    duct_dgram_rec_hdr_encode(rhdr.octets, len);
-    memcpy(dst, &rhdr, sizeof(rhdr));
-    size_t total = sizeof(rhdr) + len;
-    duct_atomic_store(&h->tail, h->stage + total, release);
-    h->stage += total;
-}
-
-/** @brief Append one @c [len][payload] record at @p rx's tail, copying
- *  @p data in.
- *
- *  For a classification or injection path whose payload lives in a separate
- *  buffer; @ref duct_dgram_rx_header_commit takes the in-place recv() case.
- *  Caller has already verified @c sizeof(duct_dgram_rec_hdr_t) + @p len
- *  bytes of space.
- */
-duct_nonnull(1) static inline void
-duct_dgram_rx_append(duct_olb_rx_t *rx, const void *data, size_t len)
-{
-    if (len)
-        memcpy(rx->data + rx->h.stage
-               + sizeof(duct_dgram_rec_hdr_t), data, len);
-    duct_dgram_rx_header_commit(rx, len);
-}
-
 #ifdef __cplusplus
 }
 #endif

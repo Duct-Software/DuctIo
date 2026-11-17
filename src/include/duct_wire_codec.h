@@ -155,21 +155,21 @@ typedef struct duct_wire_codec {
                 name[2];
     } lead;
 
-    uint32_t engine_park_len; /**< Bytes waiting in @c engine_park, 0 for an
-                                *  empty park. */
+    uint32_t engine_park_len; /**< Bytes waiting in the conn block's engine
+                                *  park, 0 for an empty park. */
 
-    /** @brief Release this codec.
-     *  Frees the inner parser, the seal engine, @c engine_park and @c self, and
-     *  drops the codec's hold on @c ct_buf: a pin keeps the buffer until it is
-     *  released. Callable at any time.
+    /** @brief Release this codec's resources.
+     *  Frees the seal engine and @c ct_buf — a pin keeps the cleartext
+     *  buffer until it is dropped — and wipes the codec's block slot, whose
+     *  storage the conn block owns and reuses. The engine park is the block's
+     *  own region and needs no release. Callable at any time.
      */
-    void (*destroy)(struct duct_wire_codec *self);
-    duct_ptr_t(uint8_t) engine_park; /**< Engine egress that met a full TX ring or bytes
-                            *  parked ahead of it, as whole records leaving
-                            *  ahead of every later byte of the conn. Allocated
-                            *  at its first use, freed with the codec; its
-                            *  @c duct_byte_len is the capacity. Worker only. */
+    void (*release)(struct duct_wire_codec *self);
 } duct_wire_codec_t;
+
+static_assert(offsetof(duct_wire_codec_t, engine) + sizeof(void *) <= duct_cacheline_size,
+              "the pointers and cursors the parse and unseal paths read fill the first"
+              " cache line exactly");
 
 /** @brief Derive @p c's lead key at the first datagram after the handshake and
  *  write the lead into @p dgram.

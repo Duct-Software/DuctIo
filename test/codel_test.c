@@ -502,8 +502,15 @@ static constexpr unsigned wait_ms = 5000u;
 /** @brief Time the ring's queue holds still before it counts as standing,
  *  nanoseconds. */
 static constexpr uint64_t still_for_ns = 100'000'000u;
-/** @brief TX ring capacity the server protocol asks for, bytes. */
-static constexpr size_t ring_cap = (size_t)1u << 20u;
+/** @brief TX ring capacity the server protocol asks for, bytes: the build's
+ *  per-conn ceiling, which a carved tx region can never exceed. */
+static constexpr size_t ring_cap = duct_conn_tx_olb_cap;
+/** @brief Payload one staging timer offers the ring: a sixteenth of it, the
+ *  share the megabyte-ring form of this scenario staged, so the fill stops
+ *  with room a probe frame still takes. */
+static constexpr size_t chunk = ring_cap / 16u;
+
+static_assert(chunk <= 65536u, "the staging buffer holds one chunk");
 
 /** @brief Payload the server session stages while its ring fills. */
 static uint8_t       g_chunk[65536];
@@ -547,8 +554,7 @@ static duct_result_t srv_on_timer(duct_session_t *s, duct_response_t *out,
     if (duct_conn_tx_end(s, duct_conn_id_primary, &end, &queued) != rc_ok
         || queued >= duct_conn_tx_cap(s, duct_conn_id_primary) / 4u * 3u)
         return rc_ok;
-    duct_response_same(out, duct_view(duct_view_u8, g_chunk, sizeof g_chunk),
-                       fl_send_static, 0);
+    duct_response_same(out, duct_view(duct_view_u8, g_chunk, chunk), fl_send_static, 0);
     return rc_ok;
 }
 
@@ -667,7 +673,7 @@ static duct_proto_t *standing_proto(void)
     auto proto = wire ? duct_proto_create(&(duct_proto_cfg_t){
         .name = "codel-standing", .wire = wire, .on_frame = on_frame,
         .on_session_open = srv_on_open, .on_timer = srv_on_timer,
-        .max_response = sizeof g_chunk, .tx_olb_cap = ring_cap,
+        .max_response = chunk, .tx_olb_cap = ring_cap,
     }) : nullptr;
     if (proto)
         proto->owned_wire = wire;

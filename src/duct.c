@@ -56,10 +56,6 @@ struct duct_engine {
     bool                    stop_on_signals;
     duct_vmq_mpsc_t        *wfq;
     duct_listener_reg_t     listener_regs[duct_runtime_max_listeners];
-    /** @brief RX slot pool of each worker, by worker index.
-     *  Created by the worker's first datagram listener node, freed last at
-     *  teardown. */
-    duct_x_slot_pool_t *_Atomic rx_pools[duct_runtime_max_workers];
     unsigned _Atomic        connect_rr; /**< Round-robins duct_io_connect across io threads. */
     unsigned _Atomic        timer_rr; /**< Round-robins duct_timer_start across workers. */
     /** @brief Outstanding @c duct_session_invoke_sync calls.
@@ -242,15 +238,6 @@ static void s_engine_destroy(duct_engine_t *e)
     }
     /* The session-close callbacks run by the reclaim above still ask a section for their shard. */
     duct_stats_list_free(&e->stats);
-    /* Last: every conn that returns a slot and every node that reads one is
-     * gone by here. */
-    for (unsigned i = 0u; i < duct_runtime_max_workers; ++i) {
-        auto pool = duct_atomic_exchange(&e->rx_pools[i], nullptr, acquire);
-        if (!pool)
-            continue;
-        duct_x_slot_pool_free(pool);
-        duct_del(pool);
-    }
     duct_atomic_store(&e->state, engine_state_dead, release);
 }
 
@@ -272,6 +259,8 @@ duct_engine_t *duct_engine_launch(const duct_engine_cfg_t *cfg)
     if (cfg->io_threads > duct_runtime_max_io_threads || cfg->workers < cfg->io_threads)
         return nullptr;
     if (cfg->workers > duct_runtime_max_workers)
+        return nullptr;
+    if (duct_worker_module_alive())
         return nullptr;
     auto e = duct_new(duct_engine_t);
     if (!e)
@@ -426,7 +415,6 @@ duct_result_t duct_listener_bind(duct_engine_t *e, const duct_listener_cfg_t *cf
     duct_do_if(!e, return rc_invalid_arg);
     duct_listener_route_t route = {
         .regs = e->listener_regs, .n_workers = e->n_workers, .n_io = e->n_io,
-        .rx_pools = e->rx_pools,
     };
     duct_listener_out_fds_t out = { .fds = out_fds, .cap = max_fds };
     duct_result_t rc = duct_listener_route_bind(&route, cfg, port, &out);
@@ -461,7 +449,7 @@ static duct_result_t s_session_close_trampoline(duct_session_t *s, duct_response
 static unsigned s_worker_of(duct_handle_t tok)
 {
     auto s = duct_session_attached_by_handle((duct_session_handle_t){ .word = tok });
-    return s ? duct_atomic_load(&s->worker_id, acquire) : conn_worker_none;
+    return s ? (unsigned)s->worker_id : conn_worker_none;
 }
 
 static duct_result_t s_session_invoke(duct_engine_t *e, duct_handle_t tok,

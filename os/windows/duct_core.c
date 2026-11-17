@@ -169,6 +169,11 @@ duct_vm_handle_t duct_vm_reserve(size_t size)
     return s_vm_map(size, MEM_RESERVE, PAGE_NOACCESS);
 }
 
+duct_vm_handle_t duct_vm_reserve_lazy(size_t size)
+{
+    return s_vm_map(size, MEM_RESERVE, PAGE_NOACCESS);
+}
+
 /* MEM_COMMIT, then VirtualLock. A lock refused for the working-set quota is tried once more after
  * the process's minimum and maximum working set are raised by size; a range not locked is
  * decommitted. */
@@ -202,6 +207,16 @@ void duct_vm_discard(void *base, size_t size)
 {
     if (size)
         duct_discard DiscardVirtualMemory(base, size);
+}
+
+duct_result_t duct_vm_commit(void *base, size_t size)
+{
+    duct_do_if(!VirtualAlloc(base, size, MEM_COMMIT, PAGE_READWRITE), return rc_no_memory);
+    return rc_ok;
+}
+
+void duct_vm_reuse([[maybe_unused]] void *base, [[maybe_unused]] size_t size)
+{
 }
 
 /* The cpu returned is the thread's ideal processor; the scheduler stays free to

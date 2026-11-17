@@ -2,6 +2,7 @@
 /* Copyright (c) 2026 Duct Software */
 
 #include "duct.h"
+#include "duct_session.h"
 #include "test_helpers.h"
 
 #include <pthread.h>
@@ -237,6 +238,10 @@ static const char *sc_proto_work(void)
            "duct_proto_switch accepted on_work-only proto");
     close(fd);
     expect(th_wait_int(&g_sess_closed, 1, wait_ms), "session did not close");
+    duct_session_handle_t stok = { .word = atomic_load(&g_sess_tok) };
+    for (unsigned i = 0u; i < wait_ms && duct_session_by_handle(stok); ++i)
+        th_sleep_ms(1u);
+    expect(!duct_session_by_handle(stok), "session close walk did not finish");
 
     g_work_only = nullptr;
     duct_proto_destroy(frame_p);
@@ -368,6 +373,12 @@ static const char *sc_stop_race(void)
 {
     auto race_p = duct_proto_create(&(duct_proto_cfg_t){
         .name = "race-work", .on_work = s_race_work });
+    /* The worker module serves one live engine: the first engine retires
+     * here, its module cleanup behind it, so the second launch re-inits the
+     * module instead of overwriting a live one's arrays. */
+    duct_engine_stop(g_e);
+    duct_engine_destroy(g_e);
+    g_e = nullptr;
     auto race_e = race_p ? duct_engine_launch(&(duct_engine_cfg_t){ .io_threads = 1u, .workers = 2u })
                          : nullptr;
     expect(race_e && race_p, "race setup failed");
@@ -428,8 +439,6 @@ int main(void)
         }
     }
 
-    duct_engine_stop(g_e);
-    duct_engine_destroy(g_e);
     if (failed)
         return 1;
     printf("worker_post: OK\n");

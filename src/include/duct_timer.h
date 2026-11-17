@@ -33,6 +33,8 @@ extern "C" {
 /** Coalescing horizon as a timespec; window itself is @c duct_timer_coalesce_us. */
 #define timer_coalesce() duct_time_from_us(duct_timer_coalesce_us)
 
+/** @brief Self-routing timer handle: processor, worker slot and local id in
+ *  one word, @ref timer_handle_null for none. */
 typedef uint64_t duct_timer_handle_t;
 
 static constexpr duct_timer_handle_t timer_handle_null = 0; /**< Invalid/absent handle. */
@@ -142,6 +144,28 @@ static constexpr unsigned timer_hash_size = 1u << duct_timer_hash_bits;
 
 typedef struct duct_timer duct_timer_t;
 
+/** @brief Timer payload folded into the wheel node, three words.
+ *  The session classes read the first shape — session token, stream token,
+ *  timer key — the free classes the second, @c arg naming the timer's own
+ *  argument where the callback wants one. @ref duct_timer_add_ctx arms a
+ *  node with it; the payload survives every fire of a repeating timer.
+ */
+typedef union duct_timer_ctx {
+    struct {
+        uint64_t session_tok;
+        uint64_t token;
+        uint32_t key;
+    };
+    struct {
+        const struct duct_proto *proto;
+        void                    *user_ctx;
+        uintptr_t                arg;
+    };
+} duct_timer_ctx_t;
+
+static_assert(sizeof(duct_timer_ctx_t) == 3u * sizeof(void *),
+              "the folded timer payload is three words");
+
 /** @brief Timer node linked into a deadline-sorted list and an id hash chain. */
 struct duct_timer {
     duct_timer_t      *next, *prev;     /**< Deadline-sorted list links. */
@@ -156,6 +180,8 @@ struct duct_timer {
     bool            fine;               /**< Counted toward
                                           *   @c duct_timer_hires_refcount;
                                           *   cleared once unreffed. */
+    duct_timer_ctx_t ctx;               /**< Folded payload of the ctx-armed
+                                          *   classes, read by @c exec. */
 };
 
 /** @brief Unref @p t once, however it retires — @c fine guards a cancelled
@@ -293,6 +319,29 @@ duct_timer_insert(duct_timers_t *tl, duct_timer_t *t)
     p->prev = t;
 }
 
+/** @brief Publish node @p t: fresh id, absolute deadline, repeat interval,
+ *  fine-timer accounting, and the links into the id hash and the sorted
+ *  list.
+ *  The node's @c exec and payload are the caller's to have set; @c t->arg
+ *  keeps whatever the caller stored.
+ *  @return The node's self-routing handle.
+ */
+duct_nonnull(1, 2) static inline duct_timer_handle_t
+duct_timer_publish(duct_timers_t *tl, duct_timer_t *t, uint8_t proc_idx,
+                   uint8_t worker_slot, uint64_t delay_us, uint64_t interval_us)
+{
+    uint64_t lid = duct_timer_new_id();
+    t->id         = lid;
+    t->deadline   = duct_time_add(duct_time_from_ns(duct_ticks_mono_ns()), duct_time_from_us(delay_us));
+    t->interval   = duct_time_from_us(interval_us);
+    t->fine       = duct_timer_is_fine(delay_us, interval_us);
+    if (t->fine)
+        duct_timer_hires_ref();
+    duct_timer_hash_insert(tl, t->id, &t->hh);
+    duct_timer_insert(tl, t);
+    return duct_timer_make_handle(proc_idx, worker_slot, lid);
+}
+
 /** @brief Add a timer.
  *
  *  @param delay_us    Delay before the first fire.
@@ -313,20 +362,34 @@ duct_timer_add(duct_timers_t *tl, uint8_t proc_idx,
 {
     auto t = duct_timer_new(tl);
     duct_do_if(!t, return timer_handle_null);
-    uint64_t lid = duct_timer_new_id();
-    t->id         = lid;
-    t->deadline   = duct_time_add(duct_time_from_ns(duct_ticks_mono_ns()), duct_time_from_us(delay_us));
-    t->interval   = duct_time_from_us(interval_us);
     t->exec       = exec;
     t->arg        = arg;
     t->arg_free   = arg_free;
     t->iterations = iterations;
-    t->fine       = duct_timer_is_fine(delay_us, interval_us);
-    if (t->fine)
-        duct_timer_hires_ref();
-    duct_timer_hash_insert(tl, t->id, &t->hh);
-    duct_timer_insert(tl, t);
-    return duct_timer_make_handle(proc_idx, worker_slot, lid);
+    return duct_timer_publish(tl, t, proc_idx, worker_slot, delay_us, interval_us);
+}
+
+/** @brief Add a timer whose payload is the folded @p ctx, arg free of its
+ *  own.
+ *  As @ref duct_timer_add, with @c t->arg naming the node itself and
+ *  @c arg_free clear: the payload lives in the wheel node, released with
+ *  it, and @c exec reads it off @p t.
+ *  @return Self-routing handle or @ref timer_handle_null on OOM.
+ */
+duct_nonnull(1, 8) static inline duct_timer_handle_t
+duct_timer_add_ctx(duct_timers_t *tl, uint8_t proc_idx,
+                   uint8_t worker_slot, uint64_t delay_us, uint64_t interval_us,
+                   uint32_t iterations, duct_exec_fn exec,
+                   const duct_timer_ctx_t *ctx)
+{
+    auto t = duct_timer_new(tl);
+    duct_do_if(!t, return timer_handle_null);
+    t->exec       = exec;
+    t->ctx        = *ctx;
+    t->arg        = t;
+    t->arg_free   = nullptr;
+    t->iterations = iterations;
+    return duct_timer_publish(tl, t, proc_idx, worker_slot, delay_us, interval_us);
 }
 
 /** @brief Cancel a timer by handle: release its arg and remove the id-hash

@@ -3,23 +3,24 @@
 
 /**
  * @file session_reclaim_race_test.c
- * @brief Multi-worker lifetime stress:
+ * @brief Multi-worker lifetime stress over the owner-run reclaim machine:
  *
  * One thread group opens a conn, sends a frame that the callback always
  * defers (`rc_defer`, never replayed away), then closes immediately. Its FIN
  * reaches the worker as the end of the conn's input, deferred behind that
  * frame, so the session's idle bound ends the leg instead — the conn-lost
  * consume must discard both defer nodes on the owner worker
- * before the session's `conn_count` reaches 0 and it becomes eligible for
- * closing → quarantine → free. A second thread group churns plain
+ * before the session's `conn_count` reaches 0 and the owner's own
+ * closing → dead transition runs. A second thread group churns plain
  * echo conns concurrently across all workers, keeping every worker's idle
- * drain (`duct_session_idle_drain`) busy scanning the shared session table
- * while the held sessions transition through the reclaim gate. A third
- * thread group drives worker-initiated close: `on_frame` replies and
- * sets `close_target_session` itself, so `duct_session_close_walk` marks
- * `session_state_closing` and posts the I/O close while the leg is still
- * attached — the conn_lost fence must still detach it (the closing →
- * quarantine gate must not race ahead of that detach).
+ * pass busy ticking its own dead-session list (a foreign worker's idle
+ * pass must never touch a closing session — each list has one writer,
+ * its owner). A third thread group drives worker-initiated close:
+ * `on_frame` replies and sets `close_target_session` itself, so
+ * `duct_session_close_walk` marks `sess_closing` and posts the I/O close
+ * while the leg is still attached — the conn_lost fence must still detach
+ * it before the grace ticks free the block (the dead → free gate must not
+ * race ahead of that detach).
  *
  * Pass: no crash/UAF (the real assertion, verified by running this binary
  * under ASAN/TSAN), every opened session closes exactly once, and the

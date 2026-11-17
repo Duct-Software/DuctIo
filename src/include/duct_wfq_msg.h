@@ -94,6 +94,15 @@ typedef struct duct_msg_frame_batch {
                                       *  sizeof(duct_msg_frame_t). */
 } duct_msg_frame_batch_t;
 
+/** @brief WFQ-full batch retry node: inline batch copy + push cursor, at most
+ *  one live per conn and carried by that conn block's retry region — the
+ *  link form stays a message, the storage is the region. */
+duct_msg_chain_decl(batch_retry_node_t,
+    unsigned worker_id;
+    uint32_t from;
+    alignas(alignof(duct_handle_t)) duct_msg_frame_batch_t batch;
+);
+
 /** @brief One host-pushed inter packet. */
 typedef struct duct_msg_inter_pkt {
     uint32_t           offset,       /**< Byte offset from whichever base the

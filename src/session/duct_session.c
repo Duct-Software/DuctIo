@@ -10,6 +10,8 @@
  */
 
 #include "duct_session.h"
+#include "duct_session_block.h"
+#include "duct_conn_block.h"
 #include "duct_dgram_rec.h"
 #include "duct_relay.h"
 #include "duct_worker.h"
@@ -19,11 +21,13 @@
 #include "duct_core.h"
 
 #include <assert.h>
+#include <string.h>
 
 duct_session_t *duct_session_by_conn(const duct_conn_t *conn)
 {
     return duct_session_attached_by_handle(
-        (duct_session_handle_t){ .word = conn->session_token });
+        (duct_session_handle_t){ .word = duct_atomic_load(&conn->session_token,
+                                                          acquire) });
 }
 
 duct_conn_id_t duct_session_conn_id_by_handle(const duct_session_t *s,
@@ -40,11 +44,14 @@ duct_conn_id_t duct_session_conn_id_by_handle(const duct_session_t *s,
 void duct_session_close_walk(duct_session_t *s, duct_close_reason_t reason)
 {
     duct_session_request_close(s, reason);
-    /* Abandon any wire-rebind fan-out in flight: a fence landing after this
-     * point sees wire_rebind_next == nullptr and abandons finishing
-     * the switch on a session that is already tearing down. */
-    s->wire_rebind_next = nullptr;
-    s->wire_rebind_ctx = nullptr;
+    /* Abandon any switch in flight: a fence landing after this point sees
+     * switch_stage != switch_fencing and abandons finishing the switch on a
+     * session that is already tearing down. The shared switch ctx goes with
+     * it — a session past attached drops its whole switch in
+     * duct_session_apply_switch's state check. */
+    s->switch_next = nullptr;
+    s->switch_ctx = nullptr;
+    s->switch_stage = switch_none;
     /* Close requests only: detach runs from duct_session_exec_conn_lost once
      * each leg's fence quiesces, so its discard and cancel steps see the leg
      * still attached. A close_normal leg's request waits behind the leg's
@@ -65,11 +72,11 @@ void duct_session_close_walk(duct_session_t *s, duct_close_reason_t reason)
  */
 static void s_worker_retire_pre_open(duct_conn_t *conn)
 {
+    auto ch = duct_conn_handle_get(conn);
+    duct_worker_conn_defer_discard(&ch);
     duct_discard duct_conn_fence_quiesce(conn);
-    if (duct_conn_fence_confirm_retire(conn)) {
-        auto ch = duct_conn_handle_get(conn);
+    if (duct_conn_fence_confirm_retire(conn))
         duct_io_retire_request(&ch);
-    }
 }
 
 void duct_session_dial_lost(const duct_proto_cfg_t *cfg, void *user_ctx, duct_result_t rc)
@@ -145,16 +152,15 @@ duct_exec_rc_t duct_session_exec_open(void *self)
         return exec_defer;
 
     duct_result_t rc = rc_no_memory;
-    auto s = duct_session_acquire();
+    auto s = duct_session_acquire(conn->worker_id);
     if (!s)
         goto fail_retire;
     if (duct_session_attach_conn(s, msg->conn_id, msg->conn) != rc_ok)
         goto fail_release;
     s->proto = msg->proto;
     s->user_ctx = msg->user_ctx;
-    duct_atomic_store(&s->worker_id, conn->worker_id, release);
-    if (duct_has(cfg->flags, fl_proto_multiplexed) && !duct_session_streams_alloc(s))
-        goto fail_release;
+    if (duct_has(cfg->flags, fl_proto_multiplexed))
+        duct_session_streams_alloc(s);
 
     auto tok = duct_session_handle_from_live(s);
     if (!duct_conn_session_bind(conn, tok.word)) {
@@ -165,7 +171,6 @@ duct_exec_rc_t duct_session_exec_open(void *self)
         /* The open never ran, so the session rolls back with no session
          * callback; the conn, already bound, closes by request and its
          * conn_lost fence finds no session. */
-        duct_session_streams_free(s);
         duct_session_release(s);
         duct_io_post_close_request(&msg->conn, close_protocol_error);
         if (msg->dialed)
@@ -193,7 +198,6 @@ duct_exec_rc_t duct_session_exec_open(void *self)
     return duct_msg_done(msg);
 
 fail_release:
-    duct_session_streams_free(s);
     duct_session_release(s);
 fail_retire:
     s_worker_retire_pre_open(conn);
@@ -259,7 +263,7 @@ duct_exec_rc_t duct_session_exec_conn_join(void *self)
     return duct_msg_done(msg);
 }
 
-static void s_wire_rebind_settle(duct_session_handle_t handle);
+static void s_session_rebind_ack(duct_session_handle_t handle);
 
 duct_exec_rc_t duct_session_exec_conn_lost(void *self)
 {
@@ -272,8 +276,8 @@ duct_exec_rc_t duct_session_exec_conn_lost(void *self)
         auto cid = duct_session_conn_id_by_handle(s, msg->conn);
         if (cid < duct_session_max_legs) {
             /* Cancel handlers and discard deferred frames for this leg
-             * before detach: both may still reference conn->rx_buf, which
-             * retire can tear down once this executor finishes. */
+             * before detach: both may still reference the conn's rx OLB,
+             * which retire can tear down once this executor finishes. */
             duct_session_streams_cancel_conn(s, cid, msg->reason);
             duct_worker_conn_defer_discard(&msg->conn);
             /* err_out is discarded. on_conn_lost's out below is this
@@ -297,7 +301,7 @@ duct_exec_rc_t duct_session_exec_conn_lost(void *self)
              * here, ahead of the control below: a dial staged there takes
              * s->proto, which the last leg out finishes switching. */
             if (duct_atomic_load(&conn->wire_rebind_next, relaxed))
-                s_wire_rebind_settle(handle);
+                s_session_rebind_ack(handle);
             if (notify) {
                 duct_response_release_owned(&out);
                 duct_response_t ctl = { .control = out.control };
@@ -375,48 +379,42 @@ bool duct_sessions_post_conn_join(duct_conn_t *conn,
     return s_post_ctrl(conn, duct_msg_ctrl_root(msg));
 }
 
-/** @brief Stream-slot find/insert by id within the matching hash bucket. */
-DUCT_HASH_DECLARE(s_stream_hash_find, s_stream_hash_insert,
-                   duct_session_t, stream_buckets, duct_stream_t,
-                   duct_stream_id_t, duct_atomic_load(&node->id, relaxed) == key,
-                   duct_session_max_streams - 1u)
-
-/** @brief Live stream-slot lookup via hash bucket, or NULL. */
+/** @brief Stream-slot find/insert by id within the carved table's matching
+ *  hash bucket. */
 static duct_nonnull(1) duct_stream_t *
 s_stream_find(const duct_session_t *s, duct_stream_id_t stream_id)
 {
-    return s_stream_hash_find(s, stream_id);
-}
-
-bool duct_session_streams_alloc(duct_session_t *s)
-{
-    duct_do_if(!s, return false);
-    if (s->streams)
-        return true;
-    s->streams = duct_at(duct_new(duct_stream_t, duct_session_max_streams));
-    duct_do_if(!s->streams, return false);
-    s->stream_buckets = duct_at(duct_new(duct_hash_handle_t *, duct_session_max_streams));
-    if (!s->stream_buckets) {
-        duct_del(s->streams);
-        return false;
+    for (auto h = duct_session_stream_buckets(s)[duct_hash_idx((uint64_t)stream_id,
+                                                              duct_session_max_streams - 1u)];
+         h; h = h->next) {
+        auto node = duct_hash_entry(h, duct_stream_t, hh);
+        if (duct_atomic_load(&node->id, relaxed) == stream_id)
+            return node;
     }
-    /* duct_new zeroes: id/proto_state/hh.pprev zero. Build the free
-     * list as slot[i].hh.next = &slot[i+1].hh, last → NULL. */
-    for (uint32_t i = 0u; i + 1u < duct_session_max_streams; ++i)
-        s->streams[i].hh.next = &s->streams[i + 1u].hh;
-    s->streams[duct_session_max_streams - 1u].hh.next = nullptr;
-    s->stream_free_head = &s->streams[0u].hh;
-    s->stream_count = 0u;
-    return true;
+    return nullptr;
 }
 
-void duct_session_streams_free(duct_session_t *s)
+static duct_nonnull(1, 3) void
+s_stream_hash_insert(duct_session_t *s, duct_stream_id_t stream_id, duct_hash_handle_t *h)
+{
+    duct_hash_insert(&duct_session_stream_buckets(s)[duct_hash_idx((uint64_t)stream_id,
+                                                                  duct_session_max_streams - 1u)],
+                     h);
+}
+
+void duct_session_streams_alloc(duct_session_t *s)
 {
     duct_do_if(!s, return);
-    duct_del(s->streams);
-    duct_del(s->stream_buckets);
-    s->stream_free_head = nullptr;
+    if (duct_has(s->flags, fl_session_multiplexed))
+        return;
+    auto streams = duct_session_streams(s);
+    memset(streams, 0, session_streams_span + session_buckets_span);
+    for (uint32_t i = 0u; i + 1u < duct_session_max_streams; ++i)
+        streams[i].hh.next = &streams[i + 1u].hh;
+    streams[duct_session_max_streams - 1u].hh.next = nullptr;
+    s->stream_free_head = &streams[0u].hh;
     s->stream_count = 0u;
+    s->flags = duct_or(s->flags, fl_session_multiplexed);
 }
 
 duct_stream_t *duct_session_stream_claim(duct_session_t *s, duct_stream_id_t stream_id,
@@ -425,7 +423,7 @@ duct_stream_t *duct_session_stream_claim(duct_session_t *s, duct_stream_id_t str
     duct_stream_admit_t admit_scratch;
     duct_stream_admit_t *w = admit ? admit : &admit_scratch;
     *w = stream_admit_unusable;
-    duct_do_if(!s || !s->streams || !s->proto, return nullptr);
+    duct_do_if(!s || !duct_has(s->flags, fl_session_multiplexed) || !s->proto, return nullptr);
     duct_do_if(stream_id == 0u, return nullptr); /* stream 0 = control, never claims */
     /* Idempotent: return the existing slot without re-firing hooks. */
     auto hit = s_stream_find(s, stream_id);
@@ -446,6 +444,7 @@ duct_stream_t *duct_session_stream_claim(duct_session_t *s, duct_stream_id_t str
     /* Commit: pop a free slot and link it at the bucket head. */
     auto slot = duct_hash_entry(s->stream_free_head, duct_stream_t, hh);
     s->stream_free_head = slot->hh.next;
+    duct_session_touched_update(s, slot);
     s_stream_hash_insert(s, stream_id, &slot->hh);
     slot->proto_state = state;
     duct_atomic_store(&slot->id, stream_id, relaxed);
@@ -485,7 +484,7 @@ void duct_session_stream_close(duct_session_t *s, duct_stream_id_t stream_id,
                                duct_close_reason_t reason)
 {
     duct_do_if(!s || !s->proto, return);
-    if (!s->streams || stream_id == 0u)
+    if (!duct_has(s->flags, fl_session_multiplexed) || stream_id == 0u)
         return;
     auto slot = s_stream_find(s, stream_id);
     if (!slot)
@@ -500,18 +499,20 @@ void duct_session_stream_close(duct_session_t *s, duct_stream_id_t stream_id,
 duct_stream_t *duct_session_stream_slot(duct_session_t *s,
                                         duct_stream_id_t stream_id)
 {
-    duct_do_if(!s || !s->streams || stream_id == 0u, return nullptr);
+    duct_do_if(!s || !duct_has(s->flags, fl_session_multiplexed) || stream_id == 0u,
+               return nullptr);
     return s_stream_find(s, stream_id);
 }
 
 void duct_session_streams_destroy(duct_session_t *s)
 {
     duct_do_if(!s, return);
-    if (!s->streams)
+    if (!duct_has(s->flags, fl_session_multiplexed))
         return;
-    auto reason = duct_atomic_load(&s->close_reason, relaxed);
+    auto reason = s->close_reason;
+    auto streams = duct_session_streams(s);
     for (uint32_t i = 0u; i < duct_session_max_streams; ++i) {
-        auto slot = &s->streams[i];
+        auto slot = &streams[i];
         duct_stream_id_t sid = duct_atomic_load(&slot->id, relaxed);
         if (sid == 0u)
             continue;
@@ -528,10 +529,11 @@ void duct_session_streams_cancel_conn(duct_session_t *s, duct_conn_id_t conn_id,
                                       duct_close_reason_t reason)
 {
     duct_do_if(!s, return);
-    if (!s->streams)
+    if (!duct_has(s->flags, fl_session_multiplexed))
         return;
+    auto streams = duct_session_streams(s);
     for (uint32_t i = 0u; i < duct_session_max_streams; ++i) {
-        auto slot = &s->streams[i];
+        auto slot = &streams[i];
         duct_stream_id_t sid = duct_atomic_load(&slot->id, relaxed);
         if (sid == 0u || !slot->handler_ctx)
             continue;
@@ -546,14 +548,10 @@ void duct_session_streams_cancel_conn(duct_session_t *s, duct_conn_id_t conn_id,
 
 void *duct_stream_state(duct_session_t *s, duct_stream_id_t stream_id)
 {
-    duct_do_if(!s || !s->streams || stream_id == 0u, return nullptr);
+    duct_do_if(!s || !duct_has(s->flags, fl_session_multiplexed) || stream_id == 0u,
+               return nullptr);
     auto slot = s_stream_find(s, stream_id);
     return slot ? slot->proto_state : nullptr;
-}
-
-uint32_t duct_session_conn_count(const duct_session_t *s)
-{
-    return duct_atomic_load(&s->conn_count, acquire);
 }
 
 duct_conn_id_t duct_session_nth_live_leg(const duct_session_t *s, uint32_t ordinal)
@@ -581,13 +579,9 @@ duct_result_t duct_proto_switch(duct_session_t *s, const duct_proto_t *next,
                                 void *migration_ctx)
 {
     duct_do_if(!s || !next || !next->cfg.on_frame, return rc_invalid_arg);
-    /* Already pending: either the synchronous record window (pending_switch_next,
-     * cleared by duct_session_apply_switch before it returns) or a wire-changing
-     * switch's rebind fan-out still draining (wire_rebind_next, cleared only once
-     * every leg's fence lands) — one switch in flight at a time either way. */
-    duct_do_if(s->pending_switch_next || s->wire_rebind_next, return rc_again);
-    s->pending_switch_next = next;
-    s->pending_switch_ctx = migration_ctx;
+    duct_do_if(s->switch_next, return rc_again);
+    s->switch_next = next;
+    s->switch_ctx = migration_ctx;
     return rc_ok;
 }
 
@@ -629,17 +623,13 @@ static void s_session_finish_switch(duct_session_t *s, const duct_proto_t *next,
      * claims no slot — multiplexing on, silently doing nothing. Idempotent, so
      * a multiplexed-to-multiplexed switch reuses the table the teardown above
      * just emptied. */
-    bool ready = !duct_has(next_cfg->flags, fl_proto_multiplexed)
-              || duct_session_streams_alloc(s);
+    if (duct_has(next_cfg->flags, fl_proto_multiplexed))
+        duct_session_streams_alloc(s);
     /* Enter phase (old proto_state still valid for a close on failure). */
     duct_result_t erc = rc_ok;
-    if (ready && next_cfg->on_proto_enter)
+    if (next_cfg->on_proto_enter)
         erc = next_cfg->on_proto_enter(s, ctx, new_state);
-    if (!ready || erc != rc_ok) {
-        /* No table, or enter refused: old streams are torn down, proto_state
-         * intact; close the session on the old proto, then free the orphaned
-         * new_state. Both causes leave exactly that state, which is why they
-         * share one disposition. */
+    if (erc != rc_ok) {
         if (next_cfg->destroy_state && new_state)
             next_cfg->destroy_state(s, next_cfg->create_state_ctx, new_state);
         duct_session_close_walk(s, close_protocol_error);
@@ -656,16 +646,24 @@ static void s_session_finish_switch(duct_session_t *s, const duct_proto_t *next,
 duct_result_t duct_session_apply_switch(duct_session_t *s)
 {
     duct_do_if(!s, return rc_invalid_arg);
-    auto next = s->pending_switch_next;
+    auto next = s->switch_next;
     if (!next)
         return rc_ok;
-    auto ctx = s->pending_switch_ctx;
-    s->pending_switch_next = nullptr;
-    s->pending_switch_ctx = nullptr;
+    duct_do_if(s->switch_stage == switch_fencing, return rc_ok);
+    auto ctx = s->switch_ctx;
+    s->switch_next = nullptr;
+    s->switch_ctx = nullptr;
+    s->switch_stage = switch_none;
     /* Abandon the switch if the session is no longer live (e.g. the same
      * callback also declared close_target=session). */
     auto st = duct_atomic_load(&s->state, acquire);
-    duct_do_if(st != session_state_attached, return rc_closed);
+    duct_do_if(st != sess_attached, return rc_closed);
+    if (duct_worker_session_tx_parked(s)) {
+        s->switch_next = next;
+        s->switch_ctx = ctx;
+        s->switch_stage = switch_parked_tx;
+        return rc_ok;
+    }
 
     auto cur_cfg = duct_proto_cfg_of(s->proto);
     auto next_cfg = duct_proto_cfg_of(next);
@@ -697,9 +695,10 @@ duct_result_t duct_session_apply_switch(duct_session_t *s)
         s_session_finish_switch(s, next, ctx);
         return rc_ok;
     }
-    s->wire_rebind_next = next;
-    s->wire_rebind_ctx = ctx;
-    s->wire_rebind_pending = pending;
+    s->switch_next = next;
+    s->switch_ctx = ctx;
+    s->switch_pending = pending;
+    s->switch_stage = switch_fencing;
     duct_session_for_each_leg(s, i, handle) {
         auto conn = duct_conn_by_handle(handle);
         if (!conn || conn->xport_type == x_inter)
@@ -710,19 +709,22 @@ duct_result_t duct_session_apply_switch(duct_session_t *s)
 }
 
 /** @brief Count one leg out of a session's wire-changing switch.
- *  The leg that brings the count to zero finishes the switch. A session that is
- *  gone or no longer attached, and one whose switch was abandoned
- *  (@c duct_session_close_walk clears @c wire_rebind_next), is left alone.
+ *  The leg that brings the count to zero finishes the switch, and the frames
+ *  deferred under the fencing stage replay under the new wire from the next
+ *  defer pass. A session that is gone or no longer attached, and one whose
+ *  switch was abandoned (@c duct_session_close_walk drops the whole switch),
+ *  is left alone.
  */
-static void s_wire_rebind_settle(duct_session_handle_t handle)
+static void s_session_rebind_ack(duct_session_handle_t handle)
 {
     auto s = duct_session_attached_by_handle(handle);
-    if (!s || !s->wire_rebind_next || --s->wire_rebind_pending != 0u)
+    if (!s || s->switch_stage != switch_fencing || --s->switch_pending != 0u)
         return;
-    auto next = s->wire_rebind_next;
-    auto ctx = s->wire_rebind_ctx;
-    s->wire_rebind_next = nullptr;
-    s->wire_rebind_ctx = nullptr;
+    auto next = s->switch_next;
+    auto ctx = s->switch_ctx;
+    s->switch_next = nullptr;
+    s->switch_ctx = nullptr;
+    s->switch_stage = switch_none;
     s_session_finish_switch(s, next, ctx);
 }
 
@@ -750,7 +752,7 @@ duct_exec_rc_t duct_session_exec_wire_fence(void *self)
         duct_discard duct_worker_tls_ensure_started(msg->conn, (duct_view_u8){});
     }
     auto handle = (duct_session_handle_t){ .word = msg->session };
-    s_wire_rebind_settle(handle);
+    s_session_rebind_ack(handle);
     return exec_done;
 }
 

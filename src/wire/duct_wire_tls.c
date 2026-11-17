@@ -26,6 +26,7 @@
 #include "duct_join.h"
 #include "duct_core.h"
 #include "duct_ticks.h"
+#include "duct_x_slot.h"
 
 #include <assert.h>
 #include <stdint.h>
@@ -54,20 +55,11 @@ static void s_tls_wire_destroy(duct_wire_t *self)
     duct_del(self);
 }
 
-/** @brief Hand out the shared parser sentinel.
- *
- *  duct_frame_rx_post routes bytes through @c on_parse while
- *  @c conn->wire_parser holds an address. Framing works from the input span
- *  alone, so one static byte serves every sealed conn.
+/** @brief The sealed wire's parse state: framing works from the input span
+ *  alone, so the binder's zeroed parser slot serves every sealed conn.
  */
-static duct_wire_parser_t *s_tls_create_parser([[maybe_unused]] const duct_wire_t *self)
-{
-    static uint8_t s_stateless;
-    return (duct_wire_parser_t *)&s_stateless;
-}
-
-static void s_tls_destroy_parser([[maybe_unused]] const duct_wire_t *self,
-                                 [[maybe_unused]] duct_wire_parser_t *parser)
+static void s_tls_init_parser([[maybe_unused]] const duct_wire_t *self,
+                              [[maybe_unused]] duct_wire_parser_t *storage)
 {
 }
 
@@ -127,16 +119,19 @@ s_tls_on_parse(const duct_wire_t *self, duct_view_u8 input, duct_frame_t *out,
     return rc_ok;
 }
 
-/** @brief Destroy a codec: the parser, the engine, the engine park and the struct go now,
- *  the cleartext buffer with its last pin. */
-static void s_tls_codec_destroy(duct_wire_codec_t *self)
+/** @brief Release a codec: the engine and the cleartext buffer go now, the
+ *  cleartext buffer with its last pin, and the carved codec slot is wiped —
+ *  its storage belongs to the conn block, whose engine park region needs no
+ *  release of its own. */
+static void s_tls_codec_release(duct_wire_codec_t *self)
 {
-    if (self->inner)
-        duct_wire_parser_destroy(self->inner, self->inner_parser);
     self->engine->vtbl->destroy(self->engine);
-    duct_del(self->engine_park);
+    if (self->ct_buf)
+        duct_alloc_touched_set(duct_block_hdr(self->ct_buf),
+                               duct_alloc_touched_encode(self->ct_len,
+                                                         duct_byte_len(self->ct_buf)));
     duct_del(self->ct_buf);
-    duct_del(self);
+    duct_secure_zero(self, sizeof *self);
 }
 
 /** @brief @c ct_buf capacity.
@@ -265,37 +260,36 @@ s_tls_on_pack(const duct_wire_t *self, [[maybe_unused]] duct_session_t *s,
     return rc_ok;
 }
 
-/** @brief Build the codec of a sealed conn on @p xport around a fresh engine.
- *  A conn on @c x_udp_shared gets no cleartext buffer, every other one a buffer of
- *  @c s_tls_ct_cap bytes. */
-static duct_wire_codec_t *s_tls_create_codec(const duct_wire_t *self, duct_xport_t xport)
+/** @brief Build the codec of a sealed conn on @p xport around a fresh engine,
+ *  in the conn block's zeroed @p codec slot with @p inner_parser, a second
+ *  parser slot, for the inner wire.
+ *  A conn on @c x_udp_shared gets no cleartext chunk, every other one a chunk
+ *  of @p ct_chunks sized by the wire's declared @c ct_buf_max. */
+static duct_wire_codec_t *s_tls_init_codec(const duct_wire_t *self, duct_xport_t xport,
+                                           duct_wire_codec_t *codec,
+                                           duct_wire_parser_t *inner_parser,
+                                           duct_x_slot_pool_t *ct_chunks)
 {
     auto tw = DUCT_CAST(duct_wire_tls_t, base, self);
     auto vt = tw->engine_vtbl;
     auto engine = vt->create(vt, tw->engine_cfg, tw->role);
     if (!engine)
         return nullptr;
-    auto ct_cap = xport == x_udp_shared ? 0u : s_tls_ct_cap(self->inner, vt);
-    duct_auto_del auto ct_buf = ct_cap ? duct_new(uint8_t, ct_cap) : nullptr;
-    if (ct_cap && !ct_buf) {
-        vt->destroy(engine);
-        return nullptr;
+    duct_ptr_t(uint8_t) ct_buf = nullptr;
+    if (xport != x_udp_shared) {
+        uint32_t idx = duct_x_slot_acquire(ct_chunks);
+        if (idx == treiber_empty) {
+            vt->destroy(engine);
+            return nullptr;
+        }
+        ct_buf = (duct_ptr_t(uint8_t))duct_x_slot_obj(ct_chunks, idx);
     }
-    auto inner_parser = self->inner ? duct_wire_parser_create(self->inner) : nullptr;
-    if (self->inner && !inner_parser) {
-        vt->destroy(engine);
-        return nullptr;
-    }
-    duct_auto_del auto codec = duct_new_secret(duct_wire_codec_t);
-    if (!codec) {
-        duct_wire_parser_destroy(self->inner, inner_parser);
-        vt->destroy(engine);
-        return nullptr;
-    }
+    if (self->inner)
+        duct_wire_parser_init(self->inner, inner_parser);
     *codec = (duct_wire_codec_t){
-        .destroy = s_tls_codec_destroy,
+        .release = s_tls_codec_release,
         .inner = self->inner,
-        .inner_parser = inner_parser,
+        .inner_parser = self->inner ? inner_parser : nullptr,
         .ct_buf = duct_move(ct_buf),
         .engine = engine,
         .tx_prefix_len = tw->tx_prefix_len,
@@ -307,7 +301,7 @@ static duct_wire_codec_t *s_tls_create_codec(const duct_wire_t *self, duct_xport
     memcpy(codec->prefix, tw->tx_prefix, sizeof codec->prefix);
     if (codec->lead_state != lead_state_none)
         memcpy(codec->lead.cover_key, self->cover_key, sizeof codec->lead.cover_key);
-    return duct_move(codec);
+    return codec;
 }
 
 void duct_wire_codec_owd_reset(duct_wire_codec_t *c)
@@ -535,6 +529,7 @@ duct_wire_t *duct_wire_create_sealed(const duct_sealed_wire_cfg_t *cfg)
     duct_do_if(engine->pdu_ct_max == 0u
               || engine->pdu_ct_max > duct_seal_pdu_ct_max,
               return nullptr);
+    duct_do_if(s_tls_ct_cap(inner, engine) > duct_wire_ct_buf_max, return nullptr);
     duct_do_if(engine->engine_hs_budget == 0u, return nullptr);
     /* A conn's engine park holds two messages of the budget and flushes whole:
      * the smallest TX ring, which duct_conn_tx_olb_cap sets, has to take it.
@@ -547,6 +542,9 @@ duct_wire_t *duct_wire_create_sealed(const duct_sealed_wire_cfg_t *cfg)
     size_t budget_cap = duct_conn_tx_olb_cap / 2u
                       - (dgram ? duct_dgram_record_hdr_size : 0u) - cfg->tx_prefix_len;
     duct_do_if(engine->engine_hs_budget > budget_cap, return nullptr);
+    duct_do_if(2u * (engine->engine_hs_budget + cfg->tx_prefix_len
+                     + (dgram ? duct_dgram_record_hdr_size : 0u)) > duct_conn_park_cap,
+               return nullptr);
     /* An inner wire has to frame the cleartext by itself: s_tls_on_pack seals
      * pack_header's bytes and the payload, and nothing else reaches the peer.
      * A wire writing fewer bytes than its header_size is one counting a
@@ -601,9 +599,11 @@ duct_wire_t *duct_wire_create_sealed(const duct_sealed_wire_cfg_t *cfg)
             .destroy = s_tls_wire_destroy,
             .on_parse = s_tls_on_parse,
             .on_pack = s_tls_on_pack,
-            .create_parser = s_tls_create_parser,
-            .destroy_parser = s_tls_destroy_parser,
-            .create_codec = s_tls_create_codec,
+            .parser_max = 0u,
+            .codec_max = sizeof(duct_wire_codec_t),
+            .ct_buf_max = s_tls_ct_cap(inner, engine),
+            .init_parser = s_tls_init_parser,
+            .init_codec = s_tls_init_codec,
             .unseal = s_tls_unseal,
         },
         .engine_vtbl = engine, .engine_cfg = cfg->engine_cfg,

@@ -34,8 +34,13 @@
  * io side out of slots and makes it fall back to copying mid-burst.
  */
 
+#define _GNU_SOURCE
+
 #include "duct.h"
 #include "duct_wire.h"
+#include "duct_conn.h"
+#include "duct_conn_block.h"
+#include "duct_listener.h"
 
 #include <stdatomic.h>
 #include <stdio.h>
@@ -505,18 +510,12 @@ mux_pack([[maybe_unused]] const duct_wire_t *self, [[maybe_unused]] duct_session
         duct_view(duct_view_u8, hdr, mux_hdr_size), frame->payload);
 }
 
-static duct_wire_parser_t *mux_create_parser([[maybe_unused]] const duct_wire_t *self)
-{
-    auto st = duct_new(mux_parser_t);
-    duct_do_if(!st, return nullptr);
-    *st = (mux_parser_t){};
-    return (duct_wire_parser_t *)st;
-}
+static_assert(sizeof(mux_parser_t) <= duct_wire_parser_slot,
+              "the test wire's parser exceeds the conn block's parser slot");
 
-static void mux_destroy_parser([[maybe_unused]] const duct_wire_t *self, duct_wire_parser_t *parser)
+static void mux_init_parser([[maybe_unused]] const duct_wire_t *self,
+                            [[maybe_unused]] duct_wire_parser_t *storage)
 {
-    auto st = (mux_parser_t *)parser;
-    duct_del(st);
 }
 
 static void mux_destroy(duct_wire_t *self)
@@ -534,7 +533,7 @@ static duct_wire_t *mux_wire_create(void)
         .header_size = mux_hdr_size,
         .max_frame   = 1024u,
         .destroy = mux_destroy, .on_parse = mux_parse, .on_pack = mux_pack,
-        .create_parser = mux_create_parser, .destroy_parser = mux_destroy_parser,
+        .parser_max = sizeof(mux_parser_t), .init_parser = mux_init_parser,
     };
     return &w->base;
 }
@@ -629,6 +628,97 @@ static bool sc_shared_multiplexed(void)
     return ok;
 }
 
+/* AI-generated test code. */
+static duct_resolve_disposition_t
+preparse_of([[maybe_unused]] void *ctx, [[maybe_unused]] const duct_peer_t *peer,
+            duct_view_u8 peek, duct_handle_t *out_tok,
+            duct_conn_id_t *out_conn_id, [[maybe_unused]] void **out_user_ctx,
+            [[maybe_unused]] size_t *out_lead)
+{
+    if (peek.size < sizeof(uint32_t))
+        return resolve_reject;
+    uint32_t cid;
+    memcpy(&cid, peek.data, sizeof cid);
+    if (cid != *(const uint32_t *)ctx)
+        return resolve_reject;
+    *out_conn_id = duct_conn_id_primary;
+    return resolve_new;
+}
+
+/** @brief Two datagram listeners of one worker each hold their own RX slot
+ *  pool: the per-worker shared array is gone, and no two listeners' conns
+ *  resolve the same pool. */
+static bool sc_two_listeners_own_rx_pools(void)
+{
+    s_reset();
+    auto io = duct_engine_launch(&(duct_engine_cfg_t){ .io_threads = 1, .workers = 1 });
+    if (!io) return false;
+
+    static uint32_t cid_a = 0x0AAA0AAAu, cid_b = 0x0BBB0BBBu;
+    auto wire_a = duct_wire_create_dgram_batch(0u, false);
+    auto wire_b = duct_wire_create_dgram_batch(0u, false);
+    auto proto_a = wire_a ? duct_proto_create(&(duct_proto_cfg_t){
+        .name = "dgram-a", .wire = wire_a,
+        .on_frame = on_dgram, .on_session_open = on_open, .on_session_close = on_close,
+        .preparse = preparse_of, .preparse_mode = resolve_sync, .preparse_ctx = &cid_a,
+        .max_response = 4096u, .flags = fl_proto_dgram_shared }) : nullptr;
+    auto proto_b = wire_b ? duct_proto_create(&(duct_proto_cfg_t){
+        .name = "dgram-b", .wire = wire_b,
+        .on_frame = on_dgram, .on_session_open = on_open, .on_session_close = on_close,
+        .preparse = preparse_of, .preparse_mode = resolve_sync, .preparse_ctx = &cid_b,
+        .max_response = 4096u, .flags = fl_proto_dgram_shared }) : nullptr;
+    if (proto_a) proto_a->owned_wire = wire_a; else duct_wire_destroy(wire_a);
+    if (proto_b) proto_b->owned_wire = wire_b; else duct_wire_destroy(wire_b);
+
+    uint16_t port_a = 0u, port_b = 0u;
+    bool ok = proto_a && proto_b
+           && duct_listener_bind(io, &(duct_listener_cfg_t){ .kind = listener_dgram,
+                  .addr = "127.0.0.1", .n_protos = 1,
+                  .protos = (const duct_proto_t *[]){ proto_a } },
+                  &port_a, nullptr, 0u, nullptr) == rc_ok
+           && duct_listener_bind(io, &(duct_listener_cfg_t){ .kind = listener_dgram,
+                  .addr = "127.0.0.1", .n_protos = 1,
+                  .protos = (const duct_proto_t *[]){ proto_b } },
+                  &port_b, nullptr, 0u, nullptr) == rc_ok;
+
+    pthread_t th;
+    if (ok && pthread_create(&th, nullptr, th_run, io) == 0) {
+        duct_sock_t fa = uc_connect(port_a), fb = uc_connect(port_b);
+        uint32_t ma = cid_a, mb = cid_b;
+        ok = fa != duct_sock_bad && fb != duct_sock_bad
+          && uc_send(fa, &ma, sizeof ma) == 0 && uc_send(fb, &mb, sizeof mb) == 0
+          && th_wait_int(&g_open_count, 2, 3000u);
+        if (fa != duct_sock_bad) close(fa);
+        if (fb != duct_sock_bad) close(fb);
+        /* The conn walk reads live blocks' xport and dgram ctx: it runs only
+         * once every engine thread joined, so no io or worker write races it. */
+        duct_engine_stop(io);
+        pthread_join(th, nullptr);
+        if (ok) {
+            duct_listener_t *seen[2] = {};
+            unsigned n_seen = 0u;
+            for (unsigned idx = 0u; idx < duct_runtime_max_conns && n_seen < 2u; ++idx) {
+                if (!duct_conn_block_live(idx))
+                    continue;
+                auto conn = (duct_conn_t *)duct_conn_block_at(idx);
+                if (conn->xport_type != x_udp_shared)
+                    continue;
+                seen[n_seen++] = duct_conn_dgram_ctx(conn)->listener;
+            }
+            ok = n_seen == 2u && seen[0] && seen[1] && seen[0] != seen[1]
+              && seen[0]->rx_slots && seen[1]->rx_slots
+              && seen[0]->rx_slots != seen[1]->rx_slots;
+        }
+    } else {
+        ok = false;
+    }
+
+    duct_engine_destroy(io);
+    if (proto_a) duct_proto_destroy(proto_a);
+    if (proto_b) duct_proto_destroy(proto_b);
+    return ok;
+}
+
 int main(void)
 {
     setvbuf(stdout, nullptr, _IOLBF, 0);
@@ -639,6 +729,13 @@ int main(void)
         pass = 0;
     } else {
         printf("dgram_shared: fl_proto_dgram_shared OK (session follows migrated peer)\n");
+    }
+
+    if (!sc_two_listeners_own_rx_pools()) {
+        fprintf(stderr, "dgram_shared: two listeners of one worker share an RX pool\n");
+        pass = 0;
+    } else {
+        printf("dgram_shared: per-listener RX pools OK (two listeners, two pools)\n");
     }
 
     if (!sc_plain_rejects_migration()) {

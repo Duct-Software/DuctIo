@@ -2,15 +2,18 @@
 /* Copyright (c) 2026 Duct Software */
 
 /** @file device_rx_pool_test.c
- *  @brief Two device legs on one io thread, each reading into its own RX slots:
- *  one leg's lane held by its worker never leaves the other's reads without
- *  engine buffers.
+ *  @brief Two device legs on one io thread, both reading into the thread's one
+ *  shared rx pool under two different spans: one leg's lane held by its worker
+ *  never leaves the other's reads without engine buffers, a span at the pool's
+ *  ceiling attaches, and a span past it is refused.
  *
  *  Both devices fill only the buffers the engine offers, so a read handed none
  *  counts as starved and produces nothing. The first leg's handler holds the
  *  one worker on that leg's first frame while its whole drive sits in the
  *  lane, and the second leg is signalled and read meanwhile. Once the handler
- *  lets go, every packet of both legs is checked for order and bytes.
+ *  lets go, every packet of both legs is checked for order and bytes. The
+ *  ceiling legs attach on the first session and stay idle: what they prove is
+ *  the attach answers alone.
  */
 
 #include "duct.h"
@@ -27,6 +30,7 @@
 static constexpr unsigned wait_ms    = 15000u;
 static constexpr unsigned read_batch = 32u;
 static constexpr unsigned pkt_len    = 512u;
+static constexpr unsigned span_other = 768u;
 static constexpr unsigned held_total = read_batch * duct_dgram_rx_max_passes * 2u;
 static constexpr unsigned free_total = read_batch * 2u;
 
@@ -73,6 +77,10 @@ static duct_session_t *g_sess[2];
 static unsigned        g_opened;
 static atomic_int      g_blocked = 0;
 static atomic_int      g_release = 0;
+/* AI-generated test code. */
+static atomic_int      g_span_max_rc = -1;
+static atomic_int      g_span_over_rc = -1;
+static device_signal_t g_span_signal;
 
 static duct_result_t device_read(void *ctx, duct_view_u8 *out, unsigned max, unsigned *n)
 {
@@ -129,7 +137,7 @@ on_session_open(duct_session_t *s, [[maybe_unused]] duct_handle_t tok,
     }
     duct_device_ops_t ops = {
         .wait_handle = (void *)(intptr_t)d->signal,
-        .rx_span = pkt_len,
+        .rx_span = d == &g_dev[1] ? span_other : pkt_len,
         .read = device_read,
         .write_reserve = device_write_reserve,
         .write_commit = device_write_commit,
@@ -138,6 +146,30 @@ on_session_open(duct_session_t *s, [[maybe_unused]] duct_handle_t tok,
     };
     auto rc = duct_conn_attach_device(s, 1u, &ops);
     duct_atomic_store(&d->attach_rc, (int)rc, release);
+    /* AI-generated test code. */
+    if (d == &g_dev[0] && rc == rc_ok) {
+        g_span_signal = s_signal_open();
+        if (g_span_signal) {
+            duct_device_ops_t at_max = {
+                .wait_handle = (void *)(intptr_t)g_span_signal,
+                .rx_span = duct_device_rx_span_max,
+                .read = device_read,
+                .write_reserve = device_write_reserve,
+                .write_commit = device_write_commit,
+                .release = device_release,
+                .ctx = d,
+            };
+            duct_atomic_store(&g_span_max_rc,
+                              (int)duct_conn_attach_device(s, 2u, &at_max), release);
+            duct_device_ops_t past = at_max;
+            past.rx_span = duct_device_rx_span_max + 1u;
+            duct_atomic_store(&g_span_over_rc,
+                              (int)duct_conn_attach_device(s, 3u, &past), release);
+        } else {
+            duct_atomic_store(&g_span_max_rc, (int)rc_no_memory, release);
+            duct_atomic_store(&g_span_over_rc, (int)rc_no_memory, release);
+        }
+    }
     return rc_ok;
 }
 
@@ -239,6 +271,10 @@ int main(void)
     if (!error && (duct_atomic_load(&g_dev[0].bad, acquire)
                    || duct_atomic_load(&g_dev[1].bad, acquire)))
         error = "a frame arrived out of order or with the wrong bytes";
+    if (!error && duct_atomic_load(&g_span_max_rc, acquire) != (int)rc_ok)
+        error = "a span at the pool's ceiling was refused";
+    if (!error && duct_atomic_load(&g_span_over_rc, acquire) != (int)rc_invalid_arg)
+        error = "a span past the pool's ceiling was not refused";
 
     for (unsigned i = 0u; i < 2u; ++i)
         if (peers[i] != duct_sock_bad)
@@ -250,6 +286,8 @@ int main(void)
     for (unsigned i = 0u; i < 2u; ++i)
         if (g_dev[i].signal)
             s_signal_close(g_dev[i].signal);
+    if (g_span_signal)
+        s_signal_close(g_span_signal);
 
     if (error) {
         fprintf(stderr, "device_rx_pool: %s (held frames=%d of %u, second frames=%d of %u, "
@@ -259,7 +297,8 @@ int main(void)
                 duct_atomic_load(&g_dev[1].reads, acquire), starved);
         return 1;
     }
-    printf("device_rx_pool: OK (%u + %u packets, the second leg read into engine buffers "
-           "while the first held its own)\n", held_total, free_total);
+    printf("device_rx_pool: OK (%u + %u packets under two spans of one shared pool, the second "
+           "leg read into engine buffers while the first held its own, a ceiling span attached "
+           "and one past it was refused)\n", held_total, free_total);
     return 0;
 }

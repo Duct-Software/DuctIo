@@ -37,6 +37,7 @@
 #include "duct_wire.h"
 #include "duct_wire_codec.h"
 #include "duct_wire_tx.h"
+#include "duct_x_slot.h"
 
 #include <stdatomic.h>
 #include <stdio.h>
@@ -159,6 +160,8 @@ typedef struct {
 typedef struct {
     duct_wire_t       *wire;
     duct_wire_codec_t *codec;
+    duct_wire_codec_t  codec_storage;
+    alignas(duct_cacheline_size) uint8_t parser_storage[duct_wire_parser_slot];
     uint8_t            prefix[duct_seal_prefix_max];
     size_t             prefix_len;
 } dl_side_t;
@@ -213,12 +216,32 @@ static duct_result_t dl_unseal(dl_side_t *to, const uint8_t *d, size_t len, dl_c
                             &t->base);
 }
 
+/* AI-generated test code. */
+static duct_x_slot_pool_t dl_ct_pool;
+
+static duct_x_slot_pool_t *dl_ct_chunks(void)
+{
+    if (!dl_ct_pool.range.base
+        && (!duct_x_slot_pool_init(&dl_ct_pool, 8u,
+                                   duct_x_slot_span_bytes(0u, 0u,
+                                                          (uint32_t)duct_wire_ct_buf_max),
+                                   0u, 0u, 4u, (duct_x_slot_hooks_t){})
+            || !duct_x_slot_pool_engage(&dl_ct_pool)))
+        duct_x_slot_pool_free(&dl_ct_pool);
+    return dl_ct_pool.range.base ? &dl_ct_pool : nullptr;
+}
+
 static bool dl_build(dl_side_t *s, void *cfg, duct_seal_role_t role)
 {
     s->wire = dl_wire(duct_noise_vtbl_dgram(), cfg, role, true);
     if (!s->wire)
         return false;
-    s->codec = s->wire->create_codec(s->wire, x_udp_peer);
+    memset(&s->codec_storage, 0, sizeof s->codec_storage);
+    memset(s->parser_storage, 0, sizeof s->parser_storage);
+    s->codec = dl_ct_chunks()
+        ? s->wire->init_codec(s->wire, x_udp_peer, &s->codec_storage,
+                              (duct_wire_parser_t *)s->parser_storage, dl_ct_chunks())
+        : nullptr;
     bool init = role == seal_role_initiator;
     memset(s->prefix, 0, sizeof s->prefix);
     if (init)
@@ -230,7 +253,7 @@ static bool dl_build(dl_side_t *s, void *cfg, duct_seal_role_t role)
 static void dl_free(dl_side_t *s)
 {
     if (s->codec)
-        s->codec->destroy(s->codec);
+        s->codec->release(s->codec);
     if (s->wire)
         duct_wire_destroy(s->wire);
     *s = (dl_side_t){};

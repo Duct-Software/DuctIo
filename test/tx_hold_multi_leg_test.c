@@ -57,8 +57,8 @@ static void fixture_init(fixture_t *f)
     f->proto = duct_proto_create_tcp("tx-hold-multi-leg", on_frame);
     assert(f->proto);
     f->x = conn_new(x_tcp);
-    f->x->rx_buf = duct_olb_rx_new(kbytes(4u));
-    assert(f->x->rx_buf);
+    duct_conn_carve_olb(f->x, kbytes(4u), kbytes(4u));
+    assert(duct_conn_rx_olb(f->x));
     f->a = conn_new(x_udp);
     f->c = conn_new(x_udp);
     f->y = conn_new(x_tcp);
@@ -196,7 +196,7 @@ static const char *expect_released(fixture_t *f, duct_tx_hold_t *hold)
 /** @brief Two answers of one dispatch on two legs, served in either order. */
 static const char *frames_across_legs(fixture_t *f, bool c_first)
 {
-    auto hold = &f->x->rx_buf->tx_hold;
+    auto hold = &duct_conn_rx_olb(f->x)->tx_hold;
     auto pa = park_frame(f, f->a, leg_a, hold, f->x);
     auto pc = park_frame(f, f->c, leg_c, hold, f->x);
     auto error = expect_held(f, hold, nullptr, "hold cleared with both answers parked");
@@ -217,7 +217,7 @@ static const char *frames_across_legs(fixture_t *f, bool c_first)
 /** @brief A fin and a frame answer of one dispatch, the frame served first. */
 static const char *frame_then_fin(fixture_t *f)
 {
-    auto hold = &f->x->rx_buf->tx_hold;
+    auto hold = &duct_conn_rx_olb(f->x)->tx_hold;
     auto pfin = park_fin(f, f->a, hold, f->x);
     auto pframe = park_frame(f, f->c, leg_c, hold, f->x);
     serve(f, f->c, pframe);
@@ -231,7 +231,7 @@ static const char *frame_then_fin(fixture_t *f)
 /** @brief An emit node and a frame answer of one conn, the frame served first. */
 static const char *frame_then_emit(fixture_t *f)
 {
-    auto hold = &f->x->rx_buf->tx_hold;
+    auto hold = &duct_conn_rx_olb(f->x)->tx_hold;
     duct_stream_ctx_t hctx = { .s = f->s, .conn_id = duct_conn_id_primary };
     auto pemit = park_emit(f, &hctx, f->a, leg_a, hold);
     auto pframe = park_frame(f, f->c, leg_c, hold, f->x);
@@ -246,7 +246,7 @@ static const char *frame_then_emit(fixture_t *f)
 /** @brief An answer parked by another conn's dispatch is not this conn's to wait on. */
 static const char *other_owner(fixture_t *f)
 {
-    auto hold = &f->x->rx_buf->tx_hold;
+    auto hold = &duct_conn_rx_olb(f->x)->tx_hold;
     duct_tx_hold_t other = {};
     auto theirs = park_frame(f, f->a, leg_a, &other, f->y);
     auto mine = park_frame(f, f->c, leg_c, hold, f->x);
@@ -259,7 +259,7 @@ static const char *other_owner(fixture_t *f)
 /** @brief A node whose ticket is already served, still on the list, is not waited on. */
 static const char *served_node_skipped(fixture_t *f)
 {
-    auto hold = &f->x->rx_buf->tx_hold;
+    auto hold = &duct_conn_rx_olb(f->x)->tx_hold;
     auto stale = park_frame(f, f->a, leg_a, hold, f->x);
     auto live = park_frame(f, f->c, leg_c, hold, f->x);
     s_tx_ticket_resolve(s_tx_seq_of(f->a));

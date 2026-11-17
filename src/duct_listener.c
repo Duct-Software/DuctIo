@@ -22,6 +22,8 @@
 #include "duct_listener.h"
 
 #include "duct.h"
+#include "duct_build_config.h"
+#include "duct_conn_block.h"
 #include "duct_dgram_rec.h"
 #include "duct_events.h"
 #include "duct_io.h"
@@ -79,6 +81,13 @@ static bool s_sync_finish(duct_listener_sync_t *sync, bool *ok)
     return signaled;
 }
 
+/** @brief The free a retired RX pool of a listener runs at its reap. */
+static void s_rx_pool_on_reap(duct_x_slot_pool_t *pool)
+{
+    duct_x_slot_pool_free(pool);
+    duct_del(pool);
+}
+
 void duct_listener_destroy(duct_listener_t *l)
 {
     if (l->local) {
@@ -87,6 +96,10 @@ void duct_listener_destroy(duct_listener_t *l)
     }
     if (l->listen_fd != duct_sock_bad)
         duct_sock_close(l->listen_fd);
+    if (l->rx_slots) {
+        duct_x_slot_pool_retire(l->rx_slots, s_rx_pool_on_reap);
+        l->rx_slots = nullptr;
+    }
     duct_io_listener_dgram_peers_free(l);
     if (l->dgram_tx_outbox)
         duct_vmq_mpsc_del((duct_vmq_mpsc_t *)l->dgram_tx_outbox);
@@ -121,13 +134,13 @@ void duct_local_listener_take(duct_listener_t *listener, duct_conn_t *conn)
 {
     ++listener->local->live;
     ++listener->pre_conn_refs;
-    conn->ctx = listener;
+    *duct_conn_listener_ref(conn) = listener;
 }
 
 void duct_local_listener_drop(duct_conn_t *conn)
 {
-    auto listener = (duct_listener_t *)conn->ctx;
-    conn->ctx = nullptr;
+    auto listener = *duct_conn_listener_ref(conn);
+    *duct_conn_listener_ref(conn) = nullptr;
     --listener->local->live;
     duct_listener_release_pre_conn_ref(listener);
 }
@@ -175,33 +188,30 @@ static void s_close_fire_and_forget(duct_listener_route_t *route, duct_sock_t fd
         duct_atomic_store(&reg->fd, duct_sock_bad, release);
 }
 
-/** @brief Resolve the RX slot pool of @p l's worker, creating it on first use.
- *  Every datagram node of that worker reads into it, all of them on io thread
- *  worker % @c n_io. Binds racing on a fresh worker publish one pool through
- *  the CAS, the loser freeing its own.
+/** @brief Build @p l's own RX slot pool, the one its datagram reads and the
+ *  classification of a datagram that names no conn share: the datagram
+ *  arrives before any conn exists, so the listener's pool is the finest cut
+ *  that matches the parties.
+ *  A slot stays checked out until the worker consumes the lane entry
+ *  holding it, so one duct_io_dgram_rx_drain holds up to
+ *  duct_dgram_rx_batch * duct_dgram_rx_max_passes; a pool short of that
+ *  stalls the socket mid-drain. The slots are the pool's ceiling: a read
+ *  batch of them goes live at a time, as a drain needs them, and goes back
+ *  at rest.
  *  @return @c nullptr on an allocation failure. */
-static duct_x_slot_pool_t *s_rx_pool_of(duct_listener_route_t *route, const duct_listener_t *l)
+static duct_x_slot_pool_t *s_rx_pool_new(const duct_listener_t *l)
 {
-    auto slot = &route->rx_pools[l->worker];
-    auto pool = duct_atomic_load(slot, acquire);
-    if (pool)
-        return pool;
-    auto fresh = duct_new(duct_x_slot_pool_t);
-    duct_do_if(!fresh, return nullptr);
-    /* A slot stays checked out until the worker consumes the lane entry
-     * holding it, so one duct_io_dgram_rx_drain holds up to
-     * duct_dgram_rx_batch * duct_dgram_rx_max_passes; a pool short of that
-     * stalls the socket mid-drain. The record header rides on top of a
-     * whole datagram, so a slot's payload area matches the fallback read.
-     * The slots are the pool's ceiling: a read batch of them goes live at a
-     * time, as a drain needs them, and goes back at rest. */
-    bool ok = duct_x_slot_pool_init(fresh, duct_dgram_rx_slots,
-                                    DUCT_LISTENER_DGRAM_DEFAULT + duct_dgram_record_hdr_size,
-                                    duct_dgram_record_hdr_size, duct_dgram_rx_batch,
-                                    duct_events_x_slot_hooks());
-    duct_do_if(!ok, duct_del(fresh); return nullptr);
-    fresh->reader = l->io_id;
-    return duct_x_slot_pool_publish(slot, fresh);
+    auto pool = duct_new(duct_x_slot_pool_t);
+    duct_do_if(!pool, return nullptr);
+    bool ok = duct_x_slot_pool_init(pool, duct_dgram_rx_slots,
+                                    duct_x_slot_span_bytes(0u, duct_dgram_record_hdr_size,
+                                                           DUCT_LISTENER_DGRAM_DEFAULT),
+                                    0u, duct_dgram_record_hdr_size, duct_dgram_rx_batch,
+                                    duct_events_x_slot_hooks())
+           && duct_x_slot_pool_engage(pool);
+    duct_do_if(!ok, duct_x_slot_pool_free(pool); duct_del(pool); return nullptr);
+    pool->reader = l->io_id;
+    return pool;
 }
 
 /* The counts follow the outbox the slots stand behind. The small class holds the lanes' capacity in
@@ -215,8 +225,10 @@ bool duct_listener_tx_slots_new(duct_listener_t *l, uint32_t lead, uint32_t chun
     uint32_t lanes = outbox->n_lanes;
     size_t lane_bytes = duct_mpsc_cap(outbox, 0u);
     uint32_t slot_bytes[2] = {
-        (uint32_t)duct_align_up(lead + duct_pmtu_path_default, duct_cacheline_size),
-        (uint32_t)duct_align_up(lead + duct_udp4_payload_max, duct_cacheline_size),
+        (uint32_t)duct_align_up(duct_x_slot_span_bytes(lead, 0u, duct_pmtu_path_default),
+                                duct_cacheline_size),
+        (uint32_t)duct_align_up(duct_x_slot_span_bytes(lead, 0u, duct_udp4_payload_max),
+                                duct_cacheline_size),
     };
     uint32_t count[2] = {
         (uint32_t)duct_max((size_t)lanes * lane_bytes / slot_bytes[0], (size_t)chunk),
@@ -226,8 +238,9 @@ bool duct_listener_tx_slots_new(duct_listener_t *l, uint32_t lead, uint32_t chun
     auto pools = duct_new(duct_x_slot_pool_t, 2);
     duct_do_if(!pools, return false);
     for (unsigned c = 0u; c < 2u; ++c) {
-        bool ok = duct_x_slot_pool_init(&duct_at(pools)[c], count[c], slot_bytes[c], lead, grain[c],
-                                        duct_events_x_slot_hooks());
+        bool ok = duct_x_slot_pool_init(&duct_at(pools)[c], count[c], slot_bytes[c], lead, 0u,
+                                        grain[c], duct_events_x_slot_hooks())
+               && duct_x_slot_pool_engage(&duct_at(pools)[c]);
         duct_do_if(!ok, duct_listener_tx_slots_free(duct_at(pools)); return false);
     }
     l->tx_slots = duct_at(pools);
@@ -283,7 +296,7 @@ s_listener_make_node(duct_listener_route_t *route, const duct_listener_cfg_t *cf
      * span each of them offers. */
     if (xport_type == x_udp) {
         duct_discard duct_xset_dgram_gro(fd, duct_listener_dgram_span(l));
-        l->rx_slots = s_rx_pool_of(route, l);
+        l->rx_slots = s_rx_pool_new(l);
         if (!l->rx_slots) {
             duct_listener_destroy(l);
             return rc_no_memory;
@@ -419,6 +432,7 @@ duct_result_t duct_listener_route_bind(duct_listener_route_t *route, const duct_
     /* The probe wait holds peek_min, so it needs probe_wait_ms, a stream listener and a value
      * one read can reach: the wait then always has room for the read that completes it. */
     auto span = duct_listener_peek_span(cfg->peek_cap);
+    duct_do_if(span > duct_preconn_peek_max, return rc_invalid_arg);
     duct_do_if(cfg->peek_min && (cfg->peek_min > span || !cfg->probe_wait_ms || cfg->kind == listener_dgram),
                return rc_invalid_arg);
 

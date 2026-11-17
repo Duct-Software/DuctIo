@@ -49,6 +49,7 @@
 #include "duct_noise_internal.h"
 #include "duct_dgram_rec.h"
 #include "duct_wire_codec.h"
+#include "duct_x_slot.h"
 
 #include <openssl/crypto.h>
 #include <stdatomic.h>
@@ -233,7 +234,9 @@ static const char *nd_framing(duct_noise_cfg_t *cfg)
         return "framing probe wire create failed";
 
     const char *err = nullptr;
-    auto parser = duct_wire_parser_create(w);
+    alignas(duct_cacheline_size) uint8_t parser_buf[duct_wire_parser_slot] = {};
+    auto parser = (duct_wire_parser_t *)parser_buf;
+    duct_wire_parser_init(w, parser);
     uint8_t buf[64] = {};
     duct_frame_t frame = {};
     size_t consumed = 0u, needed = 0u;
@@ -276,7 +279,6 @@ static const char *nd_framing(duct_noise_cfg_t *cfg)
         else if (w->tx_bound(w, ct_max + 1u) != SIZE_MAX)
             err = "a datagram wire accepted cleartext that spans two PDUs";
     }
-    duct_wire_parser_destroy(w, parser);
     duct_wire_destroy(w);
 
     if (!err) {
@@ -609,7 +611,20 @@ static const char *nd_ctl_framing(duct_noise_cfg_t *cfg)
         .inner = inner, .engine = duct_noise_vtbl(), .engine_cfg = cfg,
         .role = seal_role_initiator, .framing = seal_framing_datagram,
         .rx_ctl = nd_ctl_rx, .rx_ctl_ctx = (void *)&rule }) : nullptr;
-    auto codec = w ? w->create_codec(w, x_udp_peer) : nullptr;
+    duct_wire_codec_t codec_storage = {};
+    alignas(duct_cacheline_size) uint8_t parser_buf[duct_wire_parser_slot] = {};
+    /* AI-generated test code. */
+    static duct_x_slot_pool_t nd_ct_pool;
+    if (!nd_ct_pool.range.base
+        && (!duct_x_slot_pool_init(&nd_ct_pool, 8u,
+                                   duct_x_slot_span_bytes(0u, 0u,
+                                                          (uint32_t)duct_wire_ct_buf_max),
+                                   0u, 0u, 4u, (duct_x_slot_hooks_t){})
+            || !duct_x_slot_pool_engage(&nd_ct_pool)))
+        duct_x_slot_pool_free(&nd_ct_pool);
+    auto codec = w && nd_ct_pool.range.base
+        ? w->init_codec(w, x_udp_peer, &codec_storage,
+                        (duct_wire_parser_t *)parser_buf, &nd_ct_pool) : nullptr;
     err = codec ? nullptr : "control framing wire create failed";
     if (!err) {
         uint8_t pdu[sizeof nd_ctl_msg] = { nd_ctl };
@@ -641,7 +656,7 @@ static const char *nd_ctl_framing(duct_noise_cfg_t *cfg)
         }
     }
     if (codec)
-        codec->destroy(codec);
+        codec->release(codec);
     if (w)
         duct_wire_destroy(w);
     if (inner)

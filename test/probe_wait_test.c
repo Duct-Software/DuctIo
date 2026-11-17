@@ -1046,17 +1046,23 @@ static bool sc_hold_park_refused(void)
         th_sleep_ms(300u); /* the parks settle ahead of the over-cap dial */
         int holds0 = duct_atomic_load(&g_holds, acquire);
         bool pinned = false;
-        for (unsigned attempt = 0u; ok && !pinned && attempt < 5u; ++attempt) {
+        /* AI-generated test code. */
+        /* The over-cap dial races the accept read: an accept ahead of its
+         * bytes refuses the empty dial without asking the preparse, so the
+         * dial is retried until one lands its bytes first — a time budget,
+         * not a count, and one that ends well inside the parks' own
+         * deadline, which would otherwise free a slot and answer a dial. */
+        uint64_t probe_until = duct_ticks_mono_ns() + 1100ull * 1000'000ull;
+        while (ok && !pinned && duct_ticks_mono_ns() < probe_until) {
             over = th_connect(port);
-            ok = over != duct_sock_bad
-              && send(over, (const char *)rec, 8, 0) == 8
-              && th_read_exact(over, answer, sizeof answer) != 0
-              && th_peer_closed(over, 1500);
-            pinned = ok && duct_atomic_load(&g_holds, acquire) > holds0;
-            if (over != duct_sock_bad) {
-                close(over);
-                over = duct_sock_bad;
-            }
+            if (over == duct_sock_bad)
+                break;
+            if (send(over, (const char *)rec, 8, 0) == 8
+                  && th_read_exact(over, answer, sizeof answer) != 0
+                  && th_peer_closed(over, 150))
+                pinned = duct_atomic_load(&g_holds, acquire) > holds0;
+            close(over);
+            over = duct_sock_bad;
         }
         ok = ok && pinned && !th_peer_closed(held[1], 100)
               && s_counts("hold_park_refused", any, any, 0, 0);

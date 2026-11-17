@@ -8,6 +8,7 @@
 
 #include "duct_conn_fence.h"
 #include "duct_conn.h"
+#include "duct_conn_block.h"
 #include "duct_core.h"
 #include "duct_frame_rx.h"
 #include "duct_olb_rx.h"
@@ -43,7 +44,7 @@ s_conn_post_wire_fence(const duct_wfq_route_t *route, duct_conn_t *conn)
     duct_msg_wire_fence m = {
         .msg = { .exec_fn = duct_session_exec_wire_fence, .arg = nullptr },
         .conn = duct_conn_handle_get(conn),
-        .session = conn->session_token,
+        .session = duct_atomic_load(&conn->session_token, acquire),
     };
     auto lane_id = duct_wfq_pri_lane(wfq_pri_norm, conn->worker_id, route->n_workers,
                                      route->thread_id, route->n_io);
@@ -84,8 +85,6 @@ void duct_conn_wire_rebind(const duct_wfq_route_t *route, duct_conn_t *conn)
              * holds count in posted_off from the moment they are saved. */
             duct_olb_rx_discard(rx, tail);
         }
-        if (conn->wire && conn->wire_parser)
-            conn->wire->destroy_parser(conn->wire, conn->wire_parser);
         conn->wire = nullptr;
         conn->wire_parser = nullptr;
         if (duct_conn_bind_wire(conn, next, nullptr) != rc_ok) {
@@ -120,7 +119,7 @@ void duct_conn_fence_lost_publish(const duct_wfq_route_t *route, duct_conn_t *co
     duct_msg_conn_lost m = {
         .msg = { .exec_fn = duct_session_exec_conn_lost, .arg = nullptr },
         .conn = duct_conn_handle_get(conn),
-        .session = conn->session_token,
+        .session = duct_atomic_load(&conn->session_token, acquire),
         .reason = conn->close_reason,
     };
     memcpy(dst, &m, sizeof m);

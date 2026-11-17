@@ -436,10 +436,10 @@ duct_view_u8 duct_io_dgram_rx_scratch(void);
 
 /** @brief Park @p listener on its dry RX slot pool.
  *  Withdraws its read interest and sets the pool's @c stalled; the slot return
- *  or pin that takes the stall back posts this thread a resume, which puts the
+ *  that takes the stall back posts this thread a resume, which puts the
  *  listener back.
  *  @return true with the listener parked; false where reading goes on: a pool
- *          with no live chunk, one a held lane pins, or one a slot or a pin
+ *          with no live chunk, or one a slot
  *          came back to during the call.
  */
 duct_nonnull(1) bool duct_io_dgram_rx_stall(duct_listener_t *listener);

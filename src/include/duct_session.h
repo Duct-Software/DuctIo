@@ -6,8 +6,11 @@
  *
  *  A session binds one or more connections to a protocol and its per-session
  *  state. The session closes when its last conn closes (terminal teardown via
- *  @ref duct_session_detach_leg). Allocated from a session pool with
- *  generation-checked handles.
+ *  @ref duct_session_detach_leg). Each session is one fixed 64 KB block of
+ *  the session pool, its page 0 resident for the process's whole life and
+ *  its tail first-touch; the block's geometry lives in
+ *  @ref duct_session_block.h. Handles are generation-checked against the
+ *  slot.
  */
 
 #ifndef DUCT_SESSION_H
@@ -55,26 +58,47 @@ typedef union duct_session_handle {
 static_assert(sizeof(duct_session_handle_t) == sizeof(duct_handle_t),
     "duct_session_handle_t must be 64 bits");
 
-/** @brief Session lifecycle states. */
+/** @brief Session lifecycle states.
+ *
+ *  The owner worker runs every transition past @c sess_attached; the state
+ *  word itself is the teardown once-guard (@c sess_closing vs @c sess_dead)
+ *  and the grace carrier (@c sess_dead with @c grace_left). */
 typedef enum duct_session_state : uint8_t {
-    session_state_free = 0,    /**< Slot is unused. */
-    session_state_attached,    /**< Live with at least one attached conn. */
-    session_state_closing,     /**< Teardown started; draining pending work. */
-    session_state_quarantine,  /**< Closed; held until the drain epoch passes. */
-    session_state_count        /**< State count sentinel. */
+    sess_free = 0,    /**< Slot is unused. */
+    sess_attached,    /**< Live with at least one attached conn. */
+    sess_closing,     /**< Teardown started; draining pending work. */
+    sess_dead,        /**< Teardown finished; held for the owner's grace ticks. */
+    session_state_count /**< State count sentinel. */
 } duct_session_state_t;
 
 /** @brief Session flags. */
 typedef enum duct_session_flags : uint8_t {
-    /** @brief Guards session teardown from running more than once. */
-    fl_session_teardown_claimed = 1u << 0,
+    /** @brief No flags set: the streams region is not initialized. */
+    fl_session_none = 0u,
 
-    /** @brief Teardown has finished; the session's memory may be freed. */
-    fl_session_teardown_done    = 1u << 1,
+    /** @brief The session block's streams region is initialized. */
+    fl_session_multiplexed = 1u << 0,
 } duct_session_flags_t;
 
 static_assert(sizeof(duct_session_flags_t) == sizeof(uint8_t),
     "duct_session_flags_t width must be 8 bits");
+
+/** @brief Protocol-switch barrier: how far a pending switch has run.
+ *  The owner worker walks the stages; @c switch_none with @c switch_next
+ *  set names a switch recorded and 1 not yet applied.
+ */
+typedef enum duct_switch_stage : uint8_t {
+    switch_none,       /**< No switch in flight. */
+    switch_parked_tx,  /**< Recorded, waiting for the session's last parked TX retry. */
+    switch_fencing,    /**< Wire rebind fanned out; @c switch_pending fences owed. */
+    switch_stage_count /**< Stage count sentinel. */
+} duct_switch_stage_t;
+
+static_assert(sizeof(duct_switch_stage_t) == sizeof(uint8_t),
+    "duct_switch_stage_t width must be 8 bits");
+
+static_assert(duct_runtime_max_workers <= 256u,
+    "worker_id must fit its u8 slot");
 
 static_assert(duct_session_max_streams >= 1u,
     "duct_session_max_streams must be >= 1");
@@ -84,13 +108,6 @@ static_assert(duct_session_max_legs >= 1u,
 
 static_assert((duct_session_max_streams & (duct_session_max_streams - 1u)) == 0u,
     "duct_session_max_streams must be a power of two");
-    
-/** @brief Epoch-based reclamation grace window.
- *  A freed session slot is not reused for this number of session-pool epochs
- *  after close, so resolve-then-use references captured before the generation
- *  bump have drained.
- */
-static constexpr unsigned session_quarantine_epochs = 2u;
 
 /** @brief @c idle_at of a session with no idle timer pending.
  *  Zero; stamps are monotonic-clock readings, which are never zero. */
@@ -144,8 +161,8 @@ static_assert(sizeof(duct_stream_flags_t) == sizeof(uint8_t),
 
 /** @brief One multiplexed stream within a session.
  *
- *  Intrusive hash-chain link @c hh over the session's @c stream_buckets.
- *  Free slots reuse @c hh.next as the free-list link.
+ *  Intrusive hash-chain link @c hh over the session block's carved bucket
+ *  array. Free slots reuse @c hh.next as the free-list link.
  */
 struct duct_stream {
     duct_stream_id_t _Atomic id;    /**< Stream identifier; 0 == free slot. */
@@ -183,59 +200,47 @@ struct duct_stream {
 typedef struct duct_session {
 
     duct_cacheline_struct(
-        duct_session_id_t    session_id;  /**< Slot identifier. */
-
         /** @brief Per-slot monotonic generation. 0 means never issued.
-         *  Bumped on acquire and on invalidate, never cleared on free.
+         *  Bumped on acquire and on every pool return, never cleared on
+         *  free.
          */
         uint32_t _Atomic generation;
-
-        /** @brief Free-list Treiber stack link. */
-        uint32_t _Atomic next_free;
-
-        /** @brief Pending-reclaim Treiber stack link.
-         *  @see duct_sessions_reclaim
-         */
-        uint32_t _Atomic reclaim_next;
-
-        /** @brief On the pending-reclaim stack or a reclaim call's local
-         *  chain right now. A second push while set folds the chain
-         *  into a cycle (push writes @c reclaim_next), leaving
-         *  @ref duct_sessions_reclaim walking it forever -- every push
-         *  claims this first and skips when already claimed. */
-        bool _Atomic     reclaim_queued;
 
         /** @brief Session's current lifecycle state.
          *  @see duct_session_state_t for the state machine.
          */
         duct_session_state_t _Atomic state;
 
-        /** @brief Session flag bits. */
-        duct_session_flags_t _Atomic flags;
-
-        /** @brief Reason recorded at close. */
-        duct_close_reason_t  _Atomic close_reason;
-
-        /** @brief Drain epoch before the slot may be reused.
-         *
-         *  Set to @c drain_epoch + session_quarantine_epochs at the
-         *  closing→quarantine transition — a fixed grace, independent of
-         *  which conn triggered the close. Written before that state CAS
-         *  so concurrent drainers observe the real window.
-         */
-        uint64_t             _Atomic quarantine_after;
+        /** @brief Session flag bits; the owner worker alone writes them. */
+        duct_session_flags_t flags;
 
         /** @brief Worker thread that owns this session's protocol logic.
          *
-         *  Assigned once, at first leg attach, and immutable after — a
-         *  later join leg always routes to this same worker.
+         *  Stored by @c duct_session_acquire ahead of the @c sess_attached
+         *  publication and immutable after — a later join leg always
+         *  routes to this same worker. Readers come past an acquire of
+         *  @c state.
          */
-        uint32_t _Atomic worker_id;
+        uint8_t worker_id;
 
-        /** @brief Attached leg count. Sole writers: the owner worker, on
-         *  attach and detach. Never zeroed by the idle drainer.
+        /** @brief Attached leg count. Sole writer: the owner worker, on
+         *  attach and detach.
          */
-        uint32_t _Atomic conn_count;
+        uint8_t conn_count;
+
+        /** @brief Grace ticks the dead session still owes, owner-private.
+         *  Set at the closing→dead transition, counted down by the
+         *  owner's idle pass.
+         */
+        uint8_t grace_left;
+
+        /** @brief Reason recorded at close; owner-only writer. */
+        duct_close_reason_t close_reason;
+
+        /** @brief Link to the next dead session on the owner worker's
+         *  reclaim list, a block index; @c duct_blk_none at the tail.
+         */
+        uint32_t reclaim_next;
 
         const duct_proto_t *proto;     /**< Bound protocol descriptor. */
 
@@ -257,21 +262,19 @@ typedef struct duct_session {
      */
     uint64_t             idle_at;
 
-    /** @brief Protocol this session is switching to, once the in-flight
-     *  response finishes sending; nullptr when no switch is pending.
-     *
-     *  Worker-private: only the owning worker ever reads or writes it.
-     */
-    const duct_proto_t *pending_switch_next;
+    /** @brief Protocol the session switches to, one switch in flight at a
+     *  time: a second @c duct_proto_switch while one pends answers
+     *  @c rc_again. Clear while no switch is pending. */
+    const duct_proto_t *switch_next;
 
-    /** @brief Protocol switch still waiting on every leg's wire rebind.
-     *  The async counterpart of @ref pending_switch_next for a
-     *  switch whose new protocol's wire differs from the old one.
-     *
-     *  Nullptr once no such switch is in flight; worker-private, same as
-     *  @ref pending_switch_next.
+    /** @brief How far the pending switch has run; owner-run stages. */
+    duct_switch_stage_t  switch_stage;
+
+    /** @brief Opaque context for the pending protocol switch, passed
+     *  unchanged to both the leave and the enter callback of that switch;
+     *  one switch in flight at a time, so both switch kinds share it.
      */
-    const duct_proto_t *wire_rebind_next;
+    void                *switch_ctx;
 
     /** @brief Per-leg conn handle, indexed by conn_id; 0 when that leg
      *  is unattached.
@@ -288,86 +291,76 @@ typedef struct duct_session {
     duct_session_join_t  join;             /**< Join key, peer identity and
                                               *  lead window. */
 
-    alignas(duct_cacheline_size) duct_stream_t *streams; /**< Stream table for
-                                              *  multiplexed protocols. */
-    duct_hash_handle_t **stream_buckets;   /**< Hash bucket heads for the
-                                              *  stream table; lazily
-                                              *  allocated on first use. */
-    duct_hash_handle_t  *stream_free_head; /**< Free-list head via
-                                              *  @c hh.next; NULL when the
-                                              *  table is full. */
-    uint32_t             stream_count;     /**< Number of live streams. */
-
     /** @brief Legs still to confirm before the wire-changing switch
      *  commits.
      *  A leg leaves once: by its wire fence or, closing first, by its
      *  conn_lost.
      */
-    uint32_t             wire_rebind_pending;
+    uint32_t             switch_pending;
 
-    /** @brief Opaque context for the pending protocol switch, passed
-     *  unchanged to both the leave and the enter callback of that switch.
-     */
-    void                *pending_switch_ctx;
-
-    /** @brief Opaque context for the pending wire-changing switch.
-     *  The @ref wire_rebind_next counterpart of @ref pending_switch_ctx.
-     */
-    void                *wire_rebind_ctx;
-
-    /** @brief The session's last timer output while it waits parked, which
-     *  holds the next timer fire.
-     *  Reset with the slot; worker only.
-     */
-    duct_tx_hold_t       timer_hold;
+    alignas(duct_cacheline_size) duct_hash_handle_t *stream_free_head; /**< Free-list
+                                              *  head of the carved stream
+                                              *  table via @c hh.next; NULL
+                                              *  while the region is not
+                                              *  initialized or the table is
+                                              *  full. */
+    uint32_t             stream_count;     /**< Number of live streams. */
 } duct_session_t;
 
-static_assert(offsetof(duct_session_t, idle_at) == duct_cacheline_size,
-    "the first group must fill exactly one line");
+static_assert(offsetof(duct_session_t, user_ctx) + sizeof(void *) <= duct_cacheline_size,
+    "the identity fields end inside their line with slack");
 static_assert(offsetof(duct_session_t, conns) + sizeof(duct_handle_t) <= 2 * duct_cacheline_size,
     "the first leg must share the frame path's line");
-static_assert(offsetof(duct_session_t, streams) % duct_cacheline_size == 0u,
+static_assert(offsetof(duct_session_t, stream_free_head) % duct_cacheline_size == 0u,
     "the owner's tail starts on a line of its own, apart from the join window io advances");
 
-/** @brief Reclaim pass for epoch-expired sessions: closing → quarantine → free.
- *
- *  Drains the pending-reclaim stack (pushed onto by @ref duct_session_release,
- *  @ref duct_session_request_close, and the last @ref duct_session_detach_leg —
- *  every site that moves a slot into @c session_state_closing / quarantine),
- *  not a full pool scan; anything not yet ready for this @p drain_epoch is
- *  requeued for the next call. Called from the worker idle path;
- *  @c on_session_close has already fired (in @ref duct_session_detach_leg /
- *  @ref duct_session_request_close) before the slot reaches closing→quarantine
- *  here.
+/** @brief One grace tick of the owner's idle pass over a dead session.
+ *  A tick left on the count spends it; a session past its last tick returns
+ *  its block to the pool.
+ *  @return true when the block was returned, false when grace remains.
  */
-void duct_sessions_reclaim(uint64_t drain_epoch);
-
-/** @brief Idle-driven reclaim pass: closing → quarantine → free.
- *
- *  Bumps the pool's own epoch and drains the session quarantine against it.
- */
-void duct_sessions_reclaim_idle(void);
+duct_nonnull(1) bool duct_session_dead_tick(duct_session_t *s);
 
 /** @brief Shutdown reclaim: every live session straight to free.
  *
- *  Full pool scan, not a pending-reclaim drain — catches sessions the normal
- *  close path never pushed there (still attached with live conns). For
- *  @ref duct_engine_destroy only, after every I/O and worker thread of the
- *  dying engine has joined: the pool is process-global and outlives one
- *  engine, and a session left live here never reaches any other reclaim.
+ *  Walks the complement of the pool's free bitmap — exactly the ever-opened
+ *  blocks, never the whole slot space — and fires each live session's
+ *  teardown once, then returns its block. Resets every worker's reclaim list
+ *  through the worker module. For @ref duct_engine_destroy only, after every
+ *  I/O and worker thread of the dying engine has joined: the pool is
+ *  process-global and outlives one engine, and a session left live here
+ *  never reaches any other reclaim.
  */
 void duct_sessions_reclaim_shutdown(void);
 
-/** @brief Session slot acquisition from the pool's free stack.
- *  Nullptr if the pool is exhausted.
+/** @brief Take a session block and publish it attached to @p worker_id.
+ *  The owner's id is stored ahead of the @c sess_attached release, so a
+ *  later join leg always routes to it; the generation bumps, the body
+ *  resets and the fixed tail from the counters to page 0's end zeroes. A
+ *  pool that answers empty is swept on a private cursor until it refuses.
+ *  @return The session, or @c nullptr when no block is to be had.
  */
-duct_session_t *duct_session_acquire(void);
+duct_session_t *duct_session_acquire(uint32_t worker_id);
+
+/** @brief Block index of @p s: its offset into the pool's range. */
+duct_nonnull(1) uint32_t duct_session_idx_get(const duct_session_t *s);
+
+/** @brief Address of session block @p idx, unchecked: for a raw page-0
+ *  reader that holds its own liveness proof. */
+duct_session_t *duct_session_block_at(uint32_t idx);
+
+/** @brief Test whether session block @p idx is @c blk_active. */
+bool duct_session_block_live(uint32_t idx);
+
+/** @brief The engine's session block pool; a defer node's home resolves by
+ *  its address against this range. */
+struct duct_block_pool;
+struct duct_block_pool *duct_session_pool_blocks(void);
 
 /** @brief Resolve the per-leg traffic tallies of @p s, one entry per @c conn_id.
  *
- *  The block is pool storage beside the session slot, outside
- *  @ref duct_session_t, and @ref duct_session_acquire zeroes it. Only the
- *  owner worker writes it.
+ *  The tallies live in the session block's page 0, and
+ *  @ref duct_session_acquire zeroes them. Only the owner worker writes them.
  */
 duct_nonnull(1) duct_conn_counters_t *duct_session_counters(const duct_session_t *s);
 
@@ -386,9 +379,9 @@ typedef struct duct_session_timer_key {
 
 /** @brief Resolve the keyed-timer slots of @p s, @c session_timer_keys entries.
  *
- *  The block is pool storage beside the session slot, outside
- *  @ref duct_session_t, and @ref duct_session_acquire zeroes it. Only the
- *  owner worker reads or writes it.
+ *  The slots live in the session block's page 0, and
+ *  @ref duct_session_acquire zeroes them. Only the owner worker reads or
+ *  writes them.
  */
 duct_nonnull(1) duct_session_timer_key_t *duct_session_timer_keys(const duct_session_t *s);
 
@@ -403,11 +396,15 @@ static constexpr unsigned duct_session_join_index_slots = 4u * duct_max_conns;
  */
 duct_handle_t _Atomic *duct_session_join_index(void);
 
-/** @brief Session slot release: quarantine + per-slot generation bump. */
+/** @brief Session slot release, the rollback path of a failed open.
+ *
+ *  The session never published: @c on_session_open never ran, its token
+ *  never escaped, no borrower can exist — so the block returns to the pool
+ *  directly, past every worker's reclaim list. */
 duct_nonnull(1) void duct_session_release(duct_session_t *session);
 
-/** @brief Handle-based session resolve, either @c session_state_attached or
- *  @c session_state_closing.
+/** @brief Handle-based session resolve, either @c sess_attached or
+ *  @c sess_closing.
  *
  *  Nullptr if the generation is stale (slot recycled) or the slot was
  *  never attached. Use @ref duct_session_attached_by_handle to reject a
@@ -415,7 +412,7 @@ duct_nonnull(1) void duct_session_release(duct_session_t *session);
  */
 duct_session_t *duct_session_by_handle(duct_session_handle_t h);
 
-/** @brief Handle-based session resolve, strictly @c session_state_attached.
+/** @brief Handle-based session resolve, strictly @c sess_attached.
  *  One atomic state read covers both the resolve and the state check.
  */
 duct_session_t *duct_session_attached_by_handle(duct_session_handle_t h);
@@ -423,7 +420,7 @@ duct_session_t *duct_session_attached_by_handle(duct_session_handle_t h);
 /** @brief Leg attach at @p conn_id.
  *
  *  Stores @p handle at @c conns[conn_id] and sets
- *  @c session_state_attached. Session-side only: the caller binds the conn's
+ *  @c sess_attached. Session-side only: the caller binds the conn's
  *  fence separately via @ref duct_conn_session_bind.
  *
  *  @param session   Live session from @ref duct_session_acquire.
@@ -477,8 +474,8 @@ duct_session_open(const duct_proto_t *proto,
  *  Removes a leg; if it was the last, fires @c on_session_close once and
  *  destroys @c proto_state. Composes the internal leg-removal step with the
  *  once-guarded close fire, which runs only when the removal transitions
- *  the session to closing AND no live legs remain. Idempotent via the
- *  @c fl_session_teardown_claimed once-guard.
+ *  the session to closing AND no live legs remain. The state word itself is
+ *  the once-guard: a session past @c sess_closing has had its teardown.
  *
  *  @return true if @c on_session_close fired on this call.
  */
@@ -492,7 +489,7 @@ duct_session_detach_leg(duct_session_t *session,
  *  Marks the session closing and fires @c on_session_close now if no live
  *  legs remain, otherwise defers the fire to the last
  *  @ref duct_session_detach_leg. Sets @c close_reason and
- *  @c session_state_closing. The worker follows this with io teardown +
+ *  @c sess_closing. The worker follows this with io teardown +
  *  @ref duct_session_detach_leg per live leg; the last detach fires the
  *  close callback.
  */
@@ -503,14 +500,7 @@ duct_session_request_close(duct_session_t *session,
 /** @brief Token snapshot from a live session.
  *  A @c nullptr @p s yields a zero token.
  */
-static inline duct_session_handle_t
-duct_session_handle_from_live(const duct_session_t *s)
-{
-    return s ? (duct_session_handle_t) {
-        .id = s->session_id,
-        .gen = duct_atomic_load(&s->generation, acquire)
-    } : (duct_session_handle_t){};
-}
+duct_session_handle_t duct_session_handle_from_live(const duct_session_t *s);
 
 /** @brief Atomic load of one connection handle from slot @p conn_id.
  *  Decoded with acquire semantics; pairs with release store in
@@ -531,28 +521,6 @@ duct_session_conn_at(const duct_session_t *s, duct_conn_id_t conn_id)
 #define duct_session_for_each_leg(s, i, h) \
     for (duct_conn_id_t i = 0u; i < duct_session_max_legs; ++i) \
         if (((h) = duct_session_conn_at((s), i)).word)
-
-/** @brief Atomic OR into session flags. */
-duct_nonnull(1) static inline void
-duct_session_state_set(duct_session_t *session, duct_session_flags_t flags)
-{
-    duct_atomic_fetch(or, &session->flags, flags, release);
-}
-
-/** @brief Atomic AND-NOT clear of session flags. */
-duct_nonnull(1) static inline void
-duct_session_state_clear(duct_session_t *session, duct_session_flags_t flags)
-{
-    duct_atomic_fetch(and, &session->flags, duct_not(flags),
-                      release);
-}
-
-/** @brief Atomic session-flags load. */
-duct_nonnull(1) static inline duct_session_flags_t
-duct_session_state(const duct_session_t *session)
-{
-    return duct_atomic_load(&session->flags, acquire);
-}
 
 /** @brief Bound-session resolve for a conn; nullptr if unbound or freed. */
 duct_nonnull(1) duct_session_t *
@@ -599,12 +567,12 @@ duct_exec_rc_t duct_session_exec_conn_lost(void *self);
 
 /** @brief Wire-rebind fence node executor.
  *
- *  Decrements @c wire_rebind_pending, finishes the switch once every leg
+ *  Decrements @c switch_pending, finishes the switch once every leg
  *  has confirmed. @p self is a byte-copied VMQ payload (@ref
  *  duct_msg_wire_fence is a plain @c duct_msg_decl, not chainable) — it is
  *  never heap-owned and must not be freed here. No-op if the session is
  *  gone or the switch was already abandoned (session close clears
- *  @c wire_rebind_next first). Runs ahead of its conn's conn_lost: io posts no
+ *  @c switch_next first). Runs ahead of its conn's conn_lost: io posts no
  *  fence for a conn it has quiesced.
  */
 duct_exec_rc_t duct_session_exec_wire_fence(void *self);
@@ -719,19 +687,21 @@ duct_result_t duct_stream_reset(duct_session_t *s, duct_conn_id_t conn_id,
                                 duct_stream_id_t stream_id,
                                 duct_stream_error_t err);
 
-/** @brief Stream-table allocation for a multiplexed session.
+/** @brief Stream-region initialization for a multiplexed session.
  *
  *  Called from both open paths (@ref duct_session_open, @ref
  *  duct_session_exec_open) after the proto is bound, only when
- *  @c fl_proto_multiplexed is set. Non-multiplexed sessions keep @c streams
- *  NULL (zero overhead). Returns @c false on OOM (caller rolls back the open).
+ *  @c fl_proto_multiplexed is set: zeroes the carved stream table and its
+ *  buckets, and builds the free list. A handler-context slot clears itself
+ *  at its handler's end, so the ctx table starts where the acquire reset
+ *  left it. A non-multiplexed session never touches the region's pages.
  */
-bool duct_session_streams_alloc(duct_session_t *s);
+void duct_session_streams_alloc(duct_session_t *s);
 
 /** @brief Live-stream teardown, every slot.
  *  Fires @c on_stream_close + @c destroy_stream_state per slot. Called at
- *  terminal session close, before @c proto is cleared. No-op when
- *  @c streams is NULL.
+ *  terminal session close, before @c proto is cleared. No-op while the
+ *  streams region is not initialized.
  */
 void duct_session_streams_destroy(duct_session_t *s);
 
@@ -740,21 +710,17 @@ void duct_session_streams_destroy(duct_session_t *s);
  *  Cancels every stream handler last associated with @p conn_id and tears
  *  down its stream slot; streams owned by other legs are untouched.
  *  Called from @ref duct_session_exec_conn_lost before leg detach, while
- *  @c s->conns[conn_id] still resolves. No-op when @c streams is NULL.
+ *  @c s->conns[conn_id] still resolves. No-op while the streams region is
+ *  not initialized.
  */
 void duct_session_streams_cancel_conn(duct_session_t *s, duct_conn_id_t conn_id,
                                       duct_close_reason_t reason);
 
-/** @brief Stream-table array free, no callbacks.
- *  Called at slot reclaim and pool teardown.
- */
-void duct_session_streams_free(duct_session_t *s);
-
 /** @brief Outcome of a stream claim attempt.
  *  Separates admission outcomes for peer responses: a full table is transient,
  *  whereas a protocol rejection is final. None of them is an allocation
- *  failure — the table is built once at @ref duct_session_streams_alloc and
- *  claims pop from its free list.
+ *  failure — the carved table is initialized once at
+ *  @ref duct_session_streams_alloc and claims pop from its free list.
  */
 typedef enum duct_stream_admit : uint8_t {
     stream_admit_ok = 0,     /**< Slot claimed, or already live. */
@@ -767,10 +733,11 @@ typedef enum duct_stream_admit : uint8_t {
  *
  *  Idempotent: a second claim of the same id returns the existing slot without
  *  re-firing the hooks. Stream 0 (control) never claims → returns nullptr.
- *  Returns nullptr if @c streams is NULL, @p stream_id is 0, the table is full,
- *  or @c create_stream_state fails; @p admit takes which of those it was, and
- *  may be null. @p out is zero-init'd before @c on_stream_open;
- *  the caller processes it for TX + control only on a non-nullptr return.
+ *  Returns nullptr if the streams region is not initialized, @p stream_id is
+ *  0, the table is full, or @c create_stream_state fails; @p admit takes
+ *  which of those it was, and may be null. @p out is zero-init'd before
+ *  @c on_stream_open; the caller processes it for TX + control only on a
+ *  non-nullptr return.
  *
  *  @return The claimed slot on success (non-nullptr); the per-stream state is
  *         @c slot->proto_state (may be nullptr when @c create_stream_state is
@@ -806,8 +773,10 @@ duct_stream_t *duct_session_stream_slot(duct_session_t *s,
 
 /** @brief Pending proto-switch execution (recorded by @c duct_proto_switch).
  *
- *  Runs on the worker once the triggering turn's response has staged and no
- *  response of the session waits parked. When the new proto's wire equals the
+ *  Runs on the worker once the triggering turn's response has staged. A
+ *  response of the session still parked on TX backpressure parks the switch
+ *  at @c switch_parked_tx, its replay taking this again. When the new
+ *  proto's wire equals the
  *  old one, finishes synchronously: creates the new @c proto_state, fires
  *  @c on_proto_leave (old, with live streams), tears down old live streams,
  *  fires @c on_proto_enter (new), disposes of the old @c proto_state per the
