@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: AGPL-3.0-only */
 /* Copyright (c) 2026 Duct Software */
+/* AI-generated test code. */
 
 /**
  * @file close_order_test.c
@@ -9,7 +10,10 @@
  * A raw client with a small receive buffer reads nothing while frame_count
  * frames of frame_size bytes go out to it: more than the TX ring and both
  * socket buffers hold, pinned small on the listening socket for the accepted
- * one to inherit, so the later frames park. Once the ring holds still, a close
+ * one to inherit, and pinned again on the engine's windows and darwin send
+ * buffer through DUCT_TCP_SNDBUF, whose four-mebibyte default would swallow
+ * the run whole before the ring parks, so the later frames park. Once the
+ * ring holds still, a close
  * comes in, and only then does the client read:
  * - leg: the host posts the frames, then an invoke closes the leg with
  *   close_normal. The session stays, its parked frames are the leg's output
@@ -337,6 +341,15 @@ static const char *s_scenario(scope_t scope, bool say)
 int main(void)
 {
     setvbuf(stdout, nullptr, _IOLBF, 0);
+#ifdef _WIN32
+    char pin[32];
+    duct_discard snprintf(pin, sizeof pin, "DUCT_TCP_SNDBUF=%d", sock_buf);
+    duct_discard _putenv(pin);
+#else
+    char val[16];
+    duct_discard snprintf(val, sizeof val, "%d", sock_buf);
+    duct_discard setenv("DUCT_TCP_SNDBUF", val, 1);
+#endif
     for (unsigned i = 0u; i < sizeof s_scope_names / sizeof s_scope_names[0]; ++i) {
         /* The requests of the peer and malformed scopes are answered from the dispatch batch, where a train can open
          * on the leg between two looks at the ring; the order it breaks shows in one run of about fifty. */
