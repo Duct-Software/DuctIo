@@ -231,6 +231,12 @@ static inline uint64_t duct_xget_tx_unsent([[maybe_unused]] int fd)
     return duct_tx_unsent_unread;
 }
 
+/** @brief Nothing: this backend reads no wire state on a close. */
+static inline void duct_x_tcp_close_diag([[maybe_unused]] int fd,
+                                         [[maybe_unused]] duct_close_reason_t reason)
+{
+}
+
 /** @brief Bound how long TCP socket @p fd retransmits unanswered before the
  *  stack ends it, @p ms rounded up to whole seconds.
  *  0 restores the stack's own bound. @c TCP_RXT_CONNDROPTIME carries it, and

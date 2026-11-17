@@ -5137,6 +5137,8 @@ static bool s_conn_close(duct_io_t *t, duct_conn_t *conn, duct_close_reason_t re
     auto pre = duct_conn_fence_quiesce(conn);
     if (pre != fence_unbound && pre != fence_open)
         return false; /* already claimed by a concurrent/earlier close — no-op */
+    if (getenv("DUCT_TCP_INFO_LOG"))
+        duct_x_tcp_close_diag(conn->fd, reason);
     s_conn_detach(t, conn);
     if (pre == fence_unbound) {
         if (!duct_has(duct_conn_state(conn), fl_conn_in_wfq))

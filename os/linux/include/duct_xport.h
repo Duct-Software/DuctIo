@@ -326,6 +326,30 @@ duct_xget_tcp_stats(duct_x_sock_stats_t *x, int fd, duct_tcp_stats_t *out)
     return true;
 }
 
+/** @brief One stderr line of a closed tcp socket's kernel wire state: the
+ *  pending error, the socket state, the retransmit and RTO figures, the ages
+ *  of the last data each way, the window. Answers only a close_io_error or a
+ *  close_timeout reason. */
+static inline void duct_x_tcp_close_diag(duct_sock_t fd, duct_close_reason_t reason)
+{
+    if (reason != close_io_error && reason != close_timeout)
+        return;
+    duct_do_if(fd == duct_sock_bad, return);
+    struct tcp_info info;
+    socklen_t len = sizeof info;
+    if (getsockopt(fd, IPPROTO_TCP, TCP_INFO, &info, &len) < 0)
+        return;
+    int so_err = 0;
+    socklen_t so_len = sizeof so_err;
+    duct_discard getsockopt(fd, SOL_SOCKET, SO_ERROR, &so_err, &so_len);
+    duct_log(stderr,
+             "duct: tcp close reason %u fd %d so_error %d state %u retrans %u rto %u "
+             "sent_ms %u recv_ms %u cwnd %u",
+             (unsigned)reason, fd, so_err, info.tcpi_state, info.tcpi_retransmits,
+             info.tcpi_rto, info.tcpi_last_data_sent, info.tcpi_last_data_recv,
+             info.tcpi_snd_cwnd);
+}
+
 /** @brief Read TCP socket @p fd's unsent bytes.
  *  @return @c duct_tx_unsent_unread always: Linux reads no figure. */
 static inline uint64_t duct_xget_tx_unsent([[maybe_unused]] int fd)

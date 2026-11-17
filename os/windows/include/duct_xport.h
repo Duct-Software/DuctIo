@@ -232,6 +232,38 @@ duct_xset_tcp_ack_timeout(SOCKET fd, uint32_t ms)
                       (const char *)&(DWORD){ ms }, sizeof(DWORD)) == 0;
 }
 
+/** @brief One stderr line of a closed tcp socket's stack wire state off
+ *  SIO_TCP_INFO: the pending error, the socket state, the round trip,
+ *  retransmitted bytes, timeout episodes, SYN retransmits. Answers only a
+ *  close_io_error or a close_timeout reason. */
+static inline void duct_x_tcp_close_diag(SOCKET fd, duct_close_reason_t reason)
+{
+    if (reason != close_io_error && reason != close_timeout)
+        return;
+    duct_do_if(fd == INVALID_SOCKET, return);
+    DWORD version = 0u, got = 0u;
+    duct_x_tcp_info_v0_t info;
+    if (WSAIoctl(fd, _WSAIORW(IOC_VENDOR, 39), &version, sizeof version, &info,
+                 sizeof info, &got, nullptr, nullptr) != 0
+        || got < offsetof(duct_x_tcp_info_v0_t, TimeoutEpisodes)
+                   + sizeof info.TimeoutEpisodes) {
+        int so_err = 0;
+        int so_len = (int)sizeof so_err;
+        duct_discard getsockopt(fd, SOL_SOCKET, SO_ERROR, (char *)&so_err, &so_len);
+        duct_log(stderr, "duct: tcp close reason %u fd %u so_error %d (no tcp info)",
+                 (unsigned)reason, (unsigned)fd, so_err);
+        return;
+    }
+    int so_err = 0;
+    int so_len = (int)sizeof so_err;
+    duct_discard getsockopt(fd, SOL_SOCKET, SO_ERROR, (char *)&so_err, &so_len);
+    duct_log(stderr,
+             "duct: tcp close reason %u fd %u so_error %d state %lu rtt_us %lu "
+             "retrans %lu timeouts %lu syn_retrans %u",
+             (unsigned)reason, (unsigned)fd, so_err, info.State, info.RttUs,
+             info.BytesRetrans, info.TimeoutEpisodes, (unsigned)info.SynRetrans);
+}
+
 /** @brief The send buffer a new conn's TCP socket asks Winsock for, bytes.
  *  Winsock grants a small buffer by default and has no send autotuning: a
  *  single flow stops at the bytes it may leave unacknowledged, which caps
