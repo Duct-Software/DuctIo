@@ -41,6 +41,17 @@ typedef struct duct_dgram_out {
                         *  is empty. */
 } duct_dgram_out_t;
 
+/** @brief One record of a connected socket's TX descriptor ring: its inline
+ *  header and its payload span — the two iovec a segmented or plain send
+ *  posts, the header's bytes and the payload's living where their record
+ *  keeps them.
+ */
+typedef struct duct_tx_rec {
+    duct_view_u8 hdr;  /**< The record's inline header; zero-sized when the
+                        *  record carries none. */
+    duct_view_u8 body; /**< The record's payload span. */
+} duct_tx_rec_t;
+
 /** @brief Place of one datagram in a segmented send led by a datagram of
  *  segment size. */
 typedef enum duct_x_gso_fit : uint8_t {
@@ -93,6 +104,11 @@ duct_nonnull(1) static inline size_t duct_x_dgram_len_out(const duct_dgram_out_t
 {
     return m->hdr.size + m->body.size;
 }
+
+duct_nonnull(1) static inline size_t duct_x_dgram_len_rec(const duct_tx_rec_t *r)
+{
+    return r->hdr.size + r->body.size;
+}
 /** @} */
 
 /** @name Group scanner generator
@@ -132,6 +148,7 @@ duct_nonnull(1) static inline size_t duct_x_dgram_len_out(const duct_dgram_out_t
 DUCT_X_GSO_GROUP_DECLARE(duct_x_gso_group_bufs, duct_view_u8, duct_x_dgram_len_buf)
 DUCT_X_GSO_GROUP_DECLARE(duct_x_gso_group_peers, duct_dgram_out_t,
                          duct_x_dgram_len_out, peer)
+DUCT_X_GSO_GROUP_DECLARE(duct_x_gso_group_recs, duct_tx_rec_t, duct_x_dgram_len_rec)
 
 /** @brief Count the entries from @p m one segmented write carries.
  *  @p m is a @c duct_view_u8 array of a connected conn's records, or a
@@ -145,7 +162,9 @@ DUCT_X_GSO_GROUP_DECLARE(duct_x_gso_group_peers, duct_dgram_out_t,
         duct_view_u8 *:             duct_x_gso_group_bufs,    \
         const duct_view_u8 *:       duct_x_gso_group_bufs,    \
         duct_dgram_out_t *:       duct_x_gso_group_peers,   \
-        const duct_dgram_out_t *: duct_x_gso_group_peers)((m), (n))
+        const duct_dgram_out_t *: duct_x_gso_group_peers,   \
+        duct_tx_rec_t *:          duct_x_gso_group_recs,    \
+        const duct_tx_rec_t *:    duct_x_gso_group_recs)((m), (n))
 
 /** @brief Send the @p n datagrams at @p m as one segmented write.
  *  @p m holds a connected conn's @c duct_view_u8 records or addressed
@@ -158,7 +177,9 @@ DUCT_X_GSO_GROUP_DECLARE(duct_x_gso_group_peers, duct_dgram_out_t,
         duct_view_u8 *:             duct_xsend_gso_bufs,      \
         const duct_view_u8 *:       duct_xsend_gso_bufs,      \
         duct_dgram_out_t *:       duct_xsend_gso_peers,     \
-        const duct_dgram_out_t *: duct_xsend_gso_peers)((fd), (m), (n))
+        const duct_dgram_out_t *: duct_xsend_gso_peers,     \
+        duct_tx_rec_t *:          duct_xsend_gso_recs,      \
+        const duct_tx_rec_t *:    duct_xsend_gso_recs)((fd), (m), (n))
 
 /** @brief Send the @p n datagrams at @p m unsegmented.
  *  @p m holds a connected conn's @c duct_view_u8 records or addressed
@@ -173,7 +194,9 @@ DUCT_X_GSO_GROUP_DECLARE(duct_x_gso_group_peers, duct_dgram_out_t,
         duct_view_u8 *:             duct_xsend_bufs,          \
         const duct_view_u8 *:       duct_xsend_bufs,          \
         duct_dgram_out_t *:       duct_xsend_peers,         \
-        const duct_dgram_out_t *: duct_xsend_peers)((fd), (m), (n), (out_sent))
+        const duct_dgram_out_t *: duct_xsend_peers,         \
+        duct_tx_rec_t *:          duct_xsend_recs,          \
+        const duct_tx_rec_t *:    duct_xsend_recs)((fd), (m), (n), (out_sent))
 
 /** @brief Segmented writes one send loop made, and the datagrams they carried. */
 typedef struct duct_x_gso_tally {

@@ -11,6 +11,7 @@
 #define DUCT_EVENTS_H
 
 #include "duct_core.h"
+#include "duct_dgram_out.h"
 #include "duct_ticks.h"
 #include "duct_types.h"
 #include "duct_time.h"
@@ -71,6 +72,11 @@ static constexpr size_t duct_events_rx_scratch = 128u;
 static constexpr size_t duct_events_rx_scratch = 0u;
 #endif
 
+/** @brief Records one TX gather addresses, at most — the descriptor ring's
+ *  records, two spans each (§2: the grouped and stream posts are multi-iovec
+ *  arrays the backends take natively). */
+static constexpr unsigned duct_tx_peek_recs = (unsigned)duct_dgram_tx_batch;
+
 /** @brief Ephemeral transfer context for a single RX / TX drive.
  *  Filled by @ref duct_io_rx_reserve and @ref duct_io_tx_peek.
  */
@@ -88,6 +94,11 @@ typedef struct {
                           *  transfer holds nullptr. */
            *io_priv;    /**< Owning conn's backend registration cache. */
     duct_olb_hdr_t *olb_hdr; /**< RX/TX OLB header for duct_olb_io_begin/_done. */
+    duct_view_u8 iov[2u * duct_tx_peek_recs]; /**< TX: the gathered record
+                          *  spans, an empty header or body leaving its slot
+                          *  zero. RX leaves them untouched. */
+    unsigned iov_n;     /**< TX: spans filled, always even — twice the records
+                          *  addressed; 0 while nothing is queued. */
 } duct_io_xfer_t;
 
 typedef struct duct_listener duct_listener_t;
@@ -607,13 +618,14 @@ duct_nonnull(1) bool
 duct_io_tx_advance(void *tag, size_t offered, size_t n);
 
 /** @brief Address up to @p max whole records at the head of @p tag's TX ring.
- *  Payload spans only, each record's length prefix stepped over; the walk stops
- *  at the first record the readable run does not hold entirely.
+ *  Each record is its descriptor's two spans — the inline header and the
+ *  payload — a datagram shipping whole or not at all; a partial head record
+ *  (a stream short write left it) ends the walk.
  *  @return records addressed; 0 for a stale @p tag or a ring without record
  *  boundaries.
  */
 duct_nonnull(1, 2) unsigned
-duct_io_tx_peek_bufs(void *tag, duct_view_u8 *bufs, unsigned max);
+duct_io_tx_peek_recs(void *tag, duct_tx_rec_t *recs, unsigned max);
 
 /** @brief Advance @p tag's TX ring past its first @p n records.
  *  Completes a send that carried @p n records at once. They are the ring's

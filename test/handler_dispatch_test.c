@@ -448,7 +448,7 @@ static duct_exec_rc_t s_post_frame(s_fixture_t *f,
     uint8_t *dst = duct_olb_rx_data(rx) + prev;
     memcpy(dst, payload, len);
     uint64_t new_tail = prev + (uint64_t)len;
-    h->stage = (uint32_t)new_tail;
+    duct_atomic_store(&h->stage, (uint32_t)new_tail, relaxed);
     duct_atomic_store(&h->tail, new_tail, release);
 
     duct_msg_frame_t task = {
@@ -919,7 +919,7 @@ static void test_frame_header_size_pinned_across_wire_rebind(void)
     memcpy(dst, header, hdr_len);
     memcpy(dst + hdr_len, payload, sizeof payload);
     uint64_t new_tail = prev + hdr_len + (uint64_t)sizeof payload;
-    h->stage = (uint32_t)new_tail;
+    duct_atomic_store(&h->stage, (uint32_t)new_tail, relaxed);
     duct_atomic_store(&h->tail, new_tail, release);
 
     duct_msg_frame_t task = {
@@ -1077,7 +1077,7 @@ static void test_frame_sealed_task_dropped_after_wire_switch(void)
     uint8_t *dst = duct_olb_rx_data(rx) + prev;
     memcpy(dst, stale_bytes, sizeof stale_bytes);
     uint64_t new_tail = prev + (uint64_t)sizeof stale_bytes;
-    h->stage = (uint32_t)new_tail;
+    duct_atomic_store(&h->stage, (uint32_t)new_tail, relaxed);
     duct_atomic_store(&h->tail, new_tail, release);
 
     duct_msg_frame_t task = {
@@ -1261,7 +1261,7 @@ static void test_frame_sealed_stale_after_switch_no_double_ack(void)
     uint8_t *dst = duct_olb_rx_data(rx) + prev;
     memcpy(dst, record, sizeof record);
     uint64_t new_tail = prev + (uint64_t)sizeof record;
-    h->stage = (uint32_t)new_tail;
+    duct_atomic_store(&h->stage, (uint32_t)new_tail, relaxed);
     duct_atomic_store(&h->tail, new_tail, release);
 
     duct_msg_frame_t task = {
@@ -1419,7 +1419,7 @@ static void test_frame_sealed_pre_ack_defer_stale_after_sealed_switch(void)
     uint8_t *dst = duct_olb_rx_data(rx) + prev;
     memcpy(dst, record, sizeof record);
     uint64_t new_tail = prev + (uint64_t)sizeof record;
-    h->stage = (uint32_t)new_tail;
+    duct_atomic_store(&h->stage, (uint32_t)new_tail, relaxed);
     duct_atomic_store(&h->tail, new_tail, release);
 
     duct_msg_frame_t task = {
@@ -1512,9 +1512,13 @@ static unsigned s_ct_holders(const duct_wire_codec_t *codec)
 /* ── T20: retry_frame_save_copies_ct_buf_and_frees_orphan ──────────── */
 
 /** @brief A response echoing cleartext out of a sealed conn's codec->ct_buf
- *  is copied at save time rather than pinned. s_retry_payload_own runs ahead
- *  of s_retry_frame_save's alias check, so ct_buf keeps its one holder and
- *  a fence detaching sc->codec destroys the codec at once. */
+ *  is copied at save time rather than pinned. The copy runs ahead of
+ *  s_retry_frame_save's alias check, so ct_buf keeps its one holder and
+ *  a fence detaching sc->codec destroys the codec at once. The carved copy
+ *  carries no owning flag: fl_send_owned promises a whole heap block whose
+ *  header the drop path reads, and the replay's classification would pin a
+ *  non-object — the regional release is the node's own business
+ *  (s_retry_copy_is_regional), the node's span_mat pin its disposal. */
 static void test_retry_frame_save_copies_ct_buf_and_frees_orphan(void)
 {
     s_reset_counters();
@@ -1555,7 +1559,7 @@ static void test_retry_frame_save_copies_ct_buf_and_frees_orphan(void)
     auto node = f.w.retry_head;
     assert(node && node->kind == retry_frame && node->frame.pin == span_mat);
     assert(node->frame.out.payload.data != duct_at(codec->ct_buf));
-    assert(duct_has(node->frame.out.flags, fl_send_owned) && !node->frame.out.release);
+    assert(!duct_has(node->frame.out.flags, fl_send_owned) && !node->frame.out.release);
     assert(memcmp(node->frame.out.payload.data, ct_data, sizeof ct_data) == 0);
 
     duct_conn_sealed_codec_detach(f.conn);
@@ -1989,10 +1993,13 @@ static void s_defensive_release(void *arg)
 
 /** @brief A payload aliasing neither conn->rx_buf nor a sealed codec's
  *  ct_buf — an inter conn's own inter_lane message, freed the instant its
- *  dispatch returns — is copied and re-flagged fl_send_owned rather than
- *  parked as a raw pointer. Verifies the copy and the release wiring, and
- *  that an already fl_send_owned payload is left untouched: its own
- *  release/release_arg preserved, no second copy. */
+ *  dispatch returns — is copied into the retry region rather than parked as
+ *  a raw pointer. The carved copy carries no owning flag: fl_send_owned
+ *  promises a whole heap block whose header the drop path reads, and the
+ *  replay's classification would pin a non-object — the regional release is
+ *  the node's own business. Verifies the copy, and that an already
+ *  fl_send_owned payload is left untouched: its own release/release_arg
+ *  preserved, no second copy. */
 static void test_retry_frame_save_copies_unrecognized_payload(void)
 {
     s_reset_counters();
@@ -2009,7 +2016,7 @@ static void test_retry_frame_save_copies_unrecognized_payload(void)
     assert(node->frame.out.payload.data != src);        /* copied, not aliased */
     assert(node->frame.out.payload.size == sizeof src);
     assert(memcmp(node->frame.out.payload.data, src, sizeof src) == 0);
-    assert(duct_has(node->frame.out.flags, fl_send_owned));
+    assert(!duct_has(node->frame.out.flags, fl_send_owned));
     assert(!node->frame.out.release);
 
     s_retry_frame_out_release(node); /* the same release s_commit_response's cleanup routes */
@@ -2045,10 +2052,12 @@ static void test_retry_frame_save_copies_unrecognized_payload(void)
 /* ── T23: retry_frame_save_copies_rx_ring_payload ──────────────────── */
 
 /** @brief The RX-ring half of the same rule: a copy-mode payload aliasing
- *  conn->rx_buf is taken into a buffer the response owns, raising no
- *  rx->pins window pin. The pin is what blocks compaction, so a response
- *  parked on TX backpressure holding one stops the conn reading for every
- *  other stream on it. */
+ *  conn->rx_buf is taken into the retry region, raising no rx->pins window
+ *  pin. The pin is what blocks compaction, so a response parked on TX
+ *  backpressure holding one stops the conn reading for every other stream
+ *  on it. The carved copy carries no owning flag — the regional release is
+ *  the node's own business, and the replay's classification would pin a
+ *  non-object. */
 static void test_retry_frame_save_copies_rx_ring_payload(void)
 {
     s_reset_counters();
@@ -2071,7 +2080,7 @@ static void test_retry_frame_save_copies_rx_ring_payload(void)
     assert(node->frame.out.payload.data != duct_olb_rx_data(rx));
     assert(node->frame.out.payload.size == sizeof src);
     assert(memcmp(node->frame.out.payload.data, src, sizeof src) == 0);
-    assert(duct_has(node->frame.out.flags, fl_send_owned));
+    assert(!duct_has(node->frame.out.flags, fl_send_owned));
     assert(!node->frame.out.release);
 
     s_retry_frame_out_release(node);
@@ -3252,7 +3261,7 @@ static void test_span_pin_gates_wrap_and_compaction(void)
     /* One full pass, every posted byte acked, frontier at posted_off: only
      * the pin holds the window. */
     rx->posted_off = (uint32_t)s_olb_cap;
-    rx->h.stage = s_olb_cap;
+    duct_atomic_store(&rx->h.stage, s_olb_cap, relaxed);
     duct_atomic_store(&rx->h.tail, s_olb_cap, release);
     duct_atomic_store(&rx->acked, s_olb_cap, release);
     duct_atomic_store(&rx->dispatch_frontier, (uint32_t)s_olb_cap, release);
@@ -3285,11 +3294,14 @@ static void test_span_pin_gates_wrap_and_compaction(void)
     printf("  span_pin_gates_wrap_and_compaction OK\n");
 }
 
-/** @brief §6 tx latch: the wait target is the exact flip point of the room
- *  condition that refused, monotonic in the packed-head coordinate and
- *  clamped past the observed head — and the arm itself parks a value no
- *  disarm write ever clears. A lane conn arms on its resident header's
- *  zeroed words: the any-signal form its device wake reads. */
+/** @brief §6 tx latch: the wait target is the exact flip point of the byte
+ *  budget's limb, in drained-wire-byte coordinates — a value io's monotonic
+ *  position crosses at most once — and while the budget holds more than the
+ *  room the target stays put as io drains (the flip point moves only with
+ *  the staging position). Under budget it names the very next completion,
+ *  and the arm itself parks a value no disarm write ever clears. A lane
+ *  conn arms on its resident header's zeroed words: the any-signal form its
+ *  device wake reads. */
 static void test_tx_wait_target_forms(void)
 {
     duct_conn_pool_reclaim();
@@ -3301,53 +3313,45 @@ static void test_tx_wait_target_forms(void)
     conn->xport_type = x_tcp;
     duct_conn_carve_olb(conn, cap, cap);
     auto tx = duct_conn_tx_olb(conn);
-    auto h = &tx->h;
 
-    /* Coarse form, same pass: published spans past the wanted room, so the
-     * target is the head offset that drops the span below it. */
-    duct_olb_tx_cold_init(tx);
-    h->stage = 7u * k + 512u;
-    duct_atomic_store(&h->tail, olb_pack(0u, 7u * k + 512u), relaxed);
-    duct_atomic_store(&h->head, olb_pack(0u, 410u), relaxed);
+    /* Over the coarse floor: published bytes hold 7.5k of the 8k budget, the
+     * derived floor the budget's own eighth, so the target is the drained
+     * position at which the held bytes drop under cap − min_room. */
+    tx->stream_end = 7u * k + 512u;
     uint64_t target = duct_olb_tx_wait_target(tx, 0u);
-    assert(target == olb_pack(0u, 512u)); /* tail + min_room − buf */
-    assert(!duct_olb_tx_wait_crossed(olb_pack(0u, 410u), olb_pack(0u, 511u), target));
-    assert(duct_olb_tx_wait_crossed(olb_pack(0u, 410u), olb_pack(0u, 512u), target));
+    uint64_t expect = 7u * k + 512u + duct_olb_tx_min_room(tx)
+                    - duct_olb_tx_byte_cap(tx);
+    assert(target == expect); /* stream_end + min_room − byte_cap */
+    assert(!duct_olb_tx_wait_crossed(0u, target - 1u, target));
+    assert(duct_olb_tx_wait_crossed(0u, target, target));
 
-    /* Contig form, same pass: the wrap limb's flip at the buffer's front. */
-    h->stage = 7u * k;
-    duct_atomic_store(&h->tail, olb_pack(0u, 6u * k), relaxed);
-    duct_atomic_store(&h->head, olb_pack(0u, 1u * k), relaxed);
+    /* A refused contiguous need targets its own flip point, and while the
+     * budget stays over it the target ignores io's progress: draining bytes
+     * lowers the held count by exactly what it raises drained by. */
     target = duct_olb_tx_wait_target(tx, 2u * k);
-    assert(target == olb_pack(0u, 2u * k));
+    assert(target == expect + 2u * k - duct_olb_tx_min_room(tx));
+    duct_atomic_store(&tx->drained, 100u, relaxed);
+    assert(duct_olb_tx_wait_target(tx, 2u * k) == target);
 
-    /* A head already past the computed flip clamps one past itself: the
-     * armed word always names a position io has not reached. */
-    duct_atomic_store(&h->head, olb_pack(0u, 3u * k), relaxed);
-    assert(duct_olb_tx_wait_target(tx, 2u * k) == olb_pack(0u, 3u * k) + 1u);
+    /* Under the budget the wait is not for room but for any completion:
+     * the target names the position one past io's current one. */
+    tx->stream_end = k;
+    duct_atomic_store(&tx->drained, 0u, relaxed);
+    assert(duct_olb_tx_wait_target(tx, 2u * k) == 1u);
 
-    /* Fold form: io a pass behind targets the fold into the staging pass. */
-    duct_atomic_store(&h->head, olb_pack(0u, 1u * k), relaxed);
-    tx->stage_gen = 1u;
-    h->stage = 5u * k;
-    target = duct_olb_tx_wait_target(tx, 2u * k);
-    assert(target == olb_pack(1u, 0u)); /* stage + need ≤ buf: room at the fold */
-    tx->pass_end = 6u * k;
-    h->stage = 6u * k;
-    target = duct_olb_tx_wait_target(tx, 4u * k);
-    assert(target == olb_pack(1u, 4u * k)); /* wrap needed past the fold too */
-
-    /* The arm parks the value on the worker's own line; nothing clears it. */
+    /* The arm parks the value on the worker's own line; nothing clears it,
+     * and a re-arm after io advanced past a spent target only grows it. */
     s_tx_wait_arm(conn, 0u);
     uint64_t armed = duct_atomic_load(&tx->resume_at, relaxed);
-    assert(armed != 0u);
-    duct_atomic_store(&h->head, armed, relaxed);
-    s_tx_wait_arm(conn, 0u); /* a re-arm past the advanced head */
+    assert(armed == 1u);
+    duct_atomic_store(&tx->drained, k, relaxed); /* io drains the record */
+    assert(!duct_olb_tx_wait_crossed(k, k + 1u, armed)); /* spent: no recross */
+    s_tx_wait_arm(conn, 0u);
     assert(duct_atomic_load(&tx->resume_at, relaxed) > armed);
     duct_conn_release(conn);
 
     /* A lane conn arms on the resident header: zeroed ring words give the
-     * any-signal target no head advance ever crosses. */
+     * any-signal target no drained advance ever crosses. */
     auto lane = duct_conn_acquire();
     assert(lane);
     lane->xport_type = x_inter;
@@ -3480,7 +3484,7 @@ static void test_engine_egress_park_is_bounded_and_ordered(void)
     size_t budget = codec->engine->vtbl->engine_hs_budget,
            cap = 2u * s_hs_need(f.conn, codec);
     auto tx = duct_conn_tx_olb(f.conn);
-    size_t room = duct_olb_tx_space(tx);
+    size_t room = duct_olb_tx_byte_cap(tx);
     char *fill = duct_at(duct_new(char, room));
     assert(fill);
     assert(duct_olb_tx_stage(tx, nullptr, 0u, fill, room) == olb_tx_ok);
@@ -3502,7 +3506,7 @@ static void test_engine_egress_park_is_bounded_and_ordered(void)
     s_response_switch(f.s);
     assert(f.s->proto == f.proto && f.s->switch_next == next
            && f.s->switch_stage == switch_parked_tx);
-    duct_olb_tx_advance(tx, room);
+    duct_olb_tx_advance(tx, room, false);
     assert(s_retry_drain(&f.w));
     assert(!f.w.retry_head && !codec->engine_park_len);
     assert(duct_olb_tx_published(tx) == cap);
@@ -3528,7 +3532,7 @@ static void test_detached_frame_acks_once(bool sealed, bool already_unsealed)
         f.conn->seal.head_unsealed = already_unsealed;
     }
     duct_msg_frame_t task = { .len = 8u, .sealed_epoch = sealed ? 1u : 0u };
-    duct_conn_rx_olb(f.conn)->h.stage = task.len;
+    duct_atomic_store(&duct_conn_rx_olb(f.conn)->h.stage, task.len, relaxed);
     duct_atomic_store(&duct_conn_rx_olb(f.conn)->h.tail, task.len, release);
     if (already_unsealed)
         s_rx_ack(f.conn, task.len, task.len);
@@ -3554,7 +3558,7 @@ static void test_join_admits_without_callback_under_unrelated_tx_pressure(void)
     s_fixture_t f;
     s_fixture_init(&f, s_make_proto_sl());
     auto tx = duct_conn_tx_olb(f.conn);
-    size_t room = duct_olb_tx_space(tx);
+    size_t room = duct_olb_tx_byte_cap(tx);
     char *fill = duct_at(duct_new(char, room));
     assert(fill);
     assert(duct_olb_tx_stage(tx, nullptr, 0u, fill, room) == olb_tx_ok);

@@ -333,8 +333,17 @@ static void s_release_finish(duct_conn_t *conn, uint64_t gen)
         uint64_t want = (old_word & ~gen_req_rel_pend)
                       + (1ull << gen_req_gen_shift);
         if (duct_atomic_cas(weak, slot, &old_word, want, release, relaxed)) {
-            if (s_gen_ceiling_ok(duct_gen_req_gen(old_word), 2u))
+            if (s_gen_ceiling_ok(duct_gen_req_gen(old_word), 2u)) {
+                /* The slot's last unit is spent: nobody's commit, completion
+                 * or purge-side walk can hold the ring open now, and the
+                 * records it still carries — a timeout's unsent bytes, a
+                 * lost conn's staged train — complete here, each payload
+                 * reference dropped before the block takes its next
+                 * occupant. */
+                duct_do_if(duct_conn_tx_olb(conn),
+                           duct_olb_tx_purge(duct_conn_tx_olb(conn)));
                 s_conn_free_push(conn);
+            }
             return;
         }
     }
@@ -379,7 +388,7 @@ duct_result_t duct_conn_setup(duct_conn_t *conn, duct_sock_t fd, duct_xport_t xp
     duct_do_if(fd == duct_sock_bad, return rc_invalid_arg);
     duct_do_if(((duct_olb_rx_t *)((uintptr_t)conn + conn_off_rx))->h.buf_size,
                return rc_invalid_order);
-    duct_do_if(tx_cap > conn_tx_region_max - conn_tx_slack, return rc_invalid_arg);
+    duct_do_if(tx_cap > duct_conn_tx_olb_cap || !tx_cap, return rc_invalid_arg);
     /* A coalescing datagram socket answers one whole group per read, and its
      * reserve demands room for the worst case plus the backend's per-read
      * scratch; a vnet tun leg's reserve demands a whole cut. That room rides
@@ -399,7 +408,7 @@ duct_result_t duct_conn_setup(duct_conn_t *conn, duct_sock_t fd, duct_xport_t xp
     conn->fd = fd;
     conn->xport_type = xport;
     conn->vnet_hdr_len = (uint8_t)vnet;
-    duct_conn_carve_olb(conn, rx_cap, tx_cap + conn_tx_slack);
+    duct_conn_carve_olb(conn, rx_cap, tx_cap);
     /* A tun takes its offloads as the engine takes the fd: from here the cut
      * and merge stand behind every read and write. A type 5 write goes only to a
      * tun that took the USO flags, which fl_conn_vnet_uso records. */
@@ -606,13 +615,6 @@ duct_result_t duct_conn_bind_wire(duct_conn_t *conn, const duct_proto_t *proto,
         duct_olb_rx_threshold_set(rx,
             (duct_conn_record_framed(conn) ? sizeof(duct_dgram_rec_hdr_t) : 0u)
                 + duct_max(budget, coalesced));
-    auto tx = duct_conn_tx_olb(conn);
-    if (tx) {
-        size_t resp = cfg->max_response ? cfg->max_response : budget;
-        if (conn->wire->tx_bound)
-            resp = conn->wire->tx_bound(conn->wire, resp);
-        duct_olb_tx_min_room_set(tx, resp);
-    }
     return rc_ok;
 }
 

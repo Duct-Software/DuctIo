@@ -3,16 +3,17 @@
 
 /**
  * @file olb_tx_room_test.c
- * @brief Unit test for the TX buffer's passes and a worker's train on them.
- * What @ref duct_olb_tx_room_contig answers, a second pass bounded by io's
- * head, io draining one pass before folding into the next, and a train of
- * unpublished frames sent whole, sent in part, or handed to io. The stream end
- * the worker keeps through publishes, sends of its own and a fold, and the
- * point io has drained up to, are checked through the same cases. So is
- * @ref duct_olb_tx_rewind_idle: a drained ring rewinds to offset 0, one with bytes
- * queued or staged keeps its pass, and on Linux a load drop leaves every page
- * resident — a carved region owns no self-trim, its conn block's touched
- * accounting and sweep own residency.
+ * @brief Unit test for the TX descriptor ring's admission, staging and the
+ * §5.2 completion stepper.
+ * What @ref duct_olb_tx_room_contig answers over its two limbs — the byte
+ * budget and the descriptor count — the staged record walk with its wire-byte
+ * accounting, the materialize arena's contiguous runs and their completion
+ * order, the cursor a short write leaves inside the head record, and the
+ * worker's own direct-send settlement of its staged records. The stream end
+ * the worker keeps through publishes, sends of its own and completions, and
+ * the point io has drained up to, are checked through the same cases. So is
+ * the TX-wait value latch: a target the drained position crosses fires the
+ * edge exactly once.
  * Driven directly against a @c duct_olb_tx_t, with no engine and no io
  * thread.
  */
@@ -46,25 +47,25 @@ static void s_tx_del(duct_olb_tx_t *tx)
     duct_conn_release((duct_conn_t *)((uintptr_t)tx - conn_off_tx));
 }
 
-static constexpr size_t room_test_cap = 4096u;
+static constexpr size_t room_test_cap = kbytes(4u);
 
-/** @brief Stage exactly @p fill bytes in one shot, leaving @c stage at
- *  @p fill — @p fill is derived from the tx's real (page-rounded) @c
- *  buf_size by every caller, never a compile-time guess. */
+/** @brief Stage one whole materialize record of @p fill payload bytes plus a
+ *  4-byte inline header. */
 static duct_olb_tx_result_t s_stage_fill(duct_olb_tx_t *tx, size_t fill)
 {
+    uint8_t hdr[4] = { 1u, 2u, 3u, 4u };
     auto filler = duct_at(duct_new(char, fill));
     if (!filler)
         return olb_tx_too_large;
     memset(filler, 'a', fill);
-    auto rc = duct_olb_tx_stage(tx, nullptr, 0u, filler, fill);
+    auto rc = duct_olb_tx_stage(tx, hdr, sizeof hdr, filler, fill);
     duct_del(filler);
     return rc;
 }
 
 int main(void)
 {
-    /* Tail-room disjunct: fresh ring, small need well within buf_size. */
+    /* Tail-room disjunct: fresh ring, small need well within the budget. */
     {
         auto tx = s_tx_new(room_test_cap);
         CHECK(tx, "alloc (tail-room case)");
@@ -72,347 +73,197 @@ int main(void)
         s_tx_del(tx);
     }
 
-    /* Drained buffer: the 100-byte tail room alone is too small for a
-     * 200-byte need, but io has drained everything staged so far (head
-     * caught up to stage), so a new pass takes the whole buffer. */
+    /* A record past the byte budget never fits, whatever the descriptors. */
     {
         auto tx = s_tx_new(room_test_cap);
-        CHECK(tx, "alloc (io_idle case)");
-        size_t fill = tx->h.buf_size - 100u;
-        CHECK(s_stage_fill(tx, fill) == olb_tx_ok, "stage up to fill");
+        CHECK(tx, "alloc (too large)");
+        CHECK(!duct_olb_tx_room_contig(tx, duct_olb_tx_byte_cap(tx) + 1u),
+              "a need past the budget is terminal");
+        s_tx_del(tx);
+    }
+
+    /* The budget fills: staged-but-unpublished bytes count against it. */
+    {
+        auto tx = s_tx_new(room_test_cap);
+        CHECK(tx, "alloc (budget)");
+        size_t fill = duct_olb_tx_byte_cap(tx) - 100u;
+        CHECK(s_stage_fill(tx, fill) == olb_tx_ok, "stage up to the budget");
+        CHECK(duct_olb_tx_bytes_held(tx) == fill + 4u,
+              "staged bytes count against the budget");
+        CHECK(!duct_olb_tx_room_contig(tx, 100u),
+              "a staged need past the budget is refused");
         duct_olb_tx_publish(tx);
-        duct_olb_tx_advance(tx, fill);
+        CHECK(duct_olb_tx_published(tx) == fill + 4u,
+              "publishing moves the stream end past the record");
+        duct_olb_tx_advance(tx, fill + 4u, false);
         CHECK(duct_olb_tx_published(tx) == 0u, "io must be idle here");
-        CHECK(duct_olb_tx_room_contig(tx, 200u), "io_idle disjunct must cover a wrap-sized need");
+        CHECK(duct_olb_tx_room_contig(tx, 100u), "the drained budget reopens");
         s_tx_del(tx);
     }
 
-    /* Nothing drained: same tight tail room, and io's head still at offset 0
-     * leaves a new pass no room, so a need bigger than the tail room fails. */
+    /* The descriptor count is the second limb: byte-sized records under the
+     * build's full budget fill the ring's slots long before the budget runs
+     * out, and completion of any one frees a slot again. */
+    {
+        auto tx = s_tx_new(duct_conn_tx_olb_cap);
+        CHECK(tx, "alloc (descriptor count)");
+        unsigned staged = 0u;
+        while (s_stage_fill(tx, 8u) == olb_tx_ok)
+            ++staged;
+        CHECK(staged == duct_conn_tx_desc_n,
+              "the staged walk stops exactly at the descriptor count");
+        CHECK(duct_olb_tx_bytes_held(tx) + 4096u <= duct_olb_tx_byte_cap(tx),
+              "the byte budget still has headroom past the full slots");
+        CHECK(s_stage_fill(tx, 8u) == olb_tx_full,
+              "a full descriptor ring is backpressure");
+        duct_olb_tx_publish(tx);
+        duct_olb_tx_advance(tx, 12u, false);
+        CHECK(duct_olb_tx_descs_held(tx) == duct_conn_tx_desc_n - 1u,
+              "one completion frees one slot");
+        CHECK(s_stage_fill(tx, 8u) == olb_tx_ok, "the freed slot stages again");
+        s_tx_del(tx);
+    }
+
+    /* The materialize arena wraps: a run crossing the arena's end is refused
+     * even where the free bytes exist across it, and the front reopens only
+     * past the wrap. */
+    {
+        auto tx = s_tx_new(duct_conn_tx_olb_cap);
+        CHECK(tx, "alloc (arena wrap)");
+        size_t first = duct_conn_tx_mat_cap - 64u;
+        CHECK(s_stage_fill(tx, first) == olb_tx_ok, "stage up to the arena's end");
+        duct_olb_tx_publish(tx);
+        duct_olb_tx_advance(tx, first + 4u, false);
+        CHECK(s_stage_fill(tx, 48u) == olb_tx_ok, "a run inside the freed tail fits");
+        CHECK(s_stage_fill(tx, 32u) == olb_tx_full,
+              "a run crossing the arena's end is refused");
+        CHECK(s_stage_fill(tx, 16u) == olb_tx_ok, "the tail's last bytes fill");
+        duct_olb_tx_publish(tx);
+        duct_olb_tx_advance(tx, 68u, false);
+        CHECK(s_stage_fill(tx, 32u) == olb_tx_ok,
+              "the wrap reopened the arena's front");
+        s_tx_del(tx);
+    }
+
+    /* The stepper: a short write leaves the cursor inside the head record,
+     * the gather resumes past it, and the record completes — its arena bytes
+     * back with it — only at the last byte. */
     {
         auto tx = s_tx_new(room_test_cap);
-        CHECK(tx, "alloc (false case)");
-        size_t fill = tx->h.buf_size - 100u;
-        CHECK(s_stage_fill(tx, fill) == olb_tx_ok, "stage up to fill");
+        CHECK(tx, "alloc (stepper)");
+        CHECK(s_stage_fill(tx, 300u) == olb_tx_ok && s_stage_fill(tx, 200u) == olb_tx_ok,
+              "stage two records");
         duct_olb_tx_publish(tx);
-        CHECK(duct_olb_tx_published(tx) == fill, "io must not be idle here");
-        CHECK(!duct_olb_tx_room_contig(tx, 200u), "neither disjunct should hold");
+        duct_view_u8 iov[2u * duct_tx_peek_recs];
+        unsigned n = duct_olb_tx_peek_iov(tx, false, duct_tx_peek_recs, iov);
+        CHECK(n == 4u, "two records gather four spans");
+        size_t total = 0u;
+        for (unsigned i = 0u; i < n; ++i)
+            total += iov[i].size;
+        CHECK(total == 508u, "the gather spans both records");
+        duct_olb_tx_advance(tx, 350u, false);
+        CHECK(duct_atomic_load(&tx->cursor_off, relaxed) == 46u,
+              "the cursor rests inside the second record");
+        CHECK(duct_olb_tx_published(tx) == 204u,
+              "the unfinished record stays whole against the budget");
+        n = duct_olb_tx_peek_iov(tx, false, duct_tx_peek_recs, iov);
+        CHECK(n == 2u && iov[0].size == 0u && iov[1].size == 158u,
+              "the resume gather skips the sent head bytes");
+        duct_olb_tx_advance(tx, 158u, false);
+        CHECK(duct_olb_tx_published(tx) == 0u && duct_olb_tx_descs_held(tx) == 0u,
+              "the last byte completes the record and the ring");
+        CHECK(duct_atomic_load(&tx->mat_head, relaxed) == 500u,
+              "the arena returned both runs");
         s_tx_del(tx);
     }
 
-    /* A second pass opens over the front io has drained, stops at io's head,
-     * and gets the whole buffer once io folds into it; no third pass opens
-     * while io is still in the first. */
+    /* A record-framed leg ships its head record whole or not at all. */
     {
         auto tx = s_tx_new(room_test_cap);
-        CHECK(tx, "alloc (second pass)");
-        size_t fill = tx->h.buf_size - 100u,
-               lead = 1000u;
-        uint64_t head = 0u;
-        CHECK(s_stage_fill(tx, fill) == olb_tx_ok, "stage up to fill");
+        CHECK(tx, "alloc (record framed)");
+        CHECK(s_stage_fill(tx, 300u) == olb_tx_ok && s_stage_fill(tx, 200u) == olb_tx_ok,
+              "stage two records");
         duct_olb_tx_publish(tx);
-        CHECK(duct_olb_tx_readable(tx, &head) == fill && head == 0u, "one pass is readable");
-        duct_olb_tx_advance(tx, lead);
-        CHECK(!duct_olb_tx_room_contig(tx, lead + 1u), "a new pass cannot outgrow io's head");
-        CHECK(duct_olb_tx_room_contig(tx, lead), "the drained front admits a new pass");
-        CHECK(s_stage_fill(tx, 600u) == olb_tx_ok, "stage into the drained front");
-        duct_olb_tx_publish(tx);
-        CHECK(tx->stage_gen == 1u && tx->h.stage == 600u, "staging moved to a second pass");
-        CHECK(duct_olb_tx_published(tx) == fill - lead + 600u, "both passes count as published");
-        CHECK(duct_olb_tx_readable(tx, &head) == fill - lead && head == lead,
-              "io drains the first pass before the second");
-        CHECK(!duct_olb_tx_span_open(tx, lead - 600u + 1u), "a span stops at io's head");
-        CHECK(s_stage_fill(tx, lead - 600u + 1u) == olb_tx_full, "a stage stops at io's head");
-        CHECK(s_stage_fill(tx, lead - 600u) == olb_tx_ok, "the second pass fills up to io's head");
-        duct_olb_tx_publish(tx);
-        CHECK(!duct_olb_tx_room_contig(tx, 1u) && s_stage_fill(tx, 1u) == olb_tx_full,
-              "no third pass while io is in the first");
-        duct_olb_tx_advance(tx, fill - lead);
-        CHECK(duct_olb_tx_readable(tx, &head) == lead && head == 0u, "io folds into the second pass");
-        CHECK(s_stage_fill(tx, 100u) == olb_tx_ok && tx->h.stage == lead + 100u,
-              "the fold frees the rest of the buffer");
+        duct_view_u8 iov[2u * duct_tx_peek_recs];
+        unsigned n = duct_olb_tx_peek_iov(tx, true, duct_tx_peek_recs, iov);
+        CHECK(n == 2u && iov[0].size == 4u && iov[1].size == 300u,
+              "a record-framed gather answers its head record alone");
+        duct_olb_tx_advance(tx, 100u, true);
+        CHECK(duct_olb_tx_descs_held(tx) == 2u && duct_atomic_load(&tx->cursor_off, relaxed) == 0u,
+              "a partial datagram send completes nothing");
+        duct_olb_tx_advance(tx, 304u, true);
+        CHECK(duct_olb_tx_descs_held(tx) == 1u, "the whole record completes alone");
         s_tx_del(tx);
     }
 
-    /* Bytes staged but not published open a frame, so no new pass opens
-     * under them, and the room test admits the wrap once they are published. */
-    {
-        auto tx = s_tx_new(room_test_cap);
-        CHECK(tx, "alloc (unpublished span)");
-        size_t fill = tx->h.buf_size - 100u;
-        CHECK(s_stage_fill(tx, fill) == olb_tx_ok, "stage up to fill");
-        duct_olb_tx_publish(tx);
-        duct_olb_tx_advance(tx, fill);
-        CHECK(s_stage_fill(tx, 50u) == olb_tx_ok, "half a frame fits the tail");
-        CHECK(s_stage_fill(tx, 200u) == olb_tx_full && tx->stage_gen == 0u,
-              "no wrap under an unpublished span");
-        CHECK(!duct_olb_tx_room_contig(tx, 200u), "the room test refuses under an unpublished span");
-        duct_olb_tx_publish(tx);
-        CHECK(duct_olb_tx_room_contig(tx, 200u), "publishing the span admits the wrap");
-        s_tx_del(tx);
-    }
-
-    /* A pass opened over a drained buffer spans all of it, and a worker that
-     * sent the front of its span itself moves io past those bytes. The tail
-     * is rolled back once by hand to stand in for io's stale snapshot of it:
-     * a head already folded past that tail stays where it is. */
-    {
-        auto tx = s_tx_new(room_test_cap);
-        CHECK(tx, "alloc (idle wrap)");
-        size_t fill = tx->h.buf_size - 100u;
-        uint64_t head = 0u;
-        CHECK(s_stage_fill(tx, fill) == olb_tx_ok, "stage up to fill");
-        duct_olb_tx_publish(tx);
-        duct_olb_tx_advance(tx, fill);
-        auto mark = duct_olb_tx_mark(tx);
-        CHECK(s_stage_fill(tx, 200u) == olb_tx_ok, "an idle ring wraps");
-        CHECK(tx->stage_gen == 1u && tx->pass_free == tx->h.buf_size,
-              "a pass opened over an idle ring spans the whole buffer");
-        CHECK(duct_olb_tx_staged_since(tx, mark) == 200u, "the wrap counts from offset 0");
-        duct_olb_tx_advance_worker(tx, 50u);
-        uint64_t tail_now = duct_atomic_load(&tx->h.tail, relaxed);
-        duct_atomic_store(&tx->h.tail, olb_pack(0u, fill), relaxed);
-        CHECK(duct_olb_tx_readable(tx, &head) == 0u
-              && duct_atomic_load(&tx->h.head, relaxed) == olb_pack(1u, 50u),
-              "a head folded past a stale tail stays put");
-        duct_atomic_store(&tx->h.tail, tail_now, relaxed);
-        duct_olb_tx_publish(tx);
-        CHECK(duct_olb_tx_readable(tx, &head) == 150u && head == 50u,
-              "io resumes past what the worker sent itself");
-        s_tx_del(tx);
-    }
-
-    /* A train the socket took whole rewinds its staging, leaves io nothing and
-     * moves the stream end past itself. */
+    /* A train the socket took whole rewinds its staging, leaves io nothing
+     * and moves the stream end past itself; one taken in part publishes the
+     * unsent remainder alone, io starting at its first byte. */
     {
         auto tx = s_tx_new(room_test_cap);
         CHECK(tx, "alloc (train sent whole)");
         CHECK(s_stage_fill(tx, 300u) == olb_tx_ok && s_stage_fill(tx, 200u) == olb_tx_ok,
-              "stage a train of two frames");
+              "stage a train of two records");
         CHECK(duct_olb_tx_published(tx) == 0u, "a train stays unpublished while it runs");
         duct_olb_tx_sent_staged(tx);
-        CHECK(tx->h.stage == 0u && duct_olb_tx_published(tx) == 0u && tx->stream_end == 500u,
-              "a train sent whole leaves nothing staged, nothing for io, and its bytes in the end");
-        CHECK(s_stage_fill(tx, 100u) == olb_tx_ok && tx->h.stage == 100u,
-              "the next frame stages from where the sent train began");
+        CHECK(tx->h.stage == 0u && duct_olb_tx_published(tx) == 0u && tx->stream_end == 508u,
+              "a train sent whole leaves nothing staged, nothing for io, its bytes in the end");
+        CHECK(s_stage_fill(tx, 100u) == olb_tx_ok && tx->h.stage == 1u,
+              "the next record stages after the sent train");
         s_tx_del(tx);
     }
-
-    /* A train the socket took in part publishes the unsent tail alone, and io
-     * starts at its first byte. */
     {
         auto tx = s_tx_new(room_test_cap);
         CHECK(tx, "alloc (train sent in part)");
-        uint64_t head = 0u;
         CHECK(s_stage_fill(tx, 300u) == olb_tx_ok && s_stage_fill(tx, 200u) == olb_tx_ok,
-              "stage a train of two frames");
+              "stage a train of two records");
         duct_olb_tx_advance_worker(tx, 350u);
         duct_olb_tx_publish(tx);
-        CHECK(duct_olb_tx_published(tx) == 150u, "only the unsent tail is published");
-        CHECK(duct_olb_tx_readable(tx, &head) == 150u && head == 350u,
+        CHECK(duct_olb_tx_published(tx) == 204u,
+              "the refused record publishes whole, its sent head accounted");
+        duct_view_u8 iov[2u * duct_tx_peek_recs];
+        unsigned n = duct_olb_tx_peek_iov(tx, false, duct_tx_peek_recs, iov);
+        CHECK(n == 2u && iov[0].size == 0u && iov[1].size == 158u,
               "io starts at the first byte the socket refused");
-        duct_olb_tx_advance(tx, 150u);
+        duct_olb_tx_advance(tx, 158u, false);
         CHECK(duct_olb_tx_published(tx) == 0u, "io's drain of the tail empties the ring");
         s_tx_del(tx);
     }
 
-    /* A train published unsent is io's from its first byte. */
+    /* The wait latch: a target the drained position crosses fires the edge
+     * exactly once, and an unarmed word never crosses. */
     {
         auto tx = s_tx_new(room_test_cap);
-        CHECK(tx, "alloc (train handed to io)");
-        uint64_t head = 0u;
-        CHECK(s_stage_fill(tx, 300u) == olb_tx_ok && s_stage_fill(tx, 200u) == olb_tx_ok,
-              "stage a train of two frames");
+        CHECK(tx, "alloc (wait latch)");
+        CHECK(s_stage_fill(tx, 300u) == olb_tx_ok, "stage one record");
         duct_olb_tx_publish(tx);
-        CHECK(duct_olb_tx_readable(tx, &head) == 500u && head == 0u,
-              "a train handed over whole is io's from its first byte");
+        duct_olb_tx_wait_arm(tx, 150u);
+        CHECK(duct_olb_tx_wait_crossed(0u, 150u, 150u), "the crossing edge fires");
+        CHECK(!duct_olb_tx_wait_crossed(0u, 149u, 150u), "a shy advance never crosses");
+        CHECK(!duct_olb_tx_wait_crossed(150u, 200u, 150u), "a spent target never crosses again");
+        CHECK(!duct_olb_tx_wait_crossed(0u, 200u, 0u), "the unarmed word never crosses");
+        duct_olb_tx_advance(tx, 100u, false);
+        duct_olb_tx_wait_arm(tx, duct_olb_tx_wait_target(tx, 0u));
+        duct_olb_tx_advance(tx, 204u, false);
         s_tx_del(tx);
     }
 
-    /* An unpublished train leaves the stream end in place. Its publish moves
-     * the end past the whole train, the part the worker sent itself counting
-     * as drained, and io's drain of the rest reaches the end. */
+    /* The close paths' purge: records still held — one published, one staged
+     * — complete without any send, their arena bytes back, the staging
+     * window rewound, and the budget reopened whole. */
     {
         auto tx = s_tx_new(room_test_cap);
-        CHECK(tx, "alloc (positions)");
-        uint64_t empty = tx->stream_end;
-        CHECK(duct_olb_tx_drained(tx) == empty && duct_olb_tx_published(tx) == 0u,
-              "an empty ring is drained up to its end, nothing queued");
-        CHECK(s_stage_fill(tx, 300u) == olb_tx_ok && s_stage_fill(tx, 200u) == olb_tx_ok,
-              "stage a train of two frames");
-        CHECK(tx->stream_end == empty && duct_olb_tx_published(tx) == 0u,
-              "an unpublished train leaves the end in place and queues nothing");
-        duct_olb_tx_advance_worker(tx, 350u);
+        CHECK(tx, "alloc (purge)");
+        CHECK(s_stage_fill(tx, 100u) == olb_tx_ok, "stage one record");
         duct_olb_tx_publish(tx);
-        uint64_t end = tx->stream_end;
-        CHECK(end == empty + 500u, "the publish moves the end past the whole train, sent part included");
-        CHECK(duct_olb_tx_drained(tx) == empty + 350u && duct_olb_tx_published(tx) == 150u,
-              "the bytes a worker's direct send took are drained, its rest queued up to the end");
-        duct_olb_tx_advance(tx, 150u);
-        CHECK(duct_olb_tx_drained(tx) == end && duct_olb_tx_published(tx) == 0u,
-              "io's drain reaches the end");
-        s_tx_del(tx);
-    }
-
-    /* Positions in two passes: the stream end counts each pass's bytes, and a
-     * head at the first pass's end, folded or not, is drained up to it. */
-    {
-        auto tx = s_tx_new(room_test_cap);
-        CHECK(tx, "alloc (positions across a fold)");
-        size_t fill = tx->h.buf_size - 100u,
-               lead = 1000u;
-        CHECK(s_stage_fill(tx, fill) == olb_tx_ok, "stage up to fill");
-        duct_olb_tx_publish(tx);
-        uint64_t first = tx->stream_end;
-        duct_olb_tx_advance(tx, lead);
-        CHECK(s_stage_fill(tx, 600u) == olb_tx_ok && tx->stage_gen == 1u,
-              "stage into a second pass");
-        duct_olb_tx_publish(tx);
-        uint64_t second = tx->stream_end;
-        CHECK(first == fill && second == fill + 600u,
-              "the end counts each pass's bytes, none of the first pass's unused rest");
-        CHECK(duct_olb_tx_published(tx) == fill - lead + 600u,
-              "the queue keeps the first pass's rest beside the second's bytes");
-        CHECK(duct_olb_tx_drained(tx) == lead,
-              "io in the first pass is drained up to its head there");
-        duct_olb_tx_advance(tx, fill - lead);
-        CHECK(duct_olb_tx_drained(tx) == first,
-              "a head at the first pass's end is drained up to that pass's end");
-        CHECK(duct_olb_tx_published(tx) == 600u, "after the fold only the second pass is queued");
-        uint64_t head = 0u;
-        CHECK(duct_olb_tx_readable(tx, &head) == 600u && head == 0u,
-              "io folds into the second pass");
-        CHECK(duct_olb_tx_drained(tx) == first,
-              "a folded head at the second pass's start is drained up to the first pass's end");
-        duct_olb_tx_advance(tx, 600u);
-        CHECK(duct_olb_tx_drained(tx) == second && duct_olb_tx_published(tx) == 0u,
-              "io's drain of the second pass reaches its end");
-        s_tx_del(tx);
-    }
-
-    /* A wrap on an idle ring leaves io's head at the old pass's end, and a
-     * train sent whole rewinds the stage to the new pass's start: the ring
-     * reads drained past the train with no send to fold the head. */
-    {
-        auto tx = s_tx_new(room_test_cap);
-        CHECK(tx, "alloc (positions past an unfolded pass)");
-        size_t fill = tx->h.buf_size - 100u;
-        CHECK(s_stage_fill(tx, fill) == olb_tx_ok, "stage up to fill");
-        duct_olb_tx_publish(tx);
-        duct_olb_tx_advance(tx, fill);
-        CHECK(s_stage_fill(tx, 200u) == olb_tx_ok && tx->stage_gen == 1u, "an idle ring wraps");
-        duct_olb_tx_sent_staged(tx);
-        uint64_t tail = duct_atomic_load(&tx->h.tail, relaxed);
-        CHECK(olb_gen(tail) == 1u && olb_off(tail) == 0u
-                  && tail == duct_olb_tx_stage_packed(tx),
-              "a train sent whole rewinds to the new pass's start");
-        CHECK(olb_gen(duct_atomic_load(&tx->h.head, relaxed)) == 0u,
-              "io has not folded into the new pass");
-        CHECK(tx->stream_end == fill + 200u && duct_olb_tx_drained(tx) == tx->stream_end
-                  && duct_olb_tx_published(tx) == 0u,
-              "a pass io drained without folding leaves the ring drained past the sent train");
-        s_tx_del(tx);
-    }
-
-    /* A train the socket takes whole and a send past the ring each move the
-     * stream end, drained with nothing queued. */
-    {
-        auto tx = s_tx_new(room_test_cap);
-        CHECK(tx, "alloc (positions, train sent whole)");
-        uint64_t start = tx->stream_end;
-        CHECK(s_stage_fill(tx, 300u) == olb_tx_ok, "stage one frame");
-        duct_olb_tx_sent_staged(tx);
-        CHECK(tx->stream_end == start + 300u && duct_olb_tx_drained(tx) == tx->stream_end
-                  && duct_olb_tx_published(tx) == 0u,
-              "a train the socket took whole moves the end past itself, drained");
-        duct_olb_tx_sent_direct(tx, 100u);
-        CHECK(tx->stream_end == start + 400u && duct_olb_tx_drained(tx) == tx->stream_end,
-              "a direct send past the ring moves the end, drained");
-        s_tx_del(tx);
-    }
-
-    /* The idle check rewinds a drained ring alone, and gives the pages back
-     * once a drained pass falls past olb_tx_trim_div below the one before. */
-    {
-        auto tx = s_tx_new(duct_max(room_test_cap * 16u, duct_page_size() * 16u));
-        CHECK(tx, "alloc (rewind)");
-        uint64_t head = 0u;
-        CHECK(s_stage_fill(tx, 300u) == olb_tx_ok, "stage a short queue");
-        duct_olb_tx_publish(tx);
-        CHECK(!duct_olb_tx_rewind_idle(tx) && tx->stage_gen == 0u && tx->h.stage == 300u,
-              "a ring io has not drained is not idle and keeps its pass");
-        duct_olb_tx_advance(tx, 300u);
-        CHECK(s_stage_fill(tx, 100u) == olb_tx_ok, "stage behind the drained queue");
-        CHECK(duct_olb_tx_rewind_idle(tx) && tx->stage_gen == 0u && tx->h.stage == 400u,
-              "unpublished bytes keep the pass of an idle ring");
-        duct_olb_tx_publish(tx);
-        duct_olb_tx_advance(tx, 100u);
-        CHECK(duct_olb_tx_rewind_idle(tx) && tx->stage_gen == 1u && tx->h.stage == 0u
-                  && duct_olb_tx_published(tx) == 0u,
-              "a drained ring starts its next pass at offset 0");
-        CHECK(duct_olb_tx_rewind_idle(tx) && tx->stage_gen == 1u, "a ring at offset 0 stays in its pass");
-        CHECK(duct_olb_tx_readable(tx, &head) == 0u && head == 0u,
-              "io folds into the new pass with nothing to read");
-        size_t page = duct_page_size();
-        duct_olb_tx_min_room_set(tx, page / 2u);
-        size_t room = duct_olb_tx_min_room_get(tx),
-               deep = 8u * room + page;
-        CHECK(s_stage_fill(tx, deep) == olb_tx_ok, "stage a queue eight min_rooms deep");
-        duct_olb_tx_publish(tx);
-        duct_olb_tx_advance(tx, deep);
-        CHECK(duct_olb_tx_rewind_idle(tx) && tx->stage_gen == 2u && tx->h.stage == 0u,
-              "a deep queue rewinds as well");
-        CHECK(duct_olb_tx_data(tx)[deep - 1u] == 'a',
-              "a deep pass keeps its pages through its own drain");
-        CHECK(s_stage_fill(tx, 100u) == olb_tx_ok, "stage a short queue past the deep one");
-        duct_olb_tx_publish(tx);
-        CHECK(duct_olb_tx_readable(tx, &head) == 100u && head == 0u, "io folds into the short queue");
-        duct_olb_tx_advance(tx, 100u);
-        CHECK(duct_olb_tx_rewind_idle(tx) && tx->stage_gen == 3u && tx->h.stage == 0u,
-              "the short queue rewinds");
-#ifdef __linux__
-        CHECK(duct_olb_tx_data(tx)[room - 1u] == 'a' && duct_olb_tx_data(tx)[deep - 1u] == 'a',
-              "a carved region keeps its pages through a load drop: residency is its conn block's call");
-#endif
-        size_t mid = room + 2u * page;
-        CHECK(s_stage_fill(tx, mid) == olb_tx_ok, "stage a queue longer than the one before");
-        duct_olb_tx_publish(tx);
-        CHECK(duct_olb_tx_readable(tx, &head) == mid && head == 0u, "io folds into it");
-        duct_olb_tx_advance(tx, mid);
-        CHECK(duct_olb_tx_rewind_idle(tx) && duct_olb_tx_data(tx)[mid - 1u] == 'a',
-              "a pass longer than the one before keeps its pages");
-        CHECK(s_stage_fill(tx, 100u) == olb_tx_ok, "stage a short queue past it");
-        duct_olb_tx_publish(tx);
-        CHECK(duct_olb_tx_readable(tx, &head) == 100u && head == 0u, "io folds into that one");
-        duct_olb_tx_advance(tx, 100u);
-        CHECK(duct_olb_tx_rewind_idle(tx) && duct_olb_tx_data(tx)[mid - 1u] == 'a',
-              "a drop short of an eighth keeps the pages");
-        s_tx_del(tx);
-    }
-
-    /* A short pass drained after one that ran out of room keeps every page:
-     * the region trims nothing. */
-    {
-        auto tx = s_tx_new(duct_max(room_test_cap * 16u, duct_page_size() * 16u));
-        CHECK(tx, "alloc (traversal)");
-        duct_olb_tx_min_room_set(tx, duct_page_size() / 2u);
-        size_t room = duct_olb_tx_min_room_get(tx),
-               fill = tx->h.buf_size - 100u;
-        uint64_t head = 0u;
-        CHECK(s_stage_fill(tx, fill) == olb_tx_ok, "stage up to fill");
-        duct_olb_tx_publish(tx);
-        duct_olb_tx_advance(tx, fill);
-        CHECK(s_stage_fill(tx, 200u) == olb_tx_ok && tx->stage_gen == 1u,
-              "a pass out of room wraps");
-        duct_olb_tx_publish(tx);
-        CHECK(duct_olb_tx_readable(tx, &head) == 200u && head == 0u, "io folds into the wrap");
-        duct_olb_tx_advance(tx, 200u);
-        CHECK(duct_olb_tx_rewind_idle(tx) && tx->stage_gen == 2u && tx->h.stage == 0u,
-              "the short pass past the wrap rewinds");
-#ifdef __linux__
-        CHECK(duct_olb_tx_data(tx)[room - 1u] == 'a' && duct_olb_tx_data(tx)[fill - 1u] == 'a',
-              "a drain past a traversal keeps the pages: the region trims nothing");
-#endif
+        CHECK(s_stage_fill(tx, 60u) == olb_tx_ok, "stage a second, unpublished");
+        duct_olb_tx_purge(tx);
+        CHECK(duct_olb_tx_descs_held(tx) == 0u && tx->h.stage == 0u
+              && duct_olb_tx_bytes_held(tx) == 0u,
+              "the purge empties published and staged alike");
+        CHECK(duct_atomic_load(&tx->mat_head, relaxed) == 160u,
+              "both arena runs returned");
+        CHECK(duct_olb_tx_room_contig(tx, 100u), "the budget reopens whole");
         s_tx_del(tx);
     }
 

@@ -682,6 +682,19 @@ duct_xsend_gso_peers([[maybe_unused]] int fd,
     return rc_not_supported;
 }
 
+/** @brief Send @p n records out connected socket @p fd as one segmented
+ *  write.
+ *  @return @c rc_not_supported always: Darwin's UDP has no segmentation
+ *  offload, and the caller sends the group unsegmented.
+ */
+duct_nonnull(2) static inline duct_result_t
+duct_xsend_gso_recs([[maybe_unused]] int fd,
+                    [[maybe_unused]] const duct_tx_rec_t *recs,
+                    [[maybe_unused]] unsigned n)
+{
+    return rc_not_supported;
+}
+
 /** @brief Send @p n already wire-packed datagrams to @p fd, each from its own
  *  descriptor's two spans, unsegmented.
  *
@@ -730,6 +743,60 @@ duct_xsend_peers(int fd, const duct_dgram_out_t *msgs_in, unsigned n, unsigned *
         sent = sendmsg(fd, &msgs[0].msg_hdr, MSG_NOSIGNAL);
     while (sent < 0 && errno == EINTR);
     *out_sent = duct_x_send_consumed(sent) ? 1u : 0u;
+    return rc_ok;
+}
+
+/** @brief Send @p n records out the connected socket @p fd unsegmented, each
+ *  its inline header and its payload span.
+ *
+ *  One @c sendmmsg through @ref duct_xwrite_batch, or one @c sendmsg for a
+ *  single record. A record's header and payload become two iovecs of one
+ *  message, so the payload reaches the kernel from wherever its record's
+ *  span keeps it; an empty header contributes no iovec. A record a send
+ *  will never carry counts as taken, the datagram discipline of the
+ *  connected socket's ring.
+ *
+ *  @param out_sent records the kernel took, a prefix of @p n.
+ *  @return @c rc_ok on every path; @c rc_drop for a first record too large
+ *          for the path; @c rc_fatal for a socket to close.
+ */
+duct_nonnull(2, 4) static inline duct_result_t
+duct_xsend_recs(int fd, const duct_tx_rec_t *recs, unsigned n, unsigned *out_sent)
+{
+    *out_sent = 0u;
+    assert(n && n <= duct_dgram_tx_batch);
+    struct iovec   iovs[2u * n];
+    duct_x_mmsg_t  msgs[n];
+    unsigned cnt = 0u;
+    for (unsigned i = 0u; i < n; ++i) {
+        unsigned start = cnt;
+        if (recs[i].hdr.size)
+            iovs[cnt++] = (struct iovec){ .iov_base = recs[i].hdr.data,
+                                          .iov_len = recs[i].hdr.size };
+        if (recs[i].body.size)
+            iovs[cnt++] = (struct iovec){ .iov_base = recs[i].body.data,
+                                          .iov_len = recs[i].body.size };
+        msgs[i] = (duct_x_mmsg_t){
+            .msg_hdr = { .msg_iov = &iovs[start], .msg_iovlen = cnt - start },
+        };
+    }
+
+    if (n > 1u) {
+        duct_discard duct_xwrite_batch(fd, x_udp, msgs, n, out_sent);
+        return rc_ok;
+    }
+    ssize_t sent;
+    do
+        sent = sendmsg(fd, &msgs[0].msg_hdr, MSG_NOSIGNAL);
+    while (sent < 0 && errno == EINTR);
+    if (sent >= 0) {
+        *out_sent = 1u;
+        return rc_ok;
+    }
+    if (!duct_x_send_retryable(errno)) {
+        duct_dbg_errf("errno %d", errno);
+        return rc_fatal;
+    }
     return rc_ok;
 }
 

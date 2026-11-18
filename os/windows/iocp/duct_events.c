@@ -575,43 +575,57 @@ static int s_tx_post_err(int rc)
     return err == WSA_IO_PENDING ? NO_ERROR : err;
 }
 
-/** @brief Post one overlapped @c WSASendMsg of @p n records from @p bufs,
- *  segmented when @p n is above 1.
+/** @brief Post one overlapped @c WSASendMsg of @p n records, segmented when
+ *  @p n is above 1.
  *  @return @c NO_ERROR once posted, the Winsock code otherwise. */
 static int s_tx_post_msg(void *tag, duct_sock_t fd, iocp_op_t *op,
-                         const duct_view_u8 *bufs, unsigned n)
+                         const duct_tx_rec_t *recs, unsigned n)
 {
     *op = (iocp_op_t){ .packed = s_tag_pack(iocp_op_tx_records, tag), .records = n };
     /* Winsock copies the message, its spans and its cmsg at the call, so a
-     * pending send needs only the record bytes, which stay in the ring until
-     * its completion advances past them. */
+     * pending send needs only the record bytes, which stay held by their
+     * descriptors until their completion advances past them. */
     duct_x_gso_msg_t m;
-    return s_tx_post_err(WSASendMsg(fd, duct_x_gso_msg_bufs(&m, bufs, n), 0u, nullptr, &op->ov, nullptr));
+    return s_tx_post_err(WSASendMsg(fd, duct_x_gso_msg_recs(&m, recs, n), 0u, nullptr, &op->ov, nullptr));
 }
 
-/** @brief Post one overlapped @c WSASend of the span @p p addresses.
+/** @brief Post one overlapped @c WSASend of the spans @p p gathered.
  *  @return @c NO_ERROR once posted, the Winsock code otherwise. */
 static int s_tx_post_stream(void *tag, const duct_io_xfer_t *p, iocp_op_t *op)
 {
-    *op = (iocp_op_t){ .packed = s_tag_pack(iocp_op_tx, tag), .buf = { p->size, (char *)p->buf } };
-    return s_tx_post_err(WSASend(p->fd, &op->buf, 1u, &(DWORD){0u}, 0u, &op->ov, nullptr));
+    /* Winsock copies the spans at the call, so the stack array and the
+     * records' bytes — held by their descriptors — outlive the post as they
+     * stand; the word's length half keeps the offered byte count the
+     * completion's advance reads. */
+    WSABUF wb[2u * duct_tx_peek_recs];
+    ULONG offered = 0u;
+    DWORD cnt = 0u;
+    for (unsigned i = 0u; i < p->iov_n; ++i)
+        if (p->iov[i].size) {
+            wb[cnt++] = (WSABUF){ .len = (ULONG)p->iov[i].size,
+                                  .buf = (CHAR *)p->iov[i].data };
+            offered += (ULONG)p->iov[i].size;
+        }
+    *op = (iocp_op_t){ .packed = s_tag_pack(iocp_op_tx, tag),
+                       .buf = { offered, nullptr } };
+    return s_tx_post_err(WSASend(p->fd, wb, cnt, &(DWORD){0u}, 0u, &op->ov, nullptr));
 }
 
 /** @brief Post the records at @p tag's ring head, a segmented group where the
  *  stack cuts one.
  *  A group refused synchronously goes again as its head record alone.
  *  @return @c NO_ERROR once posted; otherwise the refusal of the head record
- *  posted alone, which the drive judges as that one record's.
+ *          posted alone, which the drive judges as that one record's.
  */
 static int s_tx_post_records(void *tag, const duct_io_xfer_t *p, iocp_op_t *op)
 {
-    duct_view_u8 bufs[duct_dgram_tx_batch];
-    unsigned n = duct_io_tx_peek_bufs(tag, bufs, duct_dgram_tx_batch);
+    duct_tx_rec_t recs[duct_tx_peek_recs];
+    unsigned n = duct_io_tx_peek_recs(tag, recs, duct_tx_peek_recs);
     assert(n);
-    unsigned group = duct_x_has_gso() ? duct_x_gso_group(bufs, n) : 1u;
-    int err = s_tx_post_msg(tag, p->fd, op, bufs, group);
+    unsigned group = duct_x_has_gso() ? duct_x_gso_group(recs, n) : 1u;
+    int err = s_tx_post_msg(tag, p->fd, op, recs, group);
     if (err != NO_ERROR && group > 1u)
-        err = s_tx_post_msg(tag, p->fd, op, bufs, 1u);
+        err = s_tx_post_msg(tag, p->fd, op, recs, 1u);
     return err;
 }
 

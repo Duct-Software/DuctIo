@@ -512,15 +512,27 @@ void *duct_wire_tx_span_open(duct_wire_tx_t *stage, size_t n)
 {
     if (stage->kind == wire_tx_gather)
         return nullptr;
-    if (stage->kind != wire_tx_vmq_view)
-        return duct_olb_tx_span_open(stage->olb, n);
-    auto v = &stage->vmq_view;
-    size_t end = 0u;
-    if (duct_ckd_add(&end, v->stage, n) || end > v->capacity)
+    if (stage->kind == wire_tx_vmq_view) {
+        auto v = &stage->vmq_view;
+        size_t end = 0u;
+        if (duct_ckd_add(&end, v->stage, n) || end > v->capacity)
+            return nullptr;
+        auto span = (uint8_t *)v->data + v->stage;
+        v->stage = end;
+        return span;
+    }
+    /* The ring's encrypt destination: the arena span a sealed codec writes
+     * its whole record into (§2.1). The reservation is the caller's to keep
+     * — on_pack's caller reads it back through the stage. */
+    auto r = &stage->ring;
+    if (r->sealed_len || stage->gathered)
         return nullptr;
-    auto span = (uint8_t *)v->data + v->stage;
-    v->stage = end;
-    return span;
+    void *at = duct_olb_tx_span_open(r->tx, n);
+    if (at) {
+        r->sealed_len = (uint32_t)n;
+        stage->gathered = true;
+    }
+    return at;
 }
 
 duct_result_t duct_wire_tx_stage(duct_wire_tx_t *stage, duct_view_u8 hdr, duct_view_u8 payload)
@@ -548,10 +560,20 @@ duct_result_t duct_wire_tx_stage(duct_wire_tx_t *stage, duct_view_u8 hdr, duct_v
             stage->gathered = true;
         }
         break;
-    case wire_tx_olb:
-        rc = duct_olb_tx_stage(stage->olb, hdr_bytes, hdr.size,
-                               payload.data, payload.size);
+    case wire_tx_ring: {
+        auto r = &stage->ring;
+        rc = stage->gathered || hdr.size > wire_tx_hdr_max
+           ? olb_tx_too_large : olb_tx_ok;
+        if (rc == olb_tx_ok) {
+            if (hdr.size) {
+                memcpy(r->hdr + r->hdr_len, hdr_bytes, hdr.size);
+                r->hdr_len += (uint32_t)hdr.size;
+            }
+            r->payload = payload;
+            stage->gathered = true;
+        }
         break;
+    }
     }
     return rc == olb_tx_ok ? rc_ok : rc == olb_tx_too_large ? rc_invalid_arg : rc_again;
 }

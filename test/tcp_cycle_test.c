@@ -86,12 +86,15 @@ static duct_session_t *g_sess[side_count];
 /* Posting window: a conn block's TX retry park is knob-bounded
  * (DUCT_CONN_RETRY_TX_NODES, its copy slots), so a side queuing a whole run
  * holds the run itself and hands the engine at most this many unresolved
- * sends — each on its own static buffer, send-done marking it free. The
- * window stays wider than the pinned path (the TX ring plus the small socket
- * buffers), so the run still keeps more queued than the path holds; the rest
- * of the queue rests in the posting loop behind it. */
+ * sends. The window stays wider than the pinned path (the TX ring plus the
+ * small socket buffers), so the run still keeps more queued than the path
+ * holds; the rest of the queue rests in the posting loop. Every frame posts
+ * from its own buffer and no buffer is ever reused: fl_send_static promises
+ * the engine bytes valid for ever, and the send-done the window counts
+ * resolves at the stage, not at the wire — a slot refilled on it would tear
+ * a record the ring still holds. */
 static constexpr unsigned post_window = 12u;
-static uint8_t       g_post_buf[side_count][post_window][frame_size];
+static uint8_t       g_post_buf[side_count][frame_count][frame_size];
 static atomic_uint   g_post_done[side_count];
 static atomic_uint   g_post_failed;
 
@@ -174,15 +177,17 @@ static side_t s_side_of(const duct_session_t *s)
     return s == g_sess[side_dial] ? side_dial : side_accept;
 }
 
-/** @brief One frame of the run, its index in @p ctx, on its side's window
+/** @brief One frame of the run, its index in @p ctx, on its side's own
  *  buffer: posted fl_send_static with a send-done token, so the engine parks
- *  no copy and the poster reuses the buffer once its send resolves. */
+ *  no copy. The buffer is that frame's alone for the whole run — static
+ *  bytes stay valid for ever, and the window counts resolutions only to
+ *  keep the engine's unresolved sends bounded. */
 static duct_result_t
 s_post(duct_session_t *s, duct_response_t *out, void *ctx)
 {
     auto i = (uint32_t)(uintptr_t)ctx;
     auto side = s_side_of(s);
-    auto b = g_post_buf[side][i % post_window];
+    auto b = g_post_buf[side][i];
     memcpy(b, &i, sizeof i);
     memset(b + sizeof i, s_fill_byte(i), frame_size - sizeof i);
     duct_response_same(out, duct_view(duct_view_u8, b, frame_size),

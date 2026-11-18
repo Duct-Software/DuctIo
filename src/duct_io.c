@@ -395,7 +395,12 @@ static duct_conn_t *s_conn_new(duct_sock_t fd, duct_xport_t xport, const duct_pr
         return nullptr;
     }
     auto cfg = proto ? duct_proto_cfg_of(proto) : nullptr;
-    size_t tx_cap = cfg ? duct_max(cfg->tx_olb_cap, duct_conn_tx_olb_cap) : duct_conn_tx_olb_cap;
+    /* The protocol's own per-conn capacity honoured as this ring's byte
+     * budget (§2.2): a smaller @c tx_olb_cap tightens admission's byte limb,
+     * 0 or a value past the build ceiling takes the ceiling. */
+    size_t tx_cap = cfg && cfg->tx_olb_cap
+                  ? duct_min(cfg->tx_olb_cap, duct_conn_tx_olb_cap)
+                  : duct_conn_tx_olb_cap;
     if (duct_conn_setup(conn, fd, xport, tx_cap) != rc_ok) {
         s_close_fd(fd, false);
         duct_conn_release(conn);
@@ -1873,7 +1878,9 @@ static void s_classify_dgram(const duct_wfq_route_t *route, duct_listener_t *lis
             auto rx = duct_conn_rx_olb(roamed);
             s_dgram_peer_candidate_clear(roamed);
             s_dgram_peer_add_at(listener, peer, roamed, true);
-            duct_atomic_store(&rx->roam_at, duct_olb_rx_total_at(rx, rx->h.stage), release);
+            duct_atomic_store(&rx->roam_at,
+                      duct_olb_rx_total_at(rx, duct_atomic_load(&rx->h.stage, relaxed)),
+                      release);
             duct_conn_state_set(roamed, fl_conn_roaming);
             duct_frame_rx_post(route, &s_io_this->frame_rx, roamed);
             return;
@@ -3079,10 +3086,12 @@ static bool s_dgram_rx_commit_group(duct_olb_rx_t *rx, size_t n, size_t seg)
     duct_do_if(rx->group_bytes, return false);
     duct_dgram_rx_header_commit(rx, seg);
     auto h = &rx->h;
-    rx->group_off = (uint32_t)h->stage;
+    uint32_t staged0 = duct_atomic_load(&h->stage, relaxed);
+    rx->group_off = staged0;
     rx->group_seg = (uint32_t)seg;
     rx->group_bytes = (uint32_t)(n - seg);
-    duct_atomic_store(&h->tail, h->stage += n - seg, release);
+    duct_atomic_store(&h->tail, staged0 + (n - seg), release);
+    duct_atomic_store(&h->stage, staged0 + (uint32_t)(n - seg), relaxed);
     return true;
 }
 
@@ -3097,7 +3106,8 @@ static bool s_vnet_rx_commit(duct_conn_t *conn, size_t n)
     auto state = duct_conn_state(conn);
     bool uso = duct_has(state, fl_conn_vnet_uso) && duct_has(state, fl_conn_vnet_uso_tx);
     size_t out = duct_vnet_cut(duct_at(s_io_this->vnet_hdr),
-                               duct_conn_rx_data(conn) + h->stage,
+                               duct_conn_rx_data(conn)
+                                 + duct_atomic_load(&h->stage, relaxed),
                                n - conn->vnet_hdr_len,
                                duct_atomic_load(&conn->vnet_gso, relaxed),
                                uso,
@@ -3110,7 +3120,9 @@ static bool s_vnet_rx_commit(duct_conn_t *conn, size_t n)
         duct_rtstat_obj_inc(s_io_this, rtstats.vnet_rx_tso_reads, 1);
         duct_rtstat_obj_inc(s_io_this, rtstats.vnet_rx_tso_pkts, pkts);
     }
-    duct_atomic_store(&h->tail, h->stage += out, release);
+    uint32_t staged1 = duct_atomic_load(&h->stage, relaxed);
+    duct_atomic_store(&h->tail, staged1 + out, release);
+    duct_atomic_store(&h->stage, staged1 + (uint32_t)out, relaxed);
     return true;
 }
 
@@ -3150,7 +3162,8 @@ void duct_io_rx_commit(void *tag, size_t n, size_t seg)
         } else {
             auto rx = duct_conn_rx_olb(conn);
             duct_dgram_rx_header_commit(rx, n);
-            if (rx->h.stage - rx->posted_off < rx->read_unit)
+            if (duct_atomic_load(&rx->h.stage, relaxed) - rx->posted_off
+                < rx->read_unit)
                 return;
         }
         auto t = s_io_this;
@@ -3158,7 +3171,9 @@ void duct_io_rx_commit(void *tag, size_t n, size_t seg)
         return;
     }
     auto h = &duct_conn_rx_olb(conn)->h;
-    duct_atomic_store(&h->tail, h->stage += n, release);
+    uint32_t staged2 = duct_atomic_load(&h->stage, relaxed);
+    duct_atomic_store(&h->tail, staged2 + n, release);
+    duct_atomic_store(&h->stage, staged2 + (uint32_t)n, relaxed);
 }
 
 void duct_io_rx_commit_units(void *tag, const uint32_t *lens, uint32_t n)
@@ -3168,7 +3183,7 @@ void duct_io_rx_commit_units(void *tag, const uint32_t *lens, uint32_t n)
     auto rx = duct_conn_rx_olb(conn);
     size_t rec = sizeof(duct_dgram_rec_hdr_t),
            unit = rx->read_unit;
-    auto base = duct_olb_rx_data(rx) + rx->h.stage;
+    auto base = duct_olb_rx_data(rx) + duct_atomic_load(&rx->h.stage, relaxed);
     uint32_t last = n;
     for (uint32_t i = 0u; i < n; ++i) {
         uint32_t hdr = duct_dgram_rec_void;
@@ -3186,7 +3201,10 @@ void duct_io_rx_commit_units(void *tag, const uint32_t *lens, uint32_t n)
     duct_conn_rx_staged(conn, (size_t)last * unit + rec + lens[last]);
     s_dgram_peer_candidate_clear(conn);
     auto h = &rx->h;
-    duct_atomic_store(&h->tail, h->stage += (size_t)last * unit + rec + lens[last], release);
+    uint32_t staged3 = duct_atomic_load(&h->stage, relaxed);
+    duct_atomic_store(&h->tail, staged3 + (size_t)last * unit + rec + lens[last], release);
+    duct_atomic_store(&h->stage,
+                      staged3 + (uint32_t)((size_t)last * unit + rec + lens[last]), relaxed);
     auto t = s_io_this;
     duct_frame_rx_post(&t->route, &t->frame_rx, conn);
 }
@@ -3252,38 +3270,37 @@ static void s_tx_start(duct_conn_t *conn)
  *  @p conn outright. A close this call wins leaves @c out->fd at
  *  @c duct_sock_bad: the conn's reactor entry is gone, its poll slot free to
  *  hold another entry by then, and nothing is left to reconcile.
- *  @param readable bytes offered by the ring; only zero transitions
- *                  @c fl_conn_closing.
+ *  @param queued whether the ring holds any unfinished record; only none
+ *                transitions @c fl_conn_closing.
  */
-static bool s_tx_peek_idle(duct_conn_t *conn, size_t readable, duct_io_xfer_t *out)
+static bool s_tx_peek_idle(duct_conn_t *conn, bool queued, duct_io_xfer_t *out)
 {
     assert(duct_conn_has_olb(conn));
     out->fd = conn->fd;
     out->io_priv = duct_conn_tx_olb(conn)->h.ext_ptr;
     out->olb_hdr = &duct_conn_tx_olb(conn)->h;
-    if (readable == 0u && duct_has(duct_conn_state(conn), fl_conn_closing)
+    if (!queued && duct_has(duct_conn_state(conn), fl_conn_closing)
         && s_conn_close(s_io_this, conn,
                         duct_gen_req_reason(duct_atomic_load(duct_conn_gen_req(conn), relaxed))))
         out->fd = duct_sock_bad;
     return false;
 }
 
-/** @brief Wake @p conn's worker if this head advance crossed its armed
+/** @brief Wake @p conn's worker if this completion advance crossed its armed
  *  TX-wait target.
- *  Called after every TX head advance — the drain's own and the fold
- *  @ref duct_olb_tx_readable performs — with @p prev_head and @p new_head
- *  bracketing the advance. The fence pairs with the worker's arm, so either
- *  its room check after arming sees what io freed, or the target load here
- *  sees the arm, and the crossing edge @c prev_head < T ≤ new_head fires
- *  exactly once per arm — the packed head is monotonic, so a spent target
- *  can never cross again and no clear write exists. The value spares a
- *  worker with nothing blocked a futex round trip per drained message.
+ *  Called after every drained-position advance, with @p prev and @p new
+ *  bracketing it. The fence pairs with the worker's arm, so either its room
+ *  check after arming sees what io freed, or the target load here sees the
+ *  arm, and the crossing edge @c prev < T ≤ @c new fires exactly once per
+ *  arm — the position is monotonic, so a spent target can never cross again
+ *  and no clear write exists. The value spares a worker with nothing blocked
+ *  a futex round trip per drained record.
  */
-static void s_tx_wake_waiter(duct_conn_t *conn, uint64_t prev_head, uint64_t new_head)
+static void s_tx_wake_waiter(duct_conn_t *conn, uint64_t prev, uint64_t now)
 {
     atomic_thread_fence(memory_order_seq_cst);
     uint64_t target = duct_atomic_load(&duct_conn_tx_olb(conn)->resume_at, relaxed);
-    if (!duct_olb_tx_wait_crossed(prev_head, new_head, target))
+    if (!duct_olb_tx_wait_crossed(prev, now, target))
         return;
     duct_worker_wake_id(conn->worker_id);
 }
@@ -3301,81 +3318,68 @@ static void s_tx_wake_signalled(duct_conn_t *conn)
     duct_worker_wake_id(conn->worker_id);
 }
 
-/* Record-framed: one record's payload, positioned past the internal
- * record-length prefix the worker staged ahead of the wire's own bytes,
- * independent of whatever shape on_pack itself writes, and stripped before the
- * peer sees it; the prefix's duct_dgram_rec_gso bit stays out of the length.
- * Stream: the whole readable region, an x_tcp one cut to the opening's piece.
- * Nothing readable resolves a pending respond-then-close right here:
- * fl_conn_closing was set while this conn still had unflushed TX, and this is
- * the drain that finally empties it. */
+/* Record-framed: whole records from the head, two spans each — the inline
+ * header a record's descriptor carries and its payload span — a datagram
+ * shipping whole or not at all. Stream: the head record's remaining bytes
+ * first, its cursor already inside it, then whole records behind, an @c x_tcp
+ * leg cut to the opening's piece. Nothing queued resolves a pending
+ * respond-then-close right here: fl_conn_closing was set while this conn
+ * still had unflushed TX, and this is the drain that finally empties it. */
 bool duct_io_tx_peek(void *tag, duct_io_xfer_t *out)
 {
     auto conn = s_conn_from_tag(tag);
     duct_do_if(!conn, return false);
-    size_t rec = duct_conn_record_framed(conn) ? sizeof(duct_dgram_rec_hdr_t) : 0u;
     auto tx = duct_conn_tx_olb(conn);
-    uint64_t head = 0u;
-    uint64_t before = duct_atomic_load(&tx->h.head, relaxed);
-    size_t n = duct_olb_tx_readable(tx, &head);
-    /* The fold @ref duct_olb_tx_readable performs is a head advance of its
-     * own — the wrap room it frees crosses the worker's fold-form target
-     * right here, with no s_tx_advance after it to bracket the edge (the
-     * drive that follows loads its prev already past the fold). */
-    uint64_t folded = duct_atomic_load(&tx->h.head, relaxed);
-    if (folded != before)
-        s_tx_wake_waiter(conn, before, folded);
-    /* n == rec is a record header with no payload, which a zero-length
-     * datagram legitimately stages: only a short header or an empty ring
-     * is idle. */
-    if (n == 0u || n < rec)
-        return s_tx_peek_idle(conn, n, out);
-    auto base = duct_conn_tx_data(conn) + (size_t)head;
-    size_t len = n;
-    if (rec) {
-        len = duct_dgram_rec_hdr_decode((const uint8_t *)base) & ~duct_dgram_rec_gso;
-        assert(n >= rec + len); /* worker staged reclen + wire bytes together as one indivisible transaction */
-    }
-    /* The bound lives here because iocp posts this span as it stands. */
+    out->iov_n = duct_olb_tx_peek_iov(tx, duct_conn_record_framed(conn),
+                                      duct_tx_peek_recs, out->iov);
+    if (!out->iov_n)
+        return s_tx_peek_idle(conn, false, out);
+    /* The opening's piece bounds one write on a stream leg: cut the gather
+     * at it, the last span shortened and the rest left for the next peek. */
     if (conn->xport_type == x_tcp) {
         size_t piece = duct_x_sock_tx_piece(duct_x_sock_tx_of(tx));
-        len = piece && piece < len ? piece : len;
+        if (piece) {
+            size_t total = 0u;
+            unsigned n = out->iov_n;
+            for (unsigned i = 0u; i < n; ++i) {
+                if (total + out->iov[i].size <= piece) {
+                    total += out->iov[i].size;
+                    continue;
+                }
+                out->iov[i].size = piece - total;
+                out->iov_n = i + 1u;
+                break;
+            }
+        }
     }
-    /* No .ctx: only a shared, unconnected socket needs the peer
-     * address for duct_xwrite. */
-    *out = (duct_io_xfer_t){
-        .buf = base + rec, .size = len,
-        .fd = conn->fd, .xport_type = conn->xport_type,
-        .io_priv = tx->h.ext_ptr, .olb_hdr = &tx->h,
-    };
+    out->fd = conn->fd;
+    out->xport_type = conn->xport_type;
+    out->io_priv = tx->h.ext_ptr;
+    out->olb_hdr = &tx->h;
     return true;
 }
 
 /** @brief Release @p offered bytes of @p conn's TX ring, @p n of them sent.
  *  @p offered is a snapshot the peek call already captured this same drive
- *  iteration; re-reading the OLB's readable length here races a
+ *  iteration; re-reading the ring's queued bytes here races a
  *  concurrently-staging worker.
  *  @return true while the drive may continue.
  */
 static bool s_tx_advance(duct_conn_t *conn, size_t offered, size_t n)
 {
     auto tx = duct_conn_tx_olb(conn);
-    uint64_t prev = duct_atomic_load(&tx->h.head, relaxed);
-    if (duct_conn_record_framed(conn)) {
-        assert(n == offered || n == 0u); /* a record-framed transport ships a
-                                           * packet whole or not at all, with
-                                           * no short-write retry concept. */
-        duct_olb_tx_advance(tx, sizeof(duct_dgram_rec_hdr_t) + offered);
-        s_tx_wake_waiter(conn, prev,
-                         duct_atomic_load(&tx->h.head, relaxed));
-        return true;
-    }
-    duct_olb_tx_advance(tx, n);
-    uint64_t now = duct_atomic_load(&tx->h.head, relaxed);
+    uint64_t prev = duct_atomic_load(&tx->drained, relaxed);
+    bool zero = duct_olb_tx_advance(tx, n, duct_conn_record_framed(conn));
+    uint64_t now = duct_atomic_load(&tx->drained, relaxed);
     /* Counted here, where an iocp completion lands as well as a write's return. */
     if (conn->xport_type == x_tcp)
         duct_x_sock_tx_sent(duct_x_sock_tx_of(tx), n);
-    s_tx_wake_waiter(conn, prev, now);
+    if (now != prev)
+        s_tx_wake_waiter(conn, prev, now);
+    else if (zero)
+        /* A zero-wire record freed its slot without moving a byte: an armed
+         * word still names a position io has now moved past. */
+        s_tx_wake_signalled(conn);
     return n == offered; /* short write: socket buffer full, caller stops */
 }
 
@@ -3386,44 +3390,30 @@ bool duct_io_tx_advance(void *tag, size_t offered, size_t n)
     return s_tx_advance(conn, offered, n);
 }
 
-/** @brief Address up to @p max whole records in the @p n ring bytes at
- *  @p base, payload spans only. */
-static unsigned s_tx_rec_bufs(uint8_t *base, size_t n, duct_view_u8 *bufs, unsigned max)
-{
-    size_t rec = sizeof(duct_dgram_rec_hdr_t),
-           off = 0u;
-    unsigned count = 0u;
-    while (count < max && n - off >= rec) {
-        size_t len = duct_dgram_rec_hdr_decode((const uint8_t *)base + off);
-        if (n - off < rec + len)
-            break;
-        bufs[count++] = (duct_view_u8){ .data = base + off + rec, .size = len };
-        off += rec + len;
-    }
-    return count;
-}
-
-/** @brief Address up to @p max whole records queued at @p conn's ring head.
- *  Payload spans only: each record's internal length prefix is stepped over,
- *  the way @ref duct_io_tx_peek strips the single one it reports. The walk
- *  stops at the first record the readable run does not hold entirely, so a
- *  worker staging concurrently never contributes a half record.
+/** @brief Address up to @p max whole records queued at @p conn's ring head,
+ *  their two spans each — the grouped send's and the staged drain's record
+ *  view of the descriptor ring. A partial head record (a stream short write
+ *  left it) is not a record the group may take: the walk stops there.
  *  @return records addressed; 0 on a leg with no record boundaries to find.
  */
-static unsigned s_tx_peek_bufs(duct_conn_t *conn, duct_view_u8 *bufs, unsigned max)
+static unsigned s_tx_peek_recs(duct_conn_t *conn, duct_tx_rec_t *recs, unsigned max)
 {
-    if (!duct_conn_record_framed(conn))
+    auto tx = duct_conn_tx_olb(conn);
+    if (!duct_conn_record_framed(conn) || duct_atomic_load(&tx->cursor_off, relaxed))
         return 0u;
-    uint64_t head = 0u;
-    size_t n = duct_olb_tx_readable(duct_conn_tx_olb(conn), &head);
-    return s_tx_rec_bufs(duct_conn_tx_data(conn) + (size_t)head, n, bufs, max);
+    duct_view_u8 iov[2u * duct_tx_peek_recs];
+    unsigned n = duct_olb_tx_peek_iov(tx, true, max, iov);
+    n /= 2u;
+    for (unsigned i = 0u; i < n; ++i)
+        recs[i] = (duct_tx_rec_t){ .hdr = iov[2u * i], .body = iov[2u * i + 1u] };
+    return n;
 }
 
-unsigned duct_io_tx_peek_bufs(void *tag, duct_view_u8 *bufs, unsigned max)
+unsigned duct_io_tx_peek_recs(void *tag, duct_tx_rec_t *recs, unsigned max)
 {
     auto conn = s_conn_from_tag(tag);
     duct_do_if(!conn, return 0u);
-    return s_tx_peek_bufs(conn, bufs, max);
+    return s_tx_peek_recs(conn, recs, duct_min(max, duct_tx_peek_recs));
 }
 
 void duct_io_tx_advance_records(void *tag, unsigned n)
@@ -3433,14 +3423,16 @@ void duct_io_tx_advance_records(void *tag, unsigned n)
     assert(n <= duct_dgram_tx_batch);
     if (n > 1u)
         s_rtstat_gso((duct_x_gso_tally_t){ .writes = 1u, .dgrams = n });
-    duct_view_u8 bufs[duct_dgram_tx_batch];
-    n = s_tx_peek_bufs(conn, bufs, n);
-    for (unsigned i = 0u; i < n; ++i)
-        duct_discard s_tx_advance(conn, bufs[i].size, bufs[i].size);
+    duct_tx_rec_t recs[duct_tx_peek_recs];
+    n = s_tx_peek_recs(conn, recs, n);
+    for (unsigned i = 0u; i < n; ++i) {
+        size_t wire = duct_x_dgram_len_rec(&recs[i]);
+        duct_discard s_tx_advance(conn, wire, wire);
+    }
 }
 
-DUCT_XSEND_GROUPED_DECLARE(s_tx_send_grouped, duct_view_u8)
 DUCT_XSEND_GROUPED_DECLARE(s_peer_send_grouped, duct_dgram_out_t)
+DUCT_XSEND_GROUPED_DECLARE(s_rec_send_grouped, duct_tx_rec_t)
 
 /** @brief Ship the records queued behind @p conn's head in one pass.
  *
@@ -3465,26 +3457,27 @@ static bool s_tx_send_batch(duct_conn_t *conn, const duct_io_xfer_t *p,
     case x_udp_shared: case x_bt: case x_can: case x_inter: case x_local:
         return false;
     }
-    duct_view_u8 bufs[duct_dgram_tx_batch];
-    unsigned n = s_tx_peek_bufs(conn, bufs, duct_dgram_tx_batch);
+    duct_tx_rec_t recs[duct_dgram_tx_batch];
+    unsigned n = s_tx_peek_recs(conn, recs, duct_dgram_tx_batch);
     if (n < 2u)
         return false;
     bool gso = !duct_has(duct_conn_state(conn), fl_conn_gso_off);
     unsigned sent = 0u;
     duct_x_gso_tally_t tally = {};
-    *out_rc = s_tx_send_grouped(p->fd, bufs, n, &sent, &tally, &gso);
+    *out_rc = s_rec_send_grouped(p->fd, recs, n, &sent, &tally, &gso);
     if (!gso)
         duct_conn_state_set(conn, fl_conn_gso_off);
     s_rtstat_gso(tally);
     for (unsigned i = 0u; i < sent; ++i)
-        duct_discard s_tx_advance(conn, bufs[i].size, bufs[i].size);
+        duct_discard s_tx_advance(conn, duct_x_dgram_len_rec(&recs[i]),
+                                  duct_x_dgram_len_rec(&recs[i]));
     switch (*out_rc) {
     case rc_ok:
         if (sent < n)
             *out_rc = rc_again;
         break;
     case rc_drop:
-        duct_discard s_tx_advance(conn, bufs[0].size, 0u);
+        duct_discard s_tx_advance(conn, duct_x_dgram_len_rec(&recs[0]), 0u);
         *out_rc = rc_ok;
         break;
     default:
@@ -3504,48 +3497,44 @@ bool duct_io_tx_send(void *tag, const duct_io_xfer_t *p, duct_result_t *out_rc)
     if (s_tx_send_batch(conn, p, out_rc))
         return *out_rc == rc_ok;
     size_t nwritten = 0u,
-           offered = p->size;
-    /* A vnet leg's ring holds bare packets and GSO records, the prefix bit
-     * telling them apart. A packet leaves under a zero header; a record leaves
-     * as its packet under the header duct_vnet_gso_open builds, its segment
-     * size counted as written since a record advances whole, and one that
-     * fails to open is dropped. No header's bytes count toward the advance. */
-    if (conn->vnet_hdr_len) {
-        duct_view_u8 pkt = { .data = p->buf, .size = p->size };
-        bool gso = duct_dgram_rec_hdr_decode((const uint8_t *)p->buf - duct_dgram_record_hdr_size)
-                 & duct_dgram_rec_gso;
-        uint8_t vh[duct_vnet_hdr_max];
-        bool bad = gso && (!duct_vnet_gso_open(&pkt, vh)
-                           || (duct_vnet_gso_is_udp(vh)
-                               && !duct_has(duct_conn_state(conn), fl_conn_vnet_uso)));
-        duct_view_u8 spans[2] = {
-            { .data = gso ? vh : (uint8_t *)&duct_vnet_zero[0], .size = conn->vnet_hdr_len },
-            pkt,
-        };
-        *out_rc = bad ? rc_drop : duct_xwritev(p->fd, p->xport_type, spans, 2u, &nwritten, 0);
-        nwritten = nwritten > conn->vnet_hdr_len
-                 ? nwritten - conn->vnet_hdr_len + (p->size - pkt.size) : 0u;
-    } else {
-        /* Under the platform's cap a write takes at most the cap, with the
-         * flags the cap names. A capped write counts whole, so the drive goes
-         * on until the socket refuses. */
-        int flags = 0;
-        if (p->xport_type == x_tcp) {
-            size_t cap = duct_x_sock_tx_cap(duct_x_sock_tx_of(duct_conn_tx_olb(conn)), &flags);
-            duct_rtstat_obj_inc(s_io_this, rtstats.tcp_writes, 1);
-            duct_rtstat_obj_inc(s_io_this, rtstats.tcp_eor_writes, cap != 0u);
-            if (cap)
-                offered = duct_min(offered, cap);
+           offered = 0u;
+    for (unsigned i = 0u; i < p->iov_n; ++i)
+        offered += p->iov[i].size;
+    /* Under the platform's cap a write takes at most the cap, with the flags
+     * the cap names. A capped write counts whole, so the drive goes on until
+     * the socket refuses. */
+    int flags = 0;
+    if (p->xport_type == x_tcp) {
+        size_t cap = duct_x_sock_tx_cap(duct_x_sock_tx_of(duct_conn_tx_olb(conn)), &flags);
+        duct_rtstat_obj_inc(s_io_this, rtstats.tcp_writes, 1);
+        duct_rtstat_obj_inc(s_io_this, rtstats.tcp_eor_writes, cap != 0u);
+        if (cap && offered > cap) {
+            duct_view_u8 cut[2u * duct_tx_peek_recs];
+            unsigned m = 0u;
+            for (size_t left = cap; m < p->iov_n && left; ++m) {
+                cut[m] = (duct_view_u8){ .data = p->iov[m].data,
+                                         .size = duct_min(p->iov[m].size, left) };
+                left -= cut[m].size;
+            }
+            /* A capped write counts whole: the cap is the offered the advance
+             * reconciles against, so a socket that took the cap keeps the
+             * drive on — answering short here would arm write interest for a
+             * socket whose readiness never changes again, with nothing left
+             * to wake io (the worker's own path is armed-gated, the kernel's
+             * edge needs a readiness transition an idle socket never gives),
+             * and the lowat follow would never step again. */
+            offered = cap;
+            *out_rc = duct_xwritev(p->fd, p->xport_type, cut, m, &nwritten, flags);
+            goto advance;
         }
-        *out_rc = duct_xwrite(p->fd, p->xport_type,
-                              (duct_view_u8){ .data = p->buf, .size = offered },
-                              &nwritten, p->ctx, flags);
     }
+    *out_rc = duct_xwritev(p->fd, p->xport_type, p->iov, p->iov_n, &nwritten, flags);
+advance:
     switch (*out_rc) {
     case rc_ok:
         return s_tx_advance(conn, offered, nwritten);
     case rc_drop:
-        return s_tx_advance(conn, p->size, 0u);
+        return s_tx_advance(conn, offered, 0u);
     default:
         return false;
     }
@@ -3625,11 +3614,9 @@ static bool s_req_do_close(duct_io_t *t, duct_conn_t *conn)
     if (!duct_has(duct_conn_state(conn), fl_conn_closing))
         return false;
     auto reason = duct_gen_req_reason(duct_atomic_load(duct_conn_gen_req(conn), relaxed));
-    if (reason != close_timeout && duct_conn_tx_olb(conn)) {
-        uint64_t head = 0u;
-        if (duct_olb_tx_readable(duct_conn_tx_olb(conn), &head) != 0u)
-            return false;
-    }
+    if (reason != close_timeout && duct_conn_tx_olb(conn)
+        && duct_olb_tx_descs_held(duct_conn_tx_olb(conn)) != 0u)
+        return false;
     return s_conn_close(t, conn, reason);
 }
 
@@ -4105,41 +4092,33 @@ duct_result_t duct_io_udp_peer_send_staged(duct_conn_t *conn, size_t *out_sent,
         return rc_again;
     }
     assert(conn->fd != duct_sock_bad);
-    size_t base = olb_off(duct_atomic_load(&tx->h.tail, relaxed)),
-           off = base,
-           end = tx->h.stage;
-    while (off < end) {
-        duct_view_u8 bufs[duct_dgram_tx_batch];
-        unsigned n = s_tx_rec_bufs(duct_olb_tx_data(tx) + off, end - off, bufs,
-                                   duct_dgram_tx_batch),
-                 sent = 0u;
-        assert(n);
-        duct_result_t rc;
-        /* A lone record takes the plain send io's own one-record drain makes. */
-        if (n == 1u) {
-            size_t written = 0u;
-            rc = duct_xwrite(conn->fd, x_udp_peer, bufs[0], &written, nullptr, 0);
-            sent = rc == rc_ok;
-        } else {
-            bool gso = !duct_has(duct_conn_state(conn), fl_conn_gso_off);
-            rc = s_tx_send_grouped(conn->fd, bufs, n, &sent, tally, &gso);
-            if (!gso)
-                duct_conn_state_set(conn, fl_conn_gso_off);
-        }
-        /* rc_drop names the first record, too large for the path: step over it. */
-        if (rc == rc_drop)
-            sent = 1u;
-        for (unsigned i = 0u; i < sent; ++i)
-            off += duct_dgram_record_hdr_size + bufs[i].size;
-        *out_sent = off - base;
-        if (rc == rc_drop || (rc == rc_ok && sent == n))
-            continue;
-#if DUCT_RUNTIME_STATS
-        duct_worker_rtstat_fast_miss(false);
-#endif
-        return rc == rc_ok ? rc_again : rc;
+    duct_tx_rec_t recs[duct_dgram_tx_batch];
+    unsigned n = duct_olb_tx_peek_staged_recs(tx, recs, duct_dgram_tx_batch);
+    if (!n)
+        return rc_again;
+    unsigned sent = 0u;
+    duct_result_t rc;
+    /* A lone record takes the plain send io's own one-record drain makes. */
+    if (n == 1u) {
+        sent = 0u;
+        rc = duct_xsend_plain(conn->fd, recs, 1u, &sent);
+    } else {
+        bool gso = !duct_has(duct_conn_state(conn), fl_conn_gso_off);
+        rc = s_rec_send_grouped(conn->fd, recs, n, &sent, tally, &gso);
+        if (!gso)
+            duct_conn_state_set(conn, fl_conn_gso_off);
     }
-    return rc_ok;
+    /* rc_drop names the first record, too large for the path: step over it. */
+    if (rc == rc_drop)
+        sent = 1u;
+    for (unsigned i = 0u; i < sent; ++i)
+        *out_sent += duct_x_dgram_len_rec(&recs[i]);
+    if (rc == rc_drop || (rc == rc_ok && sent == n))
+        return rc == rc_drop ? rc_ok : rc;
+#if DUCT_RUNTIME_STATS
+    duct_worker_rtstat_fast_miss(false);
+#endif
+    return rc == rc_ok ? rc_again : rc;
 }
 
 bool duct_io_stream_send_fast(duct_conn_t *conn, const duct_view_u8 *bufs,

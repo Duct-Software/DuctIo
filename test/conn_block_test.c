@@ -46,7 +46,8 @@ static void s_stage_rx(duct_olb_rx_t *rx, size_t len)
 {
     char chunk[4096];
     memset(chunk, 'r', sizeof chunk);
-    s_expect(len <= rx->h.buf_size - rx->h.stage, "rx stage overflows the carved cap");
+    s_expect(len <= rx->h.buf_size - duct_atomic_load(&rx->h.stage, relaxed),
+             "rx stage overflows the carved cap");
     for (size_t left = len; left;) {
         size_t take = left < sizeof chunk ? left : sizeof chunk;
         duct_olb_rx_append_raw(rx, chunk, take);
@@ -85,9 +86,10 @@ static void t_carve_shapes(void)
              "a carved OLB must not carry a vm mapping total");
     s_expect(duct_conn_lane(conn) == nullptr, "an OLB conn resolved a lane");
     s_stage_rx(rx, duct_conn_rx_olb_cap);
-    s_expect(rx->h.stage == duct_conn_rx_olb_cap, "the full rx ceiling is writable");
+    s_expect(duct_atomic_load(&rx->h.stage, relaxed) == duct_conn_rx_olb_cap,
+             "the full rx ceiling is writable");
     memset(duct_conn_tx_data(conn), 't', duct_conn_tx_olb_cap);
-    duct_conn_rx_staged(conn, rx->h.stage);
+    duct_conn_rx_staged(conn, duct_atomic_load(&rx->h.stage, relaxed));
     duct_conn_tx_staged(conn, duct_conn_tx_olb_cap);
     duct_conn_touched_update(conn);
     size_t want = (duct_conn_rx_olb_cap + duct_conn_tx_olb_cap) / duct_page_size();

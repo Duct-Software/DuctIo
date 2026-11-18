@@ -232,11 +232,18 @@ s_tls_on_pack(const duct_wire_t *self, [[maybe_unused]] duct_session_t *s,
     if (sealed_len == 0u)
         return rc_again;
     size_t pre = codec->tx_prefix_len;
+    /* The ciphertext materializes whole in one contiguous arena run (§2.1):
+     * a record past the arena's scale can never stage, and rejects here, at
+     * the response's own size — never a retry that cannot resolve. */
+    if (sealed_len + pre > duct_conn_tx_mat_cap)
+        return rc_invalid_arg;
     auto span = duct_wire_tx_span_open(stage, sealed_len + pre);
-    /* Whichever commit path led here reserved tx_bound(payload.size) first, and
-     * sealed_len <= tx_bound by construction, so a miss means a sizing site
-     * drifted from this one. */
-    duct_fatal(!span);
+    /* Whichever commit path led here checked the ring's room first, and
+     * sealed_len <= tx_bound by construction — a miss now names the
+     * materialize arena's wrap, not a sizing drift: backpressure, the
+     * caller's retry, never a fatal. */
+    if (!span)
+        return rc_again;
     uint8_t env_buf[sizeof(duct_dgram_env_t)];
     size_t n_spans = 2u;
     duct_view_u8 spans[3] = {

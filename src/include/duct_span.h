@@ -192,7 +192,13 @@ duct_span_of_static(const void *at, uint32_t len)
 duct_nonnull(1, 2) static inline void
 duct_span_rx_pin(duct_conn_t *conn, duct_olb_rx_t *rx)
 {
-    if (duct_atomic_fetch(add, &rx->pins, 1u, relaxed) == 0u)
+    /* Release, not relaxed: the io thread's wrap and compaction gates load
+     * @c pins with acquire ahead of writing anywhere in the ring, and a pin
+     * this thread takes while its payload's bytes are not yet acked must be
+     * visible to those gates by the time the ack itself is — a relaxed
+     * store lets the gate read the old count and write the very bytes the
+     * pin names (the tcp_cycle damaged frame). */
+    if (duct_atomic_fetch(add, &rx->pins, 1u, release) == 0u)
         duct_conn_ref_take(conn);
 }
 

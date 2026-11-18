@@ -213,12 +213,11 @@ static const char *run(void)
     s_fixture_t f;
     s_fixture_init(&f);
 
-    /* duct_olb_tx_new's requested capacity is a floor, not the literal
-     * buf_size -- the underlying duct_vm_new mapping rounds up to its own
-     * granularity. Query the real, empty-OLB space instead of assuming
-     * s_tx_olb_cap itself is exactly what's available, so filler/big/tiny
-     * stay correctly proportioned regardless of that rounding. */
-    size_t total_cap = duct_olb_tx_space(duct_conn_tx_olb(f.conn));
+    /* The ring's logical wire budget is what the carve placed, the
+     * descriptor ring's own ceiling. Query it rather than assuming
+     * s_tx_olb_cap itself, so filler/big/tiny stay correctly proportioned
+     * against what admission actually checks. */
+    size_t total_cap = duct_olb_tx_byte_cap(duct_conn_tx_olb(f.conn));
     if (total_cap < kbytes(4u)) {
         s_fixture_fini(&f);
         return "fixture: TX OLB smaller than this test's own assumptions need";
@@ -290,7 +289,7 @@ static const char *run(void)
 
     /* Simulate the I/O thread draining the saturated ring. The parked big
      * frame must publish on the next TX-room wake, exactly once. */
-    duct_olb_tx_advance(duct_conn_tx_olb(f.conn), after_filler);
+    duct_olb_tx_advance(duct_conn_tx_olb(f.conn), after_filler, false);
     if (!s_retry_drain(&f.w) || f.w.retry_head ||
         duct_olb_tx_published(duct_conn_tx_olb(f.conn)) == 0u) {
         s_fixture_fini(&f);

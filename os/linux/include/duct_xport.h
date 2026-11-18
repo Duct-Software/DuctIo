@@ -1036,6 +1036,88 @@ duct_xsend_gso_peers(int fd, const duct_dgram_out_t *msgs, unsigned n)
 #endif
 }
 
+/** @brief Send @p n records out connected socket @p fd as one @c UDP_SEGMENT
+ *  write cut at @p recs[0]'s length, each record its inline header and its
+ *  payload span.
+ *  @p n is at most @ref duct_x_gso_segs_max, the cut @ref duct_x_gso_group makes.
+ *  @return @c rc_ok with all @p n taken; @c rc_again for a code worth
+ *  repeating; @c rc_not_supported for every other code, which sends the group
+ *  unsegmented, and always in a build whose headers lack @c UDP_SEGMENT.
+ */
+duct_nonnull(2) static inline duct_result_t
+duct_xsend_gso_recs(int fd, const duct_tx_rec_t *recs, unsigned n)
+{
+#ifdef UDP_SEGMENT
+    struct iovec iov[2u * duct_x_gso_segs_max];
+    size_t cnt = 0u;
+    for (unsigned i = 0u; i < n; ++i) {
+        if (recs[i].hdr.size)
+            iov[cnt++] = (struct iovec){ .iov_base = recs[i].hdr.data,
+                                         .iov_len = recs[i].hdr.size };
+        if (recs[i].body.size)
+            iov[cnt++] = (struct iovec){ .iov_base = recs[i].body.data,
+                                         .iov_len = recs[i].body.size };
+    }
+    return duct_x_gso_result(duct_xsend_gso_iov(fd, iov, cnt, duct_x_dgram_len_rec(&recs[0]),
+                                                nullptr, 0));
+#else
+    return rc_not_supported;
+#endif
+}
+
+/** @brief Send @p n records out the connected socket @p fd unsegmented, each
+ *  its inline header and its payload span.
+ *
+ *  One @c sendmmsg, a record's header and payload becoming the two iovecs of
+ *  its message, so the payload reaches the kernel from wherever its record's
+ *  span keeps it; an empty header contributes no iovec. A record a send will
+ *  never carry counts as taken, the datagram discipline of the connected
+ *  socket's ring.
+ *
+ *  @param out_sent records the kernel took, a prefix of @p n.
+ *  @return @c rc_ok with @p out_sent up to @p n, short of it once the socket
+ *          fills; @c rc_drop for a first record too large for the path;
+ *          @c rc_fatal for a socket to close.
+ */
+duct_nonnull(2, 4) static inline duct_result_t
+duct_xsend_recs(int fd, const duct_tx_rec_t *recs, unsigned n, unsigned *out_sent)
+{
+    *out_sent = 0u;
+    assert(n && n <= duct_dgram_tx_batch);
+    struct iovec   iov[2u * duct_dgram_tx_batch];
+    struct mmsghdr msgs[duct_dgram_tx_batch] = {};
+    unsigned cnt = 0u;
+    for (unsigned i = 0u; i < n; ++i) {
+        unsigned start = cnt;
+        if (recs[i].hdr.size)
+            iov[cnt++] = (struct iovec){ .iov_base = recs[i].hdr.data,
+                                         .iov_len = recs[i].hdr.size };
+        if (recs[i].body.size)
+            iov[cnt++] = (struct iovec){ .iov_base = recs[i].body.data,
+                                         .iov_len = recs[i].body.size };
+        msgs[i].msg_hdr.msg_iov = &iov[start];
+        msgs[i].msg_hdr.msg_iovlen = (size_t)(cnt - start);
+    }
+    int r;
+    do
+        r = sendmmsg(fd, msgs, (unsigned)n, MSG_NOSIGNAL);
+    while (r < 0 && errno == EINTR);
+    if (r >= 0) {
+        *out_sent = (unsigned)r;
+        return rc_ok;
+    }
+    if (duct_x_send_retryable(errno))
+        return rc_again;
+    switch (errno) {
+    case EMSGSIZE:
+        duct_dbg_errf("EMSGSIZE, %zu bytes", duct_x_dgram_len_rec(&recs[0]));
+        return rc_drop;
+    default:
+        duct_dbg_errf("errno %d", errno);
+        return rc_fatal;
+    }
+}
+
 /** @brief Send @p n already wire-packed datagrams to @p fd, each from its own
  *  descriptor's two spans, unsegmented.
  *

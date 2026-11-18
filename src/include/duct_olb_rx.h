@@ -392,7 +392,8 @@ duct_nonnull(1) static inline size_t
 duct_olb_rx_room(const duct_olb_rx_t *rx)
 {
     size_t lim = rx->pass_end ? rx->pass_free : rx->h.buf_size;
-    return lim > rx->h.stage ? lim - rx->h.stage : 0u;
+    uint32_t stage = duct_atomic_load(&rx->h.stage, relaxed);
+    return lim > stage ? lim - (size_t)stage : 0u;
 }
 
 /** @brief Ack total at which a read latched for want of @p min_avail bytes
@@ -411,10 +412,11 @@ duct_olb_rx_resume_total(const duct_olb_rx_t *rx, size_t min_avail, bool restart
 {
     uint64_t posted = duct_olb_rx_posted_total(rx);
     if (!restart || rx->group_bytes || duct_atomic_load(&rx->pins, relaxed)
-        || (!rx->pass_end && rx->h.stage != rx->posted_off))
+        || (!rx->pass_end && duct_atomic_load(&rx->h.stage, relaxed) != rx->posted_off))
         return posted;
     uint64_t at = rx->pass_base + (rx->pass_end
-                ? duct_min((size_t)rx->pass_end, (size_t)rx->h.stage + min_avail)
+                ? duct_min((size_t)rx->pass_end,
+                           (size_t)duct_atomic_load(&rx->h.stage, relaxed) + min_avail)
                 : min_avail),
              low = posted > min_avail ? posted - min_avail : 0u;
     return duct_min(duct_max(at, low), posted);

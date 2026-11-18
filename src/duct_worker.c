@@ -239,15 +239,13 @@ typedef struct duct_deferred_queue {
     uint64_t _Atomic    mask[DUCT_BITMAP_WORDS];
 } duct_deferred_queue_t;
 
-#if !DUCT_EVENTS_MODEL_IOCP
-/** @brief Payload byte floor under which a batch entry copies its source
- *  instead of pinning it: the share/pin RMW pair costs more than staging a
- *  sub-MTU frame, and control datagrams live under it (§2.2's knob).
- *  Static and already-owned sources reference regardless — they pin with
- *  nothing at all or ride a share the send's own release path already
+/** @brief Payload byte floor under which an outbound record copies its
+ *  source instead of pinning it: the share/pin RMW pair costs more than
+ *  staging a sub-MTU frame, and control datagrams live under it (§2.2's
+ *  knob). Static and already-owned sources reference regardless — they pin
+ *  with nothing at all or ride a share the send's own release path already
  *  owed. */
 static constexpr uint32_t duct_tx_span_threshold = 128u;
-#endif
 
 /** @brief One @c x_udp_shared send this drain pass has staged but not yet
  *  handed to the kernel: the payload as one @c duct_span_t reference
@@ -571,48 +569,50 @@ typedef struct {
                                           *  @c ct, set ahead of the unseal. */
 } redirect_t;
 
-#if !DUCT_EVENTS_MODEL_IOCP
-/** @brief Build the payload span of one @c x_udp_shared batch entry
- *  (§2.4: @c { hdr[16], duct_span_t }): a recognized engine substrate rides
- *  a pinned reference, everything else copies into a block the entry owns.
+/** @brief A payload source's §2.1 classification verdict. */
+typedef enum : uint8_t {
+    payload_ref,  /**< @c out_span is held — a pin or a free reference. */
+    payload_copy, /**< Copy the bytes; ownership hooks fire at the copy. */
+} payload_class_t;
+
+/** @brief Recognize an outbound payload's substrate (§2.1): a recognized
+ *  engine substrate rides a pinned reference, every other source copies.
  *
- *  Recognition is §2.1's range check against the dispatch's own
- *  substrates: the inbound frame's RX ring (@c w->hold_conn — its span
- *  pinning through the §2.3 refs unit), the sealed packet's decrypt block
- *  (@p redirect->ct), the inter batch's RX slot (@c w->slot_now), and a
- *  block the response already owns with no release hook. Static bytes and
- *  an owned-without-release block reference unconditionally — they pin
- *  with nothing at all or with the share the send's own release path
- *  already owed. Every other source — a foreign @c fl_send_copy pointer,
- *  a custom @c release payload, a sub-threshold frame (§2.2's knob: the
- *  share RMW costs more than a small memcpy), a share at the 255-holder
- *  ceiling — materializes as a copy, the custom @c release firing here on
- *  the worker exactly once (§2.1: a descriptor never carries a release
- *  hook).
- *
- *  @return true with @p out_span held (pin or owned copy); false when the
- *          copy's allocation fails — the caller's @c rc_again path.
+ *  The range check runs against the dispatch's own substrates: the inbound
+ *  frame's RX ring (@c w->hold_conn — its span pinning through the §2.3 refs
+ *  unit), the sealed packet's decrypt block (@p redirect->ct), the inter
+ *  batch's RX slot (@c w->slot_now), and a block the response already owns
+ *  with no release hook. Static bytes and an owned-without-release block
+ *  reference unconditionally — they pin with nothing at all or with the
+ *  share the send's own release path already owed. Every other source — a
+ *  foreign @c fl_send_copy pointer, a custom @c release payload, a
+ *  sub-threshold frame (§2.2's knob: the share RMW costs more than a small
+ *  memcpy), a share at the 255-holder ceiling — answers @c payload_copy,
+ *  the caller staging the bytes into the carrier its record owns (§2.1: a
+ *  descriptor never carries a release hook, so the hook fires at the copy).
  */
-static bool s_dgram_span_take(duct_response_t *out, redirect_t *redirect,
-                              duct_span_t *out_span)
+static payload_class_t
+s_payload_classify(duct_view_u8 payload, duct_send_flags_t flags,
+                   void (*release)(void *), void *release_arg,
+                   redirect_t *redirect, duct_span_t *out_span)
 {
     auto w = s_this_worker;
-    auto at = (const uint8_t *)out->payload.data;
-    uint32_t len = (uint32_t)out->payload.size;
+    auto at = (const uint8_t *)payload.data;
+    uint32_t len = (uint32_t)payload.size;
 
-    bool static_src = duct_has(out->flags, fl_send_static);
-    bool owned_plain = !static_src && duct_has(out->flags, fl_send_owned)
-                    && !out->release;
+    bool static_src = duct_has(flags, fl_send_static);
+    bool owned_plain = !static_src && duct_has(flags, fl_send_owned)
+                    && !release;
     if (static_src && !((uintptr_t)at & duct_span_tag_mask)) {
         /* 4-aligned static bytes ride as-is; the tag bits must not alias
          * the address, and an unaligned literal copies like any foreign
          * buffer. */
         *out_span = duct_span_of_static(at, len);
-        return true;
+        return payload_ref;
     }
     void *share_base = nullptr;
     if (owned_plain) {
-        share_base = out->release_arg ? out->release_arg : (void *)at;
+        share_base = release_arg ? release_arg : (void *)at;
     } else if (!static_src && redirect && redirect->ct) {
         auto base = (const uint8_t *)redirect->ct;
         if (at >= base && at + len <= base + redirect->cap)
@@ -633,7 +633,7 @@ static bool s_dgram_span_take(duct_response_t *out, redirect_t *redirect,
             && at >= base && at + len <= base + pool->slot_bytes
             && duct_x_slot_claim(pool, idx)) {
             *out_span = duct_span_of_ptr(obj, (uint32_t)(at - (const uint8_t *)obj), len);
-            return true;
+            return payload_ref;
         }
     }
     if (share_base) {
@@ -642,13 +642,13 @@ static bool s_dgram_span_take(duct_response_t *out, redirect_t *redirect,
         if (len >= duct_tx_span_threshold
             && duct_try_share(share_base)) {
             *out_span = duct_span_of_ptr(share_base, off, len);
-            return true;
+            return payload_ref;
         }
     }
     if (!share_base && !static_src && !owned_plain && w && w->hold_conn) {
         /* The dispatched frame's RX ring: a relay answer reading its own
          * inbound bytes (§2.3 — the pin's refs unit holds the block while
-         * the entry lives). */
+         * the record lives). */
         auto rx = duct_conn_rx_olb(w->hold_conn);
         auto base = duct_conn_rx_data(w->hold_conn);
         if (rx && at >= base && at + len <= base + rx->h.buf_size
@@ -656,19 +656,39 @@ static bool s_dgram_span_take(duct_response_t *out, redirect_t *redirect,
             *out_span = duct_span_of_rx((duct_conn_t *)w->hold_conn,
                                         (uint32_t)(at - base), len);
             if (duct_span_pin(out_span, rx))
-                return true;
+                return payload_ref;
         }
     }
+    return payload_copy;
+}
 
+#if !DUCT_EVENTS_MODEL_IOCP /* the lane-tx batch entries are the reactive
+                             * backends' alone; iocp's outbox packs views */
+/** @brief Build the payload span of one @c x_udp_shared batch entry
+ *  (§2.4: @c { hdr[16], duct_span_t }): §2.1's recognition over the response,
+ *  the copy class landing in a heap block the entry owns.
+ *
+ *  @return true with @p out_span held (pin or owned copy); false when the
+ *          copy's allocation fails — the caller's @c rc_again path.
+ */
+static bool s_dgram_span_take(duct_response_t *out, redirect_t *redirect,
+                              duct_span_t *out_span)
+{
+    if (s_payload_classify(out->payload, out->flags, out->release,
+                           out->release_arg, redirect, out_span)
+        == payload_ref)
+        return true;
     /* Copy: foreign or sub-threshold. A custom release or owned free fires
      * here, once, on the worker — and the response must leave holding
      * nothing, or the commit's own cleanup releases a second time
      * (@c duct_response_release_owned clears nothing by contract). The copy's
      * single holder is the span's reference. */
+    uint32_t len = (uint32_t)out->payload.size;
     auto copy = duct_at(duct_new(uint8_t, len));
     duct_do_if(!copy, return false);
-    memcpy(copy, at, len);
-    if (!static_src && (out->release || duct_has(out->flags, fl_send_owned))) {
+    memcpy(copy, out->payload.data, len);
+    if (!duct_has(out->flags, fl_send_static)
+        && (out->release || duct_has(out->flags, fl_send_owned))) {
         duct_response_release_owned(out);
         out->flags = duct_and(out->flags, duct_not(fl_send_owned));
         out->release = nullptr;
@@ -677,7 +697,7 @@ static bool s_dgram_span_take(duct_response_t *out, redirect_t *redirect,
     *out_span = duct_span_of_ptr(copy, 0u, len);
     return true;
 }
-#endif
+#endif /* !DUCT_EVENTS_MODEL_IOCP */
 
 /** @brief A span's payload view: the shared §5.3 resolver. */
 static duct_view_u8 s_dgram_span_body(duct_span_t *span)
@@ -1165,20 +1185,6 @@ s_wire_pack_into(const duct_wire_t *wire, duct_session_t *s,
     return wrc == rc_ok ? olb_tx_ok : wrc == rc_invalid_arg ? olb_tx_too_large : olb_tx_full;
 }
 
-/** @brief Record-header bytes @p conn TX ring carries per packet.
- *
- *  Nonzero on a record-framed conn, whose ring holds several packets at once
- *  and needs each boundary written down for @ref duct_io_tx_peek. The engine's
- *  handshake egress and the TX reservation taken ahead of an unseal size
- *  themselves from here; @ref s_tx_stage_frame writes the same header off the
- *  same predicate, so a transport reaching one path and not the other stages a
- *  boundary the drain never finds.
- */
-static size_t s_tx_rec_size(const duct_conn_t *conn)
-{
-    return duct_conn_record_framed(conn) ? duct_dgram_record_hdr_size : 0u;
-}
-
 /** @brief Bytes @p conn's wire packs @p payload_size into, its header
  *  included.
  *  @return false when the size overflows or the wire @c tx_bound
@@ -1195,36 +1201,41 @@ static bool s_tx_wire_need(const duct_conn_t *conn, size_t payload_size, size_t 
                          conn->wire ? conn->wire->header_size : 0u);
 }
 
-/** @brief Bytes @p conn TX ring needs to hold a @p payload_size frame,
- *  the record header on a framed leg included.
+/** @brief Wire bytes @p conn's TX ring holds a @p payload_size frame under:
+ *  what the wire packs, plus a vnet leg's inline virtio header — the record
+ *  the descriptor carries, its header half included.
  *  @return false on the same terms as @ref s_tx_wire_need.
  */
 static bool s_tx_frame_need(const duct_conn_t *conn, size_t payload_size, size_t *out_need)
 {
     return s_tx_wire_need(conn, payload_size, out_need)
-        && !duct_ckd_add(out_need, *out_need, s_tx_rec_size(conn));
+        && !duct_ckd_add(out_need, *out_need, conn->vnet_hdr_len);
 }
 
-/** @brief Transactional frame stage onto @p conn's TX OLB.
+/** @brief Transactional record stage onto @p conn's TX descriptor ring.
  *
- *  On a record-framed conn, wraps the frame in the datagram record header:
- *  placeholder reclen → wire pack → backfill with the measured length. On any
- *  other transport, stages the wire-packed, or raw wireless, bytes directly.
- *  All-or-nothing: on failure (@c olb_tx_full or @c olb_tx_too_large), the
- *  TX cursor is preserved and placeholders are rewound via
- *  @ref duct_olb_tx_unmark. Callers publish after @c olb_tx_ok.
+ *  The wire packs its header into the record's inline half and the payload
+ *  rides §2.1's classification: a recognized substrate pinned by reference,
+ *  a sealed codec's whole record sealed into the materialize arena (the
+ *  ciphertext does not exist before staging — the encrypt destination), a
+ *  sub-threshold or foreign source copied into it with the response's
+ *  ownership hooks fired at the copy. On a vnet leg the inline header
+ *  carries the record's virtio header, its GSO prefix built here — the map's
+ *  one materialize-class backfill — and the gso flag rides the span's own
+ *  bit; the datagram record header and its two-phase backfill are dead.
+ *  All-or-nothing: on failure (@c olb_tx_full or @c olb_tx_too_large) the
+ *  staging cursors rewind through @c duct_olb_tx_unmark and any pin taken is
+ *  dropped before the answer. Callers publish after @c olb_tx_ok.
  */
 static duct_olb_tx_result_t
-s_tx_stage_frame(duct_conn_t *conn, duct_session_t *s, const duct_frame_t *frame)
+s_tx_stage_frame(duct_conn_t *conn, duct_session_t *s, const duct_frame_t *frame,
+                 duct_response_t *own, redirect_t *redirect)
 {
-    bool dgram_framed = duct_conn_record_framed(conn);
+    auto tx = duct_conn_tx_olb(conn);
     size_t need = 0u;
     if (!s_tx_frame_need(conn, frame->payload.size, &need))
         return olb_tx_too_large;
-    /* align answers for the whole frame, opening the next pass when this one
-     * is out of room, so the placeholder and every span on_pack stages below
-     * land in one pass and the unmark rewinds within it. */
-    if (!duct_olb_tx_align(duct_conn_tx_olb(conn), need))
+    if (!duct_olb_tx_room_contig(tx, need))
         return olb_tx_full;
 
     /* conn->wire->unseal gates the sealed-only s_tls_codec call: guards a
@@ -1233,38 +1244,96 @@ s_tx_stage_frame(duct_conn_t *conn, duct_session_t *s, const duct_frame_t *frame
      * on_pack above/below), so a plain wire never touches ctx's cold cache
      * line to rule this out. */
     auto codec = conn->wire && conn->wire->unseal ? s_tls_codec(conn) : nullptr;
-    auto mark = duct_olb_tx_mark(duct_conn_tx_olb(conn));
-    auto rec_mark = mark;
-    duct_olb_tx_result_t st = olb_tx_ok;
-    if (dgram_framed) {
-        uint8_t placeholder[duct_dgram_record_hdr_size] = {};
-        st = duct_olb_tx_stage(duct_conn_tx_olb(conn), placeholder, sizeof(placeholder), nullptr, 0u);
-        if (st == olb_tx_ok)
-            rec_mark = duct_olb_tx_mark(duct_conn_tx_olb(conn));
+    auto mark = duct_olb_tx_mark(tx);
+    duct_wire_tx_t stage = {};
+    stage.kind = wire_tx_ring;
+    stage.ring.tx = tx;
+    auto wrc = s_wire_pack_into(conn->wire, s, frame, &stage, codec);
+    if (wrc != olb_tx_ok) {
+        duct_olb_tx_unmark(tx, mark);
+        return wrc;
     }
-    if (st == olb_tx_ok) {
-        auto stage = (duct_wire_tx_t){ .kind = wire_tx_olb, .olb = duct_conn_tx_olb(conn) };
-        st = s_wire_pack_into(conn->wire, s, frame, &stage, codec);
-        if (st != olb_tx_ok)
-            /* Rewinds the header placeholder above too, on dgram_framed --
-             * a partial stage (e.g. just the wire header) must never leak
-             * the cursor forward: stage left past tail holds
-             * duct_olb_tx_wrap_room at zero, and no new pass opens for this
-             * conn again. */
-            duct_olb_tx_unmark(duct_conn_tx_olb(conn), mark);
-        else if (dgram_framed) {
-            /* A vnet leg's GSO record carries its flag in the prefix, where
-             * duct_io_tx_send reads it back to build the record's header. */
-            uint8_t rec[duct_dgram_record_hdr_size];
-            bool gso = conn->vnet_hdr_len && duct_has(frame->flags, fl_frame_gso);
-            duct_dgram_rec_hdr_encode(rec, duct_olb_tx_staged_since(duct_conn_tx_olb(conn), rec_mark)
-                                           | (gso ? duct_dgram_rec_gso : 0u));
-            duct_olb_tx_backfill(duct_conn_tx_olb(conn), rec_mark, rec, sizeof(rec));
-        }
+    auto d = duct_olb_tx_desc_open(tx);
+    if (!d) {
+        duct_olb_tx_unmark(tx, mark);
+        return olb_tx_full;
     }
-    if (st == olb_tx_ok)
+    /* The wire's packed prefix rides the record's inline header — the vnet
+     * leg overwrites it below with its virtio header, the sealed record
+     * folded its prefix into the ciphertext span ahead of it. */
+    if (stage.ring.hdr_len)
+        memcpy(d->hdr, stage.ring.hdr, stage.ring.hdr_len);
+    duct_span_t span;
+    uint32_t hdr_len = stage.ring.hdr_len;
+    bool gso = false;
+    if (stage.ring.sealed_len) {
+        /* §2.1's encrypt-destination class: the codec sealed its whole
+         * record — prefix and ciphertext — into the arena run span_open
+         * took at the arena's write position. */
+        uint32_t off = (uint32_t)((tx->mat_tail - stage.ring.sealed_len)
+                                  % duct_conn_tx_mat_cap);
+        span = duct_span_of_mat(duct_conn_tx_mat(conn), off,
+                                stage.ring.sealed_len);
+        d->span = span;
+        duct_olb_tx_staged_bytes_add(tx, stage.ring.sealed_len);
         duct_conn_tx_staged(conn, need);
-    return st;
+        return olb_tx_ok;
+    }
+    if (conn->vnet_hdr_len) {
+        /* The vnet leg's inline header is the record's virtio header, its
+         * GSO prefix built off the payload here (§2.1's cut class); the
+         * packet wire's own header is empty. */
+        duct_view_u8 pkt = stage.ring.payload;
+        uint8_t vh[duct_vnet_hdr_max];
+        if (duct_has(frame->flags, fl_frame_gso)) {
+            if (!duct_vnet_gso_open(&pkt, vh)) {
+                duct_olb_tx_unmark(tx, mark);
+                return olb_tx_too_large;
+            }
+            gso = true;
+        } else
+            memcpy(vh, duct_vnet_zero, conn->vnet_hdr_len);
+        memcpy(d->hdr, vh, conn->vnet_hdr_len);
+        hdr_len = conn->vnet_hdr_len;
+    }
+    if (s_payload_classify(stage.ring.payload,
+                           own ? own->flags : fl_send_copy,
+                           own ? own->release : nullptr,
+                           own ? own->release_arg : nullptr,
+                           redirect, &span) == payload_ref) {
+        duct_span_meta_set(&span, hdr_len, gso);
+        d->span = span;
+        duct_olb_tx_staged_bytes_add(tx, duct_span_wire_len(&d->span));
+        duct_conn_tx_staged(conn, need);
+        return olb_tx_ok;
+    }
+    /* §2.1's copy class: foreign or sub-threshold bytes, and a custom
+     * release or owned free firing here, once, on the worker — the response
+     * leaving holding nothing, or the commit's own cleanup releases a
+     * second time (@c duct_response_release_owned clears nothing by
+     * contract). */
+    size_t len = stage.ring.payload.size;
+    size_t off = duct_olb_tx_mat_open(tx, len);
+    if (off == SIZE_MAX) {
+        duct_olb_tx_unmark(tx, mark);
+        return len > duct_conn_tx_mat_cap ? olb_tx_too_large : olb_tx_full;
+    }
+    if (len)
+        memcpy(duct_olb_tx_mat_at(tx, off), stage.ring.payload.data, len);
+    span = duct_span_of_mat(duct_conn_tx_mat(conn), (uint32_t)off,
+                            (uint32_t)len);
+    duct_span_meta_set(&span, hdr_len, gso);
+    if (own && !duct_has(own->flags, fl_send_static)
+        && (own->release || duct_has(own->flags, fl_send_owned))) {
+        duct_response_release_owned(own);
+        own->flags = duct_and(own->flags, duct_not(fl_send_owned));
+        own->release = nullptr;
+        own->release_arg = nullptr;
+    }
+    d->span = span;
+    duct_olb_tx_staged_bytes_add(tx, duct_span_wire_len(&d->span));
+    duct_conn_tx_staged(conn, need);
+    return olb_tx_ok;
 }
 
 static void s_wake(unsigned worker_id)
@@ -2371,31 +2440,30 @@ static bool s_redirect_commit(duct_unseal_ctx_t *self, size_t len)
     return true;
 }
 
-/** @brief Stage engine egress, a handshake reply or an alert, into @p self's TX
- *  OLB or its codec's engine park.
- *  The codec's PDU prefix goes out ahead of @p bytes, counted with them into the
- *  record header a record-framed conn takes: handshake bytes never pass the
- *  packer, so the prefix is added here. A codec with a join lead leads the
+/** @brief Stage engine egress, a handshake reply or an alert, into @p self's
+ *  TX descriptor ring or its codec's engine park.
+ *  The codec's PDU prefix goes out ahead of @p bytes: handshake bytes never
+ *  pass the packer, so the prefix is added here, both materializing into the
+ *  arena run the record's span names. A codec with a join lead leads the
  *  record once the bytes behind its prefix are written. The ring takes the
- *  record only while the park is empty, and publishes it and posts io's drain;
- *  otherwise the park keeps it, ahead of every later byte of the conn. @p bare
- *  sends one opening packet alone and never parks: an @c x_udp_peer conn stages
- *  it as a record, an @c x_tcp conn also writes the packet's end into the
- *  socket's opening, for io to cut its writes at.
+ *  record only while the park is empty, and publishes it and posts io's
+ *  drain; otherwise the park keeps it, ahead of every later byte of the
+ *  conn. @p bare sends one opening packet alone and never parks: an
+ *  @c x_udp_peer conn stages it as a record, an @c x_tcp conn also writes
+ *  the packet's end into the socket's opening, for io to cut its writes at.
  *  @return @c false once the conn is gone, for a @p bare the conn refuses or
  *  finds no room for in the ring or the opening, and when the park has no room
  *  or no memory.
  */
 static bool s_unseal_tx_stage(duct_unseal_ctx_t *self, duct_view_u8 bytes, bool bare)
 {
-    assert(self->tx_buf->kind == wire_tx_olb);
-    auto olb = self->tx_buf->olb;
+    assert(self->tx_buf->kind == wire_tx_ring);
+    auto olb = self->tx_buf->ring.tx;
     auto h = (duct_conn_handle_t){ .word = self->handle };
     auto conn = duct_conn_by_handle(h);
     if (!conn || (bare && conn->xport_type != x_udp_peer && conn->xport_type != x_tcp))
         return false;
-    /* Train records staged in this pass take its room, and the span below
-     * never opens the next pass: they go out first. */
+    /* Train records staged in this pass take its room: they go out first. */
     s_tx_train_flush_for(h);
     /* The opening's cuts count from the stream's first byte, so its first
      * packet stages ahead of every byte published or written, a lead apart. */
@@ -2404,11 +2472,10 @@ static bool s_unseal_tx_stage(duct_unseal_ctx_t *self, duct_view_u8 bytes, bool 
     if (opening && (!duct_x_opening_room(opening, ahead, bytes.size)
                     || (!duct_x_opening_count(opening) && olb->stream_end != 0u)))
         return false;
-    size_t rec = s_tx_rec_size(conn),
-           pre = bare ? 0u : self->codec->tx_prefix_len,
-           len = rec + pre + bytes.size;
-    auto span = self->codec->engine_park_len ? nullptr
-              : (uint8_t *)duct_olb_tx_span_open(olb, len);
+    size_t pre = bare ? 0u : self->codec->tx_prefix_len,
+           len = pre + bytes.size;
+    uint8_t *span = self->codec->engine_park_len ? nullptr
+                  : (uint8_t *)duct_olb_tx_span_open(olb, len);
     bool ring = span != nullptr;
     if (!ring && !bare)
         span = s_engine_park_span(conn, self->codec, len);
@@ -2416,15 +2483,27 @@ static bool s_unseal_tx_stage(duct_unseal_ctx_t *self, duct_view_u8 bytes, bool 
         return false;
     if (opening)
         duct_x_opening_push(opening, ahead, bytes.size);
-    if (rec)
-        duct_dgram_rec_hdr_encode(span, pre + bytes.size);
     if (pre)
-        memcpy(span + rec, self->codec->prefix, pre);
+        memcpy(span, self->codec->prefix, pre);
     if (bytes.size)
-        memcpy(span + rec + pre, bytes.data, bytes.size);
+        memcpy(span + pre, bytes.data, bytes.size);
     if (pre)
-        duct_wire_codec_lead(self->codec, span + rec, pre + bytes.size);
+        duct_wire_codec_lead(self->codec, span, pre + bytes.size);
     if (ring) {
+        /* The arena run span_open took is the record's span whole; its wire
+         * length carries no inline header. */
+        auto mark = duct_olb_tx_mark(olb);
+        auto d = duct_olb_tx_desc_open(olb);
+        if (d) {
+            d->span = duct_span_of_mat(duct_conn_tx_mat(conn),
+                                       (uint32_t)((olb->mat_tail - len)
+                                                  % duct_conn_tx_mat_cap),
+                                       (uint32_t)len);
+            duct_olb_tx_staged_bytes_add(olb, (uint32_t)len);
+        } else {
+            duct_olb_tx_unmark(olb, mark);
+            return false;
+        }
         duct_olb_tx_publish(olb);
         duct_io_post_tx_drain(DUCT_CAST(duct_conn_handle_t, word, &self->handle));
     }
@@ -2524,7 +2603,7 @@ static duct_unseal_ctx_t s_engine_ctx(duct_conn_t *conn,
                                       duct_wire_tx_t *tx_stage)
 {
     auto handle = duct_conn_handle_get(conn);
-    *tx_stage = (duct_wire_tx_t){ .kind = wire_tx_olb, .olb = duct_conn_tx_olb(conn) };
+    *tx_stage = (duct_wire_tx_t){ .kind = wire_tx_ring, .ring = { .tx = duct_conn_tx_olb(conn) } };
     return (duct_unseal_ctx_t){
         .handle = handle.word,
         .codec = codec, .tx_buf = tx_stage,
@@ -2728,10 +2807,11 @@ static duct_result_t s_hs_arm(duct_unseal_ctx_t *self, uint32_t delay_ms)
 }
 
 /** @brief Bytes one engine message takes on @p conn's egress: the engine's
- *  budget, the codec's PDU prefix and a record-framed ring's record header. */
-static size_t s_hs_need(const duct_conn_t *conn, const duct_wire_codec_t *codec)
+ *  budget and the codec's PDU prefix, the record the descriptor carries. */
+static size_t s_hs_need([[maybe_unused]] const duct_conn_t *conn,
+                        const duct_wire_codec_t *codec)
 {
-    return codec->engine->vtbl->engine_hs_budget + codec->tx_prefix_len + s_tx_rec_size(conn);
+    return codec->engine->vtbl->engine_hs_budget + codec->tx_prefix_len;
 }
 
 /** @brief Test whether one engine message fits @p conn's egress now.
@@ -2746,7 +2826,7 @@ static bool s_hs_fits(const duct_conn_t *conn, const duct_wire_codec_t *codec)
     if (conn->xport_type == x_udp_shared)
         return s_dgram_out_fits(duct_conn_dgram_ctx(conn)->listener, need);
     auto tx = duct_conn_tx_olb(conn);
-    return !tx || duct_olb_tx_space(tx) >= need;
+    return !tx || duct_olb_tx_room_contig(tx, need);
 }
 
 /** @brief Run @p codec's due rekey through @p ctx and arm its next lifetime.
@@ -3126,7 +3206,7 @@ static duct_exec_rc_t s_dispatch_sealed_frame(duct_worker_t *w, duct_conn_t *con
             && duct_conn_park_cap - codec->engine_park_len < s_hs_need(conn, codec)
             && !s_engine_park_flush(conn))
             return exec_defer;
-        auto tx_stage = (duct_wire_tx_t){ .kind = wire_tx_olb, .olb = duct_conn_tx_olb(conn) };
+        auto tx_stage = (duct_wire_tx_t){ .kind = wire_tx_ring, .ring = { .tx = duct_conn_tx_olb(conn) } };
         duct_unseal_ctx_t ctx = {
             .handle = handle.word,
             .codec = codec, .tx_buf = &tx_stage,
@@ -4834,10 +4914,11 @@ static own_t s_retry_emit_payload_own(duct_response_t *out)
  *  on the RX ring blocks compaction and stops the conn reading for every
  *  other stream — and one left aliasing author memory outlives the callback
  *  that lent it. The copy lands in one of the conn block's own knob-capped
- *  slots and re-flags @c fl_send_owned with @c release and @c release_arg
- *  cleared, so the default release frees the copy exactly once, on whichever
- *  terminal outcome the retry resolves to. The frame saver and the conn-lost
- *  discard take it.
+ *  slots and dies with the block, so the payload is deliberately left
+ *  unflagged: @c fl_send_owned promises a whole heap block whose header the
+ *  drop path reads, and a carved copy has none — an owning flag here would
+ *  have the replay's classification pin a non-object. The frame saver and
+ *  the conn-lost discard take it.
  *
  *  @p out carries a payload — the caller tests that to decide whether the
  *  alias question arises at all.
@@ -4855,7 +4936,6 @@ static own_t s_retry_copy_own(duct_conn_t *conn, duct_response_t *out)
     duct_do_if(!copy, return own_failed);
     memcpy(copy, out->payload.data, out->payload.size);
     out->payload.data = copy;
-    out->flags = duct_or(out->flags, fl_send_owned);
     out->release = nullptr;
     out->release_arg = nullptr;
     return own_copied;
@@ -6004,12 +6084,13 @@ s_commit_dgram_shared(const commit_ctx_t *ctx)
 }
 
 /** @brief Send @p w's train from its ring, or hand it to io.
- *  While io has nothing published on the ring, the worker sends the frames
- *  itself and publishes only what the socket refused: an @c x_udp_peer train
- *  in segmented or batched calls, an @c x_tcp one as one write, and that only
- *  while @ref duct_io_parked reports its io thread parked. Otherwise the frames
- *  are published for io's drain. A leg gone or fenced for close drops the
- *  train. */
+ *  While io has nothing published on the ring, the worker sends the staged
+ *  records itself — gathering their spans straight from the sources — and
+ *  publishes only what the socket refused: an @c x_udp_peer train in
+ *  segmented or batched calls, an @c x_tcp one as one write, and that only
+ *  while @ref duct_io_parked reports its io thread parked. Otherwise the
+ *  records are published for io's drain. A leg gone or fenced for close
+ *  drops the train, its records completing with their unpins. */
 static void s_tx_train_flush(duct_worker_t *w)
 {
     auto t = &w->tx_train;
@@ -6019,15 +6100,14 @@ static void s_tx_train_flush(duct_worker_t *w)
     auto conn = duct_conn_by_handle(t->conn);
     auto tx = conn ? duct_conn_tx_olb(conn) : nullptr;
     if (!tx || duct_conn_phase(conn) >= conn_quiesced)
-        return;
+        return; /* the close paths' purge drops the train's records */
     if (!duct_olb_tx_published(tx) && (conn->xport_type != x_tcp || duct_io_parked(conn))) {
         size_t sent = 0u;
         duct_result_t rc;
         if (conn->xport_type == x_tcp) {
-            size_t base = olb_off(duct_atomic_load(&tx->h.tail, relaxed));
-            auto span = (duct_view_u8){ .data = duct_olb_tx_data(tx) + base,
-                                       .size = tx->h.stage - base };
-            rc = duct_io_stream_send_fast(conn, &span, 1u, &sent) ? rc_ok : rc_again;
+            duct_view_u8 iov[2u * duct_dgram_tx_batch];
+            unsigned n = duct_olb_tx_peek_staged_iov(tx, duct_dgram_tx_batch, iov);
+            rc = n && duct_io_stream_send_fast(conn, iov, n, &sent) ? rc_ok : rc_again;
         } else {
             duct_x_gso_tally_t tally = {};
             rc = duct_io_udp_peer_send_staged(conn, &sent, &tally);
@@ -6057,7 +6137,7 @@ static void s_tx_train_flush_for(duct_conn_handle_t conn)
 /** @brief Put @p ctx's commit on this worker's train, opening one for its leg
  *  where none is.
  *  A train bound for another leg is flushed first. False off a worker thread,
- *  and while io holds published bytes or a write-armed socket on the leg: a
+ *  and while io holds queued records or a write-armed socket on the leg: a
  *  direct send starts only where io has nothing left to drain, so that commit
  *  stages and publishes behind them. */
 static bool s_tx_train_board(const commit_ctx_t *ctx)
@@ -6070,7 +6150,7 @@ static bool s_tx_train_board(const commit_ctx_t *ctx)
         return true;
     s_tx_train_flush(w);
     auto conn = ctx->conn;
-    if (!duct_olb_tx_rewind_idle(duct_conn_tx_olb(conn))
+    if (duct_olb_tx_published(duct_conn_tx_olb(conn))
         || duct_olb_tx_write_armed(duct_conn_tx_olb(conn)))
         return false;
     t->conn = ctx->handle;
@@ -6090,10 +6170,10 @@ static duct_commit_rc_t s_commit_train(const commit_ctx_t *ctx, const duct_frame
 {
     auto w = s_this_worker;
     auto t = &w->tx_train;
-    auto st = s_tx_stage_frame(ctx->conn, ctx->s, frame);
+    auto st = s_tx_stage_frame(ctx->conn, ctx->s, frame, ctx->out, ctx->redirect);
     if (st == olb_tx_full && t->frames) {
         s_tx_train_flush(w);
-        return s_commit_stage_result(ctx, s_tx_stage_frame(ctx->conn, ctx->s, frame));
+        return s_commit_stage_result(ctx, s_tx_stage_frame(ctx->conn, ctx->s, frame, ctx->out, ctx->redirect));
     }
     if (st != olb_tx_ok)
         return s_commit_stage_result(ctx, st);
@@ -6128,77 +6208,20 @@ s_commit_udp_peer(const commit_ctx_t *ctx)
     if (s_tx_train_board(ctx))
         return s_commit_train(ctx, &wire_frame);
 #endif
-    return s_commit_stage_result(ctx, s_tx_stage_frame(conn, ctx->s, &wire_frame));
+    return s_commit_stage_result(ctx, s_tx_stage_frame(conn, ctx->s, &wire_frame, ctx->out, ctx->redirect));
 }
 
-#if !DUCT_EVENTS_MODEL_IOCP
-/** @brief Commit a response by sending the pack's own header and payload
- *  spans, neither of them passing through the TX ring.
+/** @brief Commit an @c x_tcp, @c x_raw or @c x_local response, trying one
+ *  direct send whenever the TX ring was idle before staging.
  *
- *  Room for the whole frame is claimed in the ring before a byte goes out: a
- *  short write leaves no staged copy behind it, so the remainder has to be
- *  known to fit first. That remainder is the only thing this path ever
- *  stages, and the payload reaches the socket from wherever its author built
- *  it.
- *
- *  Transports without framing headers supply a single payload span to
- *  @ref duct_xwritev.
- */
-static duct_commit_rc_t
-s_commit_stream_gather(const commit_ctx_t *ctx, const duct_frame_t *frame)
-{
-    auto conn = ctx->conn;
-    size_t need = 0u;
-    if (!s_tx_frame_need(conn, frame->payload.size, &need))
-        return s_commit_stage_result(ctx, olb_tx_too_large);
-    if (!duct_olb_tx_align(duct_conn_tx_olb(conn), need))
-        return s_commit_stage_result(ctx, olb_tx_full);
-
-    uint8_t hdr[wire_tx_hdr_max];
-    duct_view_u8 bufs[2] = { { .data = hdr } };
-    auto stage = (duct_wire_tx_t){ .kind = wire_tx_gather, .gather = bufs };
-    auto st = s_wire_pack_into(conn->wire, ctx->s, frame, &stage, nullptr);
-    if (st != olb_tx_ok)
-        return s_commit_stage_result(ctx, st);
-
-    size_t written = 0u;
-    bool hdr_span = bufs[0].size != 0u;
-    duct_discard duct_io_stream_send_fast(conn, hdr_span ? bufs : &bufs[1],
-                                          hdr_span ? 2u : 1u, &written);
-    duct_olb_tx_sent_direct(duct_conn_tx_olb(conn), written);
-    size_t hdr_sent = written < bufs[0].size ? written : bufs[0].size,
-           pl_sent  = written - hdr_sent,
-           hdr_left = bufs[0].size - hdr_sent,
-           pl_left  = bufs[1].size - pl_sent;
-    if (!hdr_left && !pl_left) {
-        s_fire_send_done(ctx->s, duct_proto_cfg_of(ctx->s->proto), ctx->out_conn,
-                         ctx->out_stream, ctx->out, rc_ok);
-        return commit_ok;
-    }
-    duct_conn_tx_staged(conn, hdr_left + pl_left);
-    return s_commit_stage_result(ctx,
-        duct_olb_tx_stage(duct_conn_tx_olb(conn),
-                          hdr_left ? hdr + hdr_sent : nullptr, hdr_left,
-                          pl_left ? (const uint8_t *)bufs[1].data + pl_sent : nullptr,
-                          pl_left));
-}
-#endif
-
-/** @brief Commit an @c x_tcp, @c x_raw or @c x_local response, trying one direct
- *  send whenever the TX ring was idle before staging.
- *
- *  An idle ring makes an immediate send safe: @c write and @c send
- *  can fall short, so this path runs only with nothing else queued ahead of
- *  these bytes. The wire picks between two shapes. One raising
- *  @ref fl_wire_gather, and a leg carrying no wire at all, send the spans through
- *  @ref s_commit_stream_gather and touch the ring only for what the kernel
- *  refused. Every other wire stages through @ref s_tx_stage_frame first and
- *  sends from the ring, a short or failed attempt then publishing what is
- *  already sitting there. An @c x_tcp frame on such a wire boards this
- *  worker's train instead, @ref s_commit_train; only one the train turns away
- *  takes the send here. A gather wire's frame never boards: the frames of a
- *  train are staged and unpublished, which an idle ring does not count, and a
- *  direct send passes them to the socket.
+ *  An idle ring — nothing queued ahead of io — makes an immediate send
+ *  safe: @c write and @c send can fall short, so this path runs only with
+ *  nothing else ahead of these bytes. The stage is the descriptor the wire
+ *  built either way, and the direct attempt gathers its spans straight
+ *  from the sources (§2's one commit: the old gather fork is gone); what
+ *  the socket refused stays staged and publishes for io's stepper. An
+ *  @c x_tcp frame behind a busy ring boards this worker's train instead,
+ *  @ref s_commit_train; only one the train turns away takes the send here.
  */
 static duct_commit_rc_t
 s_commit_stream(const commit_ctx_t *ctx)
@@ -6211,37 +6234,28 @@ s_commit_stream(const commit_ctx_t *ctx)
         .stream_id = out_stream, .payload = out->payload, .flags = out->frame_flags,
     };
 #if !DUCT_EVENTS_MODEL_IOCP
-    bool olb_was_idle = duct_olb_tx_rewind_idle(duct_conn_tx_olb(conn));
-    bool gathers = !conn->wire || duct_has(conn->wire->flags, fl_wire_gather);
-    if (olb_was_idle && gathers)
-        return s_commit_stream_gather(ctx, &wire_frame);
-    if (!gathers && conn->xport_type == x_tcp && s_tx_train_board(ctx))
+    bool olb_was_idle = !duct_olb_tx_published(duct_conn_tx_olb(conn));
+    if (olb_was_idle && conn->xport_type == x_tcp && s_tx_train_board(ctx))
         return s_commit_train(ctx, &wire_frame);
-    auto mark = duct_olb_tx_mark(duct_conn_tx_olb(conn));
 #endif
-    auto st = s_tx_stage_frame(conn, s, &wire_frame);
+    auto st = s_tx_stage_frame(conn, s, &wire_frame, out, ctx->redirect);
     if (st != olb_tx_ok)
         return s_commit_stage_result(ctx, st);
 #if !DUCT_EVENTS_MODEL_IOCP
     if (olb_was_idle) {
-        size_t off_now = olb_off(duct_olb_tx_stage_packed(duct_conn_tx_olb(conn))),
-               staged = duct_olb_tx_staged_since(duct_conn_tx_olb(conn), mark),
-               off = off_now - staged,
-               written = 0u;
-        auto span = (duct_view_u8){ .data = duct_conn_tx_data(conn) + off, .size = staged };
-        if (duct_io_stream_send_fast(conn, &span, 1u, &written)) {
-            /* Every byte reached the kernel -- nothing to publish, the span
-             * counting on the stream past the ring. Staging resyncs from
-             * tail's current value: s_tx_stage_frame's own align may have
-             * opened a new pass since mark, which leaves mark in a pass io
-             * may still drain, and stage rewound there desyncs from tail for
-             * good. */
-            duct_olb_tx_sent_staged(duct_conn_tx_olb(conn));
+        auto tx = duct_conn_tx_olb(conn);
+        duct_view_u8 iov[2u * duct_dgram_tx_batch];
+        unsigned n = duct_olb_tx_peek_staged_iov(tx, duct_dgram_tx_batch, iov);
+        size_t written = 0u;
+        if (n && duct_io_stream_send_fast(conn, iov, n, &written)) {
+            /* Every byte reached the kernel -- nothing to publish, the
+             * records completing here with their unpins. */
+            duct_olb_tx_sent_staged(tx);
             s_fire_send_done(s, duct_proto_cfg_of(s->proto), ctx->out_conn, out_stream, out, rc_ok);
             return commit_ok;
         }
         if (written > 0u)
-            duct_olb_tx_advance_worker(duct_conn_tx_olb(conn), written);
+            duct_olb_tx_advance_worker(tx, written);
     }
 #endif
     return s_commit_ctx_ok(ctx);
@@ -6357,22 +6371,18 @@ static bool s_vnet_train_take(const duct_conn_t *conn, duct_view_u8 pkt, size_t 
 /** @brief Commit a response on a packet-fd leg, reaching the device ahead of
  *  the ring where there is nothing queued.
  *
- *  @ref s_commit_stream cannot serve this xport. Its second fast path sends a
- *  span read back out of the ring, and on a record-framed leg that span opens
- *  with the internal record header delimiting packets there — bytes a device
- *  must never receive. Packing into gather buffers sends what the wire
- *  produced, and the fallback goes through @ref s_tx_stage_frame, so the ring
- *  still gets the header its reader expects.
- *
- *  A write that moved anything counts as sent: a packet fd takes a datagram
- *  whole, leaving no remainder to resume, and staging the frame again puts the
- *  packet's head on the wire a second time.
+ *  The stage is the descriptor either way — its inline header carrying the
+ *  record's virtio header on a vnet leg, its GSO prefix built at the stage —
+ *  and an idle ring's direct send gathers the staged records' spans straight
+ *  from the sources. A write that moved anything counts as sent: a packet fd
+ *  takes a datagram whole, leaving no remainder to resume, and staging the
+ *  frame again puts the packet's head on the wire a second time.
  *
  *  On a vnet leg a packet goes to this worker's train first, and the direct
- *  write and the stage below both flush that train before they touch the conn,
+ *  send and the stage below both flush that train before they touch the conn,
  *  which keeps the leg's packets in order. A GSO record's header is built
  *  before either path, so one no segmentation takes fails with
- *  @c rc_invalid_arg, and the direct write sends its packet under that header.
+ *  @c rc_invalid_arg, and the direct send posts its packet under that header.
  */
 static duct_commit_rc_t
 s_commit_packet_fd(const commit_ctx_t *ctx)
@@ -6392,42 +6402,40 @@ s_commit_packet_fd(const commit_ctx_t *ctx)
     bool bad = gso && (!mss || (duct_vnet_gso_is_udp(vh) && !duct_has(duct_conn_state(conn), fl_conn_vnet_uso)));
     duct_do_if(bad, return s_commit_ctx_fail(ctx, rc_invalid_arg, commit_invalid));
 #if !DUCT_EVENTS_MODEL_IOCP
-    if (duct_olb_tx_rewind_idle(duct_conn_tx_olb(conn))
-        && (!conn->wire || duct_has(conn->wire->flags, fl_wire_gather))) {
-        uint8_t hdr[wire_tx_hdr_max];
-        duct_view_u8 bufs[2] = { { .data = hdr } };
-        auto stage = (duct_wire_tx_t){ .kind = wire_tx_gather, .gather = bufs };
-        auto st = s_wire_pack_into(conn->wire, ctx->s, &wire_frame, &stage, nullptr);
+    bool idle = !duct_olb_tx_published(duct_conn_tx_olb(conn));
+    if (idle && conn->vnet_hdr_len
+        && s_vnet_train_take(conn, wire_frame.payload, mss, ctx->redirect)) {
+        s_fire_send_done(ctx->s, duct_proto_cfg_of(ctx->s->proto),
+                         ctx->out_conn, ctx->out_stream, ctx->out, rc_ok);
+        return commit_ok;
+    }
+    s_vnet_train_flush_for(ctx->handle);
+    if (idle) {
+        auto st = s_tx_stage_frame(conn, ctx->s, &wire_frame, ctx->out, ctx->redirect);
         if (st != olb_tx_ok)
             return s_commit_stage_result(ctx, st);
-        if (!mss)
-            pkt = bufs[1];
-        if (conn->vnet_hdr_len && !bufs[0].size
-            && s_vnet_train_take(conn, pkt, mss, ctx->redirect)) {
-            s_fire_send_done(ctx->s, duct_proto_cfg_of(ctx->s->proto),
-                             ctx->out_conn, ctx->out_stream, ctx->out, rc_ok);
-            return commit_ok;
-        }
-        s_vnet_train_flush_for(ctx->handle);
+        auto tx = duct_conn_tx_olb(conn);
+        duct_view_u8 iov[2u * duct_dgram_tx_batch];
+        unsigned n = duct_olb_tx_peek_staged_iov(tx, duct_dgram_tx_batch, iov);
         size_t written = 0u;
-        duct_view_u8 spans[3];
-        unsigned ns = 0u;
-        if (conn->vnet_hdr_len)
-            spans[ns++] = (duct_view_u8){ .data = mss ? vh : (uint8_t *)&duct_vnet_zero[0],
-                                        .size = conn->vnet_hdr_len };
-        if (bufs[0].size)
-            spans[ns++] = bufs[0];
-        spans[ns++] = pkt;
-        bool sent = duct_io_stream_send_fast(conn, spans, ns, &written);
-        if (sent || written != 0u) {
+        if (n && duct_io_stream_send_fast(conn, iov, n, &written)) {
+            duct_olb_tx_sent_staged(tx);
             s_fire_send_done(ctx->s, duct_proto_cfg_of(ctx->s->proto),
                              ctx->out_conn, ctx->out_stream, ctx->out, rc_ok);
             return commit_ok;
         }
+        if (written > 0u) {
+            /* A packet fd takes a datagram whole: no remainder to resume. */
+            duct_olb_tx_sent_staged(tx);
+            s_fire_send_done(ctx->s, duct_proto_cfg_of(ctx->s->proto),
+                             ctx->out_conn, ctx->out_stream, ctx->out, rc_ok);
+            return commit_ok;
+        }
+        return s_commit_ctx_ok(ctx);
     }
 #endif
     s_vnet_train_flush_for(ctx->handle);
-    return s_commit_stage_result(ctx, s_tx_stage_frame(conn, ctx->s, &wire_frame));
+    return s_commit_stage_result(ctx, s_tx_stage_frame(conn, ctx->s, &wire_frame, ctx->out, ctx->redirect));
 }
 
 /** @brief Commit a response for any xport without its own s_commit_* case.
@@ -6444,7 +6452,7 @@ s_commit_generic(const commit_ctx_t *ctx)
         .payload = ctx->out->payload,
         .flags = ctx->out->frame_flags,
     };
-    return s_commit_stage_result(ctx, s_tx_stage_frame(conn, ctx->s, &wire_frame));
+    return s_commit_stage_result(ctx, s_tx_stage_frame(conn, ctx->s, &wire_frame, ctx->out, ctx->redirect));
 }
 
 /** @brief Validate and dispatch one response commit to its xport's own
@@ -7007,7 +7015,7 @@ static duct_olb_tx_result_t s_ctl_fin_stage(duct_conn_t *conn, duct_session_t *s
     duct_frame_t wf = { .stream_id = stream_id, .flags = flg };
     if (duct_has(flg, fl_frame_rst))
         wf.payload = duct_view(duct_view_u8, (void *)code, sizeof code);
-    auto st = tx ? s_tx_stage_frame(conn, s, &wf)
+    auto st = tx ? s_tx_stage_frame(conn, s, &wf, nullptr, nullptr)
                  : s_ctl_fin_stage_dgram(conn, s, &wf);
     if (st == olb_tx_full)
         return olb_tx_full;
@@ -8215,7 +8223,9 @@ size_t duct_conn_tx_cap(duct_session_t *s, duct_conn_id_t conn_id)
         return 0u;
     auto conn = duct_conn_by_handle(duct_session_conn_at(s, conn_id));
     auto tx = conn ? duct_conn_tx_olb(conn) : nullptr;
-    return tx ? tx->h.buf_size : 0u;
+    /* The logical wire budget — the protocol's own ceiling where it named
+     * one — not the region the carve placed descriptors and arena in. */
+    return tx ? duct_olb_tx_byte_cap(tx) : 0u;
 }
 
 duct_conn_counters_t duct_conn_counters(const duct_session_t *s, duct_conn_id_t conn_id)

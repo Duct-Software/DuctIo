@@ -491,6 +491,87 @@ duct_xsend_gso_peers(SOCKET fd, const duct_dgram_out_t *msgs, unsigned n)
                                         &(DWORD){ 0 }, nullptr, nullptr));
 }
 
+/** @brief Fill @p m to send @p n records out a connected socket, each its
+ *  inline header and its payload span, cut at @p recs[0]'s length when @p n
+ *  is above 1.
+ *  @p n is at most @ref duct_x_gso_segs_max.
+ *  @return @p m's message. */
+duct_nonnull(1, 2) static inline WSAMSG *
+duct_x_gso_msg_recs(duct_x_gso_msg_t *m, const duct_tx_rec_t *recs, unsigned n)
+{
+    m->msg = (WSAMSG){};
+    DWORD cnt = 0u;
+    for (unsigned i = 0u; i < n; ++i) {
+        if (recs[i].hdr.size)
+            m->iov[cnt++] = (WSABUF){ (ULONG)recs[i].hdr.size, (char *)recs[i].hdr.data };
+        if (recs[i].body.size)
+            m->iov[cnt++] = (WSABUF){ (ULONG)recs[i].body.size, (char *)recs[i].body.data };
+    }
+    return duct_x_gso_msg_seg(m, cnt, n, duct_x_dgram_len_rec(&recs[0]));
+}
+
+/** @brief Send @p n records out connected socket @p fd as one USO write cut
+ *  at @p recs[0]'s length, each record its inline header and its payload
+ *  span.
+ *  @return @c rc_ok with all @p n taken; @c rc_again for a code worth
+ *  repeating; @c rc_not_supported for every other code, which sends the
+ *  group unsegmented. */
+duct_nonnull(2) static inline duct_result_t
+duct_xsend_gso_recs(SOCKET fd, const duct_tx_rec_t *recs, unsigned n)
+{
+    duct_x_gso_msg_t m;
+    return duct_x_gso_result(WSASendMsg(fd, duct_x_gso_msg_recs(&m, recs, n), 0,
+                                        &(DWORD){ 0 }, nullptr, nullptr));
+}
+
+/** @brief Send @p n records out the connected socket @p fd unsegmented, each
+ *  its inline header and its payload span.
+ *
+ *  One @c WSASend per record, its header and payload passed as two @c WSABUF
+ *  entries of one datagram, so the payload goes from wherever its record's
+ *  span keeps it; an empty span contributes no entry.
+ *
+ *  @param out_sent records Winsock took, a prefix of @p n, one a send will
+ *         never carry counted alongside them.
+ *  @return @c rc_ok with @p out_sent up to @p n, short of it once the socket
+ *          fills; @c rc_drop for a first record too large for the path;
+ *          @c rc_fatal for a socket to close.
+ */
+duct_nonnull(2, 4) static inline duct_result_t
+duct_xsend_recs(SOCKET fd, const duct_tx_rec_t *recs, unsigned n, unsigned *out_sent)
+{
+    *out_sent = 0u;
+    assert(n && n <= duct_dgram_tx_batch);
+    for (unsigned i = 0u; i < n; ++i) {
+        WSABUF wb[2];
+        DWORD cnt = 0u;
+        if (recs[i].hdr.size)
+            wb[cnt++] = (WSABUF){ .len = (ULONG)recs[i].hdr.size,
+                                  .buf = (CHAR *)recs[i].hdr.data };
+        if (recs[i].body.size)
+            wb[cnt++] = (WSABUF){ .len = (ULONG)recs[i].body.size,
+                                  .buf = (CHAR *)recs[i].body.data };
+        DWORD sent = 0u;
+        int r = cnt ? WSASend(fd, wb, cnt, &sent, 0, nullptr, nullptr) : 0;
+        if (r != SOCKET_ERROR) {
+            ++*out_sent;
+            continue;
+        }
+        int send_err = WSAGetLastError();
+        if (duct_x_send_retryable(send_err))
+            return rc_ok;
+        switch (send_err) {
+        case WSAEMSGSIZE:
+            duct_dbg_errf("WSAEMSGSIZE, %zu bytes", duct_x_dgram_len_rec(&recs[i]));
+            return i ? rc_ok : rc_drop;
+        default:
+            duct_dbg_errf("WSA error %d", send_err);
+            return rc_fatal;
+        }
+    }
+    return rc_ok;
+}
+
 /** @brief Send @p n whole datagrams out the connected socket @p fd, one span
  *  each.
  *

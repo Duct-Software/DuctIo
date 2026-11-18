@@ -411,9 +411,15 @@ static bool s_drain(duct_sock_t fd, unsigned n)
     duct_discard setsockopt(fd, SOL_SOCKET, SO_RCVBUF, (const char *)&cap, sizeof cap);
 #endif
     char buf[65536];
-    for (unsigned i = 0u; i < n; ++i)
-        if (th_recv(fd, buf, sizeof buf) != (int64_t)sizeof buf)
+    for (unsigned i = 0u; i < n; ++i) {
+        uint8_t fl = 0u;
+        auto got = th_recv_flags(fd, buf, sizeof buf, &fl);
+        if (got != (int64_t)sizeof buf) {
+            fprintf(stderr, "drain: frame %u/%u short: %lld flags %u\n",
+                    i, n, (long long)got, (unsigned)fl);
             return false;
+        }
+    }
     return true;
 }
 

@@ -97,6 +97,13 @@ static duct_result_t device_read([[maybe_unused]] void *ctx, duct_view_u8 *out,
     return produced ? rc_ok : rc_again;
 }
 
+/* TEMP-DIAG device_tx: the commit history and the refusal points, printed
+ * only once a disorder shows — no per-commit output, the timing stays. */
+static unsigned g_commit_log[pkt_total];
+static unsigned g_commit_log_n;
+static unsigned g_refuse_at[64];
+static unsigned g_refuse_at_n;
+
 static void *device_write_reserve([[maybe_unused]] void *ctx, size_t size)
 {
     if (size > pkt_bytes)
@@ -104,6 +111,8 @@ static void *device_write_reserve([[maybe_unused]] void *ctx, size_t size)
     duct_discard duct_atomic_fetch(add, &g_attempts, 1, release);
     if (++g_reserves % 4u == 0u) {
         duct_discard duct_atomic_fetch(add, &g_refused, 1, relaxed);
+        if (g_refuse_at_n < 64u)
+            g_refuse_at[g_refuse_at_n++] = g_reserves;
         return nullptr;
     }
     auto slot = g_ring[g_ring_next];
@@ -122,8 +131,19 @@ static duct_result_t device_write_commit([[maybe_unused]] void *ctx,
     }
     unsigned seq = 0u;
     memcpy(&seq, buf, sizeof seq);
-    if ((int)seq <= duct_atomic_load(&g_out_order, acquire))
-        duct_discard duct_atomic_fetch(add, &g_bad_write, 1, release);
+    if ((int)seq <= duct_atomic_load(&g_out_order, acquire)) {
+        fprintf(stderr, "b47-dtx: disorder at commit %u: seq=%u prev=%d\n",
+                g_commit_log_n, seq, (int)duct_atomic_load(&g_out_order, acquire));
+        fprintf(stderr, "b47-dtx: commits:");
+        for (unsigned k = 0u; k < g_commit_log_n; ++k)
+            fprintf(stderr, " %u", g_commit_log[k]);
+        fprintf(stderr, "\nb47-dtx: refused reserves:");
+        for (unsigned k = 0u; k < g_refuse_at_n; ++k)
+            fprintf(stderr, " %u", g_refuse_at[k]);
+        fprintf(stderr, "\n");
+    }
+    if (g_commit_log_n < pkt_total)
+        g_commit_log[g_commit_log_n++] = seq;
     duct_atomic_store(&g_out_order, (int)seq, release);
     duct_discard duct_atomic_fetch(add, &g_committed, 1, release);
     return rc_ok;

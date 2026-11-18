@@ -96,8 +96,17 @@ typedef struct duct_olb_hdr {
     );  /* CL-0 */
 
     duct_cacheline_struct(
-        uint32_t         stage; /**< Staging cursor, ahead of tail until
-                                  *  published. */
+        uint32_t _Atomic stage; /**< Staging cursor, ahead of tail until
+                                  *  published. RX: io-exclusive. TX: the
+                                  *  staging worker's own counter, one plain
+                                  *  word the io thread also reads — the
+                                  *  close claim's ring-draining check and
+                                  *  the public queued metric — while the
+                                  *  same worker's release-finish purge
+                                  *  rewrites it (the slot's gen word, not
+                                  *  this field, orders that hand-off), so
+                                  *  every access goes through the duct
+                                  *  atomics, relaxed both ways. */
         uint64_t _Atomic tail;  /**< Producer cursor. RX: written by the io
                                   *  thread. TX: written by the worker
                                   *  thread. */
