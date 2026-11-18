@@ -31,7 +31,7 @@
 #include "duct_protocol.h"
 #include "duct_session.h"
 #include "duct_stats.h"
-#include "duct_tx_pool.h"
+#include "duct_span.h"
 #include "duct_vmq.h"
 #include "duct_vnet.h"
 #include "duct_wfq.h"
@@ -239,104 +239,25 @@ typedef struct duct_deferred_queue {
     uint64_t _Atomic    mask[DUCT_BITMAP_WORDS];
 } duct_deferred_queue_t;
 
-/** @brief Arena bytes of a worker's region ring, one @c dgram_tx_outbox lane's
- *  capacity.
- *  The TX pool's arena holds a pass's @c x_udp_shared batch entries and every
- *  region an author takes through @ref duct_tx_pool_acquire, several at once;
- *  the cleartext ring's holds the datagram being decrypted and the payloads a
- *  vnet train still references.
- */
-static constexpr size_t duct_worker_tx_pool_cap = duct_dgram_tx_outbox_cap;
-
-/** @brief In-arena header preceding every acquired region, immediately
- *  followed by @c len bytes of payload.
- *
- *  @ref duct_tx_pool_acquire hands the region out, and
- *  @c s_tx_pool_region_bytes rounds the whole footprint up to keep the
- *  next header 8-byte aligned too.
- *
- *  @c refs counts live @c duct_worker_dgram_batch_entry_t entries still
- *  referencing this region, resolved back down at every flush, retry-save or
- *  terminal-drop point; in the cleartext ring it counts the spans of the vnet
- *  train that point into the region.
- *  @c hold is the claim of whoever took the region, set by @c s_pool_acquire.
- *  @c s_tx_pool_pass_end clears a TX region's unless @c keep carries it one pass
- *  on, @c s_tx_pool_drop_hold a cleartext region's. A region frees only once
- *  both are zero.
- *
- *  @c refs and @c hold share one 32-bit word: the ring is worker-owned and
- *  single-threaded, so neither is atomic and the header stays 8 in-arena bytes.
- */
-typedef struct {
-    uint32_t len;
-    uint32_t refs : 30;
-    uint32_t hold : 1;
-    uint32_t keep : 1;
-} duct_tx_pool_hdr_t;
-
-/** @brief Arena grid, in bytes.
- *  Header and payload both round up to it and the arena starts on it, so
- *  regions bump-allocate with no inter-region padding and every header and
- *  payload lands aligned to it. */
-static constexpr uint32_t duct_tx_pool_align = 8u;
-
-/** @brief Region header size, rounded up to the arena grid.
- *  @ref duct_tx_pool_hdr_t padded to @ref duct_tx_pool_align keeps the
- *  payload (and hence the next region's own header) on that grid. Plain
- *  arithmetic, not @ref duct_align_up: that macro's statement-expression form
- *  is not a constant expression a file-scope @c constexpr initializer
- *  accepts. */
-
-static constexpr uint32_t duct_tx_pool_hdr_bytes =
-    ((uint32_t)sizeof(duct_tx_pool_hdr_t) + duct_tx_pool_align - 1u)
-    & ~(duct_tx_pool_align - 1u);
-
-/** @brief Offset @c s_tx_pool_place answers when no room is left for a region.
- *  No offset of the arena equals it. */
-static constexpr uint32_t duct_tx_pool_no_room = UINT32_MAX;
-
-/** @brief Total in-arena footprint of a region holding @p len payload
- *  bytes: header plus 8-aligned payload, so consecutive regions bump-
- *  allocate cleanly without any inter-region padding logic. */
-static inline uint32_t s_tx_pool_region_bytes(uint32_t len)
-{
-    return duct_tx_pool_hdr_bytes + (uint32_t)duct_align_up(len, duct_tx_pool_align);
-}
-
-/** @brief Single-threaded, variable-region ring over @c arena, the type of a
- *  worker's TX staging pool and of its cleartext ring.
- *  The owning worker alone touches it, so every field is a plain counter.
- */
-typedef struct {
-    uint32_t head,       /**< Start of the oldest not-yet-reclaimed region. */
-             tail,       /**< Next bump-allocate offset. */
-             high_water; /**< Where the skipped fragment's own tail end was,
-                           *  read by reclaim while @c wrapped; meaningless
-                           *  otherwise. */
-    bool     wrapped;    /**< A pending wrap: a region that did not fit in
-                           *  @c [tail, cap) skipped that leftover fragment and
-                           *  continued at offset 0. Set, live data spans
-                           *  @c [head, high_water) from the lap before the wrap
-                           *  plus @c [0, tail) from the new one, and a fresh
-                           *  allocation may grow @c tail only up to @c head --
-                           *  never past it, never a second wrap ahead of the
-                           *  first one draining. Unset, live data is the plain
-                           *  span @c [head, tail). */
-    alignas(duct_tx_pool_align) uint8_t arena[duct_worker_tx_pool_cap];
-} duct_tx_pool_t;
+/** @brief Payload byte floor under which a batch entry copies its source
+ *  instead of pinning it: the share/pin RMW pair costs more than staging a
+ *  sub-MTU frame, and control datagrams live under it (§2.2's knob).
+ *  Static and already-owned sources reference regardless — they pin with
+ *  nothing at all or ride a share the send's own release path already
+ *  owed. */
+static constexpr uint32_t duct_tx_span_threshold = 128u;
 
 /** @brief One @c x_udp_shared send this drain pass has staged but not yet
- *  handed to the kernel. @c ptr is either a pool region's own payload
- *  (zero-copy: the author's response payload already lived there) or a
- *  region this same commit call packed the wire's bytes into (the
- *  fallback: a foreign buffer, or a wire whose @c on_pack writes a real
- *  header) — either way @c region (that region's header, @c ptr minus
- *  @ref duct_tx_pool_hdr_bytes) owns one reference this entry is
- *  responsible for releasing exactly once, at whichever point (send,
- *  lane-copy, retry-save, or terminal drop) resolves this entry — see
- *  @ref s_worker_dgram_flush. @c handle is re-resolved at flush time; callback
- *  state for @ref s_fire_send_done is copied into this entry to outlive
- *  transient handler context.
+ *  handed to the kernel: the payload as one @c duct_span_t reference
+ *  (§2.4's batch entry shape — inline wire header plus span), pinned at
+ *  append and unpinned at whichever point resolves this entry (send,
+ *  lane-copy, retry-save, or terminal drop) — see @ref s_worker_dgram_flush.
+ *  A @c span_ptr entry's base is a whole @c duct_new-style block (heap,
+ *  ct chunk or x_slot object) so its single duct_del drops the share the
+ *  pin took; a @c span_rx entry's pin rides the inbound conn's refs unit.
+ *  @c handle is re-resolved at flush time; callback state for
+ *  @ref s_fire_send_done is copied into this entry to outlive transient
+ *  handler context.
  */
 typedef struct {
     duct_conn_handle_t handle;
@@ -345,12 +266,7 @@ typedef struct {
     duct_stream_id_t    stream_id;
     duct_send_flags_t   flags;
     uintptr_t           send_token;
-    uint8_t             *ptr;
-    union {
-        duct_tx_pool_hdr_t *region;
-        void               *block;
-    };
-    uint32_t            len;
+    duct_span_t         span;
     uint8_t             hdr[wire_tx_hdr_max];
     uint8_t             hdr_len;
 } duct_worker_dgram_batch_entry_t;
@@ -361,9 +277,8 @@ typedef struct {
  *  one @c duct_coop_cycle call can produce. The kick array has the same size, and @c n and
  *  @c kick_n stay under it. This struct only borrows those arrays and is
  *  handed to @c s_commit_response's @c x_udp_shared case through @ref
- *  duct_worker_t::dgram_pass, reset per pass. Entry bytes live in the
- *  worker's persistent @ref duct_tx_pool_t; this struct carries no byte
- *  storage of its own.
+ *  duct_worker_t::dgram_pass, reset per pass. Entry payloads ride their
+ *  spans; this struct carries no byte storage of its own.
  */
 typedef struct {
     duct_worker_dgram_batch_entry_t *entries;
@@ -386,15 +301,17 @@ typedef struct {
 
 /** @brief This worker's train of TCP segments or UDP datagrams bound for one vnet tun leg.
  *  No pass ends with a train open; @c gro.segs of 0 marks it empty. Each payload
- *  span points into a region of the worker's cleartext ring, which the train
- *  holds by a reference until the write. */
+ *  span rides a block the train holds a @c duct_share reference on until the
+ *  write — the sealed packet's own decrypt block where the payload lies in
+ *  one, a private copy otherwise. */
 typedef struct {
     duct_conn_handle_t conn; /**< Leg the train is bound for; a handle, so a leg
                                *  gone by the flush resolves to nothing. */
     duct_vnet_gro_t    gro;  /**< Segments merged so far. */
-    duct_tx_pool_hdr_t *regions[duct_vnet_gro_span_max]; /**< Region behind each
-                               *  payload span of @c gro, by span. The span of a
-                               *  payload the ring had no room to copy has none:
+    void              *blocks[duct_vnet_gro_span_max]; /**< Block behind each
+                               *  payload span of @c gro, by span, held by the
+                               *  train's own share. The span of a payload the
+                               *  copy's allocation could not serve has none:
                                *  nullptr, its train written at once. */
 } vnet_train_t;
 
@@ -505,10 +422,6 @@ typedef struct duct_worker {
                                              *  its changes feed busy_enter/exit. */
     bool _Atomic            shutdown;
     unsigned _Atomic        started;
-    duct_tx_pool_t          tx_pool; /**< Worker TX staging pool. */
-    duct_tx_pool_t          ct_pool; /**< Region ring for the cleartext of the
-                               *  sealed datagrams this worker decrypts off the
-                               *  inter lane. */
     duct_x_slot_pool_t      ct_chunks; /**< Cleartext chunks of the sealed
                                *  codecs this worker builds, one per conn,
                                *  sized by the wire-declared ct_buf_max
@@ -598,170 +511,6 @@ void duct_worker_rtstat_fast_miss(bool armed)
 }
 #endif
 
-/** @brief Reclaim @p pool head past every fully dead region.
- *  Dead regions (@c refs == 0 && !hold) are reclaimed in ring order. An
- *  out-of-order-dead region (a live successor already resolved while this one
- *  is still held/referenced) waits for its predecessors; the only long-holder
- *  is one retried chunk against a pool sized for many. Crossing @c high_water
- *  while wrapped flips back to the plain single-lap regime and the walk
- *  continues from offset 0.
- */
-static void s_tx_pool_reclaim(duct_tx_pool_t *pool)
-{
-    for (;;) {
-        if (pool->wrapped && pool->head == pool->high_water) {
-            pool->head = 0u;
-            pool->wrapped = false;
-        }
-        if (pool->head == pool->tail) {
-            /* Unambiguously empty -- a wrapped tail never catches head
-             * exactly (s_tx_pool_place). Rewind to offset 0 so a
-             * following large acquire never fails on the cursor's
-             * parking spot alone: head == tail mid-arena otherwise
-             * splits the free space in two. */
-            assert(!pool->wrapped);
-            pool->head = 0u;
-            pool->tail = 0u;
-            return;
-        }
-        auto hdr = (duct_tx_pool_hdr_t *)(pool->arena + pool->head);
-        if (hdr->refs != 0u || hdr->hold)
-            return;
-        pool->head += s_tx_pool_region_bytes(hdr->len);
-    }
-}
-
-/** @brief End a worker pass: release the hold of every region not marked
- *  @c keep.
- *  A region marked @c keep spends the mark here and survives into the next
- *  pass instead, so cross-pass reuse is re-declared every pass. An author who
- *  acquires and never emits cannot wedge the ring this way — @ref
- *  s_tx_pool_reclaim frees in ring order, so one region left held blocks every
- *  region behind it.
- *  @return true when a region was still held: released here, or at the next
- *  pass end for one that carried @c keep.
- */
-static bool s_tx_pool_pass_end(duct_tx_pool_t *pool)
-{
-    uint32_t off = pool->head;
-    uint32_t end = pool->wrapped ? pool->high_water : pool->tail;
-    bool held = false;
-    for (;;) {
-        if (off >= end) {
-            if (!pool->wrapped || end == pool->tail)
-                break;
-            off = 0u;
-            end = pool->tail;
-            continue;
-        }
-        auto hdr = (duct_tx_pool_hdr_t *)(pool->arena + off);
-        held |= hdr->hold;
-        if (hdr->keep)
-            hdr->keep = 0u;
-        else
-            hdr->hold = 0u;
-        off += s_tx_pool_region_bytes(hdr->len);
-    }
-    return held;
-}
-
-/** @brief True if @p ptr falls inside @p pool arena.
- *
- *  The range check @c s_commit_dgram_shared uses to tell a pool-backed
- *  response payload from an ordinary author buffer. Two compares: a pointer
- *  outside this worker arena cannot alias into it.
- */
-static inline bool s_tx_pool_owns(const duct_tx_pool_t *pool, const uint8_t *ptr)
-{
-    return ptr >= pool->arena
-        && ptr < pool->arena + duct_worker_tx_pool_cap;
-}
-
-/** @brief Bump-allocate @p need bytes at @p pool tail, wrapping once behind @c head.
- *  @p limit is how far @c tail may grow this call without touching live data:
- *  @c head once already wrapped (nothing past it is reusable until reclaim
- *  proves otherwise), the arena end otherwise. A not-yet-wrapped pool that
- *  does not fit before the end wraps once; an already-wrapped pool that does
- *  not fit before @c head fails with @ref duct_tx_pool_no_room.
- *  @return Offset where the region header starts, or @ref duct_tx_pool_no_room.
- */
-static uint32_t s_tx_pool_place(duct_tx_pool_t *pool, uint32_t need)
-{
-    uint32_t tail = pool->tail;
-    uint32_t limit = pool->wrapped ? pool->head : duct_worker_tx_pool_cap;
-    assert(tail <= limit);
-    /* While wrapped, tail must never catch head exactly: head == tail is
-     * the ring's one "empty" sentinel (s_tx_pool_reclaim's rewind), so a
-     * full-to-the-byte wrapped pool reads as a drained one and reclaim
-     * deadlocks on it. One byte of the
-     * wrapped gap stays unusable by design; same for entering a wrap. */
-    bool fits = pool->wrapped ? need < limit - tail : need <= limit - tail;
-    if (!fits) {
-        if (pool->wrapped || need >= pool->head)
-            return duct_tx_pool_no_room;
-        pool->high_water = tail;
-        pool->wrapped = true;
-        tail = 0u;
-    }
-    uint32_t placed_at = tail;
-    tail += need;
-    if (tail == duct_worker_tx_pool_cap && pool->head != 0u) {
-        /* Landed exactly on the boundary -- zero-waste wrap, no dead
-         * space to skip. head == 0 keeps the unwrapped tail == cap form
-         * instead: wrapping there recreates the ambiguous
-         * head == tail == 0 full state. */
-        pool->high_water = duct_worker_tx_pool_cap;
-        pool->wrapped = true;
-        tail = 0u;
-    }
-    pool->tail = tail;
-    return placed_at;
-}
-
-/** @brief Take a region of @p size payload bytes from @p pool, held for its taker.
- *  Reclaims the dead regions at the head first.
- *  @return The payload, 8-byte aligned; nullptr when @p size can never fit or the
- *  ring has no room now. */
-static void *s_pool_acquire(duct_tx_pool_t *pool, size_t size)
-{
-    duct_do_if(size > UINT32_MAX, return nullptr);
-    s_tx_pool_reclaim(pool);
-    uint32_t need = s_tx_pool_region_bytes((uint32_t)size);
-    duct_do_if(need > duct_worker_tx_pool_cap, return nullptr); /* can never fit, ever */
-
-    uint32_t off = s_tx_pool_place(pool, need);
-    duct_do_if(off == duct_tx_pool_no_room, return nullptr);
-    auto hdr = (duct_tx_pool_hdr_t *)(pool->arena + off);
-    *hdr = (duct_tx_pool_hdr_t){ .len = (uint32_t)size, .refs = 0u, .hold = true };
-    return (char *)hdr + duct_tx_pool_hdr_bytes;
-}
-
-void *duct_tx_pool_acquire(size_t size)
-{
-    auto w = s_this_worker;
-    duct_do_if(!w, return nullptr);
-    void *region = s_pool_acquire(&w->tx_pool, size);
-    duct_rtstat_obj_inc(w, rtstats.tx_pool_acquire_fail, !region);
-    return region;
-}
-
-/** @brief The region header behind a payload pointer.
- *  Valid only for a pointer @c s_pool_acquire handed out, never an interior
- *  one. */
-static inline duct_tx_pool_hdr_t *s_tx_pool_hdr_of(void *ptr)
-{
-    return (duct_tx_pool_hdr_t *)((char *)ptr - duct_tx_pool_hdr_bytes);
-}
-
-/** @brief Drop the hold on the region behind @p ptr, leaving @c refs to govern it.
- *  Its callers are the packing of @c x_udp_shared responses into the TX pool, a
- *  branch the iocp build compiles out in favour of the outbox lane, and the
- *  cleartext ring: a packet's end and a vnet train's copy of a payload. */
-static void s_tx_pool_drop_hold(void *ptr)
-{
-    s_tx_pool_hdr_of(ptr)->hold = 0u;
-}
-
 static duct_exec_rc_t s_dispatch_msg(duct_vmq_hdr_t *hdr);
 static duct_exec_rc_t s_dispatch_batch(duct_vmq_hdr_t *hdr, duct_worker_t *w,
                                        uint32_t *out_defer_idx);
@@ -817,6 +566,164 @@ typedef struct {
     void                    *at;        /**< Where the unseal writes, @c span or
                                           *  @c ct, set ahead of the unseal. */
 } redirect_t;
+
+/** @brief Build the payload span of one @c x_udp_shared batch entry
+ *  (§2.4: @c { hdr[16], duct_span_t }): a recognized engine substrate rides
+ *  a pinned reference, everything else copies into a block the entry owns.
+ *
+ *  Recognition is §2.1's range check against the dispatch's own
+ *  substrates: the inbound frame's RX ring (@c w->hold_conn — its span
+ *  pinning through the §2.3 refs unit), the sealed packet's decrypt block
+ *  (@p redirect->ct), the inter batch's RX slot (@c w->slot_now), and a
+ *  block the response already owns with no release hook. Static bytes and
+ *  an owned-without-release block reference unconditionally — they pin
+ *  with nothing at all or with the share the send's own release path
+ *  already owed. Every other source — a foreign @c fl_send_copy pointer,
+ *  a custom @c release payload, a sub-threshold frame (§2.2's knob: the
+ *  share RMW costs more than a small memcpy), a share at the 255-holder
+ *  ceiling — materializes as a copy, the custom @c release firing here on
+ *  the worker exactly once (§2.1: a descriptor never carries a release
+ *  hook).
+ *
+ *  @return true with @p out_span held (pin or owned copy); false when the
+ *          copy's allocation fails — the caller's @c rc_again path.
+ */
+static bool s_dgram_span_take(duct_response_t *out, redirect_t *redirect,
+                              duct_span_t *out_span)
+{
+    auto w = s_this_worker;
+    auto at = (const uint8_t *)out->payload.data;
+    uint32_t len = (uint32_t)out->payload.size;
+
+    bool static_src = duct_has(out->flags, fl_send_static);
+    bool owned_plain = !static_src && duct_has(out->flags, fl_send_owned)
+                    && !out->release;
+    if (static_src && !((uintptr_t)at & duct_span_tag_mask)) {
+        /* 4-aligned static bytes ride as-is; the tag bits must not alias
+         * the address, and an unaligned literal copies like any foreign
+         * buffer. */
+        *out_span = duct_span_of_static(at, len);
+        return true;
+    }
+    void *share_base = nullptr;
+    if (owned_plain) {
+        share_base = out->release_arg ? out->release_arg : (void *)at;
+    } else if (!static_src && redirect && redirect->ct) {
+        auto base = (const uint8_t *)redirect->ct;
+        if (at >= base && at + len <= base + redirect->cap)
+            share_base = redirect->ct;
+    }
+    if (!share_base && !static_src && w && w->slot_now
+        && w->slot_now->kind == ack_slot) {
+        /* The inter batch's RX slot. The slot's lifetime authority is its
+         * pool's claim count — the lane's release respects a claim, while a
+         * @c duct_try_share of the slot object's own word touches a header
+         * nothing on the slot path reads — so the pin is the claim the emit
+         * answer's slot pin already takes (@c duct_x_slot_claim), past the
+         * bound of which the copy below answers. */
+        auto pool = w->slot_now->slot.pool;
+        auto idx = w->slot_now->slot.idx;
+        auto base = (const uint8_t *)duct_x_slot_data(pool, idx);
+        auto obj = duct_x_slot_obj(pool, idx);
+        if (len >= duct_tx_span_threshold
+            && at >= base && at + len <= base + pool->slot_bytes
+            && duct_x_slot_claim(pool, idx)) {
+            *out_span = duct_span_of_ptr(obj, (uint32_t)(at - (const uint8_t *)obj), len);
+            return true;
+        }
+    }
+    if (share_base) {
+        auto base = (const uint8_t *)share_base;
+        uint32_t off = (uint32_t)(at - base);
+        if (len >= duct_tx_span_threshold
+            && duct_try_share(share_base)) {
+            *out_span = duct_span_of_ptr(share_base, off, len);
+            return true;
+        }
+    }
+    if (!share_base && !static_src && !owned_plain && w && w->hold_conn) {
+        /* The dispatched frame's RX ring: a relay answer reading its own
+         * inbound bytes (§2.3 — the pin's refs unit holds the block while
+         * the entry lives). */
+        auto rx = duct_conn_rx_olb(w->hold_conn);
+        auto base = duct_conn_rx_data(w->hold_conn);
+        if (rx && at >= base && at + len <= base + rx->h.buf_size
+            && len >= duct_tx_span_threshold) {
+            *out_span = duct_span_of_rx((duct_conn_t *)w->hold_conn,
+                                        (uint32_t)(at - base), len);
+            if (duct_span_pin(out_span, rx))
+                return true;
+        }
+    }
+
+    /* Copy: foreign or sub-threshold. A custom release or owned free fires
+     * here, once, on the worker — and the response must leave holding
+     * nothing, or the commit's own cleanup releases a second time
+     * (@c duct_response_release_owned clears nothing by contract). The copy's
+     * single holder is the span's reference. */
+    auto copy = duct_at(duct_new(uint8_t, len));
+    duct_do_if(!copy, return false);
+    memcpy(copy, at, len);
+    if (!static_src && (out->release || duct_has(out->flags, fl_send_owned))) {
+        duct_response_release_owned(out);
+        out->flags = duct_and(out->flags, duct_not(fl_send_owned));
+        out->release = nullptr;
+        out->release_arg = nullptr;
+    }
+    *out_span = duct_span_of_ptr(copy, 0u, len);
+    return true;
+}
+
+/** @brief A span's payload view: its bytes where they live. */
+static duct_view_u8 s_dgram_span_body(const duct_span_t *span)
+{
+    const uint8_t *base;
+    if (duct_span_kind_of(span) == span_rx)
+        base = duct_conn_rx_data((duct_conn_t *)duct_span_base(span));
+    else
+        base = (const uint8_t *)duct_span_base(span);
+    return (duct_view_u8){
+        .data = (void *)(uintptr_t)(base + duct_span_off(span)),
+        .size = duct_span_len(span),
+    };
+}
+
+/** @brief The entry's payload view: the span's bytes where they live. */
+static duct_view_u8 s_dgram_entry_body(const duct_worker_dgram_batch_entry_t *e)
+{
+    return s_dgram_span_body(&e->span);
+}
+
+/** @brief Drop a dgram descriptor's payload reference at whichever point
+ *  resolved it — send, lane-copy, retry-save's takeover or terminal drop:
+ *  the §5.1 matrix unpin, rx pins running the §2.3 step and slot-obj spans
+ *  dropping the claim that is the slot's lifetime authority (a plain
+ *  @c duct_del would push the slot onto the free list past every claim). */
+static void s_dgram_span_drop(duct_span_t *span)
+{
+    if (duct_span_kind_of(span) == span_rx) {
+        auto conn = (duct_conn_t *)duct_span_base(span);
+        duct_span_unpin(span, duct_conn_rx_hdr(conn));
+        return;
+    }
+    if (duct_span_kind_of(span) == span_ptr) {
+        auto h = duct_block_hdr(duct_span_base(span));
+        if (!h->back && !h->secret) {
+            auto pool = duct_slot_pool_of(duct_span_base(span));
+            assert(pool);
+            duct_io_rx_slot_drop((duct_x_slot_pool_t *)pool,
+                                 duct_alloc_slot_index(h), true);
+            return;
+        }
+    }
+    duct_span_unpin(span, nullptr);
+}
+
+/** @brief Drop one batch entry's payload reference. */
+static void s_dgram_entry_span_drop(const duct_worker_dgram_batch_entry_t *e)
+{
+    s_dgram_span_drop((duct_span_t *)&e->span);
+}
 
 static duct_nonnull(1, 4, 5) duct_commit_rc_t s_commit_response(duct_session_t *s,
                                                                 duct_conn_id_t in_conn,
@@ -1932,7 +1839,6 @@ s_dispatch_resolve(duct_conn_handle_t h, duct_conn_t **out_conn, duct_session_t 
 static inline bool s_hctx_parked(const duct_stream_ctx_t *h);
 static inline void s_hctx_wake(duct_coop_t *cp, duct_stream_ctx_t *h);
 
-static size_t s_engine_park_cap(const duct_conn_t *conn, const duct_wire_codec_t *codec);
 static bool s_engine_park_flush(duct_conn_t *conn);
 static uint8_t *s_engine_park_span(duct_conn_t *conn, duct_wire_codec_t *codec, size_t len);
 
@@ -3374,8 +3280,10 @@ static void redirect_take(duct_session_t *s, const duct_proto_cfg_t *cfg,
  */
 static void s_redirect_release(redirect_t *r)
 {
-    if (r->ct)
-        s_tx_pool_drop_hold(r->ct);
+    if (r->ct) {
+        void *ct = r->ct;
+        duct_del(ct);
+    }
     if (!r->span)
         return;
     if (r->dev)
@@ -3448,15 +3356,14 @@ static void s_inter_pkt(duct_conn_handle_t handle,
             redirect_take(s, cfg, cid, frame.stream_id, want, &redirect);
         }
         if (!redirect.span) {
-            /* The cleartext is the datagram at most, plus the inner wire's header a
-             * control datagram gets ahead of its payload. A full ring is full of the
-             * train's references: writing the train frees them for one more ask. */
+            /* The cleartext is the datagram at most, plus the inner wire's
+             * header a control datagram gets ahead of its payload. The
+             * decrypt target is a whole duct_new block — the packet's
+             * cleartext rides it pinned (a handler claim, a batch entry or
+             * a vnet train take a duct_share of it) instead of a bump
+             * region no one could hold. */
             size_t room = frame.payload.size + (codec->inner ? codec->inner->header_size : 0u);
-            redirect.ct = s_pool_acquire(&w->ct_pool, room);
-            if (!redirect.ct) {
-                s_vnet_train_flush(w);
-                redirect.ct = s_pool_acquire(&w->ct_pool, room);
-            }
+            redirect.ct = duct_at(duct_new(uint8_t, room));
             if (!redirect.ct) {
                 s_fire_error(s, cfg, rc_again);
                 return;
@@ -3525,16 +3432,28 @@ static void s_inter_pkt(duct_conn_handle_t handle,
          * for producer reuse — the instant s_inter_drain's loop returns, but
          * handler dispatch is always queued to a later duct_coop_cycle pass,
          * so the payload needs a hold of its own before the coroutine is
-         * queued: a claim on the RX slot it lies in, else a copy. An RST
-         * takes neither, still closing the stream before any handler reads
-         * its bytes; a fin takes one like any other. An empty payload takes
-         * neither: a count of 0 makes duct_new answer nullptr, not out-of-memory. */
+         * queued: a claim on the RX slot it lies in, a share of the sealed
+         * packet's decrypt block (§2: the !sealed carve-out dies — the
+         * cleartext block is a whole duct_new block, pinnable through
+         * duct_share with no copy), else a copy. An RST takes neither, still
+         * closing the stream before any handler reads its bytes; a fin takes
+         * one like any other. An empty payload takes neither: a count of 0
+         * makes duct_new answer nullptr, not out-of-memory. */
         bool is_rst = duct_has(frame.flags, fl_frame_rst);
         void *copy = nullptr;
-        bool pinned = frame.payload.size && !is_rst && !sealed && b->rx_pool
-                   && duct_x_slot_holds(b->rx_pool, b->rx_slot, frame.payload.data)
-                   && duct_x_slot_claim(b->rx_pool, b->rx_slot);
-        if (!pinned && frame.payload.size && !is_rst) {
+        bool slot_pinned = frame.payload.size && !is_rst && !sealed && b->rx_pool
+                       && duct_x_slot_holds(b->rx_pool, b->rx_slot, frame.payload.data)
+                       && duct_x_slot_claim(b->rx_pool, b->rx_slot);
+        bool ct_pinned = false;
+        if (frame.payload.size && !is_rst && !slot_pinned && sealed && redirect.ct
+            && (const uint8_t *)frame.payload.data >= (const uint8_t *)redirect.ct
+            && (const uint8_t *)frame.payload.data + frame.payload.size
+                   <= (const uint8_t *)redirect.ct + redirect.cap) {
+            ct_pinned = duct_try_share(redirect.ct) != nullptr;
+            if (ct_pinned)
+                copy = redirect.ct;
+        }
+        if (!slot_pinned && !ct_pinned && frame.payload.size && !is_rst) {
             copy = duct_new(uint8_t, frame.payload.size);
             if (!copy) {
                 s_fire_error(s, cfg, rc_no_memory);
@@ -3544,12 +3463,15 @@ static void s_inter_pkt(duct_conn_handle_t handle,
         }
         /* An RST never reaches a handler (s_dispatch_stream_claim closes the
          * stream first) — payload.data stays whatever it was, unread. Every
-         * other path lands frame.payload.data on the copy, nullptr for a
-         * zero-size payload, ensuring handlers never retain pointers into the
-         * freed inter batch. */
-        if (!is_rst && !pinned)
+         * other path keeps frame.payload.data where it lies — a claimed slot
+         * byte, the pinned block's interior, the copy — with the ack naming
+         * the release handle: the slot's claim, or the owned block's base
+         * (the decrypt block for a ct pin, duct_del of whose base drops the
+         * share), so handlers never retain pointers into the freed inter
+         * batch. */
+        if (!is_rst && !slot_pinned && !ct_pinned)
             frame.payload.data = copy;
-        duct_frame_ack_t ack = pinned
+        duct_frame_ack_t ack = slot_pinned
             ? (duct_frame_ack_t){ .kind = ack_slot,
                                   .slot = { .pool = b->rx_pool, .idx = b->rx_slot } }
             : (duct_frame_ack_t){ .kind = ack_owned, .owned = { .ptr = copy } };
@@ -4143,14 +4065,16 @@ typedef struct retry_node {
         struct { duct_conn_handle_t handle, hold_of; duct_stream_id_t sid;
                  duct_frame_flags_t flags; duct_stream_error_t err;
                  uint32_t ticket; } fin;
-        /* Copy of the datagram payload to outlive the pass arena, one of the
-         * conn's TX retry copy slots — or a share of the entry's own block
-         * where the pool holds it. listener is used after handle
+        /* The parked datagram's own descriptor — the entry's span taken over
+         * whole, pin and inline header included (§2.1): the payload stays
+         * where its author built it and the node holds its reference until
+         * the drain resolves it. listener is used after handle
          * re-resolution. No subsequent worker datagram leaves ahead of a
          * parked one; dgram_parked gates flush and commits while any is
          * parked. */
         struct { duct_conn_handle_t handle; duct_listener_t *listener;
-                 duct_peer_t peer; void *block; duct_view_u8 bytes;
+                 duct_peer_t peer; duct_span_t span;
+                 uint8_t hdr[wire_tx_hdr_max]; uint8_t hdr_len;
                  duct_conn_id_t conn_id; duct_stream_id_t stream_id;
                  duct_send_flags_t flags; uintptr_t send_token; } dgram_tx;
         /* The conn whose codec's engine park holds bytes, and the wire
@@ -4383,17 +4307,14 @@ static void s_retry_frame_out_release(retry_node_t *node)
     node->frame.out.release_arg = nullptr;
 }
 
-/** @brief Release a parked dgram's block: a copy the conn's TX retry region
- *  took returns its slot, a share of the entry's own block frees through the
- *  pool's own reference. */
+/** @brief Drop a parked dgram's span — the §5.1 matrix unpin, rx spans the
+ *  §2.3 step, whose last pin may post a read and release the base conn. The
+ *  parked conn and the span's substrate need not agree: an rx span outlives
+ *  its own leg's death by its refs unit, the pin's own base naming the leg. */
 static void s_retry_dgram_block_release(retry_node_t *node)
 {
-    auto conn = s_retry_node_owner(node);
-    if (conn && s_retry_copy_is_regional(conn, node->dgram_tx.block)) {
-        s_retry_copy_release(conn, node->dgram_tx.block, node->dgram_tx.bytes.size);
-        return;
-    }
-    duct_del(node->dgram_tx.block);
+    s_dgram_span_drop(&node->dgram_tx.span);
+    node->dgram_tx.span = (duct_span_t){};
 }
 
 /** @brief Hand @p h to a parked answer of @p owner's dispatch that still waits on its ticket.
@@ -4435,16 +4356,6 @@ static bool s_hold_adopt(const duct_session_t *s, duct_tx_hold_t *h, const duct_
     return false;
 }
 
-/** @brief Capacity of @p codec's engine park on @p conn, bytes: two engine
- *  messages.
- *  One reply parked leaves room for a second in flight, and the unseal waits
- *  while the park has no room for one more. A sealed wire refuses a budget
- *  whose park the smallest TX ring cannot take whole. */
-static size_t s_engine_park_cap(const duct_conn_t *conn, const duct_wire_codec_t *codec)
-{
-    return 2u * s_hs_need(conn, codec);
-}
-
 /** @brief Stage @p conn's parked engine bytes whole into its TX ring, ahead of
  *  every later byte.
  *  @return true once the park is empty; false while the ring has no room for
@@ -4476,7 +4387,10 @@ static bool s_engine_park_flush(duct_conn_t *conn)
  *          node quota is spent. */
 static uint8_t *s_engine_park_span(duct_conn_t *conn, duct_wire_codec_t *codec, size_t len)
 {
-    assert(s_engine_park_cap(conn, codec) <= duct_conn_park_cap);
+    /* The park's whole capacity is two engine messages — one reply parked
+     * leaves room for a second in flight — which a sealed wire refuses a
+     * budget the smallest TX ring cannot take whole. */
+    assert(2u * s_hs_need(conn, codec) <= duct_conn_park_cap);
     duct_do_if(len > duct_conn_park_cap - codec->engine_park_len, return nullptr);
     if (!codec->engine_park_len) {
         auto node = s_retry_node_take(conn);
@@ -4591,34 +4505,22 @@ static void s_retry_enqueue(duct_worker_t *w, retry_node_t *node)
 /** @brief Park one packed @c x_udp_shared datagram whose outbox-lane reserve
  *  failed at flush time.
  *
- *  The node is the conn's own TX retry region; the bytes copy into one of its
- *  copy slots — or, for a block the worker's TX pool does not own and no
- *  record header prefixes, stay on a share of the entry's own block — and
- *  retry by @c s_retry_drain until the lane has room again; send_done and
- *  on_error for the entry are deferred to the node's own resolution.
- *  @return false when the region refuses — its node quota spent, or the copy
- *  past its slots or ceiling — or the entry's conn is already gone, whose
- *  silent-drop discipline the caller's terminal-drop accounting carries. */
+ *  The node is the conn's own TX retry region and takes the entry's descriptor
+ *  over whole — span with its pin, inline header — so the payload stays where
+ *  its author built it and retries by @c s_retry_drain until the lane has
+ *  room again; send_done and on_error for the entry are deferred to the
+ *  node's own resolution.
+ *  @return false when the region refuses — its node quota spent — or the
+ *  entry's conn is already gone, whose silent-drop discipline the caller's
+ *  terminal-drop accounting carries; both leave the span to the caller's
+ *  drop, which the flush runs on every non-parked path. */
 static bool s_retry_dgram_tx_save(duct_worker_t *w, const duct_worker_dgram_batch_entry_t *e,
-                                  duct_listener_t *listener, uint8_t *bytes)
+                                  duct_listener_t *listener)
 {
     auto conn = duct_conn_by_handle(e->handle);
     duct_do_if(!conn, return false);
     auto node = s_retry_node_take(conn);
     duct_do_if(!node, return false);
-    if (!e->hdr_len && !s_tx_pool_owns(&w->tx_pool, bytes)) {
-        node->dgram_tx.block = duct_share(e->block);
-        node->dgram_tx.bytes = (duct_view_u8){ .data = bytes, .size = e->len };
-    } else {
-        size_t total = (size_t)e->hdr_len + e->len;
-        auto copy = s_retry_copy_take(conn, total);
-        duct_do_if(!copy, s_retry_node_release(conn, node); return false);
-        if (e->hdr_len)
-            memcpy(copy, e->hdr, e->hdr_len);
-        memcpy(copy + e->hdr_len, bytes, e->len);
-        node->dgram_tx.block = copy;
-        node->dgram_tx.bytes = (duct_view_u8){ .data = copy, .size = total };
-    }
     node->kind = retry_dgram_tx;
     node->dgram_tx.handle = e->handle;
     node->dgram_tx.listener = listener;
@@ -4627,6 +4529,9 @@ static bool s_retry_dgram_tx_save(duct_worker_t *w, const duct_worker_dgram_batc
     node->dgram_tx.stream_id = e->stream_id;
     node->dgram_tx.flags = e->flags;
     node->dgram_tx.send_token = e->send_token;
+    node->dgram_tx.span = e->span;
+    node->dgram_tx.hdr_len = e->hdr_len;
+    memcpy(node->dgram_tx.hdr, e->hdr, e->hdr_len);
     s_retry_enqueue(w, node);
     ++w->dgram_parked;
     duct_rtstat_obj_inc(w, rtstats.retry_saved, 1);
@@ -4724,9 +4629,9 @@ static void s_slot_pin_node_drop(void *arg)
  *  retry fails outright. A payload inside the frame's owned copy rides a share
  *  of it and one inside its claimed RX slot is pinned by @ref s_slot_pin_heap;
  *  any other copy-mode payload is copied through @ref s_retry_emit_payload_own, a
- *  failed copy leaving it in place, valid while the handler is suspended, and
- *  a TX-pool payload is abandoned instead. The park holds the stream's
- *  inbound conn: its hold takes the emit's ticket on the routed leg.
+ *  failed copy leaving it in place, valid while the handler is suspended. The
+ *  park holds the stream's inbound conn: its hold takes the emit's ticket on
+ *  the routed leg.
  *  @p hctx->out parks as the handler left it otherwise: @ref s_commit_response
  *  skips releasing an @c fl_send_owned buffer on @c commit_internal, and an
  *  early release here leaves the deferred retry staging freed bytes.
@@ -4735,8 +4640,8 @@ static void s_slot_pin_node_drop(void *arg)
  *  the map's "1b tail 2" amendment: an emit answer is stream-owned and
  *  outlives any conn block a carrier could name.
  *
- *  @return false when the node or a TX-pool payload's copy finds no memory:
- *          ticket abandoned, owned payload released, @c rc_again through on_send_done.
+ *  @return false when the node finds no memory: ticket abandoned, owned
+ *          payload released, @c rc_again through on_send_done.
  */
 static bool s_retry_emit_save(duct_worker_t *w, duct_stream_ctx_t *hctx, uint32_t ticket)
 {
@@ -4753,9 +4658,9 @@ static bool s_retry_emit_save(duct_worker_t *w, duct_stream_ctx_t *hctx, uint32_
         hctx->out.flags = duct_or(hctx->out.flags, fl_send_owned);
     } else if (hctx->ack.kind == ack_slot)
         duct_discard s_slot_pin_heap(&hctx->out, &hctx->ack);
-    auto owned = hctx->out.payload.data ? s_retry_emit_payload_own(&hctx->out) : own_kept;
-    auto node = owned == own_failed && s_tx_pool_owns(&w->tx_pool, hctx->out.payload.data)
-              ? nullptr : s_retry_sess_node_take(s, retry_emit);
+    if (hctx->out.payload.data)
+        duct_discard s_retry_emit_payload_own(&hctx->out);
+    auto node = s_retry_sess_node_take(s, retry_emit);
     if (!node) {
         s_commit_ticket_abandon(duct_conn_by_handle(duct_session_conn_at(s, hctx->out.conn_id)),
                                 ticket, &hctx->out);
@@ -4793,11 +4698,7 @@ static bool s_retry_emit_save(duct_worker_t *w, duct_stream_ctx_t *hctx, uint32_
 static own_t s_retry_emit_payload_own(duct_response_t *out)
 {
     assert(out->payload.data);
-    /* A pooled payload copies whatever its flags say: the region's own hold
-     * ends with the pass that took it, and a parked node outlives that. */
-    bool pooled = s_this_worker
-               && s_tx_pool_owns(&s_this_worker->tx_pool, out->payload.data);
-    if (!pooled && duct_has(out->flags, duct_or(fl_send_owned, fl_send_static)))
+    if (duct_has(out->flags, duct_or(fl_send_owned, fl_send_static)))
         return own_kept;
     auto copy = duct_new(uint8_t, out->payload.size);
     duct_do_if(!copy, return own_failed);
@@ -4831,11 +4732,7 @@ static own_t s_retry_emit_payload_own(duct_response_t *out)
 static own_t s_retry_copy_own(duct_conn_t *conn, duct_response_t *out)
 {
     assert(out->payload.data);
-    /* A pooled payload copies whatever its flags say: the region's own hold
-     * ends with the pass that took it, and a parked node outlives that. */
-    bool pooled = s_this_worker
-               && s_tx_pool_owns(&s_this_worker->tx_pool, out->payload.data);
-    if (!pooled && duct_has(out->flags, duct_or(fl_send_owned, fl_send_static)))
+    if (duct_has(out->flags, duct_or(fl_send_owned, fl_send_static)))
         return own_kept;
     auto copy = s_retry_copy_take(conn, out->payload.size);
     duct_do_if(!copy, return own_failed);
@@ -5264,7 +5161,8 @@ static duct_nonnull(1) bool s_retry_drain(duct_worker_t *w)
             /* Pre-arm ahead of the reserve below; the post-write kick
              * after publish stays the race backstop. */
             duct_io_post_dgram_tx(node->dgram_tx.listener);
-            size_t parked = node->dgram_tx.bytes.size;
+            size_t parked = (size_t)node->dgram_tx.hdr_len
+                          + duct_span_len(&node->dgram_tx.span);
             duct_vmq_push_rc_t drc;
             dgram_out_t dout;
             bool staged = s_dgram_out_open(node->dgram_tx.listener, &node->dgram_tx.peer,
@@ -5293,7 +5191,10 @@ static duct_nonnull(1) bool s_retry_drain(duct_worker_t *w)
                 keep = true; /* lane still full -- next pass, wait_latch armed */
                 break;
             }
-            memcpy(dout.span.data, node->dgram_tx.bytes.data, parked);
+            if (node->dgram_tx.hdr_len)
+                memcpy(dout.span.data, node->dgram_tx.hdr, node->dgram_tx.hdr_len);
+            auto body = s_dgram_span_body(&node->dgram_tx.span);
+            memcpy(dout.span.data + node->dgram_tx.hdr_len, body.data, body.size);
             s_dgram_out_publish(&dout, parked);
             duct_rtstat_obj_inc(w, rtstats.dgram_lane_staged, 1);
             duct_io_post_dgram_tx(node->dgram_tx.listener);
@@ -5620,8 +5521,9 @@ s_worker_dgram_flush(void)
         for (uint32_t i = 0u; i < n; ++i)
             msgs[i] = (duct_dgram_out_t){
                 .peer = pass->entries[i].peer,
-                .hdr  = { .data = pass->entries[i].hdr, .size = pass->entries[i].hdr_len },
-                .body = { .data = pass->entries[i].ptr, .size = pass->entries[i].len },
+                .hdr  = { .data = pass->entries[i].hdr,
+                          .size = pass->entries[i].hdr_len },
+                .body = s_dgram_entry_body(&pass->entries[i]),
             };
         duct_x_gso_tally_t tally = {};
         resolved = duct_io_dgram_shared_send_batch(listener, msgs, n, &tally);
@@ -5646,31 +5548,29 @@ s_worker_dgram_flush(void)
         if (!ok) {
             duct_vmq_push_rc_t push_rc;
             dgram_out_t o;
-            size_t bytes = (size_t)e->hdr_len + e->len;
+            size_t bytes = (size_t)e->hdr_len + duct_span_len(&e->span);
             bool staged = !w->dgram_parked
                        && s_dgram_out_open(listener, &e->peer, bytes, &o, &push_rc);
             if (staged) {
                 if (e->hdr_len)
                     memcpy(o.span.data, e->hdr, e->hdr_len);
-                memcpy(o.span.data + e->hdr_len, e->ptr, e->len);
+                auto body = s_dgram_entry_body(e);
+                memcpy(o.span.data + e->hdr_len, body.data, body.size);
                 s_dgram_out_publish(&o, bytes);
                 duct_rtstat_obj_inc(w, rtstats.dgram_lane_staged, 1);
                 need_kick = true;
                 ok = true;
-            } else if (s_retry_dgram_tx_save(w, e, listener, e->ptr))
+            } else if (s_retry_dgram_tx_save(w, e, listener))
                 parked = true; /* send_done/on_error fire when the node resolves */
             else
                 duct_rtstat_obj_inc(w, rtstats.dgram_shared_tx_drop, 1);
         }
-        /* Every path above -- sent, lane-copied, retry-copied, terminal-
-         * dropped -- is done reading e->ptr here, so this entry's own
-         * reference on its pool region drops now. Every x_udp_shared entry
-         * carries exactly one, set in s_commit_response's x_udp_shared case,
-         * never null. */
-        if (s_tx_pool_owns(&w->tx_pool, e->ptr))
-            --e->region->refs;
-        else
-            duct_del(e->block);
+        /* Every path above — sent, lane-copied, parked-on-the-node, terminal-
+         * dropped — is done holding this entry's payload reference here,
+         * except a park, whose node took the span over. The unpin runs the
+         * §5.1 matrix, rx spans the §2.3 step. */
+        if (!parked)
+            s_dgram_entry_span_drop(e);
         if (parked)
             continue;
         auto conn = duct_conn_by_handle(e->handle);
@@ -5699,7 +5599,6 @@ s_worker_dgram_flush(void)
     /* The callbacks above invoke close, attach, timer, and rx operations,
      * which post messages without committing to this batch. */
     assert(pass->n == 0u);
-    s_tx_pool_reclaim(&w->tx_pool);
     }
 kick:
     duct_do_if(!pass, return);
@@ -5709,15 +5608,16 @@ kick:
 }
 
 #if !DUCT_EVENTS_MODEL_IOCP
-/** @brief Acquire @p need bytes from the shared TX pool, retrying once after a dgram-batch flush. */
-static void *s_dgram_acquire_or_flush(size_t need)
+/** @brief Stage @p need bytes of one whole packed datagram, retrying the
+ *  allocation once after a dgram-batch flush freed this pass's entries. */
+static void *s_dgram_stage_or_flush(size_t need)
 {
-    auto acquired = duct_tx_pool_acquire(need);
-    if (!acquired) {
+    auto staged = duct_at(duct_new(uint8_t, need));
+    if (!staged) {
         s_worker_dgram_flush();
-        acquired = duct_tx_pool_acquire(need);
+        staged = duct_at(duct_new(uint8_t, need));
     }
-    return acquired;
+    return staged;
 }
 #endif
 
@@ -5870,14 +5770,15 @@ s_commit_dgram_shared(const commit_ctx_t *ctx)
 
         duct_worker_dgram_batch_entry_t *entry;
         /* fl_wire_gather is the wire declaring it packs into a span pair, so
-         * on_pack writes its header straight into the entry and leaves the
-         * payload where its author built it; the send puts the two on the wire
-         * as one datagram. The pool term is the lifetime: only a pool region
-         * outlives this commit, held by the refs bump below until the flush
-         * resolves the entry. */
-        bool pooled = s_tx_pool_owns(&s_this_worker->tx_pool, out->payload.data);
-        bool owned = !pooled && duct_has(out->flags, fl_send_owned) && !out->release;
-        if (duct_has(conn->wire->flags, fl_wire_gather) && (pooled || owned)) {
+         * on_pack writes its header straight into the entry and the payload
+         * rides the entry's span where its author built it — §2.4's
+         * { hdr[16], duct_span_t }: the recognized substrates pin, sealed
+         * wires and foreign or sub-threshold payloads materialize (the
+         * sealed ciphertext does not exist before staging — §2.1's
+         * encrypt-destination class — and a gather target carries no
+         * encrypt destination). */
+        bool gathers = duct_has(conn->wire->flags, fl_wire_gather) && !codec;
+        if (gathers) {
             entry = &pass->entries[pass->n];
             duct_view_u8 bufs[2] = { { .data = entry->hdr } };
             auto stage = (duct_wire_tx_t){ .kind = wire_tx_gather, .gather = bufs };
@@ -5885,48 +5786,30 @@ s_commit_dgram_shared(const commit_ctx_t *ctx)
             if (prc != olb_tx_ok)
                 return s_commit_stage_result(ctx, prc);
             entry->hdr_len = (uint8_t)bufs[0].size;
-            auto region = pooled ? s_tx_pool_hdr_of(out->payload.data) : nullptr;
-            /* Contract: payload.data is exactly duct_tx_pool_acquire's own
-             * returned pointer, still held. An interior pointer lands this
-             * header read inside payload bytes -- both asserts catch that
-             * in debug. */
-            assert(!region || region->hold);
-            assert(!region || out->payload.size <= region->len);
-            if (region)
-                ++region->refs;
-            /* The entry carries the buffer refs above pinned, not the span
-             * on_pack echoed into bufs[1]: the two agree by the gather
-             * contract, and only this one is held for the send. */
-            if (region)
-                entry->region = region;
-            else
-                entry->block = duct_share(out->release_arg ? out->release_arg : out->payload.data);
-            entry->ptr = out->payload.data;
-            entry->len = (uint32_t)out->payload.size;
-        } else {
-            auto acquired = s_dgram_acquire_or_flush(need);
-            if (!acquired)
+            duct_span_t span;
+            if (!s_dgram_span_take(out, ctx->redirect, &span))
                 return s_commit_ctx_fail(ctx, rc_again, commit_internal);
-            auto view = (duct_vmq_tx_view_t){ .data = acquired, .stage = 0u, .capacity = need };
+            entry->span = span;
+        } else {
+            auto staged = s_dgram_stage_or_flush(need);
+            if (!staged)
+                return s_commit_ctx_fail(ctx, rc_again, commit_internal);
+            auto view = (duct_vmq_tx_view_t){ .data = staged, .stage = 0u, .capacity = need };
             auto stage = (duct_wire_tx_t){ .kind = wire_tx_vmq_view, .vmq_view = view };
             auto prc = s_wire_pack_into(conn->wire, s, &frame, &stage, codec);
             if (prc != olb_tx_ok) {
-                s_tx_pool_drop_hold(acquired);
+                void *held = staged;
+                duct_del(held);
                 return s_commit_stage_result(ctx, prc);
             }
-            auto region = s_tx_pool_hdr_of(acquired);
-            region->refs = 1u;
-            s_tx_pool_drop_hold(acquired);
             entry = &pass->entries[pass->n];
             entry->hdr_len = 0u;
-            entry->region = region;
-            entry->ptr = acquired;
-            entry->len = (uint32_t)stage.vmq_view.stage;
+            entry->span = duct_span_of_ptr(staged, 0u, (uint32_t)stage.vmq_view.stage);
         }
         pass->listener = listener;
         /* Each branch takes its slot past its own last chance to flush --
-         * nothing reaches the pass from on_pack, while s_dgram_acquire_or_flush
-         * empties it and renumbers from zero on an exhausted pool. */
+         * nothing reaches the pass from on_pack, while s_dgram_stage_or_flush
+         * empties it and renumbers from zero on an exhausted allocation. */
         assert(entry == &pass->entries[pass->n]);
         entry->handle = ctx->handle;
         entry->peer = dctx->peer;
@@ -6235,8 +6118,11 @@ static void s_vnet_train_flush(duct_worker_t *w)
             duct_rtstat_obj_inc(w, rtstats.vnet_tx_gro_single, 1);
     }
     for (unsigned i = 0u; i < t->gro.nspans; ++i)
-        if (t->regions[i])
-            --t->regions[i]->refs;
+        if (t->blocks[i]) {
+            void *held = t->blocks[i];
+            duct_del(held);
+            t->blocks[i] = nullptr;
+        }
 }
 
 /** @brief Flush this worker's train when it is bound for @p conn. */
@@ -6291,23 +6177,21 @@ static bool s_vnet_train_take(const duct_conn_t *conn, duct_view_u8 pkt, size_t 
         auto span = &t->gro.bufs[duct_vnet_gro_front + k];
         auto at = (const char *)span->data;
         auto home = redirect ? (const char *)redirect->ct : nullptr;
-        duct_tx_pool_hdr_t *region;
+        void *block;
         if (home && at >= home && at + span->size <= home + redirect->cap)
-            region = s_tx_pool_hdr_of(redirect->ct);
+            block = duct_share(redirect->ct);
         else {
-            void *copy = s_pool_acquire(&w->ct_pool, span->size);
+            auto copy = duct_at(duct_new(uint8_t, span->size));
             if (!copy) {
-                t->regions[k] = nullptr;
+                t->blocks[k] = nullptr;
                 s_vnet_train_flush(w);
                 return true;
             }
             memcpy(copy, span->data, span->size);
             span->data = copy;
-            region = s_tx_pool_hdr_of(copy);
-            s_tx_pool_drop_hold(copy);
+            block = copy;
         }
-        ++region->refs;
-        t->regions[k] = region;
+        t->blocks[k] = block;
         if (rc == vnet_gro_taken_last)
             s_vnet_train_flush(w);
         return true;
@@ -6433,9 +6317,6 @@ static duct_commit_rc_t s_commit_response(duct_session_t *s,
                                           redirect_t *redirect)
 {
     duct_do_if(!s->proto, return commit_closed);
-    if (duct_has(out->flags, fl_send_pool_keep) && out->payload.data && s_this_worker
-        && s_tx_pool_owns(&s_this_worker->tx_pool, out->payload.data))
-        s_tx_pool_hdr_of(out->payload.data)->keep = 1u;
     duct_commit_rc_t rc = commit_ok;
     /* Early declare: assigned once resolved below, read at cleanup's own
      * ticket bookkeeping -- several earlier guards goto cleanup before that
@@ -7256,10 +7137,6 @@ static size_t s_run_pass(duct_worker_t *w, unsigned hi_lane, unsigned norm_lane,
     s_worker_dgram_flush();
     s_vnet_train_flush(w);
     assert(!w->tx_train.frames);
-    /* Nothing wakes a retry node blocked on the pool; the pass that frees the
-     * held regions has to run on its own. */
-    if (s_tx_pool_pass_end(&w->tx_pool) && w->retry_head)
-        progress = true;
     return drained ? drained : progress;
 }
 
@@ -7276,8 +7153,8 @@ static void s_run_loop(duct_worker_t *w)
      * path and returns the real clock on its own. */
 
     /* x_udp_shared batching scratch, allocated once per worker thread
-     * lifetime. Entry bytes live in w->tx_pool; these arrays carry only entry
-     * and kick bookkeeping. */
+     * lifetime. Entry payloads ride their spans; these arrays carry only
+     * entry and kick bookkeeping. */
     auto dgram_entries = duct_at(duct_new(duct_worker_dgram_batch_entry_t, duct_async_cycle_quota));
     auto dgram_kick_listeners = duct_at(duct_new(duct_listener_t *, duct_async_cycle_quota));
     auto dgram_pass = duct_new(dgram_pass_t);

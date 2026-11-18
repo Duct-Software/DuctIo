@@ -104,7 +104,7 @@ s_tier(const char *path)
         s_base_is(path, "duct_x_slot"))
         return tier_pool;
     if (s_under(path, "src/conn/") || s_base_is(path, "duct_conn") ||
-        s_base_is(path, "duct_olb"))
+        s_base_is(path, "duct_olb") || s_base_is(path, "duct_span"))
         return tier_conn;
     if (s_under(path, "src/session/") || s_base_is(path, "duct_session") ||
         s_base_is(path, "duct_stream") || s_base_is(path, "duct_join"))

@@ -41,7 +41,6 @@ typedef enum duct_send_flags : uint8_t {
     fl_send_static   = 1u << 0,   /**< Zero-copy, immutable data. */
     fl_send_owned    = 1u << 1,   /**< Runtime takes ownership and releases the payload once staged or dropped. */
     fl_send_done     = 1u << 2,   /**< on_send_done via proto_cfg; set send_token for correlation. */
-    fl_send_pool_keep = 1u << 3,  /**< Payload is a TX-pool region, held one worker pass longer. @see duct_tx_pool_acquire */
 } duct_send_flags_t;
 
 static_assert(sizeof(duct_send_flags_t) == sizeof(uint8_t),

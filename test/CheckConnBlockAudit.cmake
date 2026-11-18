@@ -36,7 +36,12 @@
 #   - the timer ctx: folded into the timer wheel node (duct_timer_t.ctx,
 #     Step 2b) — zero heap timer allocations;
 #   - proto_state: protocol-owned heap, external forever by map §2;
-#   - the worker-owned pass/scratch arrays (not slot memory).
+#   - the worker-owned pass/scratch arrays (not slot memory);
+#   - the zero-copy descriptor carriers (Step 4, B/4-2): the dgram span
+#     taker's materialize copy and vmq_view staging block, the sealed
+#     datagram's decrypt block and the vnet train's homeless-packet copy —
+#     the TX/CT pool arenas' replacements, whole duct_new blocks every pin
+#     (share, claim, §2.3) can hold, per duct-zerocopy-payload.md §2.
 #
 # The session-path zero invariant (Step 2b): src/session/*.c names exactly the
 # pool-owned allocations — the session pool struct, the join index and the
@@ -160,10 +165,14 @@ duct_count(n_heap_hctx "duct_new\\(duct_stream_ctx_t\\)")
 duct_count(n_heap_timer_ctx "duct_new\\(timer_ctx_t\\)")
 duct_count(n_heap_pass_scratch "duct_new\\(duct_worker_dgram_batch_entry_t|duct_new\\(duct_listener_t \\*|duct_new\\(dgram_pass_t\\)|duct_new\\(vnet_train_t\\)")
 duct_count(n_heap_worker_arrays "duct_new\\(duct_worker_t, n_workers\\)|duct_new\\(pthread_t, n_workers\\)")
+duct_count(n_heap_span_copy "duct_new\\(uint8_t, len\\)")
+duct_count(n_heap_dgram_stage "duct_new\\(uint8_t, need\\)")
+duct_count(n_heap_ct_block "duct_new\\(uint8_t, room\\)")
+duct_count(n_heap_vnet_copy "duct_new\\(uint8_t, span->size\\)")
 duct_count(n_duct_new_all "duct_new\\(")
 duct_count(n_region_take "s_retry_node_take\\(")
 duct_count(n_region_drop "s_retry_node_drop\\(")
-duct_count(n_dgram_block_raw_free "duct_del\\(node->dgram_tx\\.block\\)")
+duct_count(n_dgram_block_raw_free "s_dgram_span_drop\\(&node->dgram_tx\\.span\\)")
 duct_count(n_frame_out_raw_free "duct_response_release_owned\\(&node->frame\\.out\\)")
 duct_count(n_sess_region_take "s_retry_sess_node_take\\(")
 duct_count(n_sess_region_release "s_retry_sess_node_release\\(")
@@ -196,7 +205,7 @@ if(NOT n_dgram_copy_heap EQUAL 0)
     list(APPEND violations "a packed datagram's park copy comes from the conn's TX retry copy slots (${n_dgram_copy_heap} heap copies)")
 endif()
 if(NOT n_dgram_block_raw_free EQUAL 1)
-    list(APPEND violations "every drain site frees a parked dgram's block through s_retry_dgram_block_release; the helper's own share drop is the one direct free (${n_dgram_block_raw_free} direct frees)")
+    list(APPEND violations "every drain site frees a parked dgram's span through s_retry_dgram_block_release; the helper's own span drop is the one direct drop (${n_dgram_block_raw_free} direct drops)")
 endif()
 if(NOT n_frame_out_raw_free EQUAL 1)
     list(APPEND violations "every drain site releases a parked frame's payload through s_retry_frame_out_release; the helper's own non-regional fallback is the one direct release (${n_frame_out_raw_free} direct releases)")
@@ -219,8 +228,20 @@ endif()
 if(NOT n_defer_region_take EQUAL 2)
     list(APPEND violations "the session defer admission is the one taker of the page-0 defer region (${n_defer_region_take} s_defer_region_take sites, definition included)")
 endif()
+if(NOT n_heap_span_copy EQUAL 1)
+    list(APPEND violations "the dgram span taker's materialize copy (foreign, sub-threshold or at the share ceiling) is the descriptor path's one such copy (${n_heap_span_copy} sites)")
+endif()
+if(NOT n_heap_dgram_stage EQUAL 2)
+    list(APPEND violations "the dgram vmq_view staging block takes its two shapes alone: the first allocation and the post-flush retry (${n_heap_dgram_stage} sites)")
+endif()
+if(NOT n_heap_ct_block EQUAL 1)
+    list(APPEND violations "a sealed datagram's cleartext decrypts into one duct_new block per packet (${n_heap_ct_block} sites)")
+endif()
+if(NOT n_heap_vnet_copy EQUAL 1)
+    list(APPEND violations "the vnet train's copy of a homeless packet is the train's one heap copy (${n_heap_vnet_copy} sites)")
+endif()
 math(EXPR n_whitelisted
-     "${n_heap_retry_node} + ${n_heap_emit_copy} + ${n_heap_emit_pin} + ${n_heap_claim_hold} + ${n_heap_defer_node} + ${n_heap_hctx} + ${n_heap_timer_ctx} + ${n_heap_pass_scratch} + ${n_heap_worker_arrays}")
+     "${n_heap_retry_node} + ${n_heap_emit_copy} + ${n_heap_emit_pin} + ${n_heap_claim_hold} + ${n_heap_defer_node} + ${n_heap_hctx} + ${n_heap_timer_ctx} + ${n_heap_pass_scratch} + ${n_heap_worker_arrays} + ${n_heap_span_copy} + ${n_heap_dgram_stage} + ${n_heap_ct_block} + ${n_heap_vnet_copy}")
 if(NOT n_duct_new_all EQUAL n_whitelisted)
     list(APPEND violations "duct_worker.c carries duct_new sites beyond the named allowances (${n_duct_new_all} total, ${n_whitelisted} whitelisted)")
 endif()

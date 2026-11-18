@@ -60,6 +60,12 @@ size_t duct_slot_byte_len(const void *obj)
     return duct_x_slot_cap(pool);
 }
 
+struct duct_x_slot_pool *duct_slot_pool_of(const void *obj)
+{
+    auto h = duct_block_hdr(obj);
+    return duct_atomic_load(&s_slot_pools[duct_alloc_pool_id(h)], acquire);
+}
+
 /** @brief Lower the acquire hint to word @p w when it sat higher. */
 static void s_hint_lower(duct_block_pool_t *pool, uint32_t w)
 {

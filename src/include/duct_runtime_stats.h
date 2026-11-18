@@ -65,8 +65,6 @@ typedef struct duct_worker_rt {
              dgram_tx_gso_writes, /**< Segmented writes the fast-path batch made, each
                                     *  one peer's group of equal-sized datagrams. */
              dgram_tx_gso_dgrams, /**< Datagrams those writes carried. */
-             tx_pool_acquire_fail, /**< duct_tx_pool_acquire returned NULL: the worker's
-                                      *  TX staging pool had no room for the request. */
              vnet_tx_gro_writes, /**< Segmented writes a vnet leg's train made,
                                    *  each of two or more segments. */
              vnet_tx_gro_pkts,   /**< Segments those writes carried. */

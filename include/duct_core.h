@@ -681,6 +681,15 @@ duct_nonnull(1) void duct_slot_release(void *obj);
  *  word. */
 duct_nonnull(1) size_t duct_slot_byte_len(const void *obj);
 
+/** @brief The registered slot pool @p obj names, by its header's slot word.
+ *
+ *  The claim-aware release path's lookup: a slot's lifetime authority is its
+ *  pool's claim count, which @c duct_slot_release bypasses — a holder that
+ *  must respect a claim (an rx slot a descriptor pins) resolves the pool
+ *  here and drops through the pool's own claim gate.
+ */
+duct_nonnull(1) struct duct_x_slot_pool *duct_slot_pool_of(const void *obj);
+
 /** @brief Stamp @p obj's header as slot @p slot_index of @p pool_id, one
  *  live holder.
  *  The engage step of a slot's take; the payload's bytes are the caller's

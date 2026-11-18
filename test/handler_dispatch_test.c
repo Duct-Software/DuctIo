@@ -58,6 +58,7 @@
  */
 
 #include "../src/duct_worker.c"
+#include "duct_span.h"
 
 #include "duct_io.h"
 #include "duct_listener.h"
@@ -1679,9 +1680,10 @@ static duct_result_t s_region_on_frame([[maybe_unused]] duct_session_t *s,
 }
 
 /** @brief One sealed datagram of a shared conn through s_inter_pkt: the engine
- *  names no cleartext size, so the cleartext lands in a region of the worker's
- *  ring, which the packet's end hands back. The protocol sees the datagram's
- *  bytes whole, behind the inner wire's header where @p inner is given. */
+ *  names no cleartext size, so the cleartext lands in a heap block of the
+ *  packet's own, which the packet's end hands back. The protocol sees the
+ *  datagram's bytes whole, behind the inner wire's header where @p inner is
+ *  given. */
 static void s_region_scenario(const duct_seal_engine_vtbl_t *engine, const duct_wire_t *inner)
 {
     s_region_frames = 0u;
@@ -1715,10 +1717,6 @@ static void s_region_scenario(const duct_seal_engine_vtbl_t *engine, const duct_
     assert(s_region_len == len && !memcmp(s_region_bytes, dgram, len));
     auto sc = duct_conn_sealed_ctx(f.conn);
     assert(sc->codec && !sc->codec->ct_buf);
-    auto at = (const uint8_t *)s_region_at;
-    assert(at >= f.w.ct_pool.arena && at < f.w.ct_pool.arena + duct_worker_tx_pool_cap);
-    s_tx_pool_reclaim(&f.w.ct_pool);
-    assert(f.w.ct_pool.head == f.w.ct_pool.tail);
 
     *duct_conn_dgram_ctx(f.conn) = (duct_dgram_shared_ctx_t){};
     f.conn->xport_type = x_tcp;
@@ -1726,7 +1724,7 @@ static void s_region_scenario(const duct_seal_engine_vtbl_t *engine, const duct_
     duct_wire_destroy(wire);
 }
 
-static void test_inter_pkt_decrypts_into_the_region_ring(void)
+static void test_inter_pkt_decrypts_into_a_heap_block(void)
 {
     s_reset_counters();
     s_region_scenario(&s_fake_engine_vtbl, nullptr);
@@ -1734,7 +1732,7 @@ static void test_inter_pkt_decrypts_into_the_region_ring(void)
     assert(inner);
     s_region_scenario(&s_fake_engine_c_vtbl, inner);
     duct_wire_destroy(inner);
-    printf("  inter_pkt_decrypts_into_the_region_ring OK\n");
+    printf("  inter_pkt_decrypts_into_a_heap_block OK\n");
 }
 
 static unsigned s_slots_free(duct_x_slot_pool_t *pool)
@@ -2408,10 +2406,11 @@ static void test_dgram_out_stages_into_a_send_slot(void)
 }
 
 #if !DUCT_EVENTS_MODEL_IOCP
-/** @brief An owned block answered on a shared datagram listener under a wire that
- *  gathers is sent from where it lies: the batch entry holds a share of the block
- *  until the flush resolves it, and a park for want of lane room shares it once
- *  more, an entry with no header being the datagram itself. */
+/** @brief An owned block answered on a shared datagram listener under a wire
+ *  that gathers is sent from where it lies: the batch entry's span holds a
+ *  share of the block until the flush resolves it, and a park for want of
+ *  lane room takes that same span over whole — one reference, from the entry
+ *  to the node, no second share. */
 static void test_commit_dgram_shared_holds_an_owned_block(void)
 {
     s_reset_counters();
@@ -2428,7 +2427,11 @@ static void test_commit_dgram_shared_holds_an_owned_block(void)
     dgram_pass_t pass = { .entries = entries };
     f.w.dgram_pass = &pass;
 
-    static const uint8_t src[] = "owned-datagram";
+    /* Past the span threshold, so the taker shares the block instead of
+     * copying the payload out of it. */
+    static uint8_t src[duct_tx_span_threshold + 64u];
+    for (size_t i = 0u; i < sizeof src; ++i)
+        src[i] = (uint8_t)(i * 7u + 1u);
     auto block = duct_at(duct_new(uint8_t, sizeof src + 4u));
     assert(block);
     memcpy(block + 4, src, sizeof src);
@@ -2443,23 +2446,31 @@ static void test_commit_dgram_shared_holds_an_owned_block(void)
     assert(s_commit_dgram_shared(&ctx) == commit_ok);
     assert(pass.n == 1u && pass.listener == &lst);
     auto e = &pass.entries[0];
-    assert(e->ptr == (const uint8_t *)(block + 4) && e->block == block);
-    assert(e->len == sizeof src && !e->hdr_len);
+    assert(!e->hdr_len);
+    assert(duct_span_kind_of(&e->span) == span_ptr
+           && duct_span_base(&e->span) == block
+           && duct_span_off(&e->span) == 4u
+           && duct_span_len(&e->span) == sizeof src);
     assert(s_block_holders(block) == 2u);
     duct_response_release_owned(&out);
     assert(s_block_holders(block) == 1u);
 
-    bool parked = s_retry_dgram_tx_save(&f.w, e, &lst, e->ptr);
+    bool parked = s_retry_dgram_tx_save(&f.w, e, &lst);
     assert(parked);
     auto node = f.w.retry_head;
-    assert(node && node->kind == retry_dgram_tx && node->dgram_tx.block == block);
-    assert(node->dgram_tx.bytes.data == (void *)e->ptr && node->dgram_tx.bytes.size == sizeof src);
-    assert(s_block_holders(block) == 2u);
-    duct_del(e->block);
+    assert(node && node->kind == retry_dgram_tx);
+    assert(node->dgram_tx.span.tagged_base == e->span.tagged_base
+           && node->dgram_tx.span.off == e->span.off
+           && node->dgram_tx.span.len == e->span.len);
+    /* The park took the entry's reference over, not a second one. */
     assert(s_block_holders(block) == 1u);
-    assert(!memcmp(node->dgram_tx.bytes.data, src, sizeof src));
+    auto body = s_dgram_span_body(&node->dgram_tx.span);
+    assert(body.data == (void *)(block + 4) && body.size == sizeof src);
+    assert(!memcmp(body.data, src, sizeof src));
 
     s_retry_dgram_block_release(node);
+    /* The release above dropped the last holder: the block is freed, nothing
+     * of it may be read from here. */
     s_retry_node_drop(node);
     f.w.retry_head = nullptr;
     f.w.retry_tail = nullptr;
@@ -3073,6 +3084,186 @@ static void test_rx_latch_edge_posts_once_per_latch(void)
     printf("  rx_latch_edge_posts_once_per_latch OK\n");
 }
 
+/** @brief §2.3 (duct-zerocopy §5.1 span_rx): the pinned span holds the
+ *  block. A conn whose rx spans ride descriptors anywhere keeps one unit of
+ *  conn->refs per 0 → 1 pin edge — through the close claim and every other
+ *  release the lifecycle takes, the slot never reaches the free bitmap, and
+ *  the last pin's drop releases that unit last, which is what frees. */
+static void test_span_pin_holds_block_across_close(void)
+{
+    duct_conn_pool_reclaim();
+    unsigned free_before = duct_conns_free();
+
+    /* The relay window: a pinned conn survives the close claim and the io
+     * unit's release, and the last unpin frees. */
+    auto conn = duct_conn_acquire();
+    assert(conn);
+    conn->xport_type = x_tcp;
+    duct_conn_carve_olb(conn, s_olb_cap, s_olb_cap);
+    auto handle = duct_conn_handle_get(conn);
+    auto rx = duct_conn_rx_olb(conn);
+
+    duct_span_rx_pin(conn, rx);
+    assert(duct_atomic_load(&rx->pins, relaxed) == 1u);
+    duct_span_rx_pin(conn, rx);
+    assert(duct_atomic_load(&rx->pins, relaxed) == 2u);
+
+    duct_conn_phase_t pre;
+    assert(duct_conn_close_claim(conn, &pre) && pre == conn_unbound);
+    duct_conn_release(conn); /* io unit; the two pin units stand */
+    assert(duct_conn_by_handle(handle));
+    assert(duct_conns_free() == free_before - 1u);
+
+    duct_span_rx_unpin(conn, rx);
+    assert(duct_atomic_load(&rx->pins, relaxed) == 1u);
+    assert(duct_conn_by_handle(handle));
+    assert(duct_conns_free() == free_before - 1u);
+
+    duct_span_rx_unpin(conn, rx); /* the last: release last, block frees */
+    assert(duct_conns_free() == free_before);
+    assert(!duct_conn_by_handle(handle));
+
+    /* The unbound fast path holds the same: pins taken, every unit the
+     * lifecycle holds released, the block stays out of the bitmap until the
+     * last pin drops. */
+    conn = duct_conn_acquire();
+    assert(conn);
+    conn->xport_type = x_tcp;
+    duct_conn_carve_olb(conn, s_olb_cap, s_olb_cap);
+    rx = duct_conn_rx_olb(conn);
+    duct_span_rx_pin(conn, rx);
+    duct_conn_release(conn);
+    assert(duct_conns_free() == free_before - 1u);
+    duct_span_rx_unpin(conn, rx);
+    assert(duct_conns_free() == free_before);
+
+    printf("  span_pin_holds_block_across_close OK\n");
+}
+
+/** @brief §2.3 level check: the 1 → 0 pin drop re-checks the armed resume
+ *  target by level and posts the read exactly when the ack edge is already
+ *  past — the window the worker's crossing post cannot cover, since the
+ *  acks may all be in while the pin still holds the wrap window. An
+ *  unarmed word never posts: outside a pause R == 0, so a pin drop is
+ *  never a spurious wake. */
+static void test_span_pin_unpin_level_check_wake(void)
+{
+    duct_conn_pool_reclaim();
+    auto wfq = duct_wfq_new(1u, 1u, DUCT_WFQ_CAP_HI, DUCT_WFQ_CAP_NORM,
+                            DUCT_WFQ_CAP_LO);
+    assert(wfq);
+    /* Threads up and joined at once, rx_latch-style: the io module stands
+     * alive so the level-check post lands in the gen_req word for real. */
+    assert(duct_io_init(1u, wfq, 1u));
+    assert(duct_io_start_threads());
+    duct_io_request_shutdown();
+    duct_io_join();
+
+    fprintf(stderr, "[dbg] io up\n");
+    auto conn = duct_conn_acquire();
+    assert(conn);
+    conn->xport_type = x_tcp;
+    duct_conn_carve_olb(conn, s_olb_cap, s_olb_cap);
+    conn->io_id = 0u;
+    auto word = duct_conn_gen_req(conn);
+    auto rx = duct_conn_rx_olb(conn);
+    uint64_t req_bit = (uint64_t)fl_req_rx_resume;
+
+    /* Acks already past the armed target: the drop posts. */
+    duct_atomic_store(&rx->acked, 150u, release);
+    duct_atomic_store(&rx->resume_at, 100u, release);
+    duct_span_rx_pin(conn, rx);
+    duct_span_rx_unpin(conn, rx);
+    assert(duct_atomic_load(word, relaxed) & req_bit);
+    assert(duct_atomic_load(&rx->pins, relaxed) == 0u);
+
+    /* Acks still short of the armed target: the drop posts nothing — the
+     * worker's later crossing ack is the post that carries this latch.
+     * A fresh conn: the first conn's posted node still sits its trunk
+     * stack, and a second post of it double-links the embedded node. */
+    conn = duct_conn_acquire();
+    assert(conn);
+    conn->xport_type = x_tcp;
+    duct_conn_carve_olb(conn, s_olb_cap, s_olb_cap);
+    conn->io_id = 0u;
+    word = duct_conn_gen_req(conn);
+    rx = duct_conn_rx_olb(conn);
+    duct_atomic_store(&rx->acked, 150u, release);
+    duct_atomic_store(&rx->resume_at, 300u, release);
+    duct_span_rx_pin(conn, rx);
+    duct_span_rx_unpin(conn, rx);
+    assert(!(duct_atomic_load(word, relaxed) & req_bit));
+    s_rx_ack(conn, 200u, s_dispatch_frontier_skip); /* 150 -> 350 crosses 300 */
+    assert(duct_atomic_load(word, relaxed) & req_bit);
+
+    /* Unarmed: a drop never posts spuriously. */
+    conn = duct_conn_acquire();
+    assert(conn);
+    conn->xport_type = x_tcp;
+    duct_conn_carve_olb(conn, s_olb_cap, s_olb_cap);
+    conn->io_id = 0u;
+    word = duct_conn_gen_req(conn);
+    rx = duct_conn_rx_olb(conn);
+    duct_atomic_store(&rx->resume_at, 0u, relaxed);
+    duct_span_rx_pin(conn, rx);
+    duct_span_rx_unpin(conn, rx);
+    assert(!(duct_atomic_load(word, relaxed) & req_bit));
+
+    duct_conn_release(conn);
+    duct_io_cleanup();
+    duct_vmq_mpsc_del(wfq);
+    printf("  span_pin_unpin_level_check_wake OK\n");
+}
+
+/** @brief §2.3 wrap gate: a live pin holds the ring's wrap/read window, not
+ *  the ack cursor — acked advances with the frames as normal, and the
+ *  second pass, the compaction and the done-count all wait on the count,
+ *  the resume target arming at the posted drain until the last drop. */
+static void test_span_pin_gates_wrap_and_compaction(void)
+{
+    duct_conn_pool_reclaim();
+    auto conn = duct_conn_acquire();
+    assert(conn);
+    conn->xport_type = x_udp_peer;
+    duct_conn_carve_olb(conn, s_olb_cap, s_olb_cap);
+    auto rx = duct_conn_rx_olb(conn);
+
+    /* One full pass, every posted byte acked, frontier at posted_off: only
+     * the pin holds the window. */
+    rx->posted_off = (uint32_t)s_olb_cap;
+    rx->h.stage = s_olb_cap;
+    duct_atomic_store(&rx->h.tail, s_olb_cap, release);
+    duct_atomic_store(&rx->acked, s_olb_cap, release);
+    duct_atomic_store(&rx->dispatch_frontier, (uint32_t)s_olb_cap, release);
+
+    size_t done = 0u;
+    /* Without a pin the pass folds: the pin, not the ack state, is the
+     * only thing holding the window. */
+    assert(duct_olb_rx_done(rx, &done) && done == s_olb_cap);
+    assert(duct_olb_rx_consumed(rx));
+
+    duct_span_rx_pin(conn, rx);
+    assert(!duct_olb_rx_done(rx, &done));
+    assert(!duct_olb_rx_consumed(rx));
+    /* The wrap form arms at the posted drain: no ack edge is left to cross,
+     * the last pin's level check is the wake. */
+    assert(duct_olb_rx_resume_total(rx, 64u, true)
+           == duct_olb_rx_posted_total(rx));
+    uint8_t *ptr = nullptr;
+    size_t avail = 0u;
+    assert(duct_olb_rx_try_space(rx, 64u, true, &ptr, &avail) == olb_rx_full);
+
+    duct_span_rx_unpin(conn, rx);
+    assert(duct_olb_rx_done(rx, &done) && done == s_olb_cap);
+    assert(duct_olb_rx_consumed(rx));
+    assert(duct_olb_rx_resume_total(rx, 64u, true) < duct_olb_rx_posted_total(rx));
+    assert(duct_olb_rx_try_space(rx, 64u, true, &ptr, &avail) == olb_rx_compacted);
+    assert(avail == s_olb_cap);
+
+    duct_conn_release(conn);
+    printf("  span_pin_gates_wrap_and_compaction OK\n");
+}
+
 /** @brief §6 tx latch: the wait target is the exact flip point of the room
  *  condition that refused, monotonic in the packed-head coordinate and
  *  clamped past the observed head — and the arm itself parks a value no
@@ -3266,7 +3457,7 @@ static void test_engine_egress_park_is_bounded_and_ordered(void)
     assert(f.conn->seal.codec);
     auto codec = f.conn->seal.codec;
     size_t budget = codec->engine->vtbl->engine_hs_budget,
-           cap = s_engine_park_cap(f.conn, codec);
+           cap = 2u * s_hs_need(f.conn, codec);
     auto tx = duct_conn_tx_olb(f.conn);
     size_t room = duct_olb_tx_space(tx);
     char *fill = duct_at(duct_new(char, room));
@@ -3396,7 +3587,7 @@ int main(void)
     test_tls_ensure_started_creates_codec_and_starts_once();
     test_retry_frame_save_copies_ct_buf_and_frees_orphan();
     test_ct_pin_blocks_compaction_and_outlives_codec();
-    test_inter_pkt_decrypts_into_the_region_ring();
+    test_inter_pkt_decrypts_into_a_heap_block();
     test_inter_pkt_claim_pins_the_rx_slot();
     test_retry_frame_save_pins_the_rx_slot();
     test_retry_emit_save_pins_the_handler_slot();
@@ -3422,6 +3613,9 @@ int main(void)
     test_unbound_defer_window_closes_with_close_post();
     test_pin_cas_against_gen_bump();
     test_value_latch_crossing_edges();
+    test_span_pin_holds_block_across_close();
+    test_span_pin_unpin_level_check_wake();
+    test_span_pin_gates_wrap_and_compaction();
     test_rx_latch_edge_posts_once_per_latch();
     test_tx_wait_target_forms();
     test_worker_frees_rings_vs_io_completion();

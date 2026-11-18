@@ -1316,33 +1316,6 @@ target_compile_features(ductio_xopening_test PRIVATE c_std_23)
 add_test(NAME xopening COMMAND ductio_xopening_test)
 set_tests_properties(xopening PROPERTIES TIMEOUT 10)
 
-# tx_pool_test includes ../src/duct_worker.c directly too (same reason and
-# exclusion as handler_dispatch_test above).
-add_executable(ductio_tx_pool_test
-    tx_pool_test.c
-    ${DUCTIO_SRC_DISPATCH}
-    ${DUCTIO_SRC_OS}
-)
-duct_platform_configure(ductio_tx_pool_test)
-if(DUCT_WITH_OPENSSL OR DUCT_WITH_NOISE)
-    target_link_libraries(ductio_tx_pool_test PRIVATE OpenSSL::SSL OpenSSL::Crypto)
-endif()
-target_include_directories(ductio_tx_pool_test PRIVATE
-    "${PROJECT_SOURCE_DIR}/include"
-    "${DUCT_GENERATED_INCLUDE_DIR}"
-    ${DUCT_INTERNAL_INCLUDE_DIRS}
-)
-target_compile_features(ductio_tx_pool_test PRIVATE c_std_23)
-target_compile_options(ductio_tx_pool_test PRIVATE
-    -Wall -Wextra -Wenum-conversion -Wformat=2
-)
-if(DUCT_ENABLE_RUNTIME_STATS)
-    target_compile_definitions(ductio_tx_pool_test PRIVATE DUCT_RUNTIME_STATS=1)
-else()
-    target_compile_definitions(ductio_tx_pool_test PRIVATE DUCT_RUNTIME_STATS=0)
-endif()
-add_test(NAME tx_pool COMMAND ductio_tx_pool_test)
-
 # vnet_train_test includes ../src/duct_worker.c directly too, and drives a seqpacket
 # socketpair in the tun's place, which only Linux has.
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
@@ -1430,7 +1403,6 @@ set_tests_properties(peer_disconnect      PROPERTIES TIMEOUT 10)
 set_tests_properties(defer_stream         PROPERTIES TIMEOUT 10)
 set_tests_properties(handler_dispatch     PROPERTIES TIMEOUT 10)
 set_tests_properties(retry_drain_quota    PROPERTIES TIMEOUT 10)
-set_tests_properties(tx_pool              PROPERTIES TIMEOUT 10)
 set_tests_properties(tx_full_batch        PROPERTIES TIMEOUT 30)
 set_tests_properties(tx_full_once         PROPERTIES TIMEOUT 60)
 set_tests_properties(owned_retry          PROPERTIES TIMEOUT 30)

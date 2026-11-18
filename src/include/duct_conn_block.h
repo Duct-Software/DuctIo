@@ -51,8 +51,9 @@ typedef struct duct_block_pool duct_block_pool_t;
 
 static_assert(sizeof(duct_msg_conn_req) == 32u,
               "the gen word and the request node take their forty bytes of page 0");
-static_assert(sizeof(duct_olb_rx_t) == 6u * duct_cacheline_size,
-              "the rx header is the common three lines plus three of its own");
+static_assert(sizeof(duct_olb_rx_t) == 7u * duct_cacheline_size,
+              "the rx header is the common three lines, its own staging and"
+              " ack lines, and the span-pin line C of duct-zerocopy §2.3");
 static_assert(sizeof(duct_olb_tx_t) == 5u * duct_cacheline_size,
               "the tx header is the common three lines plus two of its own");
 

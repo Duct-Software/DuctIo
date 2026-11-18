@@ -28,7 +28,6 @@
 #include "duct_wire.h"
 #include "duct_protocol.h"
 #include "duct_stream.h"
-#include "duct_tx_pool.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -665,10 +664,6 @@ typedef struct duct_rt_stats {
                                             toward its producer, and what a
                                             shared datagram listener discards
                                             is reported as dgram_shared_rx_drop. */
-             tx_pool_acquire_fail,    /**< duct_tx_pool_acquire calls that returned NULL,
-                                            all workers: genuine TX staging saturation --
-                                            regions are being held or referenced faster
-                                            than sends resolve them. */
              tcp_writes,              /**< x_tcp writes: worker direct sends and
                                             io drain writes, all workers and io
                                             threads. */
@@ -707,7 +702,7 @@ typedef struct duct_rt_stats {
     apply(vnet_rx_tso_reads) apply(vnet_rx_tso_pkts) apply(vnet_rx_drop) apply(vnet_tx_gro_writes) \
     apply(vnet_tx_gro_pkts) apply(vnet_tx_drop) apply(vnet_tx_gro_single)                          \
     apply(tx_train_flush_full) apply(tx_train_flush_end) apply(tx_train_flush_wait)                \
-    apply(inter_held) apply(tx_pool_acquire_fail) apply(tcp_writes) apply(tcp_eor_writes)          \
+    apply(inter_held) apply(tcp_writes) apply(tcp_eor_writes)          \
     apply(tcp_cut_writes) apply(tcp_lowat_reads) apply(tcp_lowat_sets) apply(tcp_rcvbuf_reads)     \
     apply(tcp_rcvbuf_sets)
 

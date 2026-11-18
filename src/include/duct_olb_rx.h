@@ -209,6 +209,25 @@ duct_olb_decl(duct_olb_rx,
          */
         duct_tx_hold_t tx_hold;
     );
+
+    duct_cacheline_struct(
+        /** @brief Live rx-span references riding TX descriptors of any leg
+         *  (duct_span_t, §2.3): the worker raises one strictly before the
+         *  descriptor is published into a foreign leg's ring — the 0 → 1
+         *  edge taking a unit of the conn's release count — and any thread
+         *  drops one at delivery; the 1 → 0 edge re-checks @c resume_at by
+         *  level, posts the read, and releases last. On its own line, off
+         *  the worker's ack line: a foreign io thread's fetch_sub here must
+         *  not invalidate the worker's hottest line, and the worker's ack
+         *  stores must not invalidate theirs.
+         *
+         *  While nonzero, no compaction runs and no second pass opens: a
+         *  pinned span holds the ring's wrap/read window (@c pass_free),
+         *  never the ack cursor — @c acked advances with the frames as
+         *  normal, and the block reuse the pins gate is the free bitmap's,
+         *  through the refs unit, not any scan's. */
+        uint32_t _Atomic pins;
+    );
 );
 
 static_assert(offsetof(duct_olb_rx_t, acked) % duct_cacheline_size == 0u,
@@ -325,12 +344,14 @@ duct_olb_rx_posted_total(const duct_olb_rx_t *rx)
 }
 
 /** @brief Tell whether the worker is done with every posted frame.
- *  Folds the worker's acks into @c head first, then needs all three: every
+ *  Folds the worker's acks into @c head first, then needs all four: every
  *  posted byte acked; no @c held_frames pin, which @c s_hctx_rx_ack_only
- *  keeps past its ack; and @c dispatch_frontier at @c posted_off less the
- *  bytes @c skip counts, a frontier a handler reading its frame across yields
- *  holds back until it is done. Compaction moves or reuses posted bytes only
- *  then.
+ *  keeps past its ack; no live @c pins span, which may ride TX descriptors
+ *  of any leg well past the ack — its bytes are exactly the ones compaction
+ *  would move or a new pass would overwrite; and @c dispatch_frontier at
+ *  @c posted_off less the bytes @c skip counts, a frontier a handler
+ *  reading its frame across yields holds back until it is done. Compaction
+ *  moves or reuses posted bytes only then.
  */
 duct_nonnull(1) static inline bool
 duct_olb_rx_consumed(duct_olb_rx_t *rx)
@@ -338,6 +359,7 @@ duct_olb_rx_consumed(duct_olb_rx_t *rx)
     duct_discard duct_olb_rx_ack_apply(rx);
     return duct_atomic_load(&rx->h.head, relaxed) >= duct_olb_rx_posted_total(rx)
         && duct_atomic_load(&rx->held_frames, acquire) == 0u
+        && duct_atomic_load(&rx->pins, acquire) == 0u
         && (size_t)duct_atomic_load(&rx->dispatch_frontier, acquire) + rx->skip >= rx->posted_off;
 }
 
@@ -346,7 +368,9 @@ duct_olb_rx_consumed(duct_olb_rx_t *rx)
  *  The count is of acked bytes, at most the buffer offset it reaches: bytes a
  *  discard skipped behind that point leave it short.
  *  @return false while a held frame pins bytes the ack total already covers,
- *          since acks then stop mapping onto the front of the pass. On true,
+ *          and while a live @c pins span holds the older pass — the wrap/
+ *          read window it governs is the second pass's footprint — since
+ *          acks then stop mapping onto the front of the pass. On true,
  *          the second pass takes over once the count passes the end of the
  *          older one, and @p out_done counts from its start.
  */
@@ -355,7 +379,8 @@ duct_olb_rx_done(duct_olb_rx_t *rx, size_t *out_done)
 {
     duct_discard duct_olb_rx_ack_apply(rx);
     uint64_t head = duct_atomic_load(&rx->h.head, relaxed);
-    if (duct_atomic_load(&rx->held_frames, acquire) != 0u)
+    if (duct_atomic_load(&rx->held_frames, acquire) != 0u
+        || duct_atomic_load(&rx->pins, acquire) != 0u)
         return false;
     uint64_t done = head - rx->pass_base;
     if (rx->pass_end && done >= rx->pass_end) {
@@ -384,14 +409,17 @@ duct_olb_rx_room(const duct_olb_rx_t *rx)
  *  released, and the worker down to one read of backlog, so the worker stays
  *  fed through the resume and each resume brings room for more than one
  *  read. The full drain, every posted byte acked, is the target without
- *  @p restart, with a coalesced tail pending, a frame held, or unposted bytes
- *  in a single pass, and caps the target otherwise.
+ *  @p restart, with a coalesced tail pending, a frame held, a live span pin
+ *  holding the wrap window (§2.3: the last pin's level check is the wake,
+ *  no ack edge is left to cross), or unposted bytes in a single pass, and
+ *  caps the target otherwise.
  */
 duct_nonnull(1) static inline uint64_t
 duct_olb_rx_resume_total(const duct_olb_rx_t *rx, size_t min_avail, bool restart)
 {
     uint64_t posted = duct_olb_rx_posted_total(rx);
     if (!restart || rx->group_bytes || duct_atomic_load(&rx->held_frames, relaxed)
+        || duct_atomic_load(&rx->pins, relaxed)
         || (!rx->pass_end && rx->h.stage != rx->posted_off))
         return posted;
     uint64_t at = rx->pass_base + (rx->pass_end

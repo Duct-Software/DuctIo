@@ -747,7 +747,6 @@ bool duct_engine_stats(duct_engine_t *e, duct_rt_stats_t *out)
         out->dgram_lane_staged    += duct_atomic_load(&st->dgram_lane_staged, relaxed);
         out->dgram_tx_gso_writes  += duct_atomic_load(&st->dgram_tx_gso_writes, relaxed);
         out->dgram_tx_gso_dgrams  += duct_atomic_load(&st->dgram_tx_gso_dgrams, relaxed);
-        out->tx_pool_acquire_fail += duct_atomic_load(&st->tx_pool_acquire_fail, relaxed);
         out->inter_held           += duct_atomic_load(&st->inter_held, relaxed);
         out->vnet_tx_gro_writes   += duct_atomic_load(&st->vnet_tx_gro_writes, relaxed);
         out->vnet_tx_gro_pkts     += duct_atomic_load(&st->vnet_tx_gro_pkts, relaxed);
@@ -864,11 +863,10 @@ void duct_engine_stats_print(duct_engine_t *e, FILE *out, const char *tag)
             st.defer_oom_drop, st.vnet_rx_drop, st.vnet_tx_drop);
     duct_log(out,
             "%s: backpressure commit_internal=%" PRIu64 " retry_saved=%" PRIu64
-            " wfq_full=%" PRIu64 " tx_pool_fail=%" PRIu64
-            " inter_held=%" PRIu64 " rx_stall=%" PRIu64 "/%" PRIu64,
+            " wfq_full=%" PRIu64 " inter_held=%" PRIu64
+            " rx_stall=%" PRIu64 "/%" PRIu64,
             tag, st.commit_internal, st.retry_saved, st.wfq_push_full,
-            st.tx_pool_acquire_fail, st.inter_held,
-            st.rx_full_latch, st.rx_resume_post);
+            st.inter_held, st.rx_full_latch, st.rx_resume_post);
 }
 
 /** Section name for engine-level runtime counters. */

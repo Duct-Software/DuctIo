@@ -2869,6 +2869,13 @@ static void s_rx_start(duct_conn_t *conn)
  *  read, or this side sees the ack already past the target and disarms at
  *  once — an armed word always names a target strictly ahead of @c acked,
  *  which is what makes the worker's edge post exact.
+ *
+ *  A live span pin is the one disarm exception (§2.3): the wrap form's
+ *  target is the posted drain, the acks may all be in while the pin still
+ *  holds the wrap window, and past this disarm nothing ack-side can wake
+ *  the parked read — the last pin's 1 → 0 drop re-checks the target by
+ *  level and posts, so the word stays armed for it while @c pins is
+ *  nonzero.
  */
 static void s_rx_latch([[maybe_unused]] duct_io_t *t, duct_conn_t *conn,
                        size_t min_avail, bool restart)
@@ -2877,7 +2884,8 @@ static void s_rx_latch([[maybe_unused]] duct_io_t *t, duct_conn_t *conn,
     uint64_t target = duct_olb_rx_resume_total(rx, min_avail, restart);
     duct_atomic_store(&rx->resume_at, target, release);
     atomic_thread_fence(memory_order_seq_cst);
-    if (duct_atomic_load(&rx->acked, acquire) >= target)
+    if (duct_atomic_load(&rx->acked, acquire) >= target
+        && duct_atomic_load(&rx->pins, relaxed) == 0u)
         duct_atomic_store(&rx->resume_at, 0u, relaxed);
     duct_rtstat_obj_inc(t, rtstats.rx_full_latch, 1);
 }
