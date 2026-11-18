@@ -10,7 +10,6 @@
 #include "duct_bits.h"
 #include "duct_conn.h"
 #include "duct_conn_block.h"
-#include "duct_conn_fence.h"
 #include "duct_dgram_rec.h"
 #include "duct_olb_rx.h"
 #include "duct_relay.h"
@@ -506,8 +505,8 @@ void duct_frame_rx_post(const duct_wfq_route_t *route, duct_frame_rx_ctx_t *ctx,
         return;
     /* Quiesced: no new frames past this
      * point. The worker's conn-lost consume sees every frame published before
-     * the fence, so this guard cannot drop input the fence promised to deliver. */
-    if (duct_atomic_load(&conn->conn_fence, acquire) >= fence_quiescing)
+     * the quiesce, so this guard cannot drop input the close promised to deliver. */
+    if (duct_conn_phase(conn) >= conn_quiesced)
         return;
 
     auto handle = duct_conn_handle_get(conn);
@@ -540,7 +539,7 @@ void duct_frame_rx_post(const duct_wfq_route_t *route, duct_frame_rx_ctx_t *ctx,
 void duct_frame_rx_end(const duct_wfq_route_t *route, duct_frame_rx_ctx_t *ctx, duct_conn_t *conn)
 {
     if (!duct_has(duct_conn_state(conn), fl_conn_rx_eof)
-        || duct_atomic_load(&conn->conn_fence, acquire) >= fence_quiescing)
+        || duct_conn_phase(conn) >= conn_quiesced)
         return;
     auto handle = duct_conn_handle_get(conn);
     if (ctx->retry_q.head && s_retry_find(ctx, handle))

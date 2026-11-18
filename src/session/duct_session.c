@@ -14,7 +14,6 @@
 #include "duct_conn_block.h"
 #include "duct_dgram_rec.h"
 #include "duct_relay.h"
-#include "duct_worker.h"
 #include "duct_protocol.h"
 #include "duct_stream_ctx.h"
 #include "duct_hash.h"
@@ -65,18 +64,18 @@ void duct_session_close_walk(duct_session_t *s, duct_close_reason_t reason)
 /** @brief Pre-open retire.
  *
  *  No session was ever (or is still) bound to @p conn — DOA close, join
- *  rejection before bind, or a bind race lost to I/O. Quiesces (idempotent
- *  if I/O already won that CAS), then asks the owning I/O thread to retire
- *  the conn once no further access remains, which is one posted request bit.
+ *  rejection before bind, or a bind race lost to I/O. Posts the owning I/O
+ *  thread a close request: its dispatch claims the phase CAS, runs both
+ *  teardown halves and drops the io unit of @c conn->refs, so the slot
+ *  returns once this ctrl's own release drains the rest. Idempotent when
+ *  I/O already closed the conn — the close claim there simply loses.
  *  No @c conn_lost is ever posted for an unbound conn.
  */
 static void s_worker_retire_pre_open(duct_conn_t *conn)
 {
     auto ch = duct_conn_handle_get(conn);
     duct_worker_conn_defer_discard(&ch);
-    duct_discard duct_conn_fence_quiesce(conn);
-    if (duct_conn_fence_confirm_retire(conn))
-        duct_io_retire_request(&ch);
+    duct_io_post_close_request(&ch, close_normal);
 }
 
 void duct_session_dial_lost(const duct_proto_cfg_t *cfg, void *user_ctx, duct_result_t rc)
@@ -113,15 +112,18 @@ static bool s_conn_start(duct_session_t *s, duct_conn_t *conn, duct_seal_prefix_
 }
 
 /** @brief Resolve @p handle to its conn while no session has bound it.
- *  A stale handle answers nullptr, and so does a conn io quiesced first, which
- *  is retired here: no session is prepared for it and no author callback runs. */
+ *  A stale handle answers nullptr, and so does a conn io quiesced first: no
+ *  session is prepared for it and no author callback runs — the io unit of
+ *  its refs already drained at the quiesce, so dropping this ctrl's own
+ *  unit here is what returns the slot. */
 static duct_conn_t *s_unbound_conn(duct_conn_handle_t handle)
 {
     auto conn = duct_conn_by_handle(handle);
     duct_do_if(!conn, return nullptr);
-    if (duct_atomic_load(&conn->conn_fence, acquire) == fence_unbound)
+    if (duct_conn_phase(conn) == conn_unbound)
         return conn;
     s_worker_retire_pre_open(conn);
+    duct_conn_release(conn);
     return nullptr;
 }
 
@@ -201,6 +203,7 @@ fail_release:
     duct_session_release(s);
 fail_retire:
     s_worker_retire_pre_open(conn);
+    duct_conn_release(conn);
     if (msg->dialed)
         duct_session_dial_lost(cfg, msg->user_ctx, rc);
     return duct_msg_done(msg);
@@ -217,6 +220,7 @@ duct_exec_rc_t duct_session_exec_conn_join(void *self)
         /* Stale/closing token or occupied slot: no leg was ever prepared for
          * this conn. */
         s_worker_retire_pre_open(conn);
+        duct_conn_release(conn);
         return duct_msg_done(msg);
     }
     auto cfg = s->proto ? duct_proto_cfg_of(s->proto) : nullptr;
@@ -236,12 +240,14 @@ duct_exec_rc_t duct_session_exec_conn_join(void *self)
     }
     if (duct_session_attach_conn(s, msg->conn_id, msg->conn) != rc_ok) {
         s_worker_retire_pre_open(conn);
+        duct_conn_release(conn);
         return duct_msg_done(msg);
     }
     auto tok = duct_session_handle_from_live(s);
     if (!duct_conn_session_bind(conn, tok.word)) {
         duct_discard duct_session_detach_leg(s, msg->conn_id, close_internal_error);
         s_worker_retire_pre_open(conn);
+        duct_conn_release(conn);
         return duct_msg_done(msg);
     }
     if (!s_conn_start(s, conn, &msg->tx_prefix)) {
@@ -311,35 +317,40 @@ duct_exec_rc_t duct_session_exec_conn_lost(void *self)
         /* else: s_refuse_leg detached the leg ahead of this fence, which finds
          * no leg of the conn left. */
     }
-    /* Every parked output naming this leg lets go of it ahead of the retire
-     * confirm: past it io frees the leg's rings while its handle still
-     * resolves, until the slot is reclaimed. */
+    /* Every parked output naming this leg lets go of it ahead of the
+     * physical teardown: past it the worker frees the leg's rings while its
+     * handle still resolves, until the release drains the last unit. */
     duct_worker_conn_retry_discard(&msg->conn);
     /* Sealed-wire codec, if any. A handler or answer still pinning its cleartext
      * buffer keeps the buffer alive past this destroy. */
     duct_conn_sealed_codec_detach(conn);
-    duct_conn_session_unbind(conn);
-    /* Every train bound for this conn is gone before the confirm: past it io
-     * reclaims the slot, and a later flush lands on its next occupant. */
+    duct_atomic_store(&conn->session_token, handle_null, release);
+    /* Every train bound for this conn is gone before the teardown half:
+     * past it a later flush lands on its next occupant. */
     duct_worker_conn_train_flush(&msg->conn);
-    if (duct_conn_fence_confirm_retire(conn))
-        duct_io_retire_request(&msg->conn);
+    duct_conn_teardown_worker(conn);
+    if (conn->xport_type == x_inter && duct_conn_device_ops(conn))
+        duct_io_conn_device_release_post(conn);
+    else
+        duct_conn_teardown_ctx(conn);
+    duct_conn_phase_move(conn, conn_lost_posted, conn_retire_done);
+    duct_conn_release(conn);
     return exec_done;
 }
 
-/** @brief Post @p msg to @p conn's worker, the conn flagged as holding a ctrl
- *  message in flight.
+/** @brief Post @p msg to @p conn's worker, one unit of @c conn->refs taken
+ *  for the in-flight ctrl.
  *  Callers pass @c duct_msg_ctrl_root of the message, which checks its type.
- *  @return false when no worker takes it; the flag is cleared and @p msg freed. */
+ *  The unit converts into the bound worker's own at a winning bind, and
+ *  drops with the handler's exit on every path that leaves the conn
+ *  unbound.
+ *  @return false when no worker takes it; the unit is dropped and @p msg freed. */
 static bool s_post_ctrl(duct_conn_t *conn, duct_msg_t *msg)
 {
-    duct_conn_state_set(conn, fl_conn_in_wfq);
+    duct_conn_ref_take(conn);
     if (duct_worker_post_ctrl_msg(conn->worker_id, msg))
         return true;
-    /* duct_worker_post_ctrl_msg fails only for a worker_id past the workers, which
-     * a conn's never is; the flag still clears, since a set one blocks
-     * s_conn_close's fence_unbound fast-reclaim. */
-    duct_conn_state_clear(conn, fl_conn_in_wfq);
+    duct_conn_release(conn);
     duct_msg_done(msg);
     return false;
 }
@@ -737,10 +748,10 @@ duct_exec_rc_t duct_session_exec_wire_fence(void *self)
      * upstream cancels a handler still parked on this codec's cleartext
      * buffer: the detach destroys the codec so no new task reaches it, and the
      * handler's pin keeps the buffer its frame points into. */
-    auto conn = duct_conn_by_handle(msg->conn);
+    auto conn = duct_conn_by_handle((duct_conn_handle_t){ .word = msg->conn });
     /* io posts no fence for a conn it has quiesced, so this one runs ahead of its
      * conn_lost, while the worker still holds the conn. */
-    assert(!conn || duct_atomic_load(&conn->conn_fence, relaxed) < fence_retire_ready);
+    assert(!conn || duct_conn_phase(conn) < conn_retire_done);
     if (conn) {
         duct_conn_sealed_codec_detach(conn);
         /* conn->wire is the *new* wire by this point (same rebind-before-
@@ -749,7 +760,8 @@ duct_exec_rc_t duct_session_exec_wire_fence(void *self)
          * client side) needs this exact hook to speak, the same
          * as a fresh accept/connect. msg->conn is already the handle conn
          * was resolved from above. */
-        duct_discard duct_worker_tls_ensure_started(msg->conn, (duct_view_u8){});
+        duct_discard duct_worker_tls_ensure_started(
+            (duct_conn_handle_t){ .word = msg->conn }, (duct_view_u8){});
     }
     auto handle = (duct_session_handle_t){ .word = msg->session };
     s_session_rebind_ack(handle);

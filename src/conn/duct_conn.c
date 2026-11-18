@@ -1,7 +1,6 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* Copyright (c) 2026 Duct Software, author: Constantin Papizh */
 
-#include "duct.h"
 #include "duct_bits.h"
 #include "duct_conn.h"
 #include "duct_conn_block.h"
@@ -14,11 +13,15 @@
 #include "duct_protocol.h"
 #include "duct_relay.h"
 #include "duct_ticks.h"
+#include "duct_vmq.h"
 #include "duct_vnet.h"
 #include "duct_wire.h"
-#include "duct_wire_codec.h"
 #include "duct_xport.h"
 #include "../pool/duct_block_pool.h"
+
+#if DUCT_RUNTIME_STATS
+#include "duct_runtime_stats.h"
+#endif
 
 #include <string.h>
 #include <unistd.h>
@@ -252,10 +255,12 @@ duct_conn_t *duct_conn_acquire(void)
      * because a fresh generation is not itself a publication channel: no
      * thread resolves this conn by handle until a later message hands the
      * handle out with its own release/acquire edge. Do not reorder.
-     * duct_conn_reclaim always tears down before release, and the page-0
-     * reset below zeroes both lane words and the ctx for the next occupant.
+     * Every teardown path runs ahead of the release that drains @c refs,
+     * and the page-0 reset below zeroes both lane words and the ctx for
+     * the next occupant.
      */
     duct_atomic_store(&conn->state, 0u, relaxed);
+    duct_atomic_store(&conn->refs, 1u, relaxed);
     conn->fd = duct_sock_bad;
     conn->wire = nullptr;
     conn->wire_parser = nullptr;
@@ -266,72 +271,76 @@ duct_conn_t *duct_conn_acquire(void)
      * its first unseal. */
     conn->seal = (duct_sealed_conn_ctx_t){};
     duct_atomic_store(&conn->wire_rebind_next, nullptr, relaxed);
-    duct_atomic_store(&conn->conn_fence, fence_unbound, relaxed);
     conn->io_id = conn_io_none;
     conn->worker_id = conn_worker_none;
-    /* Shutdown reclaims a bound conn with no unbind, and its slot returns bound. */
-    duct_atomic_store(&conn->bound_worker, 0u, relaxed);
     s_page0_reset(conn);
     return conn;
 }
 
 static void s_conn_free_push(duct_conn_t *conn)
 {
-    duct_conn_state_clear(conn, fl_conn_in_wfq);
     duct_atomic_fetch(add, &s_pool->free_n, 1u, relaxed);
     duct_conn_touched_update(conn);
     duct_block_pool_release(&s_pool->blocks, duct_conn_idx_get(conn),
                             duct_conn_stats(conn)->touched);
 }
 
-void duct_conn_release(duct_conn_t *conn)
+/** @brief Finish a release at @c refs == 0: arm @c rel_pend over live
+ *  request flags, or clear it, bump the generation and push the slot.
+ *  The bump and the flags test are one whole-word CAS: a post landing first
+ *  holds the finish for its node's run, and one landing after finds a
+ *  generation nothing matches. The bump is guarded because generation
+ *  shares that word, where an add at the ceiling wraps it to 0. The push
+ *  asks for two bumps: the next acquire needs its own, and without it that
+ *  acquire fails having already popped the slot, leaking it.
+ *  @p gen, when nonzero, must still match the word — a recycled slot
+ *  belongs to its next occupant's cycle.
+ */
+static void s_release_finish(duct_conn_t *conn, uint64_t gen)
 {
-    /* Same exclusivity as duct_conn_acquire: by now this generation's
-     * handle is unreachable — it was never handed out (io's s_conn_new
-     * setup-failure path). duct_conn_reclaim advances slot generation
-     * ahead of teardown. */
-    bool advanced = s_gen_advance(conn);
-    duct_do_if(!advanced, return); /* per-conn gen overflow, slot retired for good */
-    s_conn_free_push(conn);
-}
-
-void duct_conn_reclaim(duct_conn_t *conn)
-{
-    /* The bump and the test for a posted request are one CAS: a post landing
-     * first holds the reclaim for its node's run, and one landing after finds
-     * a generation nothing matches. The bump is guarded because generation
-     * shares that word, where an add at the ceiling wraps it to 0. The test
-     * asks for two bumps: the next acquire needs its own, and without it that
-     * acquire fails having already popped the slot, leaking it. */
-    auto gen_slot = duct_conn_gen_req(conn);
-    uint64_t old_word = duct_atomic_load(gen_slot, relaxed),
-             g = 0u;
+    auto slot = duct_conn_gen_req(conn);
+    uint64_t old_word = duct_atomic_load(slot, relaxed);
     for (;;) {
+        if (gen && duct_gen_req_gen(old_word) != gen)
+            return;
         if (duct_gen_req_flags(old_word)) {
-            duct_conn_state_set(conn, fl_conn_reclaim_held);
+            if (old_word & gen_req_rel_pend)
+                return;
+            if (duct_atomic_cas(weak, slot, &old_word,
+                                old_word | gen_req_rel_pend, release, relaxed))
+                return;
+            continue;
+        }
+        if (!s_gen_ceiling_ok(duct_gen_req_gen(old_word), 1u))
+            return; /* per-conn gen overflow, slot retired for good */
+        uint64_t want = (old_word & ~gen_req_rel_pend)
+                      + (1ull << gen_req_gen_shift);
+        if (duct_atomic_cas(weak, slot, &old_word, want, release, relaxed)) {
+            if (s_gen_ceiling_ok(duct_gen_req_gen(old_word), 2u))
+                s_conn_free_push(conn);
             return;
         }
-        g = duct_gen_req_gen(old_word);
-        if (!s_gen_ceiling_ok(g, 1u)
-            || duct_atomic_cas(weak, gen_slot, &old_word,
-                               old_word + (1ull << gen_req_gen_shift), release, relaxed))
-            break;
     }
-    bool retiring = !s_gen_ceiling_ok(g, 2u);
+}
 
-    /* host_pins counts an unregistered reader — duct_io_inter_batch,
-     * called from a host thread the close-fence protocol never sees
-     * (it only tracks worker/io references). The bump above already
-     * shut the door on new pins, so a nonzero count here is just one
-     * already in flight, about to finish. Spin here so the lane teardown
-     * below can't race a still-running push. The fence matters because
-     * acquire/release alone won't pair this spin-load with the other
-     * thread's own pin-then-recheck on a weak-ordered CPU. */
-    atomic_thread_fence(memory_order_seq_cst);
-    for( ; duct_atomic_load(&conn->host_pins, relaxed); duct_cpu_relax()){}
-    duct_conn_teardown(conn);
-    if (!retiring)
-        s_conn_free_push(conn);
+void duct_conn_release(duct_conn_t *conn)
+{
+    if (duct_atomic_fetch(sub, &conn->refs, 1u, acq_rel) != 1u)
+        return;
+    s_release_finish(conn, 0u);
+}
+
+void duct_conn_release_finish(duct_conn_t *conn, uint64_t gen)
+{
+    s_release_finish(conn, gen);
+}
+
+void duct_conn_discard(duct_conn_t *conn)
+{
+    duct_conn_teardown_io(conn);
+    duct_conn_teardown_worker(conn);
+    duct_conn_teardown_ctx(conn);
+    duct_conn_release(conn);
 }
 
 duct_result_t duct_conn_setup(duct_conn_t *conn, duct_sock_t fd, duct_xport_t xport,
@@ -378,7 +387,7 @@ void duct_conn_sealed_codec_detach(duct_conn_t *conn)
     if (sc && sc->codec) {
         auto codec = sc->codec;
         sc->codec = nullptr;
-        codec->release(codec);
+        duct_wire_codec_destroy(codec);
     }
 }
 
@@ -397,39 +406,41 @@ static void s_conn_transport_fini_lane(duct_conn_t *conn)
     duct_mpsc_ctrl(lane, 0u)->wake_latch = nullptr;
 }
 
-void duct_conn_teardown(duct_conn_t *conn)
+void duct_conn_teardown_io(duct_conn_t *conn)
 {
-    conn->wire_parser = nullptr;
-    conn->wire = nullptr;
-    duct_conn_sealed_codec_detach(conn);
-    /* One arm resolves, never both: the xport that shaped this block decides
-     * which page-0 substructures were live. */
-    auto lane = duct_conn_lane(conn);
-    if (lane)
-        s_conn_transport_fini_lane(conn);
-    auto rx = duct_conn_rx_olb(conn);
-    if (rx)
-        duct_olb_del(&rx->h);
-    auto tx = duct_conn_tx_olb(conn);
-    if (tx)
-        duct_olb_del(&tx->h);
-    /* This function is the actual choke point every teardown path
-     * funnels through: duct_conn_reclaim: both the fence-driven retire
-     * and s_conn_close's direct fence_unbound branch.
-     * Runs before the ctx walk below, while the region still points
-     * at what the xport put there. */
+    /* Runs before the physical half, while the ctx region still points
+     * at what the xport put there — and holds only the parts no queued
+     * worker work can still reference: the x_local drop is admission
+     * accounting and a listener reference the worker's egress never
+     * touches. */
     switch (conn->xport_type) {
-    case x_udp_shared:
+    case x_local:
+        if (*duct_conn_listener_ref(conn))
+            duct_local_listener_drop(conn);
+        break;
+    default:
+        break;
+    }
+}
+
+void duct_conn_teardown_ctx(duct_conn_t *conn)
+{
+    /* Runs after the physical half drained the lane: batches queued ahead of
+     * the consume could still carry device-lent payloads and reserve into
+     * the listener outbox, so the releases below wait the lane out. */
+    switch (conn->xport_type) {
+    case x_udp_shared: {
         auto dctx = duct_conn_dgram_ctx(conn);
         if (dctx->listener) {
-            duct_listener_release_pre_conn_ref(dctx->listener);
+            duct_io_listener_pre_conn_ref_release(dctx->listener);
             dctx->listener = nullptr;
         }
         break;
-    /* Lane before release: past ops.release the device belongs to the
-     * application again and may be closed, so nothing of ours may still
-     * reference it. */
-    case x_inter:
+    }
+    case x_inter: {
+        /* Holds before release: past ops.release the device belongs to the
+         * application again and may be closed, so nothing of ours may still
+         * reference it. */
         auto ops = duct_conn_device_ops(conn);
         if (ops) {
             duct_io_device_teardown(conn);
@@ -438,12 +449,31 @@ void duct_conn_teardown(duct_conn_t *conn)
             duct_conn_ctx(conn)->link = nullptr;
         }
         break;
-    case x_local:
-        if (*duct_conn_listener_ref(conn))
-            duct_local_listener_drop(conn);
-        break;
+    }
     default:
         break;
+    }
+}
+
+void duct_conn_teardown_worker(duct_conn_t *conn)
+{
+    conn->wire_parser = nullptr;
+    conn->wire = nullptr;
+    duct_conn_sealed_codec_detach(conn);
+    /* One arm resolves, never both: the xport that shaped this block decides
+     * which page-0 substructures were live. */
+    auto lane = duct_conn_lane(conn);
+    if (lane) {
+        /* host_pins counts an unregistered reader — duct_io_inter_batch,
+         * called from a host thread the release count never sees. The close
+         * already shut the door on new pins, so a nonzero count here is just
+         * one already in flight, about to finish. Spin here so the lane
+         * teardown below can't race a still-running push. The fence matters
+         * because acquire/release alone won't pair this spin-load with the
+         * other thread's own pin-then-recheck on a weak-ordered CPU. */
+        atomic_thread_fence(memory_order_seq_cst);
+        for (; duct_atomic_load(&conn->host_pins, relaxed); duct_cpu_relax()) {}
+        s_conn_transport_fini_lane(conn);
     }
     if (conn->fd != duct_sock_bad) {
         duct_sock_close(conn->fd);
@@ -451,9 +481,8 @@ void duct_conn_teardown(duct_conn_t *conn)
         /* The descriptor just freed may be the one a parked listener waits for. */
         duct_io_accept_resume();
     }
-    /* ::session_token and ::conn_fence retained — conn-lost consume
-     * reads them before the fence confirms retire-ready.
-     * ::generation and ::owner_io are owned by pool. */
+    /* ::session_token retained — conn-lost consume reads it ahead of its
+     * teardown half. ::generation and ::io_id are owned by pool. */
 }
 
 void duct_conn_pool_reclaim(void)
@@ -473,11 +502,30 @@ void duct_conn_pool_reclaim(void)
             auto conn = duct_conn_block_at(idx);
             if (duct_gen_req_gen(duct_atomic_load(duct_conn_gen_req(conn), relaxed)) == 0u)
                 continue;
-            /* Mirrors io's s_conn_shutdown, except
-             * for poll/io-list and the retry-node discard. */
+            /* Mirrors io's s_conn_shutdown, except for the events/io-list
+             * walk, with the threads already joined: every ctx release runs
+             * inline, past the lane drain, and the slot is pushed regardless
+             * of @c refs. */
             duct_atomic_fetch(and, duct_conn_gen_req(conn),
-                              ~(uint64_t)gen_req_flags_mask, relaxed);
-            duct_conn_reclaim(conn);
+                              ~((uint64_t)gen_req_flags_mask | gen_req_rel_pend),
+                              relaxed);
+            duct_atomic_store(&conn->refs, 0u, relaxed);
+            duct_conn_teardown_io(conn);
+            duct_conn_teardown_worker(conn);
+            if (conn->xport_type == x_udp_shared) {
+                auto dctx = duct_conn_dgram_ctx(conn);
+                if (dctx->listener) {
+                    duct_listener_release_pre_conn_ref(dctx->listener);
+                    dctx->listener = nullptr;
+                }
+            } else if (conn->xport_type == x_inter && duct_conn_device_ops(conn)) {
+                auto ops = duct_conn_device_ops(conn);
+                duct_io_device_teardown(conn);
+                if (ops->release)
+                    ops->release(ops->ctx);
+                duct_conn_ctx(conn)->link = nullptr;
+            }
+            s_release_finish(conn, 0u);
         }
     }
 }
@@ -537,4 +585,70 @@ duct_result_t duct_conn_bind_wire(duct_conn_t *conn, const duct_proto_t *proto,
         duct_olb_tx_min_room_set(tx, resp);
     }
     return rc_ok;
+}
+
+static duct_nonnull(1, 2) void
+s_fence_retry_arm(const duct_wfq_route_t *route, duct_conn_t *conn)
+{
+#if DUCT_RUNTIME_STATS
+    duct_io_rtstat_fence_push_full_inc();
+#endif
+    duct_io_trunk_req_post(route->trunk, duct_conn_handle_get(conn), fl_req_fence_retry);
+    duct_worker_wfq_wait_arm(conn->worker_id, route->thread_id);
+}
+
+static duct_nonnull(1, 2) void
+s_conn_post_wire_fence(const duct_wfq_route_t *route, duct_conn_t *conn)
+{
+    duct_msg_wire_fence m = {
+        .msg = { .exec_fn = duct_session_exec_wire_fence, .arg = nullptr },
+        .conn = duct_conn_handle_get(conn).word,
+        .session = duct_atomic_load(&conn->session_token, acquire),
+    };
+    auto lane_id = duct_wfq_pri_lane(wfq_pri_norm, conn->worker_id, route->n_workers,
+                                     route->thread_id, route->n_io);
+    auto lane = duct_mpsc_lane(route->wfq, lane_id);
+    if (vmq_push_ok != duct_vmq_push(&lane, msg_callback, wfq_pri_norm, &m, sizeof m)) {
+        s_fence_retry_arm(route, conn);
+        return;
+    }
+    duct_vmq_notify(lane.ctrl);
+    duct_atomic_store(&conn->wire_rebind_next, nullptr, relaxed);
+}
+
+void duct_conn_wire_rebind(const duct_wfq_route_t *route, duct_conn_t *conn)
+{
+    auto next = duct_atomic_load(&conn->wire_rebind_next, relaxed);
+    duct_do_if(!next, return); /* fence already landed on an earlier attempt */
+    /* A quiesced conn keeps its sentinel and posts no fence: its conn_lost pays
+     * the leg's share of the switch, and a fence queued behind that message
+     * runs past the worker's confirm. */
+    duct_do_if(duct_conn_phase(conn) >= conn_quiesced, return);
+    auto next_cfg = duct_proto_cfg_of(next);
+    if (conn->wire != next_cfg->wire) {
+        auto rx = duct_conn_rx_olb(conn);
+        if (rx) {
+            size_t tail = duct_atomic_load(&rx->h.tail, relaxed),
+                   avail = tail - rx->posted_off;
+
+            /* Wait only for a pending full old-wire header — peer committed to a
+             * known length, a real in-flight tail; duct_frame_rx_post retries
+             * once the buffer drains. Anything shorter, or no old wire, is
+             * indistinguishable from dead — discard it.
+             * avail > 0u guards sealed wires (header_size == 0).
+             */
+            if (conn->wire && avail > 0u && avail >= conn->wire->header_size)
+                return;
+            /* Everything past posted_off is unparsed: frames a retry node
+             * holds count in posted_off from the moment they are saved. */
+            duct_olb_rx_discard(rx, tail);
+        }
+        conn->wire = nullptr;
+        conn->wire_parser = nullptr;
+        if (duct_conn_bind_wire(conn, next, nullptr) != rc_ok) {
+            duct_io_conn_close(conn, close_internal_error);
+            return;
+        }
+    }
+    s_conn_post_wire_fence(route, conn);
 }

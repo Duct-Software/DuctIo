@@ -18,7 +18,6 @@
 
 #include "duct_core.h"
 #include "duct_wire.h"
-#include "duct_worker.h"
 
 #include <assert.h>
 #include <stdatomic.h>

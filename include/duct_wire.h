@@ -46,6 +46,17 @@ typedef struct duct_x_slot_pool duct_x_slot_pool_t;
  */
 static constexpr size_t duct_wire_parser_slot = 64u;
 
+/** @brief Bytes of a conn block codec slot: the ceiling the sealed codec
+ *  struct is asserted against where the type is complete. The conn block
+ *  carves its codec region from this ceiling alone, never from the type.
+ */
+static constexpr size_t duct_wire_codec_slot = 256u;
+
+/** @brief Most bytes of TX header a wire's @c on_pack stages ahead of the
+ *  payload, the gather target's reserved lead.
+ */
+static constexpr size_t wire_tx_hdr_max = 16u;
+
 /** @brief Per-conn sealed-wire reassembly state — cleartext buffer,
  *  parse/ack cursors, crypto engine handle.
  *  Initialized by sealed wire's @c init_codec in the conn block's codec slot,
@@ -53,6 +64,13 @@ static constexpr size_t duct_wire_parser_slot = 64u;
  *  teardown.
  */
 typedef struct duct_wire_codec duct_wire_codec_t;
+
+/** @brief Release @p codec's resources through its vtable.
+ *  The one call consumers holding a codec by pointer make — the conn's
+ *  sealed-codec detach and the worker's build-abort path — since the codec
+ *  struct is wire-internal and they never see its members.
+ */
+duct_nonnull(1) void duct_wire_codec_destroy(duct_wire_codec_t *codec);
 
 /** @brief TX staging handle for @c on_pack.
  *  Opaque: either a conn's internal @ref duct_olb_tx_t ring or a

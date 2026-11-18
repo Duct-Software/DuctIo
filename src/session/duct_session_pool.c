@@ -17,7 +17,6 @@
 #include "duct_session.h"
 #include "duct_session_block.h"
 #include "duct_types.h"
-#include "duct_worker.h"
 #include "../pool/duct_block_pool.h"
 
 #include <assert.h>

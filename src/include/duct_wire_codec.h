@@ -170,6 +170,8 @@ typedef struct duct_wire_codec {
 static_assert(offsetof(duct_wire_codec_t, engine) + sizeof(void *) <= duct_cacheline_size,
               "the pointers and cursors the parse and unseal paths read fill the first"
               " cache line exactly");
+static_assert(sizeof(duct_wire_codec_t) <= duct_wire_codec_slot,
+              "the conn block's codec slot ceiling holds the codec struct");
 
 /** @brief Derive @p c's lead key at the first datagram after the handshake and
  *  write the lead into @p dgram.

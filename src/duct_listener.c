@@ -21,7 +21,7 @@
 
 #include "duct_listener.h"
 
-#include "duct.h"
+#include "duct_wire.h"
 #include "duct_build_config.h"
 #include "duct_conn_block.h"
 #include "duct_dgram_rec.h"

@@ -213,12 +213,12 @@ static void s_engine_destroy(duct_engine_t *e)
        without executing them, so no TLS borrow either. */
     auto listener_head = duct_io_listeners_detach();
     duct_io_cleanup();
-    /* Pool-level safety net: a conn stays at fence_retire_ready if its io
-       thread exited before the retire-bitmap scan, or was never linked to the
+    /* Pool-level safety net: a conn is still live if its consuming worker
+       exited before its conn_lost drained, or was never linked to the
        conn list duct_io_cleanup walks — the x_inter and x_udp_shared
        light-attach path links none. Must precede duct_listener_destroy_chain:
        an x_udp_shared teardown reaches its listener back-reference through
-       duct_conn_teardown's duct_listener_release_pre_conn_ref, and that frees
+       the io-half's duct_listener_release_pre_conn_ref, and that frees
        every listener struct. Also before the caller's proto/wire teardown. */
     duct_conn_pool_reclaim();
     /* Session-pool analogue of duct_conn_pool_reclaim just above; see

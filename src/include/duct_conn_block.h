@@ -34,8 +34,7 @@
 #include "duct_protocol.h"
 #include "duct_vmq.h"
 #include "duct_vnet.h"
-#include "duct_wire_codec.h"
-#include "duct_wire_tx.h"
+#include "duct_wire.h"
 #include "duct_wfq_msg.h"
 #include "duct_xport.h"
 
@@ -100,8 +99,6 @@ static constexpr size_t conn_tx_slack = duct_dgram_record_hdr_size + wire_tx_hdr
 /** @brief Ceiling of the tx region: the ring cap plus its framing slack. */
 static constexpr size_t conn_tx_region_max = duct_conn_tx_olb_cap + conn_tx_slack;
 
-/** @brief Bytes of one wire codec slot. */
-static constexpr size_t duct_wire_codec_slot = sizeof(duct_wire_codec_t);
 /** @brief Ceiling of the wire region: two parser slots — the conn's own and
  *  the codec's inner parser — then the codec slot. */
 static constexpr size_t conn_wire_region_max =
@@ -234,6 +231,22 @@ duct_nonnull(1) static inline uint8_t *duct_conn_tx_data(const duct_conn_t *conn
 duct_nonnull(1) static inline uint8_t *duct_olb_rx_data(const duct_olb_rx_t *rx)
 {
     return duct_conn_rx_data((const duct_conn_t *)((const uint8_t *)rx - conn_off_rx));
+}
+
+/** @brief The conn whose rx OLB header @p hdr is, derived from the header's
+ *  fixed page-0 offset. */
+duct_nonnull(1) static inline duct_conn_t *
+duct_conn_of_olb_rx(duct_olb_hdr_t *hdr)
+{
+    return (duct_conn_t *)((uint8_t *)hdr - conn_off_rx);
+}
+
+/** @brief The conn whose tx OLB header @p hdr is, derived from the header's
+ *  fixed page-0 offset. */
+duct_nonnull(1) static inline duct_conn_t *
+duct_conn_of_olb_tx(duct_olb_hdr_t *hdr)
+{
+    return (duct_conn_t *)((uint8_t *)hdr - conn_off_tx);
 }
 
 /** @brief Base of @p tx's ring data, derived from the header's fixed page-0

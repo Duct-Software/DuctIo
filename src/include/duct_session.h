@@ -16,6 +16,7 @@
 #ifndef DUCT_SESSION_H
 #define DUCT_SESSION_H
 
+#include "duct.h"
 #include "duct_core.h"
 #include "duct_types.h"
 #include "duct_conn.h"
@@ -57,6 +58,26 @@ typedef union duct_session_handle {
 
 static_assert(sizeof(duct_session_handle_t) == sizeof(duct_handle_t),
     "duct_session_handle_t must be 64 bits");
+
+/** @brief Post a host-driven invoke onto the owning worker.
+ *  Backs @ref duct_session_invoke and @ref duct_session_invoke_done.
+ *
+ *  Resolves @p h on @p worker_id, runs @p fn(s, out, ctx) and commits @c
+ *  out through @ref duct_response_commit. The commit's @c in_conn/ @c in_stream
+ *  anchors are @ref duct_conn_id_primary / @ref duct_stream_id_default — the
+ *  same pair @ref duct_session_exec_open uses for @c on_session_open's @c out.
+ *  No-op if @p h no longer resolves on @p worker_id.
+ *
+ *  @retval true   The message is posted, @p on_done still pending.
+ *  @retval false  @p worker_id is out of range or allocation failed;
+ *                 @p on_done already ran by the time this returns.
+ */
+duct_nonnull(2) bool
+duct_worker_post_session_invoke(unsigned worker_id,
+                                const duct_session_handle_t *h,
+                                duct_session_fn fn, void *ctx,
+                                duct_session_invoke_done_fn on_done,
+                                void *done_ctx);
 
 /** @brief Session lifecycle states.
  *
@@ -565,18 +586,6 @@ duct_exec_rc_t duct_session_exec_conn_join(void *self);
  */
 duct_exec_rc_t duct_session_exec_conn_lost(void *self);
 
-/** @brief Wire-rebind fence node executor.
- *
- *  Decrements @c switch_pending, finishes the switch once every leg
- *  has confirmed. @p self is a byte-copied VMQ payload (@ref
- *  duct_msg_wire_fence is a plain @c duct_msg_decl, not chainable) — it is
- *  never heap-owned and must not be freed here. No-op if the session is
- *  gone or the switch was already abandoned (session close clears
- *  @c switch_next first). Runs ahead of its conn's conn_lost: io posts no
- *  fence for a conn it has quiesced.
- */
-duct_exec_rc_t duct_session_exec_wire_fence(void *self);
-
 /** @brief Report a dial that ended before @c on_session_open to @p cfg's @c on_error.
  *  The callback gets a null session, @p rc and @p user_ctx as its state, and the
  *  response it fills is ignored. Reached by a dialed open that fails, by a
@@ -834,18 +843,6 @@ duct_msg_decl(duct_msg_conn_lost,
     duct_conn_handle_t  conn;
     duct_handle_t       session;
     duct_close_reason_t reason);
-
-/** @brief Wire-rebind fence node.
- *
- *  Pushed by the I/O thread directly onto the owner worker's normal WFQ lane
- *  (not the ctrl_stack) so it drains after every frame batch this conn
- *  already posted under the old wire. @c session is the token captured at
- *  post time; the worker finds the leg via
- *  @ref duct_session_conn_id_by_handle, a stale/absent leg is idempotent.
- */
-duct_msg_decl(duct_msg_wire_fence,
-    duct_conn_handle_t conn;
-    duct_handle_t      session);
 
 #ifdef __cplusplus
 }

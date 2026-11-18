@@ -26,7 +26,6 @@
 #define DUCT_BLOCK_POOL_H
 
 #include "duct_core.h"
-#include "duct_conn.h"
 
 #include <stdatomic.h>
 #include <stdint.h>
@@ -34,9 +33,6 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
-
-static_assert(alloc_slot_bits == hconn_idx_bits,
-              "the header's slot word and the handle word are one index width");
 
 /** @brief Life of one block, held in its @c meta word.
  *  Transitions run by compare-exchange from an acquire or the sweeper, and

@@ -281,6 +281,23 @@ typedef struct duct_response {
     } control;
 } duct_response_t;
 
+/** @brief Release the owned payload of @p out.
+ *  Nothing without @c fl_send_owned. With it, a set @c release is called on @c release_arg; with
+ *  none, @c duct_del frees @c release_arg, or @c payload.data where that is nullptr. It clears
+ *  nothing in @p out: a second call releases a second time.
+ */
+static inline void duct_response_release_owned(duct_response_t *out)
+{
+    if (!duct_has(out->flags, fl_send_owned))
+        return;
+    if (out->release) {
+        out->release(out->release_arg);
+        return;
+    }
+    void *block = out->release_arg ? out->release_arg : out->payload.data;
+    duct_del(block);
+}
+
 /** @brief Echo: copy the frame's payload back on the same routing, preserving its frame flags. */
 static inline void duct_response_echo(duct_response_t *out, const duct_frame_t *frame) {
     *out = (duct_response_t){ .payload = frame->payload, .flags = fl_send_copy,
@@ -1036,6 +1053,15 @@ duct_nonnull(1) uint64_t duct_conn_tx_unsent(duct_session_t *s, duct_conn_id_t c
  */
 duct_nonnull(1) size_t duct_conn_tx_cap(duct_session_t *s, duct_conn_id_t conn_id);
 
+/** @brief The remote queue verdict of leg @p conn_id's datagram peer, read afresh.
+ *
+ *  The queue figure the leg's sealed codec recorded off the peer's last report,
+ *  0 where the codec never heard one or its reading is older than the owd
+ *  baseline's staleness bound. Call from session callbacks.
+ */
+duct_nonnull(1) uint64_t
+duct_conn_dgram_remote_q(const duct_session_t *s, duct_conn_id_t conn_id, uint64_t now);
+
 /** @brief Traffic tally of one leg slot, kept by the session's worker.
  *
  *  The tally belongs to the session's @c conn_id slot from session open to
@@ -1424,6 +1450,28 @@ typedef struct duct_proto_cfg {
 
     duct_proto_flags_t flags;               /**< Capability flags. */
 } duct_proto_cfg_t;
+
+/** @brief How many encoded-response slots a callback transaction needs. */
+typedef enum duct_admit_reserve : uint8_t {
+    admit_reserve_response  = 1u, /**< Just the data response. */
+    admit_reserve_with_push = 2u, /**< The data response, plus a possible
+                                     *  stream-open push riding along. */
+} duct_admit_reserve_t;
+
+/** @brief Encoded-response slot count for the next callback transaction.
+ *
+ *  @retval admit_reserve_with_push  @p cfg's stream-open push may ride along
+ *                                   with the data response, multiplexed +
+ *                                   @c on_stream_open.
+ *  @retval admit_reserve_response   Otherwise.
+ */
+duct_nonnull(1) static inline duct_admit_reserve_t
+duct_admit_slots(const duct_proto_cfg_t *cfg)
+{
+    return duct_has(cfg->flags, fl_proto_multiplexed)
+        && cfg->on_stream_open
+            ? admit_reserve_with_push : admit_reserve_response;
+}
 
 /** @brief Protocol handle — the config, borrowed pointers and all, by value.
  *

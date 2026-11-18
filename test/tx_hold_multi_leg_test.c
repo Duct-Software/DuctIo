@@ -87,7 +87,7 @@ static void fixture_fini(fixture_t *f)
     duct_discard duct_session_detach_leg(f->s, duct_conn_id_primary, close_normal);
     duct_conn_t *conns[] = { f->x, f->a, f->c, f->y };
     for (unsigned i = 0u; i < sizeof conns / sizeof conns[0]; ++i) {
-        duct_conn_teardown(conns[i]);
+        duct_conn_teardown_worker(conns[i]);
         duct_conn_release(conns[i]);
     }
     duct_proto_destroy(f->proto);

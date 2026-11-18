@@ -28,7 +28,6 @@
 #include "../pool/duct_block_pool.h"
 #include "duct_relay.h"
 #include "duct_dgram_out.h"
-#include "duct_host.h"
 #include "duct_protocol.h"
 #include "duct_session.h"
 #include "duct_stats.h"
@@ -175,12 +174,14 @@ static bool s_tx_held(const duct_session_t *s, duct_tx_hold_t *h, const duct_con
  *  inter lane's on a conn without a ring. */
 static duct_tx_hold_t *s_conn_tx_hold(const duct_conn_t *conn)
 {
+    static_assert(sizeof(duct_tx_hold_t) == vmq_hold_bytes,
+                  "the lane's parking slot holds the conn layer's hold word");
     auto rx = duct_conn_rx_olb(conn);
     if (rx)
         return &rx->tx_hold;
     auto lane = duct_conn_lane(conn);
     assert(lane);
-    return &duct_mpsc_ctrl(lane, 0u)->tx_hold;
+    return (duct_tx_hold_t *)(void *)&duct_mpsc_ctrl(lane, 0u)->tx_hold;
 }
 
 /** @brief Unbounded drain quota sentinel. */
@@ -1879,12 +1880,16 @@ static duct_exec_rc_t s_dispatch_msg(duct_vmq_hdr_t *hdr)
 typedef enum : uint8_t { res_ok, res_gone, res_no_proto, res_unbound, res_retired } resolve_rc_t;
 
 /** @brief Shared handle → conn → session → proto resolution for frame/inter-pkt
- *  dispatch and frame retry. @c res_unbound is a live conn with no session yet
- *  and @c conn_fence == fence_unbound — its own ctrl (session_open/conn_join)
- *  is still queued behind the ext_pending backlog while this handle's WFQ
- *  traffic already drained, not a torn-down conn. @c res_retired is a live conn
- *  with no session at or past @c fence_retire_ready: its worker has confirmed
- *  no further access and io tears the rings down at any moment, so a caller
+ *  dispatch and frame retry. @c res_unbound is a live conn with no session yet,
+ *  @c phase == conn_unbound and no @c fl_req_close armed — its own ctrl
+ *  (session_open/conn_join) is still queued behind the ext_pending backlog
+ *  while this handle's WFQ traffic already drained, not a torn-down conn; a
+ *  close request posted means the ctrl handler already refused the bind and
+ *  the io run is dropping the last unit, so deferring to a bind that will
+ *  never come would orphan the node past the slot's recycle. Both tests read
+ *  one acquire load of the word. @c res_retired is a live conn
+ *  with no session at or past @c conn_retire_done: its worker has finished
+ *  the teardown half and the release count is draining, so a caller
  *  reads and acks none of them. Centralizes resolution only, not policy:
  *  callers apply their own distinct outcome per state (defer/drop/ack), and
  *  anything beyond conn+session+proto — @c rx_buf, @c wire_rebind_next —
@@ -1900,9 +1905,11 @@ s_dispatch_resolve(duct_conn_handle_t h, duct_conn_t **out_conn, duct_session_t 
     if (!conn)
         return res_gone;
     if (!s) {
-        auto fence = duct_atomic_load(&conn->conn_fence, acquire);
-        return fence == fence_unbound ? res_unbound
-             : fence >= fence_retire_ready ? res_retired : res_gone;
+        uint64_t word = duct_atomic_load(duct_conn_gen_req(conn), acquire);
+        auto phase = duct_gen_req_phase(word);
+        if (phase == conn_unbound && !(word & (uint64_t)fl_req_close))
+            return res_unbound;
+        return phase >= conn_retire_done ? res_retired : res_gone;
     }
     return s->proto ? res_ok : res_no_proto;
 }
@@ -2540,6 +2547,8 @@ static duct_exec_rc_t s_rekey_fire(void *arg)
     return exec_done;
 }
 
+uint64_t _Atomic duct_timer_global_id = 0;
+
 /** @brief Arm a timer of @p w's set running @p exec after @p delay_us, again
  *  every @p interval_us unless that is 0, its payload @p ctx folded into the
  *  wheel node — no heap allocation, nothing to release at retirement.
@@ -2899,7 +2908,7 @@ static duct_wire_codec_t *s_tls_codec_open(duct_conn_t *conn, duct_view_u8 tx_pr
                  && (conn->xport_type == x_tcp || conn->xport_type == x_local))
             lead = tx_prefix;
         else {
-            codec->release(codec);
+            duct_wire_codec_destroy(codec);
             return nullptr;
         }
     }
@@ -3613,12 +3622,12 @@ static size_t s_inter_drain(duct_worker_t *w)
              * one field read before the match. */
             if (!conn)
                 continue;
-            if (duct_atomic_load(&conn->bound_worker, relaxed) != w->worker_id + 1u)
+            if (conn->worker_id != w->worker_id
+                || duct_conn_phase(conn) != conn_bound)
                 continue;
             auto lane = duct_conn_lane(conn);
             if (!lane)
                 continue;
-            assert(duct_atomic_load(&conn->conn_fence, relaxed) < fence_retire_ready);
             bool stopped = false;
             /* Handle taken before the drain: dispatching a packet can close
              * this conn, and the resume is addressed to the leg that was
@@ -5933,7 +5942,7 @@ static void s_tx_train_flush(duct_worker_t *w)
     t->frames = 0u;
     auto conn = duct_conn_by_handle(t->conn);
     auto tx = conn ? duct_conn_tx_olb(conn) : nullptr;
-    if (!tx || duct_atomic_load(&conn->conn_fence, acquire) >= fence_quiescing)
+    if (!tx || duct_conn_phase(conn) >= conn_quiesced)
         return;
     if (!duct_olb_tx_published(tx) && (conn->xport_type != x_tcp || duct_io_parked(conn))) {
         size_t sent = 0u;
@@ -6174,7 +6183,7 @@ static void s_vnet_train_flush(duct_worker_t *w)
     auto conn = duct_conn_by_handle(t->conn);
     uint8_t vh[duct_vnet_hdr_max];
     duct_vnet_gro_finish(&t->gro, vh);
-    if (conn && duct_atomic_load(&conn->conn_fence, acquire) < fence_quiescing) {
+    if (conn && duct_conn_phase(conn) < conn_quiesced) {
         t->gro.bufs[0] = (duct_view_u8){ .data = vh, .size = conn->vnet_hdr_len };
         size_t written = 0u;
         if (!duct_io_stream_send_fast(conn, t->gro.bufs, duct_vnet_gro_front + t->gro.nspans,
@@ -7259,11 +7268,11 @@ static void s_run_loop(duct_worker_t *w)
         }
         /* Idle: tick this worker's dead sessions and step the session pool's
          * tail sweep. The close callback fires at the detach/close-request
-         * transition, not here — this only reclaims slots, safe with a
+         *  transition, not here — this only reclaims slots, safe with a
          * non-empty defer_q since conn-lost consume discards a conn's defer
          * node before its leg detaches. Conn slots need no idle drain of
-         * their own: duct_conn_fence_retire tears one down synchronously the
-         * instant no reference remains. */
+         * their own: the release count tears one down the instant its last
+         * unit drains. */
         s_sessions_reclaim_drain(w);
         if (duct_atomic_load(&w->shutdown, acquire))
             break;

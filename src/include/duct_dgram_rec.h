@@ -20,7 +20,6 @@
 #ifndef DUCT_DGRAM_REC_H
 #define DUCT_DGRAM_REC_H
 
-#include "duct_olb_rx.h"
 #include "duct_wire.h"
 
 #include <stddef.h>

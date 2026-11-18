@@ -57,6 +57,7 @@
 #include "tls_engine_null.h"
 #include "duct_conn.h"
 #include "duct_conn_block.h"
+#include "duct_wire_codec.h"
 
 #include <stdatomic.h>
 #include <stdio.h>

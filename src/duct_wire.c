@@ -27,6 +27,7 @@
  */
 
 #include "duct_wire.h"
+#include "duct_wire_codec.h"
 #include "duct_wire_tx.h"
 #include "duct_conn_block.h"
 #include "duct_dgram_rec.h"
@@ -37,6 +38,14 @@
 #include "duct_types.h"
 #include <stdint.h>
 #include <string.h>
+
+/** @brief The vtable release behind the api's opaque destroy: the codec
+ *  struct is complete only here in the wire tier, consumers below hold it
+ *  by pointer. */
+void duct_wire_codec_destroy(duct_wire_codec_t *codec)
+{
+    codec->release(codec);
+}
 
 static constexpr size_t lp_max_frame = 1u << 20;
 /** @name Length-prefix header bits

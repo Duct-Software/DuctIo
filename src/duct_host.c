@@ -21,7 +21,7 @@
 #include "duct_session.h"
 #include "duct_vmq.h"
 #include "duct_wfq.h"
-#include "duct.h"
+#include "duct_stream.h"
 
 #include <string.h>
 
@@ -270,21 +270,25 @@ duct_result_t duct_io_inter_batch(duct_engine_t *e, duct_handle_t tok,
      * resolve is fail-fast validation only. */
     auto live = duct_conn_by_handle(h);
     duct_do_if(!live, return rc_closed);
-    /* host_pins: this thread is an unregistered reader the close-fence
-     * protocol never enumerates — that protocol proves no worker/io
-     * reference remains, nothing about host threads. Pin before touching
-     * inter_lane, then re-check below. A mismatch means duct_conn_reclaim's
-     * generation bump already landed, so its host_pins spin either passed
-     * this conn before the pin or waits for the decrement below; either way
-     * inter_lane stays untouched past this point. */
+    /* host_pins: this thread is an unregistered reader the release count
+     * never enumerates — refs proves no worker/io reference remains,
+     * nothing about host threads. Pin before touching
+     * inter_lane, then re-check below. A mismatch means the release
+     * finish's generation bump already landed, so the teardown's host_pins
+     * spin either passed this conn before the pin or waits for the
+     * decrement below; either way inter_lane stays untouched past this
+     * point. */
     duct_atomic_fetch(add, &live->host_pins, 1u, relaxed);
     /* Dekker-shaped store-then-load across two different atomics: host_pins
-     * here, gen_req in duct_conn_reclaim. Acquire/release gives no StoreLoad
+     * here, gen_req in the release finish. Acquire/release gives no StoreLoad
      * barrier, so a weakly-ordered arch reorders the later load ahead of
      * this store — AArch64 pre-LSE ldaxr/stlxr among them. The full fence
-     * closes that window. */
+     * closes that window. The phase test beside the generation one is the
+     * door the quiesce claim shut: the generation bumps only at the release
+     * count's zero crossing, past the teardown half, so the generation alone
+     * no longer stops a pin that arrives while that half runs. */
     atomic_thread_fence(memory_order_seq_cst);
-    if (!duct_conn_by_handle(h)) {
+    if (!duct_conn_by_handle(h) || duct_conn_phase(live) >= conn_quiesced) {
         duct_atomic_fetch(sub, &live->host_pins, 1u, release);
         return rc_closed;
     }
@@ -322,7 +326,7 @@ duct_result_t duct_io_inter_batch(duct_engine_t *e, duct_handle_t tok,
     duct_vmq_publish(&ln, &pos);
     duct_conn_lane_staged(live, pos.aligned);
     /* Mark then notify, both still pinned: duct_vmq_notify derefs ln.ctrl,
-     * which lives inside the inter_lane allocation, and duct_conn_reclaim
+     * which lives inside the inter_lane allocation, and the teardown half
      * frees that once host_pins hits zero. Bit before wake, and
      * live->worker_id read here while the pin holds. s_inter_drain worker_id
      * check stays as backstop. */

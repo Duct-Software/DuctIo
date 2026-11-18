@@ -12,7 +12,6 @@
 
 #include "duct_codel.h"
 #include "duct_vnet.h"
-#include "duct_worker.h"
 
 #include <assert.h>
 

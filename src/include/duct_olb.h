@@ -28,6 +28,9 @@
 extern "C" {
 #endif
 
+typedef struct duct_conn duct_conn_t;
+void duct_conn_release(duct_conn_t *conn);
+
 /** @brief Parked output that an inbound conn's frames or a session's timers
  *  wait on.
  *  It stands while @c leg's @c tx_seq_serve has not passed @c ticket. The
@@ -56,14 +59,14 @@ static constexpr uint64_t olb_off_mask = (uint64_t)(uint32_t)-1;
 /** @brief Offset half of packed cursor @p val, bytes. */
 #define olb_off(val) ((size_t)((val) & olb_off_mask))
 
-/** @brief Bits for @c duct_olb_hdr_t::lifecycle, the rendezvous between an
- *  in-flight io operation and a delete request. See @ref duct_olb_io_begin,
- *  @ref duct_olb_io_done, @ref duct_olb_del.
+/** @brief Bits for @c duct_olb_hdr_t::lifecycle — the io thread's
+ *  single-flight marker for the backend op embedded in @c ext. The
+ *  operation's lifetime borrow is a unit of the owning conn's @c refs, not
+ *  this byte. See @ref duct_olb_io_begin, @ref duct_olb_io_done.
  */
 typedef enum duct_olb_flags : uint8_t {
-    fl_olb_none       = 0u,      /**< No flags set. */
-    fl_olb_io_busy    = 1u << 0, /**< An io operation is in flight. */
-    fl_olb_delete_req = 1u << 1, /**< Deletion was requested while busy. */
+    fl_olb_none    = 0u,      /**< No flags set. */
+    fl_olb_io_busy = 1u << 0, /**< An io operation is in flight. */
 } duct_olb_flags_t;
 
 /** @brief Cursors, allocation metadata, and backend scratch shared by
@@ -133,7 +136,8 @@ static_assert(sizeof(duct_olb_hdr_t) % duct_cacheline_size == 0u,
 /** @brief Mark @p hdr as having a live in-flight io operation.
  *
  *  Every call pairs with a later @ref duct_olb_io_done. The marker is a flag,
- *  not a count: at most one operation may be in flight per @p hdr.
+ *  not a count: at most one operation may be in flight per @p hdr — the
+ *  single @c iocp_op_t embedded in @c ext is the reason.
  *
  *  @retval true   @p hdr was already busy; the caller must not post.
  *  @retval false  The marker now stands for this caller's operation.
@@ -145,40 +149,19 @@ duct_olb_io_begin(duct_olb_hdr_t *hdr)
     return duct_has(prev, fl_olb_io_busy);
 }
 
-/** @brief Clear the in-flight marker.
- *  Pairs with @ref duct_olb_io_begin.
- *
- *  @retval true   @p hdr had a pending delete request; this call freed it,
- *                 and @p hdr must not be touched again.
- *  @retval false  Nothing was pending; @p hdr stays live.
+/** @brief Clear the in-flight marker and drop the operation's borrow of
+ *  @p conn's release count.
+ *  Pairs with @ref duct_olb_io_begin and the @c refs unit its caller took
+ *  ahead of the submission. The marker clears first, while the header's
+ *  block is certainly live; the release may be the count's last unit, which
+ *  finalizes the slot — @p conn and @p hdr must not be touched again after
+ *  this returns.
  */
-[[nodiscard]] duct_nonnull(1) static inline bool
-duct_olb_io_done(duct_olb_hdr_t *hdr)
+duct_nonnull(1, 2) static inline void
+duct_olb_io_done(duct_olb_hdr_t *hdr, duct_conn_t *conn)
 {
-    auto prev = duct_atomic_fetch(and, &hdr->lifecycle, duct_not(fl_olb_io_busy), acq_rel);
-    if (!duct_has(prev, fl_olb_delete_req))
-        return false;
-    if (hdr->total_size)
-        duct_vm_del(&(duct_vm_handle_t){ .base = hdr, .size = hdr->total_size });
-    return true;
-}
-
-/** @brief Request deletion of @p hdr.
- *
- *  Deletes it immediately if no io operation is in flight. Otherwise
- *  defers the deletion to the matching @ref duct_olb_io_done.
- *
- *  @retval true   This call freed @p hdr itself.
- *  @retval false  Deferred.
- */
-duct_nonnull(1) static inline bool duct_olb_del(duct_olb_hdr_t *hdr)
-{
-    auto prev = duct_atomic_fetch(or, &hdr->lifecycle, fl_olb_delete_req, acq_rel);
-    if (duct_has(prev, fl_olb_io_busy))
-        return false;
-    if (hdr->total_size)
-        duct_vm_del(&(duct_vm_handle_t){ .base = hdr, .size = hdr->total_size });
-    return true;
+    duct_atomic_fetch(and, &hdr->lifecycle, duct_not(fl_olb_io_busy), acq_rel);
+    duct_conn_release(conn);
 }
 
 #ifdef __cplusplus

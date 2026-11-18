@@ -44,11 +44,18 @@
 #include <string.h>
 
 #include "duct_core.h"
-#include "duct_olb.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+/** @brief Bytes of the lane ctrl's parked-answer slot.
+ *  The slot holds the conn layer's hold descriptor; the lane stores it as
+ *  bytes so the channel stays below the type, and the worker that owns the
+ *  lane casts. The conn layer pins the type to the ceiling with a
+ *  static_assert where both words are visible.
+ */
+static constexpr unsigned vmq_hold_bytes = 16u;
 
 /** @brief Bit position of the generation inside a packed cursor.
  *  A cursor carries the generation in the upper 32 bits, the offset in the
@@ -136,11 +143,12 @@ typedef struct duct_vmq_ctrl {
                                       *  batch, so it costs no contention here
                                       *  for the same reason wait_latch does
                                       *  not. */
-        duct_tx_hold_t    tx_hold;  /**< Answer to an inter conn's message
-                                      *  left parked, which holds the lane's
-                                      *  next message. Zero from the mapping,
-                                      *  none; the consumer worker alone
-                                      *  writes and reads it, and no lane but
+        alignas(8u) uint8_t tx_hold[vmq_hold_bytes]; /**< Parking slot for an
+                                      *  inter conn's parked answer, which holds
+                                      *  the lane's next message. Zero from the
+                                      *  mapping, none; the consumer worker
+                                      *  alone writes and reads it through the
+                                      *  conn layer's hold type, and no lane but
                                       *  a conn's inter lane uses it. */
     ); /* CL-0: dominated by consumer */
 

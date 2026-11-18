@@ -16,6 +16,7 @@
 #include "duct_dgram_rec.h"
 #include "duct_listener.h"
 #include "duct_protocol.h"
+#include "duct_str.h"
 #include "duct_xport.h"
 
 #ifdef _WIN32

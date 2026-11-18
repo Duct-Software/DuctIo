@@ -101,7 +101,7 @@ int duct_io_thread_cpu(unsigned io_id);
 /** @brief CAS @p bit into @p handle's conn's gen_req, generation-checked; on
  *  a 0→nonzero req_flags transition, post + kick @p trunk's coalesced
  *  request message. Rejected outright once @p handle's generation no longer
- *  matches (@ref duct_conn_reclaim already won this conn's retire race).
+ *  matches (the slot's release already finished its retire race).
  *  @return the 0→nonzero transition.
  */
 duct_nonnull(1) bool
@@ -149,6 +149,15 @@ duct_nonnull(1) void duct_io_listener_dgram_peers_close_all(duct_listener_t *lis
  *  nothing otherwise.
  */
 void duct_io_accept_resume(void);
+
+/** @brief Release one @c pre_conn_refs unit of @p listener from any thread.
+ *  The release can destroy the listener, and destruction touches the events
+ *  backend, so off the listener's own io thread — and while the io module is
+ *  still up — the finish is posted to that thread's trunk; the shutdown
+ *  reclaim path, past @c duct_io_cleanup with every thread joined, keeps the
+ *  inline form.
+ */
+duct_nonnull(1) void duct_io_listener_pre_conn_ref_release(duct_listener_t *listener);
 
 #if DUCT_RUNTIME_STATS
 typedef struct duct_io_rt duct_io_rt_t;

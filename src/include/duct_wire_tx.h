@@ -49,10 +49,6 @@ typedef struct duct_vmq_tx_view {
     size_t capacity;  /**< Bytes @c data holds, set by whoever sized it. */
 } duct_vmq_tx_view_t;
 
-/** @brief Header bytes one @c pack_header call can write, the width of the
- *  @c uint8_t[16] every one of them takes. */
-static constexpr size_t wire_tx_hdr_max = 16u;
-
 /** @brief Which member of @c duct_wire_tx_t's union is live. */
 typedef enum : uint8_t {
     wire_tx_olb,      /**< Per-conn TX ring. */

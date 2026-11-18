@@ -260,6 +260,18 @@ typedef uint64_t _Atomic duct_wfq_io_waiters_t;
  */
 static constexpr unsigned duct_wfq_io_waiters_max = 64u;
 
+/** @brief Wire-rebind fence node.
+ *
+ *  Pushed by the I/O thread directly onto the owner worker's normal WFQ lane
+ *  (not the ctrl_stack) so it drains after every frame batch this conn
+ *  already posted under the old wire. @c session is the token captured at
+ *  post time; the worker finds the leg via
+ *  @ref duct_session_conn_id_by_handle, a stale/absent leg is idempotent.
+ */
+duct_msg_decl(duct_msg_wire_fence,
+    uint64_t      conn;
+    duct_handle_t session);
+
 #ifdef __cplusplus
 }
 #endif

@@ -12,6 +12,7 @@
 #include "duct_events.h"
 #include "duct_io.h"
 
+#include "duct_conn_block.h"
 #include "duct_listener.h"
 #include "duct_olb.h"
 #include "duct_pre_conn.h"
@@ -439,9 +440,11 @@ static void s_drain_completions(duct_events_env_t *env, bool armed)
                 case iocp_op_rx:
                 case iocp_op_rx_msg:
                 case iocp_op_rx_failed:
+                    duct_olb_io_done(s_op_hdr(op), duct_conn_of_olb_rx(s_op_hdr(op)));
+                    break;
                 case iocp_op_tx:
                 case iocp_op_tx_records:
-                    duct_discard duct_olb_io_done(s_op_hdr(op));
+                    duct_olb_io_done(s_op_hdr(op), duct_conn_of_olb_tx(s_op_hdr(op)));
                     break;
                 case iocp_op_connect:
                 case iocp_op_probe:
@@ -518,7 +521,7 @@ void duct_events_rx_stall([[maybe_unused]] duct_sock_t fd,
 }
 
 /* A read the kernel refuses is queued back to this thread's port on its own op, so its close runs
- * in the loop and never inside the registration that posts a conn's first read. A port that
+ * in the loop and never inside a registration that posts a conn's first read. A port that
  * refuses the post leaves the close here, at once. */
 void duct_events_drive_rx(void *tag)
 {
@@ -527,6 +530,8 @@ void duct_events_drive_rx(void *tag)
         return; /* OLB is full (self-repost already posted) or stale tag */
     if (duct_olb_io_begin(r.olb_hdr))
         return; /* another recv is already in flight */
+    auto conn = duct_conn_of_olb_rx(r.olb_hdr);
+    duct_conn_ref_take(conn);
     auto op = (iocp_op_t *)r.olb_hdr->ext;
     auto recvmsg_fn = duct_x_wsa_recvmsg();
     int rc;
@@ -553,8 +558,10 @@ void duct_events_drive_rx(void *tag)
         default:
             duct_dbg_errf("WSA error %d", rc);
             op->packed = s_tag_pack(iocp_op_rx_failed, tag);
-            if (!PostQueuedCompletionStatus(s_port, 0u, 0u, &op->ov) && !duct_olb_io_done(r.olb_hdr))
+            if (!PostQueuedCompletionStatus(s_port, 0u, 0u, &op->ov)) {
+                duct_olb_io_done(r.olb_hdr, conn);
                 duct_io_rx_done(tag, rc_fatal);
+            }
         }
 }
 
@@ -621,6 +628,8 @@ void duct_events_drive_tx(void *tag)
     while (duct_io_tx_peek(tag, &p)) {
         if (duct_olb_io_begin(p.olb_hdr))
             return; /* a send is already in flight */
+        auto conn = duct_conn_of_olb_tx(p.olb_hdr);
+        duct_conn_ref_take(conn);
         auto op = (iocp_op_t *)p.olb_hdr->ext;
         int err = p.xport_type == x_udp_peer ? s_tx_post_records(tag, &p, op)
                                              : s_tx_post_stream(tag, &p, op);
@@ -629,8 +638,7 @@ void duct_events_drive_tx(void *tag)
             return;
         case WSAEMSGSIZE:
             duct_dbg_errf("WSAEMSGSIZE, %zu bytes", p.size);
-            if (duct_olb_io_done(p.olb_hdr))
-                return;
+            duct_olb_io_done(p.olb_hdr, conn);
             if (!duct_xport_delimited(p.xport_type)) {
                 duct_io_tx_done(tag, rc_fatal);
                 return;
@@ -639,8 +647,8 @@ void duct_events_drive_tx(void *tag)
             continue;
         default:
             duct_dbg_errf("WSA error %d", err);
-            if (!duct_olb_io_done(p.olb_hdr))
-                duct_io_tx_done(tag, rc_fatal);
+            duct_olb_io_done(p.olb_hdr, conn);
+            duct_io_tx_done(tag, rc_fatal);
             return;
         }
     }
@@ -1016,13 +1024,13 @@ void duct_events_unwatch(duct_events_env_t *env, duct_sock_t fd,
             duct_discard duct_rio_rx_close(s_rio,ctx->rio_rx);
         return;
     }
-    /* Conn fd: duct_conn_teardown's close, at actual reclaim, may run
+    /* Conn fd: duct_conn_teardown_worker's close may run
      * well after this call -- a worker's TX fast path can still be
      * mid-send on it. A pending overlapped WSARecv/WSASend on this fd
      * otherwise never completes once the peer is already gone --
      * nothing else forces it -- so cancel it here, same as the listener
-     * case above; duct_olb_del / duct_olb_io_done at teardown still
-     * settle the resulting completion. */
+     * case above; each resulting completion still drains its own unit of
+     * the conn's release count through duct_olb_io_done. */
     s_cancel_io(fd);
 }
 
@@ -1315,28 +1323,34 @@ static inline void s_on_completion(duct_events_env_t *env, OVERLAPPED_ENTRY *ent
     auto tag = s_tag_unpack(op->packed, &kind);
     switch (kind) {
     case iocp_op_rx:
-        if (!duct_olb_io_done(s_op_hdr(op)))
-            s_on_rx_completion(tag, entries[i].dwNumberOfBytesTransferred, entries[i].Internal, 0u);
-        break;
     case iocp_op_rx_msg:
-        if (!duct_olb_io_done(s_op_hdr(op)))
-            s_on_rx_completion(tag, entries[i].dwNumberOfBytesTransferred, entries[i].Internal,
-                               duct_x_gro_seg(op->rx_msg->Control));
-        break;
-    case iocp_op_rx_failed:
-        /* No kernel op behind it: duct_events_drive_rx queued the refusal of a read, and the
-         * close it ends in runs here. */
-        if (!duct_olb_io_done(s_op_hdr(op)))
+    case iocp_op_rx_failed: {
+        /* Fields read ahead of duct_olb_io_done: its release may finalize the
+         * slot and hand the block to its next occupant. */
+        size_t seg = kind == iocp_op_rx_msg ? duct_x_gro_seg(op->rx_msg->Control) : 0u;
+        auto hdr = s_op_hdr(op);
+        duct_olb_io_done(hdr, duct_conn_of_olb_rx(hdr));
+        if (kind == iocp_op_rx_failed)
             duct_io_rx_done(tag, rc_fatal);
+        else
+            s_on_rx_completion(tag, entries[i].dwNumberOfBytesTransferred,
+                               entries[i].Internal, seg);
         break;
-    case iocp_op_tx:
-        if (!duct_olb_io_done(s_op_hdr(op)))
-            s_on_tx_completion(tag, entries[i].dwNumberOfBytesTransferred, (size_t)op->buf.len);
+    }
+    case iocp_op_tx: {
+        size_t offered = (size_t)op->buf.len;
+        auto hdr = s_op_hdr(op);
+        duct_olb_io_done(hdr, duct_conn_of_olb_tx(hdr));
+        s_on_tx_completion(tag, entries[i].dwNumberOfBytesTransferred, offered);
         break;
-    case iocp_op_tx_records:
-        if (!duct_olb_io_done(s_op_hdr(op)))
-            s_on_tx_records_completion(tag, op->records);
+    }
+    case iocp_op_tx_records: {
+        unsigned records = op->records;
+        auto hdr = s_op_hdr(op);
+        duct_olb_io_done(hdr, duct_conn_of_olb_tx(hdr));
+        s_on_tx_records_completion(tag, records);
         break;
+    }
     case iocp_op_connect:
         duct_del(op);
         auto pre_conn = (duct_pre_conn_t *)tag;

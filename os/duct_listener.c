@@ -12,7 +12,6 @@
  *  over; any other occupant refuses the bind.
  */
 
-#include "duct.h"
 #include "duct_core.h"
 #include "duct_listener.h"
 #include "duct_xport.h"

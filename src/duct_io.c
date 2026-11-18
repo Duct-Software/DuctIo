@@ -15,7 +15,6 @@
 #include "duct_io.h"
 #include "duct_xport.h"
 #include "duct_conn_block.h"
-#include "duct_conn_fence.h"
 #include "duct_dgram_rec.h"
 #include "duct_events.h"
 #include "duct_frame_rx.h"
@@ -307,6 +306,8 @@ static struct duct_device_leg *s_device_find(const duct_io_t *t, const void *han
 static void s_device_link(duct_io_t *t, duct_conn_t *conn);
 static void s_device_unlink(duct_io_t *t, duct_conn_t *conn);
 static bool s_req_do_close(duct_io_t *t, duct_conn_t *conn);
+static void s_fence_retry(duct_io_t *t, duct_conn_t *conn);
+static void s_conn_lost_publish(duct_io_t *t, duct_conn_t *conn);
 
 int duct_io_sockaddr_from_peer(const duct_peer_t *peer, struct sockaddr_storage *out)
 {
@@ -450,11 +451,11 @@ static bool s_conn_register(duct_io_t *t, duct_conn_t *conn, bool promote)
 
 /** @brief Reclaim @p conn that failed before going live, its fd's watch dropped first.
  *  A promoted fd still carries the io_tag_pre_conn watch, which the close in
- *  @c duct_conn_teardown leaves behind. */
+ *  @c duct_conn_teardown_worker leaves behind. */
 static void s_conn_unwatch_reclaim(duct_io_t *t, duct_conn_t *conn)
 {
     duct_events_unwatch(t->trunk.events, conn->fd, nullptr);
-    duct_conn_reclaim(conn);
+    duct_conn_discard(conn);
 }
 
 /** @brief Propagate a failed outbound dial to whichever worker owns
@@ -565,7 +566,7 @@ static void s_attach_inter(const duct_wfq_route_t *route, const duct_session_han
  *  A handle one of this thread's device legs already holds is refused before
  *  any conn exists. Releases @p ops's ctx on every failure that leaves no conn
  *  behind, and hands it to the conn's ctx region otherwise — from there
- *  duct_conn_teardown is the one release site, which is why the watch failure
+ *  duct_conn_teardown_io is the one release site, which is why the watch failure
  *  reclaims without releasing. The ctx region doubles as the device
  *  discriminator: a host-driven x_inter conn leaves it null.
  */
@@ -595,7 +596,7 @@ static void s_attach_device(const duct_wfq_route_t *route,
     duct_conn_ctx(conn)->link = &leg->ops;
     if (!duct_events_watch_device(s_io_this->trunk.events, ops->wait_handle,
                                   (void *)(uintptr_t)s_conn_tag_word(conn))) {
-        duct_conn_reclaim(conn);
+        duct_conn_discard(conn);
         return;
     }
     s_device_link(s_io_this, conn);
@@ -626,7 +627,7 @@ s_dgram_shared_conn_new(const duct_wfq_route_t *route, duct_listener_t *listener
                     : duct_conn_idx_get(conn) % route->n_workers;
     s_inter_lane_attach(conn);
     if (duct_conn_bind_wire(conn, proto, nullptr) != rc_ok) {
-        duct_conn_reclaim(conn);
+        duct_conn_discard(conn);
         return nullptr;
     }
     *duct_conn_dgram_ctx(conn) = (duct_dgram_shared_ctx_t){
@@ -3578,15 +3579,15 @@ static bool s_req_do_close(duct_io_t *t, duct_conn_t *conn)
  *  requests across slot reclaims.
  *
  *  Dispatches every req_flags bit live at execution time in the fixed order
- *  wire_rebind -> tx_drain -> close_req -> rx_resume -> fence_retry -> retire. wire_rebind runs first so a
- *  same-pass rx_resume sees the already-rebound wire. tx_drain runs before
- *  close_req so a respond-then-close turn gets its best chance at closing
- *  in the same wake. retire runs last because close_req and retire can
- *  both reclaim @p conn synchronously, making the slot visible to a
- *  concurrent @ref duct_conn_acquire immediately — close_req short-circuits
- *  subsequent dispatch on connection close.
- *  A reclaim held for this node runs ahead of all of it and ends the pass;
- *  on a closed conn only fence_retry and retire run.
+ *  rel_pend -> wire_rebind -> tx_drain -> close_req -> peer_roam -> rx_resume
+ *  -> fence_retry. A rel_pend pass keeps only the close bit — the slot's
+ *  release reached zero with this node posted, so the word, not a refs
+ *  unit, holds the slot until this run's trailing duct_conn_release_finish
+ *  returns it; the close claim inside the pass clears the bit the finish
+ *  waits on. wire_rebind runs next so a same-pass rx_resume sees
+ *  the already-rebound wire. tx_drain runs before close_req so a
+ *  respond-then-close turn gets its best chance at closing in the same
+ *  wake. On a closed conn only fence_retry and a stale close bit run.
  *  Cross-conn order is unspecified; only this per-conn ordering is a
  *  correctness requirement.
  */
@@ -3598,25 +3599,26 @@ static duct_exec_rc_t s_req_exec(void *self)
         return exec_done;
     auto t = s_io_this;
     /* fetch_and, not exchange: gen_req's generation, and between close posts
-     * its reason, must survive this clear — only the flags bits get zeroed.
-     * Returns the pre-clear word, so bits set after an earlier racing post
-     * but before this AND still land in it. acq_rel, not acquire: this clear
-     * re-opens the coalescing gate in s_req_post_ex, so its store must
-     * publish what duct_io_on_wake already did to &m->msg — the reverse-pass
-     * write to its own next pointer — before a winning racer there writes
-     * that same pointer again. */
-    duct_conn_req_flags_t flags = duct_gen_req_flags(
-        duct_atomic_fetch(and, duct_conn_gen_req(conn), ~(uint64_t)gen_req_flags_mask, acq_rel));
-    auto state = duct_conn_state(conn);
-    /* duct_io_on_wake read this node's next before running it, so the slot
-     * can go now. */
-    if (duct_has(state, fl_conn_reclaim_held)) {
-        duct_conn_state_clear(conn, fl_conn_reclaim_held);
-        duct_conn_reclaim(conn);
-        return exec_done;
-    }
-    if (duct_has(state, fl_conn_closed))
-        flags &= fl_req_fence_retry | fl_req_retire;
+     * its reason, must survive this clear — the flags bits other than
+     * fl_req_close get zeroed. The close bit survives until the claim CAS
+     * clears it together with the quiesce, so a word reader never sees the
+     * flag gone while the phase still reads conn_unbound — that gap would
+     * let a dispatch defer a frame onto a conn whose last unit the posted
+     * close is about to drop. Returns the pre-clear word, so bits set after
+     * an earlier racing post but before this AND still land in it. acq_rel,
+     * not acquire: this clear re-opens the coalescing gate in
+     * s_req_post_ex, so its store must publish what duct_io_on_wake already
+     * did to &m->msg — the reverse-pass write to its own next pointer —
+     * before a winning racer there writes that same pointer again. */
+    uint64_t word = duct_atomic_fetch(and, duct_conn_gen_req(conn),
+                                      ~((uint64_t)gen_req_flags_mask
+                                        & ~(uint64_t)fl_req_close), acq_rel);
+    duct_conn_req_flags_t flags = duct_gen_req_flags(word);
+    bool rel = (word & gen_req_rel_pend) != 0u;
+    if (rel)
+        flags &= fl_req_close;
+    if (duct_has(duct_conn_state(conn), fl_conn_closed))
+        flags &= fl_req_fence_retry | fl_req_close;
     /* Rebind first: nothing else in this function touches the wire, but
      * running it first keeps any rx_resume in the same pass reading the
      * already-rebound wire. */
@@ -3630,17 +3632,25 @@ static duct_exec_rc_t s_req_exec(void *self)
          * persistent pending flag, single-threaded, with no race
          * against s_tx_start's own later read of it. */
         duct_conn_state_set(conn, fl_conn_closing);
-        if (s_req_do_close(t, conn))
+        if (s_req_do_close(t, conn)) {
+            if (rel)
+                duct_conn_release_finish(conn, m->handle.gen);
             return exec_done; /* conn may already be a different occupant's past this point */
+        }
+        if (duct_conn_phase(conn) >= conn_quiesced)
+            /* A close already claimed elsewhere consumed this post; the bit
+             * the run-clear kept has no handler left to drop it. */
+            duct_atomic_fetch(and, duct_conn_gen_req(conn),
+                              ~(uint64_t)fl_req_close, release);
     }
     if (duct_has(flags, fl_req_peer_roam))
         s_req_do_peer_roam(conn);
     if (duct_has(flags, fl_req_rx_resume))
         s_req_do_rx_read(conn);
     if (duct_has(flags, fl_req_fence_retry))
-        duct_conn_fence_retry(&t->route, conn);
-    if (duct_has(flags, fl_req_retire))
-        duct_conn_fence_retire(conn);
+        s_fence_retry(t, conn);
+    if (rel)
+        duct_conn_release_finish(conn, m->handle.gen);
     return exec_done;
 }
 
@@ -3855,6 +3865,76 @@ void duct_io_post_tx_drain(const duct_conn_handle_t *conn)
 s_io_post_bit(duct_io_post_rx_read, fl_req_rx_resume)
 s_io_post_bit(duct_io_post_peer_roam, fl_req_peer_roam)
 
+duct_msg_chain_decl(duct_msg_listener_pre_conn_ref,
+    duct_listener_t              *listener;
+);
+
+static duct_exec_rc_t s_msg_exec_listener_pre_conn_ref(void *self)
+{
+    auto m = (duct_msg_listener_pre_conn_ref *)self;
+    duct_listener_release_pre_conn_ref(m->listener);
+    return duct_msg_done(m);
+}
+
+/** @brief Release one @c pre_conn_refs unit of @p listener from any thread.
+ *  The release can destroy the listener, and destruction touches the events
+ *  backend, so off the listener's own io thread it posts the finish to that
+ *  thread's trunk; with the io module already down — engine shutdown past
+ *  @c duct_io_cleanup — the threads are joined and the release runs inline.
+ */
+void duct_io_listener_pre_conn_ref_release(duct_listener_t *listener)
+{
+    auto io_id = listener->io_id;
+    if (s_io_this && s_io_this->route.thread_id == io_id) {
+        duct_listener_release_pre_conn_ref(listener);
+        return;
+    }
+    if (io_id >= s_imod.n_io) {
+        duct_listener_release_pre_conn_ref(listener);
+        return;
+    }
+    auto m = duct_msg_new(duct_msg_listener_pre_conn_ref, s_msg_exec_listener_pre_conn_ref, nullptr);
+    if (!m) {
+        duct_listener_release_pre_conn_ref(listener);
+        return;
+    }
+    m->listener = listener;
+    s_msg_push(io_id, &m->msg);
+}
+
+duct_msg_chain_decl(duct_msg_conn_device_release,
+    duct_conn_handle_t           conn;
+);
+
+static duct_exec_rc_t s_msg_exec_conn_device_release(void *self)
+{
+    auto m = (duct_msg_conn_device_release *)self;
+    auto conn = duct_conn_by_handle(m->conn);
+    assert(conn);
+    duct_conn_teardown_ctx(conn);
+    duct_conn_release(conn);
+    return duct_msg_done(m);
+}
+
+/** @brief Hand @p conn's device holds and @c ops->release to its owning io
+ *  thread, one unit of @c conn->refs borrowed for the posted finish.
+ *  The conn-lost consume calls this past its lane drain: a host callback
+ *  keeps its io thread contract, and the borrow keeps the slot resolvable
+ *  until the finish drops it.
+ */
+void duct_io_conn_device_release_post(duct_conn_t *conn)
+{
+    duct_conn_ref_take(conn);
+    auto m = duct_msg_new(duct_msg_conn_device_release, s_msg_exec_conn_device_release, nullptr);
+    if (!m) {
+        duct_conn_teardown_ctx(conn);
+        duct_conn_release(conn);
+        return;
+    }
+    m->conn = duct_conn_handle_get(conn);
+    s_msg_push(conn->io_id, &m->msg);
+}
+
 void duct_io_post_wire_rebind(const duct_conn_handle_t *conn, const duct_proto_t *next)
 {
     auto c = s_conn_ranged(*conn);
@@ -3863,8 +3943,6 @@ void duct_io_post_wire_rebind(const duct_conn_handle_t *conn, const duct_proto_t
     duct_atomic_store(&c->wire_rebind_next, next, relaxed);
     duct_io_trunk_req_post(&s_imod.xports[c->io_id].trunk, *conn, fl_req_wire_rebind);
 }
-
-s_io_post_bit(duct_io_retire_request, fl_req_retire)
 
 /* Kicks without the park check: what it wakes the thread for, the frame-rx
  * retry drain, pushes nothing onto the trunk for that check to see. */
@@ -5115,55 +5193,130 @@ static void s_conn_detach(duct_io_t *t, duct_conn_t *conn)
     duct_conn_io_list_unlink(conn, t->route.thread_id);
 }
 
-/** @brief Unified close: I/O-side quiesce, unbound and bound fence paths.
+/** @brief Publish @p conn's @c conn_lost onto its owner worker's WFQ lane.
  *
- *  CASes conn_fence to fence_quiescing; any other state means a concurrent or
- *  earlier close already ran, or a lost bind race already self-retired —
+ *  Called once the io thread has torn down the fd/poll registration for a
+ *  conn that was bound to a live session — pushes the conn_lost message onto
+ *  the worker's normal WFQ lane, where @ref duct_session_exec_conn_lost runs
+ *  it, so it drains after every frame batch already accepted for this conn.
+ *  Advances the phase @c conn_quiesced → @c conn_lost_posted inside the word
+ *  once the lane slot is reserved and before the message is published, so
+ *  the worker never sees the message ahead of the state; a lane with no room
+ *  leaves the conn @c conn_quiesced and arms @c fl_req_fence_retry instead.
+ *  On the successful publish the io unit of @c conn->refs drops here — the
+ *  worker's consume and every in-flight kernel borrow drain the rest.
+ */
+static void s_conn_lost_publish(duct_io_t *t, duct_conn_t *conn)
+{
+    auto lane_id = duct_wfq_pri_lane(wfq_pri_norm, conn->worker_id, t->route.n_workers,
+                                     t->route.thread_id, t->route.n_io);
+    auto lane = duct_mpsc_lane(t->route.wfq, lane_id);
+    duct_vmq_reserve_pos_t pos;
+    duct_vmq_push_rc_t rc;
+    auto dst = duct_vmq_reserve(&lane, msg_callback, wfq_pri_norm,
+                                sizeof(duct_msg_conn_lost), &pos, &rc);
+    if (!dst) {
+#if DUCT_RUNTIME_STATS
+        duct_io_rtstat_fence_push_full_inc();
+#endif
+        duct_io_trunk_req_post(&t->trunk, duct_conn_handle_get(conn), fl_req_fence_retry);
+        duct_worker_wfq_wait_arm(conn->worker_id, t->route.thread_id);
+        return;
+    }
+    duct_msg_conn_lost m = {
+        .msg = { .exec_fn = duct_session_exec_conn_lost, .arg = nullptr },
+        .conn = duct_conn_handle_get(conn),
+        .session = duct_atomic_load(&conn->session_token, acquire),
+        .reason = conn->close_reason,
+    };
+    memcpy(dst, &m, sizeof m);
+    duct_conn_phase_move(conn, conn_quiesced, conn_lost_posted);
+    duct_vmq_publish(&lane, &pos);
+    duct_vmq_notify(lane.ctrl);
+    duct_conn_release(conn);
+}
+
+/** @brief Retry a fence-retry request for @p conn.
+ *
+ *  Independent things it may be retrying:
+ *  — a close still at @c conn_quiesced, its conn_lost unposted for a full
+ *  lane,
+ *  — a wire-rebind fence whose sentinel is still set, on a conn short of
+ *  @c conn_quiesced.
+ */
+static void s_fence_retry(duct_io_t *t, duct_conn_t *conn)
+{
+    if (duct_conn_phase(conn) == conn_quiesced)
+        s_conn_lost_publish(t, conn);
+    if (duct_atomic_load(&conn->wire_rebind_next, relaxed))
+        duct_conn_wire_rebind(&t->route, conn); /* rebind already done or buf still not drained */
+}
+
+/** @brief Unified close: I/O-side quiesce, unbound and bound paths.
+ *
+ *  CASes the @c gen_req phase below @c conn_quiesced to @c conn_quiesced;
+ *  any other state means a concurrent or earlier close already ran —
  *  idempotent either way. Deregisters from the events backend only; the fd
- *  stays open until teardown's own close at reclaim, since a worker's TX fast
+ *  stays open until the physical teardown half, since a worker's TX fast
  *  path may still be using it for a commit queued before this quiesce won.
  *
- *  fence_unbound, with fl_conn_in_wfq unset: fast-releases now, since
- *  the generation bump invalidates any pending session_open or
- *  conn_join handle before its ctrl runs. Set: leaves teardown to that
- *  ctrl's own fence check and the later fence retire. fence_open:
- *  publishes conn_lost onto the owner worker's WFQ lane; reclaim, and
- *  the fd close, wait behind every already-queued commit there,
- *  same-lane FIFO.
+ *  @c conn_unbound: a ctrl still in flight holds its own @c refs unit, so
+ *  the discard here leaves the slot's return to that ctrl handler's own
+ *  release when one exists, and finishes it now when none does.
+ *  @c conn_bound: publishes conn_lost onto the owner worker's WFQ lane;
+ *  the physical half, and the fd close, wait behind every already-queued
+ *  commit there, same-lane FIFO.
  *
- *  @retval true   Won the quiesce CAS — callers still dispatching work
+ *  @retval true   Won the phase CAS — callers still dispatching work
  *                 against @p conn must stop.
  *  @retval false  Close already claimed elsewhere; @p conn untouched.
  */
 static bool s_conn_close(duct_io_t *t, duct_conn_t *conn, duct_close_reason_t reason)
 {
     assert(conn);
-    auto pre = duct_conn_fence_quiesce(conn);
-    if (pre != fence_unbound && pre != fence_open)
-        return false; /* already claimed by a concurrent/earlier close — no-op */
+    duct_conn_phase_t pre;
+    if (!duct_conn_close_claim(conn, &pre)) {
+        /* already claimed by a concurrent/earlier close — no-op; a post that
+         * raced it left its fl_req_close armed on the quiesced word, and no
+         * winning claim is left to clear it. */
+        duct_atomic_fetch(and, duct_conn_gen_req(conn),
+                          ~(uint64_t)fl_req_close, release);
+        return false;
+    }
     if (getenv("DUCT_TCP_INFO_LOG"))
         duct_x_tcp_close_diag(conn->fd, reason);
     s_conn_detach(t, conn);
-    if (pre == fence_unbound) {
-        if (!duct_has(duct_conn_state(conn), fl_conn_in_wfq))
-            duct_conn_reclaim(conn);
+    duct_conn_teardown_io(conn);
+    if (pre == conn_unbound) {
+        /* A rel_pend run arrives with refs already at zero: its trailing
+         * duct_conn_release_finish owns the return, and the decrement the
+         * discard path owes would underflow. The bit cannot change between
+         * the claim and this load — arming needs a 0-cross, and the io unit
+         * this caller holds keeps refs above zero outside that run. */
+        bool rel = (duct_atomic_load(duct_conn_gen_req(conn), acquire)
+                    & gen_req_rel_pend) != 0u;
+        duct_conn_teardown_worker(conn);
+        duct_conn_teardown_ctx(conn);
+        if (!rel)
+            duct_conn_release(conn);
         return true;
     }
     conn->close_reason = reason;
-    duct_conn_fence_lost_publish(&t->route, conn);
+    s_conn_lost_publish(t, conn);
     return true;
 }
 
-/** @brief Non-graceful teardown for process shutdown: no conn_lost, no fence
+/** @brief Non-graceful teardown for process shutdown: no conn_lost, no phase
  *  dance — workers may already be gone. Releases every resource directly,
  *  the conn's pending requests dropped first, since no request node runs
- *  past shutdown to release a held reclaim.
+ *  past shutdown to release a held return.
  */
 static void s_conn_shutdown(duct_io_t *t, duct_conn_t *conn)
 {
     s_conn_detach(t, conn);
-    duct_atomic_fetch(and, duct_conn_gen_req(conn), ~(uint64_t)gen_req_flags_mask, relaxed);
-    duct_conn_reclaim(conn);
+    duct_atomic_fetch(and, duct_conn_gen_req(conn),
+                      ~((uint64_t)gen_req_flags_mask | gen_req_rel_pend), relaxed);
+    duct_conn_discard(conn);
 }
 
 void duct_io_conn_close(duct_conn_t *conn, duct_close_reason_t reason)

@@ -1565,3 +1565,12 @@ if(NOT WIN32)
     target_compile_options(ductio_socket_prepare_test PRIVATE -UNDEBUG)
     add_test(NAME socket_prepare COMMAND ductio_socket_prepare_test)
 endif()
+
+# The include-layer DAG law on the live tree: walks include/, src/, os/,
+# checks every quoted include against the layering map's tier table and
+# proves the resolved graph acyclic. No engine link — the tree is the oracle.
+add_executable(ductio_layer_dag_test layer_dag_test.c)
+target_compile_definitions(ductio_layer_dag_test PRIVATE
+    DUCT_LAYER_ROOT="${PROJECT_SOURCE_DIR}")
+target_compile_features(ductio_layer_dag_test PRIVATE c_std_23)
+add_test(NAME layer_dag COMMAND ductio_layer_dag_test)

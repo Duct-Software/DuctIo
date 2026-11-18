@@ -164,7 +164,7 @@ static void s_fixture_init(s_fixture_t *f)
  *  the backpressure it parked on never clears, the peer socket never being
  *  read. The real route to that list is @c s_shutdown_drain, which returns
  *  at once without a WFQ this fixture has none of, so @c s_retry_clear runs
- *  straight — and ahead of @c duct_conn_teardown, which nulls the @c rx_buf
+ *  straight — and ahead of @c duct_conn_teardown_worker, which nulls the @c rx_buf
  *  the ring pin is dropped through. */
 static void s_fixture_release_parked_retry(s_fixture_t *f)
 {
@@ -176,7 +176,7 @@ static void s_fixture_fini(s_fixture_t *f)
     s_fixture_release_parked_retry(f);
     duct_timers_destroy(&f->w.timers);
     s_this_worker = nullptr;
-    duct_conn_teardown(f->conn);
+    duct_conn_teardown_worker(f->conn);
     duct_sock_close(f->peer_fd);
     duct_session_detach_leg(f->s, duct_conn_id_primary, close_normal);
     duct_conn_release(f->conn);
