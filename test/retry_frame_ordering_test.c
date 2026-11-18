@@ -143,8 +143,10 @@ static void s_fixture_init(s_fixture_t *f)
     f->conn->fd = conn_fd;
     f->conn->xport_type = x_tcp;
     /* Model the IO-side EAGAIN latch explicitly. A transient kernel EAGAIN
-     * can clear during fixture setup as ACKs arrive, even without a reader. */
-    duct_conn_state_set(f->conn, fl_conn_write_armed);
+     * can clear during fixture setup as ACKs arrive, even without a reader.
+     * The latch is the tx header's io-line value, resident in page 0 ahead
+     * of the carve. */
+    duct_olb_tx_write_armed_set(duct_conn_tx_hdr(f->conn), true);
     duct_conn_carve_olb(f->conn, s_rx_olb_cap, s_tx_olb_cap);
     assert(duct_conn_rx_olb(f->conn) && duct_conn_tx_olb(f->conn));
 

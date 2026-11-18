@@ -186,11 +186,35 @@ duct_nonnull(1) static inline duct_olb_rx_t *duct_conn_rx_olb(const duct_conn_t 
         ? (duct_olb_rx_t *)((uintptr_t)conn + conn_off_rx) : nullptr;
 }
 
+/** @brief The conn's rx OLB header in page 0 — resident for every conn,
+ *  ring or lane.
+ *  Only the header itself is fixed in page 0; a lane conn's ring data words
+ *  are inert zeros, but the worker-written ack-line bits (the author's RX
+ *  suspend) park there for lane conns too — a device leg's io gate reads
+ *  them while its packets ride the lane instead of a ring.
+ */
+duct_nonnull(1) static inline duct_olb_rx_t *duct_conn_rx_hdr(const duct_conn_t *conn)
+{
+    return (duct_olb_rx_t *)((uintptr_t)conn + conn_off_rx);
+}
+
 /** @brief The conn's tx OLB header in page 0, @c nullptr on a lane conn. */
 duct_nonnull(1) static inline duct_olb_tx_t *duct_conn_tx_olb(const duct_conn_t *conn)
 {
     return duct_conn_has_olb(conn)
         ? (duct_olb_tx_t *)((uintptr_t)conn + conn_off_tx) : nullptr;
+}
+
+/** @brief The conn's tx OLB header in page 0 — resident for every conn,
+ *  ring or lane.
+ *  The worker's TX-room wait target parks on the staging line for lane
+ *  conns too: a lane conn's ring words read zero, so its wait target takes
+ *  the "wake on the next signal" form while nothing io-side ever advances a
+ *  head against it.
+ */
+duct_nonnull(1) static inline duct_olb_tx_t *duct_conn_tx_hdr(const duct_conn_t *conn)
+{
+    return (duct_olb_tx_t *)((uintptr_t)conn + conn_off_tx);
 }
 
 /** @brief The conn's inter lane header in page 0, @c nullptr on an OLB conn. */

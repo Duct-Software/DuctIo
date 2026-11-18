@@ -970,26 +970,31 @@ static constexpr uint32_t s_dispatch_frontier_skip = UINT32_MAX;
 
 /** @brief The frame batch in flight on this worker.
  *  @c conn is its leg while the batch dispatches; @c owed records that an ack
- *  of that leg left its read-latch check to the batch end.
+ *  of that leg left its read-latch check to the batch end, @c prev the acked
+ *  total the first of those acks shifted from — the edge the batch-end check
+ *  crosses is that first shift's, so a latch armed anywhere inside the batch
+ *  still gets its one post.
  */
 static thread_local struct {
     const duct_conn_t *conn;
     bool               owed;
+    uint64_t           prev;
 } s_rx_ack_batch;
 
-/** @brief Repost @p conn's read when @p acked reaches its latched resume
- *  target.
+/** @brief Post @p conn's read resume strictly on the ack crossing edge
+ *  @c prev_acked < R ≤ new_acked.
  *  The @c seq_cst fence pairs with @ref s_rx_latch's: either this sees the
- *  latch, or the io thread's recheck after latching sees @p acked. A stalled
- *  reactive backend never re-signals backlog already signaled, so this repost
- *  is what resumes the read.
+ *  armed target, or the io thread's recheck after arming sees the acked
+ *  total and disarms. A stalled reactive backend never re-signals backlog
+ *  already signaled, so this post is what resumes the read — exactly one
+ *  per latch: the edge fires for the single shift that crosses R, and io's
+ *  disarm store answers it.
  */
-static void s_rx_ack_check(duct_conn_t *conn, uint64_t acked)
+static void s_rx_ack_check(duct_conn_t *conn, uint64_t prev_acked, uint64_t new_acked)
 {
     atomic_thread_fence(memory_order_seq_cst);
-    if (duct_has(duct_conn_state(conn), fl_conn_rx_full)
-        && acked >= duct_atomic_load(&duct_conn_rx_olb(conn)->resume_at, relaxed)) {
-        duct_conn_state_clear(conn, fl_conn_rx_full);
+    uint64_t target = duct_atomic_load(&duct_conn_rx_olb(conn)->resume_at, relaxed);
+    if (duct_olb_rx_resume_crossed(prev_acked, new_acked, target)) {
         auto ch = duct_conn_handle_get(conn);
         duct_io_post_rx_read(&ch);
         duct_rtstat_obj_inc(s_this_worker, rtstats.rx_resume_post, 1);
@@ -1005,13 +1010,18 @@ static void s_rx_ack_check(duct_conn_t *conn, uint64_t acked)
  */
 static inline void s_rx_ack(duct_conn_t *conn, size_t len, uint32_t end_off)
 {
-    uint64_t acked = duct_olb_rx_ack(duct_conn_rx_olb(conn), len);
+    auto rx = duct_conn_rx_olb(conn);
+    uint64_t prev_acked = duct_atomic_load(&rx->acked, relaxed);
+    uint64_t acked = duct_olb_rx_ack(rx, len);
     if (end_off != s_dispatch_frontier_skip)
-        duct_atomic_store(&duct_conn_rx_olb(conn)->dispatch_frontier, end_off, release);
-    if (s_rx_ack_batch.conn == conn)
-        s_rx_ack_batch.owed = true;
-    else
-        s_rx_ack_check(conn, acked);
+        duct_atomic_store(&rx->dispatch_frontier, end_off, release);
+    if (s_rx_ack_batch.conn == conn) {
+        if (!s_rx_ack_batch.owed) {
+            s_rx_ack_batch.owed = true;
+            s_rx_ack_batch.prev = prev_acked;
+        }
+    } else
+        s_rx_ack_check(conn, prev_acked, acked);
 }
 
 /** @brief Sealed-codec cleartext-buffer compaction.
@@ -1370,14 +1380,19 @@ static inline bool s_admit_leg_room(const duct_conn_t *conn, size_t need)
 }
 
 /** @brief Arm @p conn's TX-room wake ahead of the caller's last room check.
- *  The fence pairs with the one io runs after freeing room: either that check
- *  sees the room, or io sees @c fl_conn_tx_wait and wakes this worker. An arm
- *  placed after a failed check lets io free the room unseen.
+ *  The stored value is the monotonic packed-head target the wait resolves at
+ *  — @p need is the contiguous span a refused room check demanded, 0 the
+ *  coarse backpressure form — and the fence pairs with the one io runs after
+ *  each head advance: either that check sees the room, or io sees the target
+ *  and its next advance's crossing edge wakes this worker. An arm placed
+ *  after a failed check lets io free the room unseen. A lane conn arms on
+ *  its resident header's zeroed words: the target takes the any-signal
+ *  shape its device wake reads.
  */
-static void s_tx_wait_arm(duct_conn_t *conn)
+static void s_tx_wait_arm(duct_conn_t *conn, size_t need)
 {
-    duct_conn_state_set(conn, fl_conn_tx_wait);
-    atomic_thread_fence(memory_order_seq_cst);
+    duct_olb_tx_wait_arm(duct_conn_tx_hdr(conn),
+                         duct_olb_tx_wait_target(duct_conn_tx_hdr(conn), need));
 }
 
 /** @brief Test @p conn's TX room for @p need, and on a refusal flush this
@@ -1398,7 +1413,7 @@ bool duct_worker_admit_leg(duct_conn_handle_t handle, size_t need)
     auto conn = duct_conn_by_handle(handle);
     if (s_admit_leg_room_flushed(handle, conn, need))
         return true;
-    s_tx_wait_arm(conn);
+    s_tx_wait_arm(conn, need);
     return s_admit_leg_room(conn, need);
 }
 
@@ -3119,7 +3134,7 @@ static duct_exec_rc_t s_dispatch_sealed_frame(duct_worker_t *w, duct_conn_t *con
         /* rc_again leaves the PDU to replay whole, as the deferred task replays
          * it; the run after the arm is the room check the arm pairs with. */
         if (rc == rc_again) {
-            s_tx_wait_arm(conn);
+            s_tx_wait_arm(conn, 0u);
             rc = conn->wire->unseal(conn->wire, codec, pdu, &ctx);
             if (rc == rc_again)
                 return exec_defer;
@@ -3242,6 +3257,7 @@ s_dispatch_batch_frames(duct_worker_t *w, const duct_msg_frame_batch_t *b,
     s_rx_ack_batch.conn = conn;
     auto rc = s_dispatch_batch_run(w, h, b, from, out_defer_idx);
     bool owed = s_rx_ack_batch.owed;
+    uint64_t prev = s_rx_ack_batch.prev;
     s_rx_ack_batch.conn = nullptr;
     s_rx_ack_batch.owed = false;
     /* The batch holds no refs unit of its own — generations guard its stale
@@ -3252,7 +3268,8 @@ s_dispatch_batch_frames(duct_worker_t *w, const duct_msg_frame_batch_t *b,
      * finish parks it at conn_spent), so the check below either sees a live
      * conn or pins nothing at all. */
     if (owed && duct_conn_pin(conn, h.gen) == rc_ok) {
-        s_rx_ack_check(conn, duct_atomic_load(&duct_conn_rx_olb(conn)->acked, relaxed));
+        s_rx_ack_check(conn, prev,
+                       duct_atomic_load(&duct_conn_rx_olb(conn)->acked, relaxed));
         duct_conn_unpin(conn);
     }
     w->tx_train.more = false;
@@ -4108,7 +4125,7 @@ typedef struct retry_node {
          * A slot-pinned answer (alias_none, the response's release hook set)
          * carries its RX slot claim in slot_pool/slot_idx — the node is the pin
          * record, the claim outliving no node that holds it. handle is the
-         * ticket-owning routed leg, re-resolve target and fl_conn_tx_wait
+         * ticket-owning routed leg, re-resolve target and TX-wait
          * owner; rx_handle is the inbound leg the payload was read from,
          * meaningful only while pinned or carrying an ack. hold_of is the conn
          * whose dispatch parked the node, 0 for none. */
@@ -4441,7 +4458,7 @@ static bool s_engine_park_flush(duct_conn_t *conn)
     auto tx = duct_conn_tx_olb(conn);
     size_t n = codec->engine_park_len;
     if (!tx || duct_olb_tx_stage(tx, nullptr, 0u, duct_conn_engine_park(conn), n) != olb_tx_ok) {
-        s_tx_wait_arm(conn);
+        s_tx_wait_arm(conn, n);
         return false;
     }
     duct_conn_tx_staged(conn, n);
@@ -4473,7 +4490,7 @@ static uint8_t *s_engine_park_span(duct_conn_t *conn, duct_wire_codec_t *codec, 
     }
     auto span = duct_conn_engine_park(conn) + codec->engine_park_len;
     codec->engine_park_len += (uint32_t)len;
-    s_tx_wait_arm(conn);
+    s_tx_wait_arm(conn, 0u);
     return span;
 }
 
@@ -5131,7 +5148,7 @@ static duct_nonnull(1) bool s_retry_drain(duct_worker_t *w)
              * emit's round-robin routing can differ from. */
             auto emit_conn = duct_conn_by_handle(duct_session_conn_at(s, node->emit.out.conn_id));
             if (emit_conn)
-                s_tx_wait_arm(emit_conn);
+                s_tx_wait_arm(emit_conn, 0u);
             auto c_rc = s_response_retry(s, &node->emit.out, hctx->conn_id, hctx->stream_id,
                                          fl_frame_none, &emit_ticket);
             if (c_rc == commit_internal) {
@@ -5171,7 +5188,7 @@ static duct_nonnull(1) bool s_retry_drain(duct_worker_t *w)
             }
             auto cid = duct_session_conn_id_by_handle(s, node->frame.handle);
             auto frame_ticket = node->frame.ticket;
-            s_tx_wait_arm(conn);
+            s_tx_wait_arm(conn, 0u);
             c_rc = s_response_retry(s, &node->frame.out, cid, node->frame.sid, node->frame.flags,
                                     &frame_ticket);
             if (c_rc == commit_internal) {
@@ -5197,7 +5214,7 @@ static duct_nonnull(1) bool s_retry_drain(duct_worker_t *w)
                 break;
             }
             uint32_t fin_ticket = node->fin.ticket;
-            s_tx_wait_arm(fin_conn);
+            s_tx_wait_arm(fin_conn, 0u);
             auto fin_st = s_ctl_fin_stage(fin_conn, s, node->fin.sid, node->fin.flags,
                                           node->fin.err, &fin_ticket);
             if (fin_st == olb_tx_full) {
@@ -6015,7 +6032,8 @@ static bool s_tx_train_board(const commit_ctx_t *ctx)
         return true;
     s_tx_train_flush(w);
     auto conn = ctx->conn;
-    if (!duct_olb_tx_rewind_idle(duct_conn_tx_olb(conn)) || duct_has(duct_conn_state(conn), fl_conn_write_armed))
+    if (!duct_olb_tx_rewind_idle(duct_conn_tx_olb(conn))
+        || duct_olb_tx_write_armed(duct_conn_tx_olb(conn)))
         return false;
     t->conn = ctx->handle;
     t->first_ns = duct_ticks_mono_ns();
@@ -6670,10 +6688,12 @@ static void s_ctl_apply_now(duct_session_t *s, const duct_response_t *out)
             auto conn = duct_conn_by_handle(handle);
             if (!conn)
                 continue;
+            /* The suspend bit lives on the rx header's ack line — this
+             * worker's own line — for every leg, ring or lane. */
             if (out->control.rx == rx_op_pause)
-                duct_conn_state_set(conn, fl_conn_suspended);
+                duct_atomic_store(&duct_conn_rx_hdr(conn)->suspended, 1u, relaxed);
             else {
-                duct_conn_state_clear(conn, fl_conn_suspended);
+                duct_atomic_store(&duct_conn_rx_hdr(conn)->suspended, 0u, relaxed);
                 /* A reactive backend's readiness signal may not re-fire for
                  * data that arrived while suspended; post an rx_read so the
                  * io thread reads explicitly on resume. */

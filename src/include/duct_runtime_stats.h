@@ -33,7 +33,8 @@ typedef struct duct_worker_rt {
              batch_partial_defer, /**< Frame batches deferred mid-batch: a prefix already
                                     *  dispatched, the remainder parked on defer_q. */
              defer_oom_drop, /**< Frames ack+dropped because a defer-node alloc failed. */
-             rx_resume_post, /**< s_rx_ack cleared an RX-full latch and reposted. */
+             rx_resume_post, /**< s_rx_ack posted the read resume on its
+                              *  crossing edge over the armed target. */
              commit_internal, /**< s_commit_response returned commit_internal. */
              retry_saved,     /**< Successful emit/frame/timer retry save (s_retry_*_save). */
              dgram_shared_tx_drop, /**< x_udp_shared response dropped: its listener's

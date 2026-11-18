@@ -125,12 +125,40 @@ duct_olb_decl(duct_olb_tx,
 
     duct_x_sock_stats_fields
 
+    /** @brief Packed-head target at which a refused TX room wait resolves;
+     *  0 while unarmed. The worker's single-writer value latch (§6): a turn
+     *  the ring refused — admission, an engine park flush, a parked retry
+     *  node — stores the monotonic @c head position it waits for (release)
+     *  ahead of a @c seq_cst fence and then re-checks its room condition.
+     *  Io, on each TX head advance @c prev_head → @c new_head, fences, loads
+     *  this word and wakes the conn's worker strictly on the crossing edge
+     *  @c prev_head < T ≤ @c new_head — no bit, no clear, no RMW, and no
+     *  disarm write on wake: @c head is monotonic in the packed coordinate,
+     *  so a spent target can never cross again. The next arm overwrites with
+     *  a fresh target computed past the current @c head; a lane conn arms
+     *  here too, its zeroed ring words yielding the "any signal" form the
+     *  device wake takes.
+     */
+    uint64_t _Atomic resume_at;
+
     duct_cacheline_struct(
         uint32_t _Atomic pass_end; /**< End of the previous pass, bytes.
                                      *  Stored with release before the
                                      *  @c tail that opens the next pass;
                                      *  io loads it with acquire only while
                                      *  its head is one pass behind @c tail. */
+
+        /** @brief Current write-interest state for reactive backend
+         *  registration, 1 while the io thread holds the socket armed —
+         *  same contract as @c duct_listener_t::dgram_tx_write_armed.
+         *  Io-written (plain store — the one writer) on this its own line;
+         *  the worker-side TX fast path (@c x_udp_peer, @c x_tcp, @c x_raw)
+         *  reads it as a stale-tolerant hint and falls back to the io drain
+         *  on a stale 1. iocp never touches it — its dgram TX has no
+         *  reactive readiness concept.
+         */
+        uint8_t _Atomic write_armed;
+
         duct_x_sock_tx_fields
     );
 );
@@ -492,6 +520,88 @@ duct_nonnull(1) static inline bool duct_olb_tx_rewind_idle(duct_olb_tx_t *tx)
         return true;
     duct_olb_tx_wrap(tx, h->buf_size);
     return true;
+}
+
+/** @brief Packed-head target at which the staging worker's TX room wait
+ *  resolves — the value @c resume_at carries while armed.
+ *
+ *  @p need names the contiguous span a refused @c duct_olb_tx_room_contig
+ *  check demanded; 0 falls to the coarse form, the @c min_room backpressure
+ *  bound. The target is the exact flip point of whichever condition failed:
+ *  a fold into the staging pass while io still drains the previous one, the
+ *  offset a same-pass wrap needs free at the buffer's front, or the head
+ *  offset that drops published bytes below the wanted room. Clamped past
+ *  the current @c head, so an armed word always names a position io has not
+ *  reached — a target behind the head never crosses, and the caller's own
+ *  post-arm recheck answers the room io already freed.
+ *  Staging worker only.
+ */
+duct_nonnull(1) static inline uint64_t
+duct_olb_tx_wait_target(duct_olb_tx_t *tx, size_t need)
+{
+    auto h = &tx->h;
+    size_t room = need ? need : duct_olb_tx_min_room_get(tx);
+    uint64_t head_g = duct_atomic_load(&h->head, acquire),
+             tail_g = duct_atomic_load(&h->tail, relaxed);
+    size_t tail = olb_off(tail_g);
+    uint64_t target;
+    if (olb_gen(head_g) != tx->stage_gen) {
+        /* Io still drains the previous pass: the fold into this pass is the
+         * first point the staging math re-runs, and past it the offset
+         * target applies in this pass's coordinates. */
+        size_t want = need ? ((h->stage + need > h->buf_size) ? need : 0u)
+                      : (tail + room > h->buf_size ? tail + room - h->buf_size : 0u);
+        target = olb_pack(tx->stage_gen, want);
+    } else {
+        /* Same pass: contig room fails only through the wrap limb, which
+         * flips at the buffer's front; the coarse form at the published
+         * span. Both are offsets of this pass. */
+        size_t want = need ? need
+                      : (tail + room > h->buf_size ? tail + room - h->buf_size : 0u);
+        target = olb_pack(tx->stage_gen, want);
+    }
+    /* One past the observed head at the least: never arm a target the head
+     * has passed, and never the unarmed zero. */
+    return target > head_g ? target : head_g + 1u;
+}
+
+/** @brief True when the head shift @p prev_head → @p new_head crosses the
+ *  armed wait target @p target: strictly the edge @c prev_head < T ≤
+ *  @c new_head, the unarmed zero never crossing. The one expression both
+ *  io's advance wake and the edge tests answer the crossing by.
+ */
+static inline bool
+duct_olb_tx_wait_crossed(uint64_t prev_head, uint64_t new_head, uint64_t target)
+{
+    return target != 0u && prev_head < target && new_head >= target;
+}
+
+/** @brief Arm @p tx's TX room wake at @p target.
+ *  The store publishes first, the @c seq_cst fence pairs with io's
+ *  post-advance load, and the caller re-checks its room condition after
+ *  this returns: either that recheck sees the room io freed, or io sees the
+ *  target and its next advance crosses it. Staging worker only.
+ */
+duct_nonnull(1) static inline void
+duct_olb_tx_wait_arm(duct_olb_tx_t *tx, uint64_t target)
+{
+    duct_atomic_store(&tx->resume_at, target, release);
+    atomic_thread_fence(memory_order_seq_cst);
+}
+
+/** @brief True while @p tx's io thread holds the socket armed for write
+ *  readiness. Worker-side stale-tolerant hint read. */
+duct_nonnull(1) static inline bool
+duct_olb_tx_write_armed(const duct_olb_tx_t *tx)
+{
+    return duct_atomic_load(&tx->write_armed, relaxed);
+}
+
+/** @brief Record @p tx's write-interest state. Io thread only. */
+duct_nonnull(1) static inline void
+duct_olb_tx_write_armed_set(duct_olb_tx_t *tx, bool armed)
+{
+    duct_atomic_store(&tx->write_armed, armed, relaxed);
 }
 
 #ifdef __cplusplus

@@ -164,11 +164,28 @@ duct_olb_decl(duct_olb_rx,
          */
         uint32_t _Atomic dispatch_frontier;
 
-        /** @brief Ack total at which a latched read resumes.
-         *  Stored by the io thread from @ref duct_olb_rx_resume_total before
-         *  it latches @c fl_conn_rx_full; the worker ack that brings
-         *  @c acked to it reposts the read. Read only while that latch is
-         *  set.
+        /** @brief The author's rx_op_pause request, 1 while the conn's input
+         *  stands paused. Worker-written (plain store — the one writer), read
+         *  at the io thread's RX gates as a stale-tolerant bit: the resume
+         *  side posts @c fl_req_rx_resume after clearing it, so io either
+         *  sees the clear or re-reads it on that post's drive. Resident on
+         *  this line for every conn — a lane conn's ring words stay zero
+         *  while its device gate still reads this bit.
+         */
+        uint8_t _Atomic suspended;
+
+        /** @brief Ack total at which a latched read resumes; 0 while
+         *  unarmed. Io's single-writer value latch: the io thread stores the
+         *  @ref duct_olb_rx_resume_total target (release) ahead of a
+         *  @c seq_cst fence and re-checks @c acked — a target the worker
+         *  already passed disarms at once (0 again), so an armed word always
+         *  holds a target strictly past @c acked. The worker, on each ack
+         *  shift @c prev_acked → @c new_acked, stores @c acked (release),
+         *  fences, loads this word and posts @c fl_req_rx_resume strictly on
+         *  the crossing edge @c prev_acked < R ≤ @c new_acked — exactly one
+         *  post per latch, no bit, no clear, no RMW on either side. Io
+         *  disarms on the wake (plain 0 store) before re-driving. The gate
+         *  both sides derive: stalled means @c acked < resume_at.
          */
         uint64_t _Atomic resume_at;
 
@@ -398,6 +415,29 @@ duct_olb_rx_ack(duct_olb_rx_t *rx, size_t nbytes)
     uint64_t ack = duct_atomic_load(&rx->acked, relaxed) + (uint64_t)nbytes;
     duct_atomic_store(&rx->acked, ack, release);
     return ack;
+}
+
+/** @brief True while @p rx's read stands latched: the worker has not acked
+ *  up to the resume target @c resume_at names.
+ *  Io's derived RX stall gate — an unarmed word (0) never stalls, and an
+ *  armed one is disarmed the moment its target is behind @c acked.
+ */
+duct_nonnull(1) static inline bool
+duct_olb_rx_stalled(const duct_olb_rx_t *rx)
+{
+    return duct_atomic_load(&rx->acked, acquire)
+         < duct_atomic_load(&rx->resume_at, relaxed);
+}
+
+/** @brief True when the ack shift @p prev_acked → @p new_acked crosses the
+ *  armed resume target @p target: strictly the edge @c prev_acked < R ≤
+ *  @c new_acked, the unarmed zero never crossing. The one expression the
+ *  worker's post-on-ack check and the edge tests answer the crossing by.
+ */
+static inline bool
+duct_olb_rx_resume_crossed(uint64_t prev_acked, uint64_t new_acked, uint64_t target)
+{
+    return target != 0u && prev_acked < target && new_acked >= target;
 }
 
 #ifdef __cplusplus

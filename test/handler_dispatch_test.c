@@ -379,8 +379,10 @@ static void s_fixture_init(s_fixture_t *f, duct_proto_t *proto)
     f->conn->fd = conn_fd;
     f->conn->xport_type = x_tcp;
     /* Model the IO-side EAGAIN latch explicitly. A transient kernel EAGAIN
-     * can clear during fixture setup as ACKs arrive, even without a reader. */
-    duct_conn_state_set(f->conn, fl_conn_write_armed);
+     * can clear during fixture setup as ACKs arrive, even without a reader.
+     * The latch is the tx header's io-line value, resident in page 0 ahead
+     * of the carve. */
+    duct_olb_tx_write_armed_set(duct_conn_tx_hdr(f->conn), true);
     duct_conn_carve_olb(f->conn, s_olb_cap, s_olb_cap);
     assert(duct_conn_rx_olb(f->conn) && duct_conn_tx_olb(f->conn));
 
@@ -2983,6 +2985,240 @@ static void test_pin_cas_against_gen_bump(void)
     printf("  pin_cas_against_gen_bump OK\n");
 }
 
+/** @brief §6 value latches: both crossing edges are strictly single-shot.
+ *  The rx ack edge posts at exactly the shift that reaches the armed target,
+ *  the tx head edge wakes at exactly the advance that reaches it — and a
+ *  target the moving side has already passed never fires again, which is
+ *  what lets the values replace bits with no clear and no RMW. */
+static void test_value_latch_crossing_edges(void)
+{
+    /* Unarmed never crosses. */
+    assert(!duct_olb_rx_resume_crossed(0u, 100u, 0u));
+    assert(!duct_olb_tx_wait_crossed(0u, 100u, 0u));
+
+    /* Below the target, up to and touching it short, never crosses. */
+    assert(!duct_olb_rx_resume_crossed(40u, 99u, 100u));
+    assert(!duct_olb_tx_wait_crossed(40u, 99u, 100u));
+
+    /* The crossing shift — exactly one: the shift that lands on the target. */
+    assert(duct_olb_rx_resume_crossed(40u, 100u, 100u));
+    assert(duct_olb_rx_resume_crossed(40u, 130u, 100u));
+    assert(duct_olb_tx_wait_crossed(40u, 100u, 100u));
+    assert(duct_olb_tx_wait_crossed(40u, 130u, 100u));
+
+    /* Past the target nothing fires again: prev has caught up with it. */
+    assert(!duct_olb_rx_resume_crossed(100u, 130u, 100u));
+    assert(!duct_olb_rx_resume_crossed(130u, 140u, 100u));
+    assert(!duct_olb_tx_wait_crossed(100u, 130u, 100u));
+    assert(!duct_olb_tx_wait_crossed(130u, 140u, 100u));
+
+    printf("  value_latch_crossing_edges OK\n");
+}
+
+/** @brief §6 rx latch: the worker posts the read resume strictly on the ack
+ *  crossing edge and exactly once per latch.
+ *  A light io module (threads never started) makes the resume post real:
+ *  its gen_req bit rises at the crossing shift and at no other, the
+ *  coalescing gate holding one node per latch — the edge, not a level, is
+ *  what fires. */
+static void test_rx_latch_edge_posts_once_per_latch(void)
+{
+    duct_conn_pool_reclaim();
+    auto wfq = duct_wfq_new(1u, 1u, DUCT_WFQ_CAP_HI, DUCT_WFQ_CAP_NORM,
+                            DUCT_WFQ_CAP_LO);
+    assert(wfq);
+    /* Threads up and joined at once, tick_sweep-style: the io module's
+     * structures stand alive for the post below, and cleanup at the end
+     * finds a real events backend to release. */
+    assert(duct_io_init(1u, wfq, 1u));
+    assert(duct_io_start_threads());
+    duct_io_request_shutdown();
+    duct_io_join();
+
+    auto conn = duct_conn_acquire();
+    assert(conn);
+    conn->xport_type = x_tcp;
+    duct_conn_carve_olb(conn, s_olb_cap, s_olb_cap);
+    conn->io_id = 0u;
+    auto word = duct_conn_gen_req(conn);
+    auto rx = duct_conn_rx_olb(conn);
+    duct_atomic_store(&rx->acked, 40u, release);
+    /* io's latch: the target sits past the worker's acked total. */
+    duct_atomic_store(&rx->resume_at, 100u, release);
+    assert(duct_olb_rx_stalled(rx));
+
+    /* A shift still short of the target posts nothing. */
+    s_rx_ack(conn, 30u, s_dispatch_frontier_skip);
+    assert(!(duct_atomic_load(word, relaxed) & (uint64_t)fl_req_rx_resume));
+
+    /* The crossing shift posts the resume — one node, one bit. */
+    s_rx_ack(conn, 30u, s_dispatch_frontier_skip);
+    assert(duct_atomic_load(word, relaxed) & (uint64_t)fl_req_rx_resume);
+    assert(!duct_olb_rx_stalled(rx));
+
+    /* No later shift re-posts: the run consumed the bit, and prev_acked has
+     * caught up with the target — the crossing cannot recur. */
+    duct_atomic_fetch(and, word, ~(uint64_t)fl_req_rx_resume, acq_rel);
+    s_rx_ack(conn, 10u, s_dispatch_frontier_skip);
+    assert(!(duct_atomic_load(word, relaxed) & (uint64_t)fl_req_rx_resume));
+
+    /* The disarmed word (0) is the unarmed one: no shift crosses it. */
+    duct_atomic_store(&rx->resume_at, 0u, relaxed);
+    s_rx_ack(conn, 5u, s_dispatch_frontier_skip);
+    assert(!(duct_atomic_load(word, relaxed) & (uint64_t)fl_req_rx_resume));
+
+    duct_conn_release(conn);
+    duct_io_cleanup();
+    duct_vmq_mpsc_del(wfq);
+    printf("  rx_latch_edge_posts_once_per_latch OK\n");
+}
+
+/** @brief §6 tx latch: the wait target is the exact flip point of the room
+ *  condition that refused, monotonic in the packed-head coordinate and
+ *  clamped past the observed head — and the arm itself parks a value no
+ *  disarm write ever clears. A lane conn arms on its resident header's
+ *  zeroed words: the any-signal form its device wake reads. */
+static void test_tx_wait_target_forms(void)
+{
+    duct_conn_pool_reclaim();
+    constexpr size_t cap = kbytes(8u);
+    constexpr uint64_t k = 1024u;
+
+    auto conn = duct_conn_acquire();
+    assert(conn);
+    conn->xport_type = x_tcp;
+    duct_conn_carve_olb(conn, cap, cap);
+    auto tx = duct_conn_tx_olb(conn);
+    auto h = &tx->h;
+
+    /* Coarse form, same pass: published spans past the wanted room, so the
+     * target is the head offset that drops the span below it. */
+    duct_olb_tx_cold_init(tx);
+    h->stage = 7u * k + 512u;
+    duct_atomic_store(&h->tail, olb_pack(0u, 7u * k + 512u), relaxed);
+    duct_atomic_store(&h->head, olb_pack(0u, 410u), relaxed);
+    uint64_t target = duct_olb_tx_wait_target(tx, 0u);
+    assert(target == olb_pack(0u, 512u)); /* tail + min_room − buf */
+    assert(!duct_olb_tx_wait_crossed(olb_pack(0u, 410u), olb_pack(0u, 511u), target));
+    assert(duct_olb_tx_wait_crossed(olb_pack(0u, 410u), olb_pack(0u, 512u), target));
+
+    /* Contig form, same pass: the wrap limb's flip at the buffer's front. */
+    h->stage = 7u * k;
+    duct_atomic_store(&h->tail, olb_pack(0u, 6u * k), relaxed);
+    duct_atomic_store(&h->head, olb_pack(0u, 1u * k), relaxed);
+    target = duct_olb_tx_wait_target(tx, 2u * k);
+    assert(target == olb_pack(0u, 2u * k));
+
+    /* A head already past the computed flip clamps one past itself: the
+     * armed word always names a position io has not reached. */
+    duct_atomic_store(&h->head, olb_pack(0u, 3u * k), relaxed);
+    assert(duct_olb_tx_wait_target(tx, 2u * k) == olb_pack(0u, 3u * k) + 1u);
+
+    /* Fold form: io a pass behind targets the fold into the staging pass. */
+    duct_atomic_store(&h->head, olb_pack(0u, 1u * k), relaxed);
+    tx->stage_gen = 1u;
+    h->stage = 5u * k;
+    target = duct_olb_tx_wait_target(tx, 2u * k);
+    assert(target == olb_pack(1u, 0u)); /* stage + need ≤ buf: room at the fold */
+    tx->pass_end = 6u * k;
+    h->stage = 6u * k;
+    target = duct_olb_tx_wait_target(tx, 4u * k);
+    assert(target == olb_pack(1u, 4u * k)); /* wrap needed past the fold too */
+
+    /* The arm parks the value on the worker's own line; nothing clears it. */
+    s_tx_wait_arm(conn, 0u);
+    uint64_t armed = duct_atomic_load(&tx->resume_at, relaxed);
+    assert(armed != 0u);
+    duct_atomic_store(&h->head, armed, relaxed);
+    s_tx_wait_arm(conn, 0u); /* a re-arm past the advanced head */
+    assert(duct_atomic_load(&tx->resume_at, relaxed) > armed);
+    duct_conn_release(conn);
+
+    /* A lane conn arms on the resident header: zeroed ring words give the
+     * any-signal target no head advance ever crosses. */
+    auto lane = duct_conn_acquire();
+    assert(lane);
+    lane->xport_type = x_inter;
+    s_tx_wait_arm(lane, 0u);
+    auto lane_hdr = duct_conn_tx_hdr(lane);
+    uint64_t signal_form = duct_atomic_load(&lane_hdr->resume_at, relaxed);
+    assert(signal_form != 0u);
+    assert(!duct_olb_tx_wait_crossed(0u, signal_form - 1u, signal_form));
+    duct_conn_release(lane);
+
+    printf("  tx_wait_target_forms OK\n");
+}
+
+/** @brief The 3c edge: the worker frees the rings while an io completion is
+ *  still in flight, the close's gate holding the rings' last references.
+ *  The completion runs gated by @c fl_conn_closed — past it io touches
+ *  page-0 words only — and the refs unit its armed submission borrowed is
+ *  what keeps the slot from its next occupant while the worker's teardown
+ *  half drains and closes against it. Whichever side runs first, the slot
+ *  returns exactly once, at the last unit. */
+static void test_worker_frees_rings_vs_io_completion(void)
+{
+    duct_conn_pool_reclaim();
+    unsigned free_before = duct_conns_free();
+
+    /* Completion first: the worker's teardown frees the rings while the
+     * completion still holds its borrow, then the completion lands on the
+     * gated conn. */
+    auto conn = duct_conn_acquire();
+    assert(conn);
+    conn->xport_type = x_tcp;
+    duct_conn_carve_olb(conn, s_olb_cap, s_olb_cap);
+    duct_sock_t peer_fd, peer_fd2;
+    s_tiny_pair_open(&conn->fd, &peer_fd);
+    auto handle = duct_conn_handle_get(conn);
+    duct_conn_ref_take(conn); /* the posted ctrl's unit, converted at bind */
+    assert(duct_conn_session_bind(conn, UINT64_MAX));
+    duct_conn_ref_take(conn); /* the armed kernel submission's borrow (§2) */
+    duct_conn_phase_t pre;
+    assert(duct_conn_close_claim(conn, &pre) && pre == conn_bound);
+    duct_conn_state_set(conn, fl_conn_closed); /* the gate completions read */
+    duct_conn_release(conn); /* io's own unit, dropped past the lost publish */
+
+    /* The worker's half: rings, fd — the slot must outlive the completion. */
+    duct_conn_teardown_worker(conn);
+    duct_conn_release(conn);
+    assert(duct_conns_free() == free_before - 1u);
+    assert(duct_conn_by_handle(handle));
+
+    /* The completion lands on the closed conn: gated to its page-0 words,
+     * it clears the busy marker and drops the borrow — the last unit. */
+    duct_olb_io_done(&duct_conn_rx_olb(conn)->h, conn);
+    assert(!duct_conn_by_handle(handle));
+    assert(duct_conns_free() == free_before);
+
+    /* Worker-side completion order flipped: the completion drains its
+     * borrow first, the worker's teardown half runs against the slot the
+     * ctrl unit still holds, and its release is the final one. */
+    conn = duct_conn_acquire();
+    assert(conn);
+    conn->xport_type = x_tcp;
+    duct_conn_carve_olb(conn, s_olb_cap, s_olb_cap);
+    s_tiny_pair_open(&conn->fd, &peer_fd2);
+    handle = duct_conn_handle_get(conn);
+    duct_conn_ref_take(conn);
+    assert(duct_conn_session_bind(conn, UINT64_MAX));
+    duct_conn_ref_take(conn);
+    assert(duct_conn_close_claim(conn, &pre) && pre == conn_bound);
+    duct_conn_state_set(conn, fl_conn_closed);
+    duct_conn_release(conn);
+    duct_olb_io_done(&duct_conn_tx_olb(conn)->h, conn); /* tx completion first */
+    assert(duct_conns_free() == free_before - 1u);
+    assert(duct_conn_by_handle(handle));
+    duct_conn_teardown_worker(conn);
+    duct_conn_release(conn);
+    assert(!duct_conn_by_handle(handle));
+    assert(duct_conns_free() == free_before);
+
+    duct_sock_close(peer_fd);
+    duct_sock_close(peer_fd2);
+    printf("  worker_frees_rings_vs_io_completion OK\n");
+}
+
 /* ── Main ─────────────────────────────────────────────────────────── */
 
 duct_msg_chain_decl(s_fifo_test_msg, bool *blocked; unsigned *calls;);
@@ -3185,6 +3421,10 @@ int main(void)
     test_close_races_ctrl_at_release_boundaries();
     test_unbound_defer_window_closes_with_close_post();
     test_pin_cas_against_gen_bump();
+    test_value_latch_crossing_edges();
+    test_rx_latch_edge_posts_once_per_latch();
+    test_tx_wait_target_forms();
+    test_worker_frees_rings_vs_io_completion();
     printf("All handler_dispatch tests passed.\n");
     return 0;
 }

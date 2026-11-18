@@ -2838,8 +2838,12 @@ static void s_rx_start(duct_conn_t *conn)
          * closing the descriptor under us — its fd store is the one write
          * this read must not race. */
         return;
-    if (st & (fl_conn_suspended | fl_conn_rx_full | fl_conn_rx_eof)) {
-        duct_events_rx_stall(conn->fd, duct_conn_rx_olb(conn)->h.ext_ptr);
+    auto rx = duct_conn_rx_olb(conn);
+    if ((st & fl_conn_rx_eof) || duct_atomic_load(&rx->suspended, relaxed)
+        || duct_olb_rx_stalled(rx)) {
+        /* The stall gate is the derived latch: the worker has not acked up
+         * to the resume target the ring names. */
+        duct_events_rx_stall(conn->fd, rx->h.ext_ptr);
         return;
     }
     /* A protocol error leaves the wire's parser state untrustworthy, so
@@ -2856,28 +2860,34 @@ static void s_rx_start(duct_conn_t *conn)
     duct_events_drive_rx((void *)(uintptr_t)s_conn_tag_word(conn));
 }
 
-/** @brief Latch @p conn's RX as stalled until the worker's acks reach its
+/** @brief Latch @p conn's RX as stalled until the worker's acks cross its
  *  resume target.
  *  Publishes @ref duct_olb_rx_resume_total for @p min_avail and @p restart as
- *  @c resume_at ahead of the latch, so the ack reaching it reposts the read.
- *  The @c seq_cst fence pairs with @ref s_rx_ack_check's: that check either
- *  sees the latch and reposts, or its ack is visible to whatever the caller
- *  checks after this.
+ *  @c resume_at (release) ahead of the @c seq_cst fence, then re-checks
+ *  @c acked: the fence pairs with the worker's @ref s_rx_ack_check, so
+ *  either that check sees the target and its crossing ack reposts the
+ *  read, or this side sees the ack already past the target and disarms at
+ *  once — an armed word always names a target strictly ahead of @c acked,
+ *  which is what makes the worker's edge post exact.
  */
 static void s_rx_latch([[maybe_unused]] duct_io_t *t, duct_conn_t *conn,
                        size_t min_avail, bool restart)
 {
     auto rx = duct_conn_rx_olb(conn);
-    duct_atomic_store(&rx->resume_at, duct_olb_rx_resume_total(rx, min_avail, restart), relaxed);
-    duct_conn_state_set(conn, fl_conn_rx_full);
+    uint64_t target = duct_olb_rx_resume_total(rx, min_avail, restart);
+    duct_atomic_store(&rx->resume_at, target, release);
     atomic_thread_fence(memory_order_seq_cst);
+    if (duct_atomic_load(&rx->acked, acquire) >= target)
+        duct_atomic_store(&rx->resume_at, 0u, relaxed);
     duct_rtstat_obj_inc(t, rtstats.rx_full_latch, 1);
 }
 
-/** @brief Repost @p conn's read when no worker ack is left to clear the latch.
- *  A posted byte still unacked means an ack is coming and carries the repost
- *  with it; past that, nothing else wakes this conn, so the repost chains on
- *  itself until the stall lifts.
+/** @brief Repost @p conn's read when no worker ack is left to cross the
+ *  latch.
+ *  A posted byte still unacked means an ack is coming, and the armed target
+ *  sits strictly past @c acked, so that ack's crossing edge carries the
+ *  repost with it; past that, nothing else wakes this conn, so the repost
+ *  chains on itself until the stall lifts.
  */
 static void s_rx_latch_repost(duct_conn_t *conn)
 {
@@ -2920,7 +2930,7 @@ static bool s_rx_reserve_space([[maybe_unused]] duct_io_t *t, duct_conn_t *conn,
         s_rx_latch_repost(conn);
         return false;
     }
-    duct_conn_state_clear(conn, fl_conn_rx_full);
+    duct_atomic_store(&rx->resume_at, 0u, relaxed);
     return true;
 }
 
@@ -2957,15 +2967,16 @@ bool duct_io_rx_reserve(void *tag, duct_io_xfer_t *out)
 {
     auto conn = s_conn_from_tag(tag);
     duct_do_if(!conn, return false);
+    auto rx = duct_conn_rx_olb(conn);
     /* Closed/suspended/ended gate: a reactive backend already checked this
      * before reaching here, so it is redundant there. A proactive
      * backend's own completion chain reposts unconditionally without
      * touching duct_conn_t, so only this check stops its next read after an
      * rx_op_pause or the end of the conn's input. */
-    if (duct_conn_state(conn) & (fl_conn_closed | fl_conn_suspended | fl_conn_rx_eof))
+    if ((duct_conn_state(conn) & (fl_conn_closed | fl_conn_rx_eof))
+        || duct_atomic_load(&rx->suspended, relaxed))
         return s_rx_reserve_stall(conn, out);
     auto t = s_io_this;
-    auto rx = duct_conn_rx_olb(conn);
     uint8_t *ptr = nullptr;
     size_t avail = 0u;
     size_t rec = duct_conn_record_framed(conn) ? sizeof(duct_dgram_rec_hdr_t) : 0u,
@@ -3183,20 +3194,21 @@ void duct_io_rx_done(void *tag, duct_result_t rc)
      * drive the full ring latched ends on the backend's initial rc_again too,
      * its kernel queue still full, and a buffer shrunk under that queue has the
      * kernel prune it. */
-    if (rc == rc_again && conn->xport_type == x_tcp
-        && !(duct_conn_state(conn) & (fl_conn_rx_full | fl_conn_suspended | fl_conn_closed))) {
+    if (rc == rc_again && conn->xport_type == x_tcp) {
         auto rx = duct_conn_rx_olb(conn);
-        switch (duct_x_sock_rx_follow(duct_x_sock_rx_of(rx), conn->fd,
-                                      duct_atomic_load(&rx->acked, relaxed))) {
-        case x_follow_set:
-            duct_rtstat_obj_inc(t, rtstats.tcp_rcvbuf_sets, 1);
-            [[fallthrough]];
-        case x_follow_read:
-            duct_rtstat_obj_inc(t, rtstats.tcp_rcvbuf_reads, 1);
-            break;
-        case x_follow_none:
-            break;
-        }
+        if (!(duct_has(duct_conn_state(conn), fl_conn_closed))
+            && !duct_atomic_load(&rx->suspended, relaxed) && !duct_olb_rx_stalled(rx))
+            switch (duct_x_sock_rx_follow(duct_x_sock_rx_of(rx), conn->fd,
+                                          duct_atomic_load(&rx->acked, relaxed))) {
+            case x_follow_set:
+                duct_rtstat_obj_inc(t, rtstats.tcp_rcvbuf_sets, 1);
+                [[fallthrough]];
+            case x_follow_read:
+                duct_rtstat_obj_inc(t, rtstats.tcp_rcvbuf_reads, 1);
+                break;
+            case x_follow_none:
+                break;
+            }
     }
     if (rc == rc_closed && duct_conn_reads_eof(conn)) {
         /* The input ends once: a parse error in this same drive ends it first. */
@@ -3246,6 +3258,39 @@ static bool s_tx_peek_idle(duct_conn_t *conn, size_t readable, duct_io_xfer_t *o
     return false;
 }
 
+/** @brief Wake @p conn's worker if this head advance crossed its armed
+ *  TX-wait target.
+ *  Called after every TX head advance — the drain's own and the fold
+ *  @ref duct_olb_tx_readable performs — with @p prev_head and @p new_head
+ *  bracketing the advance. The fence pairs with the worker's arm, so either
+ *  its room check after arming sees what io freed, or the target load here
+ *  sees the arm, and the crossing edge @c prev_head < T ≤ new_head fires
+ *  exactly once per arm — the packed head is monotonic, so a spent target
+ *  can never cross again and no clear write exists. The value spares a
+ *  worker with nothing blocked a futex round trip per drained message.
+ */
+static void s_tx_wake_waiter(duct_conn_t *conn, uint64_t prev_head, uint64_t new_head)
+{
+    atomic_thread_fence(memory_order_seq_cst);
+    uint64_t target = duct_atomic_load(&duct_conn_tx_olb(conn)->resume_at, relaxed);
+    if (!duct_olb_tx_wait_crossed(prev_head, new_head, target))
+        return;
+    duct_worker_wake_id(conn->worker_id);
+}
+
+/** @brief Signal-side form of the TX wake: a device whose send ring freed
+ *  room raises its handle, and any armed wait answers — a lane conn's zeroed
+ *  ring words give its target the "next signal" shape no head advance ever
+ *  crosses.
+ */
+static void s_tx_wake_signalled(duct_conn_t *conn)
+{
+    atomic_thread_fence(memory_order_seq_cst);
+    if (duct_atomic_load(&duct_conn_tx_hdr(conn)->resume_at, relaxed) == 0u)
+        return;
+    duct_worker_wake_id(conn->worker_id);
+}
+
 /* Record-framed: one record's payload, positioned past the internal
  * record-length prefix the worker staged ahead of the wire's own bytes,
  * independent of whatever shape on_pack itself writes, and stripped before the
@@ -3261,7 +3306,15 @@ bool duct_io_tx_peek(void *tag, duct_io_xfer_t *out)
     size_t rec = duct_conn_record_framed(conn) ? sizeof(duct_dgram_rec_hdr_t) : 0u;
     auto tx = duct_conn_tx_olb(conn);
     uint64_t head = 0u;
+    uint64_t before = duct_atomic_load(&tx->h.head, relaxed);
     size_t n = duct_olb_tx_readable(tx, &head);
+    /* The fold @ref duct_olb_tx_readable performs is a head advance of its
+     * own — the wrap room it frees crosses the worker's fold-form target
+     * right here, with no s_tx_advance after it to bracket the edge (the
+     * drive that follows loads its prev already past the fold). */
+    uint64_t folded = duct_atomic_load(&tx->h.head, relaxed);
+    if (folded != before)
+        s_tx_wake_waiter(conn, before, folded);
     /* n == rec is a record header with no payload, which a zero-length
      * datagram legitimately stages: only a short header or an empty ring
      * is idle. */
@@ -3288,22 +3341,6 @@ bool duct_io_tx_peek(void *tag, duct_io_xfer_t *out)
     return true;
 }
 
-/** @brief Wake @p conn's worker if a turn armed @c fl_conn_tx_wait on it.
- *  Called after every TX head advance and on every device signal. The fence
- *  pairs with the worker's arm, so either its room check after arming sees
- *  what io freed or this sees the flag, and with the fence the worker runs
- *  after clearing its wake latch. Nothing re-polls a missed wake. The flag
- *  spares a worker with nothing blocked a futex round trip per drained message.
- */
-static void s_tx_wake_waiter(duct_conn_t *conn)
-{
-    atomic_thread_fence(memory_order_seq_cst);
-    if (!duct_has(duct_conn_state(conn), fl_conn_tx_wait))
-        return;
-    duct_conn_state_clear(conn, fl_conn_tx_wait);
-    duct_worker_wake_id(conn->worker_id);
-}
-
 /** @brief Release @p offered bytes of @p conn's TX ring, @p n of them sent.
  *  @p offered is a snapshot the peek call already captured this same drive
  *  iteration; re-reading the OLB's readable length here races a
@@ -3312,19 +3349,23 @@ static void s_tx_wake_waiter(duct_conn_t *conn)
  */
 static bool s_tx_advance(duct_conn_t *conn, size_t offered, size_t n)
 {
+    auto tx = duct_conn_tx_olb(conn);
+    uint64_t prev = duct_atomic_load(&tx->h.head, relaxed);
     if (duct_conn_record_framed(conn)) {
         assert(n == offered || n == 0u); /* a record-framed transport ships a
                                            * packet whole or not at all, with
                                            * no short-write retry concept. */
-        duct_olb_tx_advance(duct_conn_tx_olb(conn), sizeof(duct_dgram_rec_hdr_t) + offered);
-        s_tx_wake_waiter(conn);
+        duct_olb_tx_advance(tx, sizeof(duct_dgram_rec_hdr_t) + offered);
+        s_tx_wake_waiter(conn, prev,
+                         duct_atomic_load(&tx->h.head, relaxed));
         return true;
     }
-    duct_olb_tx_advance(duct_conn_tx_olb(conn), n);
+    duct_olb_tx_advance(tx, n);
+    uint64_t now = duct_atomic_load(&tx->h.head, relaxed);
     /* Counted here, where an iocp completion lands as well as a write's return. */
     if (conn->xport_type == x_tcp)
-        duct_x_sock_tx_sent(duct_x_sock_tx_of(duct_conn_tx_olb(conn)), n);
-    s_tx_wake_waiter(conn);
+        duct_x_sock_tx_sent(duct_x_sock_tx_of(tx), n);
+    s_tx_wake_waiter(conn, prev, now);
     return n == offered; /* short write: socket buffer full, caller stops */
 }
 
@@ -3515,10 +3556,7 @@ void duct_io_tx_write_armed_set(void *tag, bool armed)
     duct_do_if(!conn, return);
     if (!duct_conn_has_olb(conn))
         return;
-    if (armed)
-        duct_conn_state_set(conn, fl_conn_write_armed);
-    else
-        duct_conn_state_clear(conn, fl_conn_write_armed);
+    duct_olb_tx_write_armed_set(duct_conn_tx_olb(conn), armed);
     /* Only a drive the socket refused with bytes still readable steps the
      * platform's lowat follow: a leg that never backs up keeps the bound it
      * was created with. */
@@ -3549,11 +3587,14 @@ static void s_req_do_tx_drain(duct_conn_t *conn)
 
 static void s_req_do_rx_read(duct_conn_t *conn)
 {
-    /* Clear fl_conn_rx_full to enable buffer space re-check in s_rx_start. */
-    duct_conn_state_clear(conn, fl_conn_rx_full);
+    /* Disarm the value latch: the crossing post this run answers is spent,
+     * and s_rx_start's derived stall gate must let the re-drive through. */
+    auto rx = duct_conn_rx_olb(conn);
+    if (rx)
+        duct_atomic_store(&rx->resume_at, 0u, relaxed);
     /* The ctx region, not the xport alone: a host-driven x_inter leg has no
-     * device to read and belongs on the socket path below. Clearing the latch
-     * first lets this drive get past s_device_drive's own entry guard. */
+     * device to read and belongs on the socket path below. Disarming first
+     * lets this drive get past s_device_drive's own entry guard. */
     if (conn->xport_type == x_inter && duct_conn_device_ops(conn)) {
         s_device_drive(conn);
         return;
@@ -4027,14 +4068,14 @@ duct_result_t duct_io_udp_peer_send_staged(duct_conn_t *conn, size_t *out_sent,
                                            duct_x_gso_tally_t *tally)
 {
     *out_sent = 0u;
-    if (duct_has(duct_conn_state(conn), fl_conn_write_armed)) {
+    auto tx = duct_conn_tx_olb(conn);
+    if (duct_olb_tx_write_armed(tx)) {
 #if DUCT_RUNTIME_STATS
         duct_worker_rtstat_fast_miss(true);
 #endif
         return rc_again;
     }
     assert(conn->fd != duct_sock_bad);
-    auto tx = duct_conn_tx_olb(conn);
     size_t base = olb_off(duct_atomic_load(&tx->h.tail, relaxed)),
            off = base,
            end = tx->h.stage;
@@ -4075,7 +4116,7 @@ duct_result_t duct_io_udp_peer_send_staged(duct_conn_t *conn, size_t *out_sent,
 bool duct_io_stream_send_fast(duct_conn_t *conn, const duct_view_u8 *bufs,
                               unsigned n, size_t *out_written)
 {
-    if (duct_has(duct_conn_state(conn), fl_conn_write_armed)) {
+    if (duct_olb_tx_write_armed(duct_conn_tx_olb(conn))) {
 #if DUCT_RUNTIME_STATS
         duct_worker_rtstat_fast_miss(true);
 #endif
@@ -4944,10 +4985,12 @@ s_device_push_desc(duct_conn_t *conn, duct_device_leg_t *leg,
     return rc_ok;
 }
 
-/** @brief Latch RX-full on @p conn and take its device off the readiness set. */
+/** @brief Take @p conn's device off the readiness set until the worker's
+ *  lane drain frees room. The stall state itself is derived — the lane not
+ *  whole is what @ref s_device_drive re-reads on every entry; a lane this
+ *  pass emptied carries the resume as its own rx_read post. */
 static void s_device_stall(duct_conn_t *conn)
 {
-    duct_conn_state_set(conn, fl_conn_rx_full);
     duct_events_device_rx_interest(s_io_this->trunk.events,
         duct_conn_device_ops(conn)->wait_handle, false);
 }
@@ -4967,14 +5010,18 @@ static void s_device_stall(duct_conn_t *conn)
  *  @c inter_lane_cap — 32 at an Ethernet 1500 against 144 KB — that copy
  *  dropping the tail a jumbo frame leaves no room for.
  *  Releases lent packets on fully drained lanes. If unread bytes remain,
- *  latches @c fl_conn_rx_full until worker drain resumes.
+ *  stalls the device off the readiness set until the worker's lane drain
+ *  posts the resume.
  */
 static void s_device_drive(duct_conn_t *conn)
 {
-    if (duct_conn_state(conn) & (fl_conn_closed | fl_conn_suspended | fl_conn_rx_full))
+    if (duct_has(duct_conn_state(conn), fl_conn_closed)
+        || duct_atomic_load(&duct_conn_rx_hdr(conn)->suspended, relaxed))
         return;
     auto ln = duct_mpsc_lane(duct_conn_lane(conn), 0u);
     if (duct_vmq_room(&ln) != ln.capacity) {
+        /* The lane still holds batches the worker has not drained: that
+         * not-whole lane is the derived RX-full gate the bit once carried. */
         s_device_stall(conn);
         return;
     }
@@ -4987,7 +5034,7 @@ static void s_device_drive(duct_conn_t *conn)
      * a device prompt without a second handle or a capability
      * flag; one that never signals writability costs a flag test here, and
      * its parked response waits for the worker's next event. */
-    s_tx_wake_waiter(conn);
+    s_tx_wake_signalled(conn);
     duct_events_device_rx_interest(t->trunk.events, dev->wait_handle, true);
     for (unsigned pass = 0u; pass < duct_dgram_rx_max_passes; ++pass) {
         if (leg->n_held && duct_vmq_room(&ln) == ln.capacity)

@@ -626,8 +626,8 @@ duct_nonnull(1) void duct_io_conn_device_release_post(duct_conn_t *conn);
 /** @brief Post RX resume for @p conn.
  *
  *  Restarts reading after RX-full or suspend backpressure. The assigned I/O
- *  thread clears @c fl_conn_rx_full and runs @ref duct_events_drive_rx.
- *  Coalesced via @c fl_req_rx_resume.
+ *  thread disarms the rx header's value latch and runs
+ *  @ref duct_events_drive_rx. Coalesced via @c fl_req_rx_resume.
  */
 duct_nonnull(1) void duct_io_post_rx_read(const duct_conn_handle_t *conn);
 
@@ -678,8 +678,8 @@ duct_io_dgram_shared_send_batch(duct_listener_t *listener,
  *  The span runs from the published tail to the staging cursor. A run of
  *  equal-length records leaves as one segmented write where the stack cuts
  *  datagrams, a lone record through a plain send. Callable only while io has
- *  no published byte of that ring left to drain. @c fl_conn_write_armed is
- *  io's, read relaxed, and @c conn->fd stays open until
+ *  no published byte of that ring left to drain. The TX header's
+ *  @c write_armed is io's, read relaxed, and @c conn->fd stays open until
  *  @ref duct_conn_teardown_worker, which for a bound conn runs at its
  *  worker's conn_lost consume.
  *  @param out_sent bytes of whole records taken, or refused as too large for

@@ -75,7 +75,14 @@ static_assert(sizeof(duct_conn_handle_t) == sizeof(duct_handle_t),
 /** @brief Zero-valued connection handle. */
 static constexpr duct_conn_handle_t conn_handle_null = {};
 
-/** @brief Connection state flags.
+/** @brief Connection state flags — the io thread's gate bits, plus the two
+ *  sticky TX hints the shared grouped-send helper records from whichever
+ *  thread met the kernel's refusal.
+ *  The latch bits this word once carried are single-writer values now:
+ *  the RX read stall is the rx header's @c resume_at edge (§6), the TX room
+ *  wait the tx header's own @c resume_at, the author's RX pause a bit on the
+ *  rx header's ack line, and the write-interest state lives on the tx
+ *  header's io line.
  *  Atomically manipulated via @ref duct_conn_state_set and
  *  @ref duct_conn_state_clear helpers.
  */
@@ -87,68 +94,41 @@ typedef enum duct_conn_flags : uint16_t {
                                      *  @ref duct_conn_acquire's state
                                      *  reset. */
 
-    fl_conn_suspended   = 1u << 1,  /**< RX paused by an author's rx_op_pause
-                                      *  request. Written by the worker, read
-                                      *  at the io thread's RX gate. */
-
-    fl_conn_rx_full     = 1u << 2, /**< RX OLB out of space; reads paused
-                                     *  until the worker acks resume. Set and
-                                     *  cleared by the io thread's RX-reserve
-                                     *  path and by the worker's resume
-                                     *  request; read by both. */
-
-    fl_conn_closing     = 1u << 3, /**< Worker requested close; quiesce once
+    fl_conn_closing     = 1u << 1, /**< Worker requested close; quiesce once
                                      *  TX drains. Set once by the io thread;
                                      *  read at the close fence and at the io
                                      *  thread's drain and quiesce gates;
                                      *  cleared only by the next @ref
                                      *  duct_conn_acquire's state reset. */
 
-    fl_conn_tx_wait     = 1u << 4, /**< A worker turn was refused TX room on
-                                     *  this conn, or a retry node is parked
-                                     *  waiting for some to free. Set by the
-                                     *  worker; read and cleared by the io
-                                     *  thread after each TX head advance and
-                                     *  device signal, which wakes the assigned
-                                     *  worker only when set. */
-    fl_conn_write_armed = 1u << 5, /**< Current write-interest state for
-                                     *  reactive backend registration — same
-                                     *  contract as @c duct_listener_t::dgram_tx_write_armed:
-                                     *  updated exclusively by the assigned
-                                     *  I/O thread, gates the worker-side TX
-                                     *  fast path (@c x_udp_peer, @c x_tcp,
-                                     *  @c x_raw) as a stale-tolerant hint.
-                                     *  iocp never touches it — its dgram TX
-                                     *  has no reactive readiness concept. */
-    fl_conn_roaming     = 1u << 6,  /**< An @c x_udp_peer leg whose listener
+    fl_conn_roaming     = 1u << 2,  /**< An @c x_udp_peer leg whose listener
                                       *  holds a candidate address for it, put
                                       *  there by a datagram that arrived from
                                       *  somewhere other than where this socket
                                       *  is connected. Written by I/O thread,
-                                      *  read by worker thread under the same
-                                      *  contract as @c fl_conn_write_armed:
-                                      *  the worker posts @c fl_req_peer_roam
-                                      *  for an accepted frame whose ack total
-                                      *  reaches the RX ring's @c roam_at, and
-                                      *  io moves the socket from there. A
-                                      *  stale read costs one post io then
-                                      *  finds nothing to do. */
-    fl_conn_rx_eof      = 1u << 7,  /**< End of the conn's input, read off the
+                                      *  read by worker thread as a
+                                      *  stale-tolerant hint: the worker posts
+                                      *  @c fl_req_peer_roam for an accepted
+                                      *  frame whose ack total reaches the RX
+                                      *  ring's @c roam_at, and io moves the
+                                      *  socket from there. A stale read costs
+                                      *  one post io then finds nothing to do. */
+    fl_conn_rx_eof      = 1u << 3,  /**< End of the conn's input, read off the
                                       *  peer. Set by the io thread on the
                                       *  zero-length read, and every later read
                                       *  stops at its RX gates; cleared only by
-                                      *  the next @ref duct_conn_acquire's state
-                                      *  reset. */
-    fl_conn_vnet_uso    = 1u << 8, /**< Conn whose tun took the USO flags at its open.
+                                      *  the next @ref duct_conn_acquire's
+                                      *  state reset. */
+    fl_conn_vnet_uso    = 1u << 4, /**< Conn whose tun took the USO flags at its open.
                                       *  Set once by the io thread in
                                       *  @ref duct_conn_setup; read by the worker's
                                       *  vnet write train, which merges UDP
                                       *  datagrams for a conn that carries it.
                                       *  Cleared only by the next
                                       *  @ref duct_conn_acquire's state reset. */
-    fl_conn_dgram_gro   = 1u << 9,
-    fl_conn_gso_off     = 1u << 10,
-    fl_conn_vnet_uso_tx = 1u << 11,
+    fl_conn_dgram_gro   = 1u << 5,
+    fl_conn_gso_off     = 1u << 6,
+    fl_conn_vnet_uso_tx = 1u << 7,
 } duct_conn_flags_t;
 
 static_assert(sizeof(duct_conn_flags_t) == sizeof(uint16_t),
