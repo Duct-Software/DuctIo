@@ -806,6 +806,12 @@ target_compile_features(ductio_park_control_test PRIVATE c_std_23)
 add_test(NAME park_control COMMAND ductio_park_control_test)
 set_tests_properties(park_control PROPERTIES TIMEOUT 30)
 
+add_executable(ductio_dgram_peer_burst_test dgram_peer_burst_test.c)
+target_link_libraries(ductio_dgram_peer_burst_test PRIVATE DuctIo::ductio)
+target_compile_features(ductio_dgram_peer_burst_test PRIVATE c_std_23)
+add_test(NAME dgram_peer_burst COMMAND ductio_dgram_peer_burst_test)
+set_tests_properties(dgram_peer_burst PROPERTIES TIMEOUT 30)
+
 add_executable(ductio_tcp_cycle_test tcp_cycle_test.c)
 target_link_libraries(ductio_tcp_cycle_test PRIVATE DuctIo::ductio)
 target_compile_features(ductio_tcp_cycle_test PRIVATE c_std_23)

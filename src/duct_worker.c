@@ -2139,6 +2139,23 @@ static duct_exec_rc_t s_dispatch_frame_body(duct_worker_t *w, duct_conn_t *conn,
     case claim_fallthrough: break;
     default: duct_unreachable();
     }
+    {
+        static thread_local uint64_t disp_at = 0u;
+        uint64_t now = duct_ticks_mono_ns();
+        if (frame.payload.size <= 300u && now - disp_at > 200ull * 1000ull * 1000ull) {
+            disp_at = now;
+            duct_log(stderr, "ductio: dispatch cid=%u size=%u head=%02x%02x%02x%02x%02x%02x%02x%02x",
+                     (unsigned)cid, (unsigned)frame.payload.size,
+                     frame.payload.size > 0u ? frame.payload.data[0] : 0u,
+                     frame.payload.size > 1u ? frame.payload.data[1] : 0u,
+                     frame.payload.size > 2u ? frame.payload.data[2] : 0u,
+                     frame.payload.size > 3u ? frame.payload.data[3] : 0u,
+                     frame.payload.size > 4u ? frame.payload.data[4] : 0u,
+                     frame.payload.size > 5u ? frame.payload.data[5] : 0u,
+                     frame.payload.size > 6u ? frame.payload.data[6] : 0u,
+                     frame.payload.size > 7u ? frame.payload.data[7] : 0u);
+        }
+    }
     duct_response_t out;
     duct_response_reset(&out);
     auto rc = cfg->on_frame(s, cid, &frame, &out, s->proto_state);
@@ -3243,18 +3260,40 @@ static void s_inter_pkt(duct_conn_handle_t handle,
 {
     duct_conn_t *conn;
     duct_session_t *s;
-    if (s_dispatch_resolve(handle, &conn, &s) != res_ok)
+    auto res = s_dispatch_resolve(handle, &conn, &s);
+    if (pkt->len <= 300u) {
+        const uint8_t *ipkt_head = s_inter_payload(b, pkt);
+        duct_log(stderr, "ductio: inter pkt res=%u len=%u sid=%u head=%02x%02x%02x%02x",
+                 (unsigned)res, (unsigned)pkt->len, (unsigned)pkt->stream_id,
+                 pkt->len > 0u ? ipkt_head[0] : 0u,
+                 pkt->len > 1u ? ipkt_head[1] : 0u,
+                 pkt->len > 2u ? ipkt_head[2] : 0u,
+                 pkt->len > 3u ? ipkt_head[3] : 0u);
+    } else {
+        static thread_local uint64_t ipkt_big_at = 0u;
+        uint64_t ipkt_big_now = duct_ticks_mono_ns();
+        if (ipkt_big_now - ipkt_big_at > 200ull * 1000ull * 1000ull) {
+            ipkt_big_at = ipkt_big_now;
+            duct_log(stderr, "ductio: inter pkt big res=%u len=%u sid=%u",
+                     (unsigned)res, (unsigned)pkt->len, (unsigned)pkt->stream_id);
+        }
+    }
+    if (res != res_ok)
         return;
-    if (s->wire_rebind_next)
+    if (s->wire_rebind_next) {
+        duct_log(stderr, "ductio: inter pkt rebind drop len=%u", (unsigned)pkt->len);
         return; /* wire-changing switch in flight elsewhere in the session; no replay path here */
+    }
     auto cfg = duct_proto_cfg_of(s->proto);
     duct_do_if(!cfg->on_frame, return);
     auto w = s_this_worker;
     auto cid = duct_session_conn_id_by_handle(s, handle);
     /* A refused join's leg awaiting its close fence: dropped with no callback
      * and no report. */
-    if (cid == duct_session_max_legs)
+    if (cid == duct_session_max_legs) {
+        duct_log(stderr, "ductio: inter pkt max-legs drop len=%u", (unsigned)pkt->len);
         return;
+    }
     duct_frame_t frame = {
         .stream_id = pkt->stream_id,
         .flags = pkt->flags,
@@ -3268,8 +3307,10 @@ static void s_inter_pkt(duct_conn_handle_t handle,
     bool sealed = conn->wire && conn->wire->unseal;
     if (sealed) {
         auto codec = s_tls_codec(conn);
-        if (!codec)
+        if (!codec) {
+            duct_log(stderr, "ductio: inter pkt no codec len=%u", (unsigned)pkt->len);
             return;
+        }
         /* The strip runs before the question, not after: unseal_size answers
          * about the engine's own PDU, and counting the conn's prefix into it
          * over-reserves on the destination leg, while a datagram too short to
@@ -3294,6 +3335,8 @@ static void s_inter_pkt(duct_conn_handle_t handle,
                 redirect.ct = s_pool_acquire(&w->ct_pool, room);
             }
             if (!redirect.ct) {
+                duct_log(stderr, "ductio: inter pkt ct pool full len=%u",
+                         (unsigned)frame.payload.size);
                 s_fire_error(s, cfg, rc_again);
                 return;
             }
@@ -3312,14 +3355,34 @@ static void s_inter_pkt(duct_conn_handle_t handle,
         s_rekey_take(conn, codec, &redirect.base);
         auto urc = conn->wire->unseal(conn->wire, codec, frame.payload, &redirect.base);
         if (urc != rc_ok) {
+            static thread_local uint64_t useal_at = 0u;
+            uint64_t useal_now = duct_ticks_mono_ns();
+            if (useal_now - useal_at > 200ull * 1000ull * 1000ull) {
+                useal_at = useal_now;
+                duct_log(stderr, "ductio: inter pkt unseal fail rc=%u len=%u head=%02x%02x",
+                         (unsigned)urc, (unsigned)frame.payload.size,
+                         frame.payload.size > 0u ? frame.payload.data[0] : 0u,
+                         frame.payload.size > 1u ? frame.payload.data[1] : 0u);
+            }
             s_fire_error(s, cfg, urc);
             return;
         }
-        if (!s_peer_auth_fire(s, cfg, cid, codec))
+        if (!s_peer_auth_fire(s, cfg, cid, codec)) {
+            static thread_local uint64_t pauth_at = 0u;
+            uint64_t pauth_now = duct_ticks_mono_ns();
+            if (pauth_now - pauth_at > 200ull * 1000ull * 1000ull) {
+                pauth_at = pauth_now;
+                duct_log(stderr, "ductio: inter pkt peer-auth skip len=%u",
+                         (unsigned)frame.payload.size);
+            }
             return;
+        }
         frame.payload = duct_view(duct_view_u8, (void *)redirect.at, redirect.len);
-        if (frame.payload.size == 0u)
+        if (frame.payload.size == 0u) {
+            duct_log(stderr, "ductio: inter pkt unseal empty len=%u",
+                     (unsigned)pkt->len);
             return;
+        }
         /* A datagram PDU holds exactly one inner frame, datagram framing
          * sealing one per PDU; a cleartext that frame does not fill exactly
          * costs only this datagram. */
@@ -3333,6 +3396,13 @@ static void s_inter_pkt(duct_conn_handle_t handle,
                                                 &needed) == rc_ok
                       && consumed == frame.payload.size;
             if (!whole) {
+                static thread_local uint64_t torn_at = 0u;
+                uint64_t torn_now = duct_ticks_mono_ns();
+                if (torn_now - torn_at > 200ull * 1000ull * 1000ull) {
+                    torn_at = torn_now;
+                    duct_log(stderr, "ductio: inter pkt inner torn len=%u",
+                             (unsigned)frame.payload.size);
+                }
                 s_fire_error(s, cfg, rc_invalid_arg);
                 return;
             }
@@ -3477,6 +3547,8 @@ static bool s_inter_msg_take(duct_vmq_hdr_t *hdr, void *arg)
     auto w = s_this_worker;
     if (s_tx_held(duct_session_by_conn(conn), hold, conn)) {
         duct_rtstat_obj_inc(w, rtstats.inter_held, 1);
+        duct_log(stderr, "ductio: inter held conn=%u n=%u", (unsigned)duct_conn_idx_get(conn),
+                 (unsigned)b->n);
         s_rx_pin(conn, b->rx_pool);
         return false;
     }
@@ -5239,6 +5311,15 @@ typedef struct {
 static duct_commit_rc_t
 s_commit_ctx_fail(const commit_ctx_t *ctx, duct_result_t err, duct_commit_rc_t crc)
 {
+    {
+        static thread_local uint64_t cfail_at = 0u;
+        uint64_t cfail_now = duct_ticks_mono_ns();
+        if (cfail_now - cfail_at > 200ull * 1000ull * 1000ull) {
+            cfail_at = cfail_now;
+            duct_log(stderr, "ductio: commit fail err=%u commit=%u xport=%u",
+                     (unsigned)err, (unsigned)crc, (unsigned)ctx->conn->xport_type);
+        }
+    }
     return s_commit_fail(ctx->s, duct_proto_cfg_of(ctx->s->proto), ctx->out_conn, ctx->out_stream, ctx->out,
                          err, crc, ctx->is_replay);
 }
@@ -5479,8 +5560,17 @@ static void s_tx_train_flush(duct_worker_t *w)
     t->frames = 0u;
     auto conn = duct_conn_by_handle(t->conn);
     auto tx = conn ? duct_conn_tx_olb(conn) : nullptr;
-    if (!tx || duct_atomic_load(&conn->conn_fence, acquire) >= fence_quiescing)
+    if (!tx || duct_atomic_load(&conn->conn_fence, acquire) >= fence_quiescing) {
+        static thread_local uint64_t tfence_at = 0u;
+        uint64_t tfence_now = duct_ticks_mono_ns();
+        if (tfence_now - tfence_at > 200ull * 1000ull * 1000ull) {
+            tfence_at = tfence_now;
+            duct_log(stderr, "ductio: train fence drop tx=%u fence=%u",
+                     tx ? 1u : 0u,
+                     tx ? (unsigned)duct_atomic_load(&conn->conn_fence, acquire) : 0u);
+        }
         return;
+    }
     if (!duct_olb_tx_published(tx) && (conn->xport_type != x_tcp || duct_io_parked(conn))) {
         size_t sent = 0u;
         duct_result_t rc;
@@ -5493,6 +5583,15 @@ static void s_tx_train_flush(duct_worker_t *w)
             rc = duct_io_udp_peer_send_staged(conn, &sent, &tally);
             duct_rtstat_obj_inc(w, rtstats.dgram_tx_gso_writes, tally.writes);
             duct_rtstat_obj_inc(w, rtstats.dgram_tx_gso_dgrams, tally.dgrams);
+        }
+        if (rc != rc_ok) {
+            static thread_local uint64_t tflush_at = 0u;
+            uint64_t tflush_now = duct_ticks_mono_ns();
+            if (tflush_now - tflush_at > 200ull * 1000ull * 1000ull) {
+                tflush_at = tflush_now;
+                duct_log(stderr, "ductio: train send rc=%u sent=%zu xport=%u",
+                         (unsigned)rc, sent, (unsigned)conn->xport_type);
+            }
         }
         if (rc == rc_ok) {
             duct_olb_tx_sent_staged(tx);

@@ -653,8 +653,15 @@ static unsigned s_dgram_shared_parse(duct_conn_t *conn, uint8_t *scratch, size_t
          * malformed input. Stop, keep what already parsed cleanly, drop
          * the remainder. */
         auto rc = conn->wire->on_parse(conn->wire, input, &frame, conn->wire_parser, &consumed, &needed);
-        if (rc != rc_ok || consumed == 0u)
+        if (rc != rc_ok || consumed == 0u) {
+            duct_log(stderr, "ductio: dgram parse stop conn=%u rc=%u consumed=%zu off=%zu size=%zu head=%02x%02x%02x%02x",
+                     (unsigned)duct_conn_idx_get(conn), (unsigned)rc, consumed, off, scratch_bytes,
+                     off + 0u < scratch_bytes ? scratch[off] : 0u,
+                     off + 1u < scratch_bytes ? scratch[off + 1u] : 0u,
+                     off + 2u < scratch_bytes ? scratch[off + 2u] : 0u,
+                     off + 3u < scratch_bytes ? scratch[off + 3u] : 0u);
             break;
+        }
         frames[n++] = (dgram_shared_frame_t){
             .payload = frame.payload, .stream_id = frame.stream_id, .flags = frame.flags,
         };
@@ -3451,8 +3458,17 @@ bool duct_io_tx_send(void *tag, const duct_io_xfer_t *p, duct_result_t *out_rc)
         return s_tx_advance(conn, offered, nwritten);
     case rc_drop:
         return s_tx_advance(conn, p->size, 0u);
-    default:
+    default: {
+        static thread_local uint64_t txs_at = 0u;
+        uint64_t txs_now = duct_ticks_mono_ns();
+        if (txs_now - txs_at > 200ull * 1000ull * 1000ull) {
+            txs_at = txs_now;
+            duct_log(stderr, "ductio: tx send ref rc=%u xport=%u size=%zu armed=%u",
+                     (unsigned)*out_rc, (unsigned)p->xport_type, p->size,
+                     duct_has(duct_conn_state(conn), fl_conn_write_armed) ? 1u : 0u);
+        }
         return false;
+    }
     }
 }
 
@@ -3904,6 +3920,13 @@ duct_result_t duct_io_udp_peer_send_staged(duct_conn_t *conn, size_t *out_sent,
 {
     *out_sent = 0u;
     if (duct_has(duct_conn_state(conn), fl_conn_write_armed)) {
+        static thread_local uint64_t psk_at = 0u;
+        uint64_t psk_now = duct_ticks_mono_ns();
+        if (psk_now - psk_at > 200ull * 1000ull * 1000ull) {
+            psk_at = psk_now;
+            size_t readable = duct_olb_tx_readable(conn->tx_buf, &(uint64_t){ 0u });
+            duct_log(stderr, "ductio: peer send armed-skip readable=%zu", readable);
+        }
 #if DUCT_RUNTIME_STATS
         duct_worker_rtstat_fast_miss(true);
 #endif
