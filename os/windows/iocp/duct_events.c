@@ -659,7 +659,9 @@ void duct_events_drive_tx(void *tag)
  *  IPv4 where an IPv6 socket cannot be made.
  *  @return @c rc_ok with the @c AcceptEx out; @c rc_defer when no accept socket can be made
  *          or @c AcceptEx answers @c WSAEMFILE or @c WSAENOBUFS; @c rc_fatal on any other
- *          error, which leaves the listener with no @c AcceptEx out. */
+ *          error, which leaves the listener with no @c AcceptEx out — the caller reports
+ *          it up its own line (@c s_listener_create at the first post) or parks on it
+ *          (@c s_accept_rearm past the first). */
 static duct_result_t s_post_accept(listener_ctx_t *ctx)
 {
     auto fd = ctx->listener->listen_fd;
@@ -686,26 +688,33 @@ static duct_result_t s_post_accept(listener_ctx_t *ctx)
         case ERROR_IO_PENDING:
             break;
         default:
-            duct_dbg_errf("WSA error %d", rc);
+            duct_diag("iocp: AcceptEx post error %d leaves listener %p unarmed",
+                      rc, (void *)ctx->listener);
             closesocket(ctx->accept_fd);
             ctx->accept_fd = duct_sock_bad;
-            /* TODO: handle error */
             return rc == WSAEMFILE || rc == WSAENOBUFS ? rc_defer : rc_fatal;
         }
     }
     return rc_ok;
 }
 
-/** @brief Post @p ctx's next @c AcceptEx, parking its listener when no accept socket can be made.
- *  The post is tried once more past the park, so a socket closed in between is taken; a
- *  later close puts the listener back through @ref duct_events_listener_rx_interest, which
- *  posts again. */
+/** @brief Post @p ctx's next @c AcceptEx, parking its listener whenever the
+ *  post did not go out.
+ *  Both refusal kinds park: @c rc_defer — no accept socket to make, or the
+ *  stack's @c WSAEMFILE / @c WSAENOBUFS — and @c rc_fatal alike leave the
+ *  listener with no @c AcceptEx out, and a listener that is neither armed
+ *  nor parked is engine silence nothing reports and nothing re-arms. Parked,
+ *  the refusal is visible state (@c rx_parked, the @c accept_parked count)
+ *  and @ref duct_io_accept_resume — a conn fd closed anywhere — or a slot
+ *  unstall walks it back through @ref duct_events_listener_rx_interest. The
+ *  post is tried once more past the park, so a socket closed in between is
+ *  taken; only a post that actually went out unparks. */
 static void s_accept_rearm(listener_ctx_t *ctx)
 {
-    if (s_post_accept(ctx) != rc_defer)
+    if (s_post_accept(ctx) == rc_ok)
         return;
     duct_io_accept_park(ctx->listener);
-    if (s_post_accept(ctx) != rc_defer)
+    if (s_post_accept(ctx) == rc_ok)
         duct_io_accept_unpark(ctx->listener);
 }
 
@@ -1430,8 +1439,15 @@ void duct_events_run_loop(duct_events_env_t *env, bool _Atomic *shutdown)
             case WAIT_TIMEOUT:
                 break;
             default:
-                /* TODO: handle error */
-                return;
+                /* No completion will ever arrive again: the port this loop
+                 * is the whole pump of just refused it. A bare return would
+                 * strand every park behind this thread's silence — the
+                 * engine hangs with no word said. The loop has no
+                 * degradation path, so the refusal is explicit: named, then
+                 * fatal. */
+                duct_diag("iocp: GetQueuedCompletionStatusEx error %d — io loop cannot continue",
+                          rc);
+                duct_fatal(true);
             }
         in_window = duct_spin_next(&spin, n > 0u, duct_ticks_mono_ns());
         if (n == 0u)

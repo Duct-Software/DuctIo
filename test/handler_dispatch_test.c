@@ -2911,6 +2911,78 @@ static void test_unbound_defer_window_closes_with_close_post(void)
     printf("  unbound_defer_window_closes_with_close_post OK\n");
 }
 
+/** @brief §5: the pin CAS against the generation bump, and the spent finish.
+ *  A stale generation never pins — the bump the release finish took moved
+ *  the word past the handle, so the pin CAS refuses the raw page-0 slot a
+ *  poster would still address, taking nothing. A live word pins and
+ *  saturates at 15; the quiesce claim then shuts the door on new pins with
+ *  the nibble preserved; the count's 0-crossing hands the finish to the pin
+ *  side as @c conn_spent, which the last unpin completes — and the unpin
+ *  running first leaves the count's own finish to observe @c pins == 0 and
+ *  complete itself. */
+static void test_pin_cas_against_gen_bump(void)
+{
+    duct_conn_pool_reclaim();
+    unsigned free_before = duct_conns_free();
+
+    /* Stale generation: the release bumped the word past the handle. */
+    auto conn = duct_conn_acquire();
+    assert(conn);
+    conn->xport_type = x_inter;
+    auto stale = duct_conn_handle_get(conn);
+    duct_conn_release(conn);
+    assert(duct_conns_free() == free_before);
+    assert(duct_conn_pin(duct_conn_block_at(stale.idx), stale.gen)
+           == rc_closed);
+
+    /* Live word: bind opens the pin gate; the nibble saturates at 15. */
+    conn = duct_conn_acquire();
+    assert(conn);
+    conn->xport_type = x_inter;
+    auto handle = duct_conn_handle_get(conn);
+    assert(duct_conn_session_bind(conn, UINT64_MAX));
+    assert(duct_conn_pin(conn, handle.gen) == rc_ok);
+    assert((duct_atomic_load(duct_conn_gen_req(conn), relaxed)
+            & gen_req_pins_mask) == 1ull << gen_req_pins_shift);
+    for (unsigned i = 1u; i < 15u; ++i)
+        assert(duct_conn_pin(conn, handle.gen) == rc_ok);
+    assert(duct_conn_pin(conn, handle.gen) == rc_defer);
+
+    /* The quiesce claim closes the pin door, nibble held in the word. */
+    duct_conn_phase_t pre;
+    assert(duct_conn_close_claim(conn, &pre) && pre == conn_bound);
+    assert(duct_conn_pin(conn, handle.gen) == rc_closed);
+
+    /* Count first: the 0-crossing marks the word spent; the last unpin
+     * finishes it, not one unpin sooner. */
+    duct_conn_release(conn);
+    assert(duct_conn_phase(conn) == conn_spent);
+    assert(duct_conns_free() == free_before - 1u);
+    assert(duct_conn_by_handle(handle));
+    for (unsigned i = 0u; i < 14u; ++i)
+        duct_conn_unpin(conn);
+    assert(duct_conns_free() == free_before - 1u);
+    duct_conn_unpin(conn);
+    assert(duct_conns_free() == free_before);
+    assert(!duct_conn_by_handle(handle));
+
+    /* Pin side first: the last unpin on a count still holding its unit is
+     * a no-op; the count's own finish observes pins == 0 and completes. */
+    conn = duct_conn_acquire();
+    assert(conn);
+    conn->xport_type = x_inter;
+    handle = duct_conn_handle_get(conn);
+    assert(duct_conn_session_bind(conn, UINT64_MAX));
+    assert(duct_conn_pin(conn, handle.gen) == rc_ok);
+    duct_conn_unpin(conn);
+    assert(duct_conn_by_handle(handle));
+    duct_conn_release(conn);
+    assert(!duct_conn_by_handle(handle));
+    assert(duct_conns_free() == free_before);
+
+    printf("  pin_cas_against_gen_bump OK\n");
+}
+
 /* ── Main ─────────────────────────────────────────────────────────── */
 
 duct_msg_chain_decl(s_fifo_test_msg, bool *blocked; unsigned *calls;);
@@ -3112,6 +3184,7 @@ int main(void)
     test_wire_rebind_posts_no_fence_once_closing();
     test_close_races_ctrl_at_release_boundaries();
     test_unbound_defer_window_closes_with_close_post();
+    test_pin_cas_against_gen_bump();
     printf("All handler_dispatch tests passed.\n");
     return 0;
 }

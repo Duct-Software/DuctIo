@@ -2831,7 +2831,14 @@ static void s_rx_start(duct_conn_t *conn)
 {
     if (!conn || !duct_conn_rx_olb(conn))
         return;
-    if (duct_conn_state(conn) & (fl_conn_closed | fl_conn_suspended | fl_conn_rx_full | fl_conn_rx_eof)) {
+    auto st = duct_conn_state(conn);
+    if (st & fl_conn_closed)
+        /* The close decision already unwatched this fd: no reactive
+         * interest remains to drop, and the worker's teardown half may be
+         * closing the descriptor under us — its fd store is the one write
+         * this read must not race. */
+        return;
+    if (st & (fl_conn_suspended | fl_conn_rx_full | fl_conn_rx_eof)) {
         duct_events_rx_stall(conn->fd, duct_conn_rx_olb(conn)->h.ext_ptr);
         return;
     }
@@ -4729,7 +4736,8 @@ void duct_io_device_teardown(duct_conn_t *conn)
 /** @brief Copy @p n packets from @p bufs onto @p conn's inter lane and arm
  *  its worker.
  *  The io thread that owns @p conn runs this, so it needs none of the
- *  @c host_pins dance @ref duct_io_inter_batch does for a host caller.
+ *  §5 word pin @ref duct_io_inter_batch takes for a host caller: the io
+ *  owner's own @c refs unit holds the slot for the length of this push.
  *
  *  Places the longest fitting prefix of @p bufs onto the lane.
  *

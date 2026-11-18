@@ -286,13 +286,21 @@ static void s_conn_free_push(duct_conn_t *conn)
 }
 
 /** @brief Finish a release at @c refs == 0: arm @c rel_pend over live
- *  request flags, or clear it, bump the generation and push the slot.
+ *  request flags, hand a pinned word to the last unpin as @c conn_spent,
+ *  or clear the bit, bump the generation and push the slot.
  *  The bump and the flags test are one whole-word CAS: a post landing first
  *  holds the finish for its node's run, and one landing after finds a
  *  generation nothing matches. The bump is guarded because generation
  *  shares that word, where an add at the ceiling wraps it to 0. The push
  *  asks for two bumps: the next acquire needs its own, and without it that
  *  acquire fails having already popped the slot, leaking it.
+ *  A pin nibble still holding units (§5) is the spent handoff: no new pin
+ *  can land past the quiesce claim, so the count only waits out the decay,
+ *  and the unpin that takes @c pins 1 → 0 re-enters here on a word nothing
+ *  else can move — both races closed by the CAS: an unpin landing between
+ *  this loop's read and its spent-CAS fails that CAS and the re-loop sees
+ *  @c pins == 0, a spent mark landing before the last unpin hands the
+ *  completion to that unpin's own finish.
  *  @p gen, when nonzero, must still match the word — a recycled slot
  *  belongs to its next occupant's cycle.
  */
@@ -308,6 +316,15 @@ static void s_release_finish(duct_conn_t *conn, uint64_t gen)
                 return;
             if (duct_atomic_cas(weak, slot, &old_word,
                                 old_word | gen_req_rel_pend, release, relaxed))
+                return;
+            continue;
+        }
+        if (old_word & gen_req_pins_mask) {
+            if (duct_gen_req_phase(old_word) == conn_spent)
+                return; /* the last unpin's completion, already handed off */
+            uint64_t want = (old_word & ~gen_req_phase_mask)
+                          | ((uint64_t)conn_spent << gen_req_phase_shift);
+            if (duct_atomic_cas(weak, slot, &old_word, want, release, relaxed))
                 return;
             continue;
         }
@@ -328,6 +345,19 @@ void duct_conn_release(duct_conn_t *conn)
     if (duct_atomic_fetch(sub, &conn->refs, 1u, acq_rel) != 1u)
         return;
     s_release_finish(conn, 0u);
+}
+
+void duct_conn_unpin(duct_conn_t *conn)
+{
+    uint64_t prev = duct_atomic_fetch(sub, duct_conn_gen_req(conn),
+                                      1ull << gen_req_pins_shift, acq_rel);
+    if ((prev & gen_req_pins_mask) != (1ull << gen_req_pins_shift))
+        return;
+    /* Only a word already marked spent owes this unpin a finish: anything
+     * else still holds @c refs > 0, whose own 0-crossing re-enters the
+     * finish loop and observes pins == 0 there. */
+    if (duct_conn_phase(conn) == conn_spent)
+        s_release_finish(conn, 0u);
 }
 
 void duct_conn_release_finish(duct_conn_t *conn, uint64_t gen)
@@ -403,7 +433,11 @@ static void s_conn_transport_fini_lane(duct_conn_t *conn)
 {
     auto lane = duct_conn_lane(conn);
     duct_discard duct_vmq_mpsc_drain(lane, duct_conn_inter_slot_release, nullptr);
-    duct_mpsc_ctrl(lane, 0u)->wake_latch = nullptr;
+    /* wake_latch stays bound: the latch is its worker's, outliving the conn,
+     * and a host thread pinned in §5's word may still notify it after this
+     * drain — an empty wake, harmless. Clearing the pointer here would race
+     * that notify's read of it; the next occupant's page-0 reset clears it
+     * with no pins left to observe the write. */
 }
 
 void duct_conn_teardown_io(duct_conn_t *conn)
@@ -464,15 +498,10 @@ void duct_conn_teardown_worker(duct_conn_t *conn)
      * which page-0 substructures were live. */
     auto lane = duct_conn_lane(conn);
     if (lane) {
-        /* host_pins counts an unregistered reader — duct_io_inter_batch,
-         * called from a host thread the release count never sees. The close
-         * already shut the door on new pins, so a nonzero count here is just
-         * one already in flight, about to finish. Spin here so the lane
-         * teardown below can't race a still-running push. The fence matters
-         * because acquire/release alone won't pair this spin-load with the
-         * other thread's own pin-then-recheck on a weak-ordered CPU. */
-        atomic_thread_fence(memory_order_seq_cst);
-        for (; duct_atomic_load(&conn->host_pins, relaxed); duct_cpu_relax()) {}
+        /* A host reader still pinned in the word (§5) is one more MPSC
+         * producer this drain pairs with, and the pinned word keeps the
+         * slot out of every reuse path — no spin and no fence needed: the
+         * generation bump cannot land until the last unpin's finish. */
         s_conn_transport_fini_lane(conn);
     }
     if (conn->fd != duct_sock_bad) {

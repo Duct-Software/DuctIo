@@ -325,8 +325,9 @@ typedef struct duct_conn {
          *  @c s_post_ctrl, converted at bind), and every armed async kernel
          *  I/O submission (+1 before submit, -1 in @c duct_olb_io_done).
          *  The 0-crossing fetch_sub finalizes the slot: @c rel_pend when
-         *  request flags are live, else the generation bump and the push
-         *  back to the block pool.
+         *  request flags are live, @c conn_spent when a host pin rides the
+         *  word (§5), else the generation bump and the push back to the
+         *  block pool.
          */
         uint32_t _Atomic refs;
 
@@ -336,15 +337,6 @@ typedef struct duct_conn {
          *  observes it complete.
          */
         duct_handle_t _Atomic session_token;
-
-        /** @brief Host-thread readers currently pinning this conn.
-         *  Unregistered readers, e.g. @ref duct_io_inter_batch,
-         *  hold a pin between their generation re-check and their
-         *  last touch of @c inter_lane.
-         *  @ref duct_conn_teardown_worker spins on this, reaching 0 before
-         *  tearing down @c inter_lane.
-         */
-        uint32_t _Atomic  host_pins;
 
         /** @brief Next / prev links in io thread's live-conn list.
          *  Linked by @ref duct_conn_io_list_link, unlinked by
@@ -706,6 +698,45 @@ duct_conn_phase_move(duct_conn_t *conn, duct_conn_phase_t from,
     }
 }
 
+/** @brief Take one host pin on @p conn's lifecycle word, §5.
+ *
+ *  A host thread — one the release count never enumerates — resolves the
+ *  conn by handle and pins it in the same CAS: the generation check, the
+ *  phase gate and the pin increment are one atomic operation on @c gen_req,
+ *  so no Dekker store/load pair and no second resolve are needed. The pin
+ *  never touches @c conn->refs: a pinned word cannot reach the generation
+ *  bump (the count's finish marks it @c conn_spent instead), so the slot
+ *  stays put until @ref duct_conn_unpin's 1→0 drop finishes it.
+ *
+ *  @retval rc_ok     Pinned: @c pins went up by one. The word still matches
+ *                    @p gen, and the phase is a live bind.
+ *  @retval rc_closed The handle is stale — @p gen no longer matches — or the
+ *                    phase reached @c conn_quiesced: the close shut the door
+ *                    on new pins, nothing was taken.
+ *  @retval rc_defer  The conn is still @c conn_unbound (nothing to deliver
+ *                    a batch to), or the pin nibble is saturated at 15.
+ */
+duct_nonnull(1) static inline duct_result_t
+duct_conn_pin(duct_conn_t *conn, uint64_t gen)
+{
+    auto slot = duct_conn_gen_req(conn);
+    uint64_t old = duct_atomic_load(slot, acquire);
+    for (;; duct_cpu_relax()) {
+        if (duct_gen_req_gen(old) != gen)
+            return rc_closed;
+        auto phase = duct_gen_req_phase(old);
+        if (phase >= conn_quiesced)
+            return rc_closed;
+        if (phase == conn_unbound || (old & gen_req_pins_mask) == gen_req_pins_mask)
+            return rc_defer;
+        /* +1 on the nibble: the saturation check above keeps the carry out
+         * of bit 63 from ever being attempted. */
+        if (duct_atomic_cas(weak, slot, &old,
+                            old + (1ull << gen_req_pins_shift), acquire, relaxed))
+            return rc_ok;
+    }
+}
+
 /** @brief Return conn's slot index within the pool. */
 duct_nonnull(1) uint32_t
 duct_conn_idx_get(const duct_conn_t *conn);
@@ -763,9 +794,11 @@ duct_conn_t *duct_conn_acquire(void);
 /** @brief Drop one unit of @p conn's release count.
  *  The 0-crossing fetch_sub finalizes the slot: with live request flags it
  *  arms @c rel_pend inside the word and returns — @c s_req_exec finishes the
- *  release as it runs the posted node — otherwise it bumps the generation
- *  and pushes the slot back to the block pool (or retires it for good at
- *  the generation ceiling).
+ *  release as it runs the posted node — with a live host pin it CASes the
+ *  word to @c conn_spent and returns, handing the finish to the last
+ *  @ref duct_conn_unpin — otherwise it bumps the generation and pushes the
+ *  slot back to the block pool (or retires it for good at the generation
+ *  ceiling).
  */
 duct_nonnull(1) void duct_conn_release(duct_conn_t *conn);
 
@@ -792,10 +825,22 @@ duct_nonnull(1) void duct_conn_teardown_io(duct_conn_t *conn);
  */
 duct_nonnull(1) void duct_conn_teardown_ctx(duct_conn_t *conn);
 
+/** @brief Drop one host pin taken by @ref duct_conn_pin.
+ *  The 1→0 fetch_sub on the word's pin nibble is the pin side's whole
+ *  protocol: on a word the count's finish already marked @c conn_spent, this
+ *  last unpin is the completing one — it bumps the generation and pushes the
+ *  slot (or arms @c rel_pend over live request flags); on any other word the
+ *  release count still holds the slot and its own finish observes
+ *  @c pins == 0 and completes.
+ */
+duct_nonnull(1) void duct_conn_unpin(duct_conn_t *conn);
+
 /** @brief Run @p conn's physical teardown half: sealed codec detach, inter
  *  lane drain, fd close and @ref duct_io_accept_resume. Safe against io
  *  completions still in flight: each holds its own @c refs unit and only
- *  touches page-0 words. Spins on @c host_pins ahead of the lane teardown.
+ *  touches page-0 words. A host pin still riding the word (§5) is equally
+ *  bounded: its in-flight push into the lane is one more MPSC producer the
+ *  drain pairs with, and the pinned word keeps the slot from any reuse.
  */
 duct_nonnull(1) void duct_conn_teardown_worker(duct_conn_t *conn);
 

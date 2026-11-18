@@ -1941,8 +1941,20 @@ static duct_exec_rc_t s_dispatch_frame(duct_worker_t *w, duct_conn_handle_t hand
         return exec_done;
     if (rr == res_gone) {
         /* A closing session is a sink until its outbound ring drains. Leaving
-         * these bytes unacked can close both peers' windows permanently. */
-        if (conn && duct_conn_rx_olb(conn)) {
+         * these bytes unacked can close both peers' windows permanently.
+         * Bound conns only: a word still at conn_bound has not taken the
+         * close claim, so nothing has entered any release path and the ring
+         * is stable under the ack; past the claim, a bound conn's finalize
+         * runs at the conn_lost consume on this same worker — never parallel
+         * to a frame of its own — while an unbound conn io discards
+         * mid-batch with its frames deferred unacked, io's release and the
+         * next acquire's page-0 reset running parallel to this frame. The
+         * session_token load — retained until that consume — is the one
+         * race-free word that still names the bound conns among them. */
+        if (conn
+            && (duct_conn_phase(conn) == conn_bound
+                || duct_atomic_load(&conn->session_token, acquire) != handle_null)
+            && duct_conn_rx_olb(conn)) {
             auto sc = duct_conn_sealed_ctx(conn);
             if (task->sealed_epoch && sc && sc->head_unsealed)
                 sc->head_unsealed = false;
@@ -3232,8 +3244,17 @@ s_dispatch_batch_frames(duct_worker_t *w, const duct_msg_frame_batch_t *b,
     bool owed = s_rx_ack_batch.owed;
     s_rx_ack_batch.conn = nullptr;
     s_rx_ack_batch.owed = false;
-    if (owed)
+    /* The batch holds no refs unit of its own — generations guard its stale
+     * runs — but this deferred ack-check touches the ring past the run, and
+     * a close that drained every unit lets the slot's next acquire memset
+     * that ring under the load. The §5 word pin is the gate the resolve
+     * cannot be: pinned, the word cannot reach its generation bump (the
+     * finish parks it at conn_spent), so the check below either sees a live
+     * conn or pins nothing at all. */
+    if (owed && duct_conn_pin(conn, h.gen) == rc_ok) {
         s_rx_ack_check(conn, duct_atomic_load(&duct_conn_rx_olb(conn)->acked, relaxed));
+        duct_conn_unpin(conn);
+    }
     w->tx_train.more = false;
     s_tx_train_flush(w);
     s_worker_dgram_flush();

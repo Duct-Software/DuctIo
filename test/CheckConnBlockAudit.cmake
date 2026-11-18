@@ -73,7 +73,6 @@ set(member_files
     "${SRCDIR}/duct_io.c"
     "${SRCDIR}/duct_worker.c"
     "${SRCDIR}/duct_frame_rx.c"
-    "${SRCDIR}/conn/duct_conn_fence.c"
     "${SRCDIR}/duct_host.c"
     "${SRCDIR}/session/duct_session.c")
 foreach(path IN LISTS member_files)
@@ -87,7 +86,6 @@ endforeach()
 
 set(wire_files
     "${SRCDIR}/conn/duct_conn.c"
-    "${SRCDIR}/conn/duct_conn_fence.c"
     "${SRCDIR}/duct_io.c"
     "${SRCDIR}/duct_worker.c"
     "${SRCDIR}/duct_frame_rx.c"
