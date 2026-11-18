@@ -385,20 +385,13 @@ duct_io_on_dgram_slot(duct_listener_t *listener, const duct_peer_t *peer, uint32
 
 typedef struct duct_dgram_tx_entry duct_dgram_tx_entry_t;
 
-/** @brief Post one queued send.
- *  The callback of @ref duct_io_dgram_send_drain.
- *  @return false when the backend can take no more now, which leaves @p entry queued; true once
- *          @p entry is spent, posted or not.
- */
-typedef bool (*duct_dgram_send_fn)(void *arg, const duct_dgram_tx_entry_t *entry);
+typedef unsigned (*duct_dgram_send_fn)(void *arg,
+                                       const duct_dgram_tx_entry_t *const *entries,
+                                       unsigned n);
 
-/** @brief Hand the entries queued in @p listener's @c dgram_tx_outbox to @p send, lane by lane.
- *  A lane drains in order and stops at the first entry @p send refuses; the entries it took are
- *  committed, and a producer parked on a full lane is woken. The first lane served moves on at each
- *  call. On the listener's io thread.
- */
 duct_nonnull(1, 2) void
-duct_io_dgram_send_drain(duct_listener_t *listener, duct_dgram_send_fn send, void *arg);
+duct_io_dgram_send_drain(duct_listener_t *listener, duct_dgram_send_fn send, void *arg,
+                         unsigned max_batch);
 
 /** @brief Length standing for a datagram too large for the buffer offered it.
  *
@@ -443,10 +436,10 @@ duct_view_u8 duct_io_dgram_rx_scratch(void);
 
 /** @brief Park @p listener on its dry RX slot pool.
  *  Withdraws its read interest and sets the pool's @c stalled; the slot return
- *  or pin that takes the stall back posts this thread a resume, which puts the
+ *  that takes the stall back posts this thread a resume, which puts the
  *  listener back.
  *  @return true with the listener parked; false where reading goes on: a pool
- *          with no live chunk, one a held lane pins, or one a slot or a pin
+ *          with no live chunk, or one a slot
  *          came back to during the call.
  */
 duct_nonnull(1) bool duct_io_dgram_rx_stall(duct_listener_t *listener);

@@ -41,7 +41,6 @@ typedef enum duct_send_flags : uint8_t {
     fl_send_static   = 1u << 0,   /**< Zero-copy, immutable data. */
     fl_send_owned    = 1u << 1,   /**< Runtime takes ownership and releases the payload once staged or dropped. */
     fl_send_done     = 1u << 2,   /**< on_send_done via proto_cfg; set send_token for correlation. */
-    fl_send_pool_keep = 1u << 3,  /**< Payload is a TX-pool region, held one worker pass longer. @see duct_tx_pool_acquire */
 } duct_send_flags_t;
 
 static_assert(sizeof(duct_send_flags_t) == sizeof(uint8_t),
@@ -280,6 +279,23 @@ typedef struct duct_response {
         duct_close_reason_t close_reason;
     } control;
 } duct_response_t;
+
+/** @brief Release the owned payload of @p out.
+ *  Nothing without @c fl_send_owned. With it, a set @c release is called on @c release_arg; with
+ *  none, @c duct_del frees @c release_arg, or @c payload.data where that is nullptr. It clears
+ *  nothing in @p out: a second call releases a second time.
+ */
+static inline void duct_response_release_owned(duct_response_t *out)
+{
+    if (!duct_has(out->flags, fl_send_owned))
+        return;
+    if (out->release) {
+        out->release(out->release_arg);
+        return;
+    }
+    void *block = out->release_arg ? out->release_arg : out->payload.data;
+    duct_del(block);
+}
 
 /** @brief Echo: copy the frame's payload back on the same routing, preserving its frame flags. */
 static inline void duct_response_echo(duct_response_t *out, const duct_frame_t *frame) {
@@ -951,6 +967,7 @@ duct_nonnull(1) uint16_t duct_conn_gso_max(const duct_session_t *s, duct_conn_id
 
 duct_nonnull(1) bool duct_conn_has_vnet_uso(const duct_session_t *s, duct_conn_id_t conn_id);
 duct_nonnull(1) duct_result_t duct_conn_set_uso(duct_session_t *s, duct_conn_id_t conn_id, bool on);
+duct_nonnull(1) duct_result_t duct_conn_set_dgram_env(duct_session_t *s, duct_conn_id_t conn_id, bool on);
 
 /** @brief Point in one leg's byte stream.
  *  @ref duct_conn_tx_end reads it and @ref duct_conn_tx_sent compares it; two
@@ -1034,6 +1051,15 @@ duct_nonnull(1) uint64_t duct_conn_tx_unsent(duct_session_t *s, duct_conn_id_t c
  *  session callbacks.
  */
 duct_nonnull(1) size_t duct_conn_tx_cap(duct_session_t *s, duct_conn_id_t conn_id);
+
+/** @brief The remote queue verdict of leg @p conn_id's datagram peer, read afresh.
+ *
+ *  The queue figure the leg's sealed codec recorded off the peer's last report,
+ *  0 where the codec never heard one or its reading is older than the owd
+ *  baseline's staleness bound. Call from session callbacks.
+ */
+duct_nonnull(1) uint64_t
+duct_conn_dgram_remote_q(const duct_session_t *s, duct_conn_id_t conn_id, uint64_t now);
 
 /** @brief Traffic tally of one leg slot, kept by the session's worker.
  *
@@ -1206,6 +1232,12 @@ typedef duct_result_t (*duct_timer_fn)(duct_session_t *s,
                                         void *proto_state,
                                         uint64_t arg);
 
+/** @brief One @c on_work tour: runs on the addressed worker, outside any
+ *  session; @c arg is the tag supplied at @c duct_proto_post.
+ */
+typedef void (*duct_proto_work_fn)(duct_engine_t *e, unsigned worker,
+                                   void *user_ctx, uintptr_t arg);
+
 /** @brief Outcome passed to @c on_send_done. */
 typedef struct duct_send_done_info {
     duct_conn_id_t   conn_id;     /**< Conn the send targeted. */
@@ -1346,6 +1378,7 @@ typedef struct duct_proto_cfg {
     duct_error_fn         on_error;         /**< Transport or runtime error. */
     duct_send_done_fn     on_send_done;     /**< Pack/enqueue completion for @c fl_send_done responses. */
     duct_timer_fn         on_timer;         /**< Timer fire (keepalive / idle / re-arm); null = no timers. */
+    duct_proto_work_fn    on_work;          /**< Worker tour outside a session; null = none. */
 
     /* Listener resolve — optional; @c preparse == NULL means always-new fast
      * path / fallback. */
@@ -1417,6 +1450,28 @@ typedef struct duct_proto_cfg {
     duct_proto_flags_t flags;               /**< Capability flags. */
 } duct_proto_cfg_t;
 
+/** @brief How many encoded-response slots a callback transaction needs. */
+typedef enum duct_admit_reserve : uint8_t {
+    admit_reserve_response  = 1u, /**< Just the data response. */
+    admit_reserve_with_push = 2u, /**< The data response, plus a possible
+                                     *  stream-open push riding along. */
+} duct_admit_reserve_t;
+
+/** @brief Encoded-response slot count for the next callback transaction.
+ *
+ *  @retval admit_reserve_with_push  @p cfg's stream-open push may ride along
+ *                                   with the data response, multiplexed +
+ *                                   @c on_stream_open.
+ *  @retval admit_reserve_response   Otherwise.
+ */
+duct_nonnull(1) static inline duct_admit_reserve_t
+duct_admit_slots(const duct_proto_cfg_t *cfg)
+{
+    return duct_has(cfg->flags, fl_proto_multiplexed)
+        && cfg->on_stream_open
+            ? admit_reserve_with_push : admit_reserve_response;
+}
+
 /** @brief Protocol handle — the config, borrowed pointers and all, by value.
  *
  *  Completed here (public) so the runtime and worker can read callbacks and
@@ -1437,6 +1492,10 @@ struct duct_proto {
      *  runtime state the author never sets.
      */
     size_t admit_need[2];
+    /** Hold word owned by the runtime: the top byte is the proto state, the low
+     *  bits count outstanding @c duct_proto_post holds. Never written by
+     *  callers; a protocol with outstanding holds must not be destroyed. */
+    uint64_t _Atomic life;
 };
 
 /** @brief Borrow the live config off a protocol handle. */
@@ -1450,7 +1509,8 @@ duct_proto_cfg_of(const duct_proto_t *p)
  *
  *  The runtime borrows the protocol from @c duct_io_listen, @c duct_io_connect,
  *  or @c duct_listener_bind until @c duct_engine_destroy; keep it alive that long, then
- *  release it with @ref duct_proto_destroy. @c cfg.on_frame is required.
+ *  release it with @ref duct_proto_destroy. @c cfg must set at least one of @c on_frame,
+ *  @c on_work, or @c on_timer.
  *
  *  @param cfg  Configuration read during the call only.
  *  @return Protocol handle, or @c nullptr on invalid config or allocation failure.

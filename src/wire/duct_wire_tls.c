@@ -25,11 +25,12 @@
 #include "duct_dgram_lead.h"
 #include "duct_join.h"
 #include "duct_core.h"
+#include "duct_ticks.h"
+#include "duct_x_slot.h"
 
 #include <assert.h>
 #include <stdint.h>
 #include <string.h>
-
 
 typedef struct duct_wire_tls {
     duct_wire_t                    base;
@@ -41,6 +42,7 @@ typedef struct duct_wire_tls {
     duct_lead_state_t               lead_state; /**< State its codecs start in:
                               *  unkeyed for an initiator that leads its
                               *  datagrams, none for every other. */
+    bool                            dgram_env;
     duct_seal_ctl_fn                rx_ctl;
     void                           *rx_ctl_ctx;
     uint16_t                        opening_ceiling; /**< The config's
@@ -53,20 +55,11 @@ static void s_tls_wire_destroy(duct_wire_t *self)
     duct_del(self);
 }
 
-/** @brief Hand out the shared parser sentinel.
- *
- *  duct_frame_rx_post routes bytes through @c on_parse while
- *  @c conn->wire_parser holds an address. Framing works from the input span
- *  alone, so one static byte serves every sealed conn.
+/** @brief The sealed wire's parse state: framing works from the input span
+ *  alone, so the binder's zeroed parser slot serves every sealed conn.
  */
-static duct_wire_parser_t *s_tls_create_parser([[maybe_unused]] const duct_wire_t *self)
-{
-    static uint8_t s_stateless;
-    return (duct_wire_parser_t *)&s_stateless;
-}
-
-static void s_tls_destroy_parser([[maybe_unused]] const duct_wire_t *self,
-                                 [[maybe_unused]] duct_wire_parser_t *parser)
+static void s_tls_init_parser([[maybe_unused]] const duct_wire_t *self,
+                              [[maybe_unused]] duct_wire_parser_t *storage)
 {
 }
 
@@ -126,16 +119,18 @@ s_tls_on_parse(const duct_wire_t *self, duct_view_u8 input, duct_frame_t *out,
     return rc_ok;
 }
 
-/** @brief Destroy a codec: the parser, the engine, the engine park and the struct go now,
- *  the cleartext buffer with its last pin. */
-static void s_tls_codec_destroy(duct_wire_codec_t *self)
+/** @brief Release a codec: the engine and the cleartext buffer go now, the
+ *  cleartext buffer with its last pin, and the carved codec slot is wiped —
+ *  its storage belongs to the conn block, whose engine park region needs no
+ *  release of its own. */
+static void s_tls_codec_release(duct_wire_codec_t *self)
 {
-    if (self->inner)
-        duct_wire_parser_destroy(self->inner, self->inner_parser);
     self->engine->vtbl->destroy(self->engine);
-    duct_del(self->engine_park);
-    duct_del(self->ct_buf);
-    duct_del(self);
+    /* ct_buf is a chunk of the worker's cleartext pool: its owner word names
+     *  the pool, the plain lane return puts it back. */
+    if (self->ct_buf)
+        duct_x_slot_release_obj(duct_at(self->ct_buf));
+    duct_secure_zero(self, sizeof *self);
 }
 
 /** @brief @c ct_buf capacity.
@@ -171,6 +166,8 @@ static size_t s_tls_tx_bound(const duct_wire_t *self, size_t ct_len)
     auto vt = tw->engine_vtbl;
     size_t ct_total = ct_len;
     if (self->inner && duct_ckd_add(&ct_total, ct_total, self->inner->header_size))
+        return SIZE_MAX;
+    if (tw->dgram_env && duct_ckd_add(&ct_total, ct_total, sizeof(duct_dgram_env_t)))
         return SIZE_MAX;
     if (tw->framing == seal_framing_datagram && ct_total > vt->pdu_ct_max)
         return SIZE_MAX;
@@ -208,6 +205,7 @@ s_tls_on_pack(const duct_wire_t *self, [[maybe_unused]] duct_session_t *s,
 {
     if (!codec)
         return rc_again;
+    auto tw = DUCT_CAST(duct_wire_tls_t, base, self);
     auto vt = codec->engine->vtbl;
     /* The inner wire on_pack never runs here, only pack_header, so
      * its bound is enforced in its place: a length past it reaches the flag
@@ -215,11 +213,18 @@ s_tls_on_pack(const duct_wire_t *self, [[maybe_unused]] duct_session_t *s,
     if (self->inner && self->inner->max_frame
         && frame->payload.size > self->inner->max_frame)
         return rc_invalid_arg;
+    duct_frame_t clean = *frame;
+    clean.flags = (duct_frame_flags_t)(clean.flags & ~fl_frame_env);
     uint8_t inner_hdr[16];
     size_t inner_hdr_len = self->inner
-        ? self->inner->pack_header(self->inner, frame, inner_hdr) : 0u;
+        ? self->inner->pack_header(self->inner, &clean, inner_hdr) : 0u;
+    bool use_env = tw->dgram_env && codec->env_on;
     size_t ct_total = 0u;
     if (duct_ckd_add(&ct_total, inner_hdr_len, frame->payload.size))
+        return rc_invalid_arg;
+    if (use_env && duct_ckd_add(&ct_total, ct_total, sizeof(duct_dgram_env_t)))
+        return rc_invalid_arg;
+    if (tw->framing == seal_framing_datagram && ct_total > vt->pdu_ct_max)
         return rc_invalid_arg;
     if (ct_total == 0u && !duct_has(vt->flags, fl_seal_empty))
         return rc_ok;
@@ -232,59 +237,137 @@ s_tls_on_pack(const duct_wire_t *self, [[maybe_unused]] duct_session_t *s,
      * sealed_len <= tx_bound by construction, so a miss means a sizing site
      * drifted from this one. */
     duct_fatal(!span);
-    duct_view_u8 spans[2] = {
+    uint8_t env_buf[sizeof(duct_dgram_env_t)];
+    size_t n_spans = 2u;
+    duct_view_u8 spans[3] = {
         duct_view(duct_view_u8, inner_hdr, inner_hdr_len),
         frame->payload,
     };
+    if (use_env) {
+        assert(inner_hdr_len >= 1u);
+        inner_hdr[0] |= (uint8_t)fl_frame_env;
+        duct_dgram_env_t env = {};
+        duct_wire_codec_owd_tx(codec, &env, duct_ticks_mono_ns());
+        duct_store_le32(env_buf, env.tx_us);
+        duct_store_le32(env_buf + 4u, env.peer_q_us);
+        spans[n_spans++] = duct_view(duct_view_u8, env_buf, sizeof env_buf);
+    }
     if (pre)
         memcpy(span, codec->prefix, pre);
-    vt->seal(codec->engine, spans, 2u, (uint8_t *)span + pre);
+    vt->seal(codec->engine, spans, n_spans, (uint8_t *)span + pre);
     duct_wire_codec_lead(codec, span, pre + sealed_len);
     return rc_ok;
 }
 
-/** @brief Build the codec of a sealed conn on @p xport around a fresh engine.
- *  A conn on @c x_udp_shared gets no cleartext buffer, every other one a buffer of
- *  @c s_tls_ct_cap bytes. */
-static duct_wire_codec_t *s_tls_create_codec(const duct_wire_t *self, duct_xport_t xport)
+/** @brief Build the codec of a sealed conn on @p xport around a fresh engine,
+ *  in the conn block's zeroed @p codec slot with @p inner_parser, a second
+ *  parser slot, for the inner wire.
+ *  A conn on @c x_udp_shared gets no cleartext chunk, every other one a chunk
+ *  of @p ct_chunks sized by the wire's declared @c ct_buf_max. */
+static duct_wire_codec_t *s_tls_init_codec(const duct_wire_t *self, duct_xport_t xport,
+                                           duct_wire_codec_t *codec,
+                                           duct_wire_parser_t *inner_parser,
+                                           duct_x_slot_pool_t *ct_chunks)
 {
     auto tw = DUCT_CAST(duct_wire_tls_t, base, self);
     auto vt = tw->engine_vtbl;
     auto engine = vt->create(vt, tw->engine_cfg, tw->role);
     if (!engine)
         return nullptr;
-    auto ct_cap = xport == x_udp_shared ? 0u : s_tls_ct_cap(self->inner, vt);
-    duct_auto_del auto ct_buf = ct_cap ? duct_new(uint8_t, ct_cap) : nullptr;
-    if (ct_cap && !ct_buf) {
-        vt->destroy(engine);
-        return nullptr;
+    duct_ptr_t(uint8_t) ct_buf = nullptr;
+    if (xport != x_udp_shared) {
+        uint32_t idx = duct_x_slot_acquire(ct_chunks);
+        if (idx == treiber_empty) {
+            vt->destroy(engine);
+            return nullptr;
+        }
+        ct_buf = (duct_ptr_t(uint8_t))duct_x_slot_obj(ct_chunks, idx);
     }
-    auto inner_parser = self->inner ? duct_wire_parser_create(self->inner) : nullptr;
-    if (self->inner && !inner_parser) {
-        vt->destroy(engine);
-        return nullptr;
-    }
-    duct_auto_del auto codec = duct_new_secret(duct_wire_codec_t);
-    if (!codec) {
-        duct_wire_parser_destroy(self->inner, inner_parser);
-        vt->destroy(engine);
-        return nullptr;
-    }
+    if (self->inner)
+        duct_wire_parser_init(self->inner, inner_parser);
     *codec = (duct_wire_codec_t){
-        .destroy = s_tls_codec_destroy,
+        .release = s_tls_codec_release,
         .inner = self->inner,
-        .inner_parser = inner_parser,
+        .inner_parser = self->inner ? inner_parser : nullptr,
         .ct_buf = duct_move(ct_buf),
         .engine = engine,
         .tx_prefix_len = tw->tx_prefix_len,
         .rx_prefix_len = self->rx_prefix_len,
         .lead_state = tw->lead_state,
+        .env_capable = tw->dgram_env,
         .opening_ceiling = tw->opening_ceiling,
     };
     memcpy(codec->prefix, tw->tx_prefix, sizeof codec->prefix);
     if (codec->lead_state != lead_state_none)
         memcpy(codec->lead.cover_key, self->cover_key, sizeof codec->lead.cover_key);
-    return duct_move(codec);
+    return codec;
+}
+
+void duct_wire_codec_owd_reset(duct_wire_codec_t *c)
+{
+    c->owd = (typeof(c->owd)){};
+}
+
+void duct_wire_codec_owd_tx(const duct_wire_codec_t *c, duct_dgram_env_t *out, uint64_t now_ns)
+{
+    out->tx_us = (uint32_t)(now_ns / 1000ull);
+    out->peer_q_us = c->owd.have && now_ns - c->owd.rx_q_at <= duct_owd_stale_ns
+                   ? c->owd.rx_q_us : 0u;
+}
+
+void duct_wire_codec_owd_rx(duct_wire_codec_t *c, const duct_dgram_env_t *env, uint64_t now_ns)
+{
+    c->owd.remote_q_ns = (uint64_t)env->peer_q_us * 1000ull;
+    c->owd.remote_q_at = now_ns;
+    c->owd.remote_q_have = true;
+
+    uint32_t raw_us = (uint32_t)((uint32_t)(now_ns / 1000ull) - env->tx_us);
+    if (!c->owd.have || now_ns - c->owd.half_at >= 2u * duct_owd_window_ns) {
+        c->owd.have = true;
+        c->owd.slot = 0u;
+        c->owd.mins[0] = raw_us;
+        c->owd.mins[1] = raw_us;
+        c->owd.half_at = now_ns;
+        c->owd.rx_q_us = 0u;
+        c->owd.rx_q_at = now_ns;
+        c->owd.floor_us = UINT32_MAX;
+        c->owd.floor_at = now_ns;
+        return;
+    }
+    if (now_ns - c->owd.half_at >= duct_owd_window_ns) {
+        c->owd.slot ^= 1u;
+        c->owd.mins[c->owd.slot] = raw_us;
+        c->owd.half_at += duct_owd_window_ns;
+    } else if ((int32_t)(raw_us - c->owd.mins[c->owd.slot]) < 0) {
+        c->owd.mins[c->owd.slot] = raw_us;
+    }
+    uint32_t base_us = (int32_t)(c->owd.mins[1] - c->owd.mins[0]) < 0
+                     ? c->owd.mins[1] : c->owd.mins[0];
+    int32_t diff_us = (int32_t)(raw_us - base_us);
+    if (diff_us <= 0) {
+        c->owd.floor_us = UINT32_MAX;
+        c->owd.floor_at = now_ns;
+    } else {
+        if (c->owd.floor_us == UINT32_MAX || (int32_t)(raw_us - c->owd.floor_us) < 0)
+            c->owd.floor_us = raw_us;
+        if ((uint32_t)diff_us > (uint32_t)(duct_owd_step_ns / 1000u)
+            || (now_ns - c->owd.floor_at >= duct_owd_hold_ns
+                && now_ns - c->owd.rx_q_at < duct_owd_hold_ns)) {
+            c->owd.mins[0] = c->owd.floor_us;
+            c->owd.mins[1] = c->owd.floor_us;
+            c->owd.rx_q_us = 0u;
+            c->owd.rx_q_at = now_ns;
+            c->owd.floor_us = UINT32_MAX;
+            c->owd.floor_at = now_ns;
+            return;
+        }
+    }
+    uint32_t excess_us = diff_us > 0 ? (uint32_t)diff_us : 0u;
+    if (now_ns - c->owd.rx_q_at > duct_owd_gap_ns || excess_us >= c->owd.rx_q_us)
+        c->owd.rx_q_us = excess_us;
+    else
+        c->owd.rx_q_us -= (c->owd.rx_q_us - excess_us + 3u) / 4u;
+    c->owd.rx_q_at = now_ns;
 }
 
 void duct_wire_codec_lead_write(duct_wire_codec_t *c, uint8_t *dgram, size_t len)
@@ -304,6 +387,57 @@ void duct_wire_codec_lead_write(duct_wire_codec_t *c, uint8_t *dgram, size_t len
  *  without parsing — @c s_inter_pkt unseals the packet where it lies, and
  *  takes the same strip to size its redirect.
  */
+typedef struct {
+    duct_unseal_ctx_t  base;
+    duct_unseal_ctx_t *real;
+    duct_wire_codec_t *codec;
+    uint8_t           *dst;
+} s_env_unseal_ctx_t;
+
+static void *s_env_reserve(duct_unseal_ctx_t *self, size_t *out_cap)
+{
+    auto s = DUCT_CAST(s_env_unseal_ctx_t, base, self);
+    s->dst = (uint8_t *)s->real->reserve(s->real, out_cap);
+    return s->dst;
+}
+
+static bool s_env_commit(duct_unseal_ctx_t *self, size_t len)
+{
+    auto s = DUCT_CAST(s_env_unseal_ctx_t, base, self);
+    if (s->dst && len > 0u && (s->dst[0] & (uint8_t)fl_frame_env)) {
+        if (len < 1u + sizeof(duct_dgram_env_t))
+            return false;
+        size_t body_len = len - sizeof(duct_dgram_env_t);
+        const uint8_t *tail = s->dst + body_len;
+        duct_dgram_env_t env = {
+            .tx_us = duct_load_le32(tail),
+            .peer_q_us = duct_load_le32(tail + 4u),
+        };
+        s->dst[0] &= ~(uint8_t)fl_frame_env;
+        duct_wire_codec_owd_rx(s->codec, &env, duct_ticks_mono_ns());
+        len = body_len;
+    }
+    return s->real->commit(s->real, len);
+}
+
+static bool s_env_tx_append(duct_unseal_ctx_t *self, duct_view_u8 bytes)
+{
+    auto r = DUCT_CAST(s_env_unseal_ctx_t, base, self)->real;
+    return r->tx_append && r->tx_append(r, bytes);
+}
+
+static bool s_env_tx_append_bare(duct_unseal_ctx_t *self, duct_view_u8 bytes)
+{
+    auto r = DUCT_CAST(s_env_unseal_ctx_t, base, self)->real;
+    return r->tx_append_bare && r->tx_append_bare(r, bytes);
+}
+
+static duct_result_t s_env_arm(duct_unseal_ctx_t *self, uint32_t delay_ms)
+{
+    auto r = DUCT_CAST(s_env_unseal_ctx_t, base, self)->real;
+    return r->arm ? r->arm(r, delay_ms) : rc_not_supported;
+}
+
 static duct_result_t
 s_tls_unseal(const duct_wire_t *self, duct_wire_codec_t *codec,
 
@@ -322,7 +456,22 @@ s_tls_unseal(const duct_wire_t *self, duct_wire_codec_t *codec,
     if (!ctl.size) {
         bool carries = duct_wire_codec_rx_strip(codec, &pv);
         duct_do_if(!carries, return rc_invalid_arg);
-        return codec->engine->vtbl->unseal(codec->engine, pv, ctx);
+        if (!tw->dgram_env)
+            return codec->engine->vtbl->unseal(codec->engine, pv, ctx);
+        s_env_unseal_ctx_t shim = {
+            .base = *ctx,
+            .real = ctx,
+            .codec = codec,
+        };
+        shim.base.reserve = s_env_reserve;
+        shim.base.commit = s_env_commit;
+        if (ctx->tx_append)
+            shim.base.tx_append = s_env_tx_append;
+        if (ctx->tx_append_bare)
+            shim.base.tx_append_bare = s_env_tx_append_bare;
+        if (ctx->arm)
+            shim.base.arm = s_env_arm;
+        return codec->engine->vtbl->unseal(codec->engine, pv, &shim.base);
     }
     assert((const uint8_t *)ctl.data >= (const uint8_t *)pv.data
            && (const uint8_t *)ctl.data + ctl.size <= (const uint8_t *)pv.data + pv.size);
@@ -379,6 +528,7 @@ duct_wire_t *duct_wire_create_sealed(const duct_sealed_wire_cfg_t *cfg)
     duct_do_if(engine->pdu_ct_max == 0u
               || engine->pdu_ct_max > duct_seal_pdu_ct_max,
               return nullptr);
+    duct_do_if(s_tls_ct_cap(inner, engine) > duct_wire_ct_buf_max, return nullptr);
     duct_do_if(engine->engine_hs_budget == 0u, return nullptr);
     /* A conn's engine park holds two messages of the budget and flushes whole:
      * the smallest TX ring, which duct_conn_tx_olb_cap sets, has to take it.
@@ -391,6 +541,9 @@ duct_wire_t *duct_wire_create_sealed(const duct_sealed_wire_cfg_t *cfg)
     size_t budget_cap = duct_conn_tx_olb_cap / 2u
                       - (dgram ? duct_dgram_record_hdr_size : 0u) - cfg->tx_prefix_len;
     duct_do_if(engine->engine_hs_budget > budget_cap, return nullptr);
+    duct_do_if(2u * (engine->engine_hs_budget + cfg->tx_prefix_len
+                     + (dgram ? duct_dgram_record_hdr_size : 0u)) > duct_conn_park_cap,
+               return nullptr);
     /* An inner wire has to frame the cleartext by itself: s_tls_on_pack seals
      * pack_header's bytes and the payload, and nothing else reaches the peer.
      * A wire writing fewer bytes than its header_size is one counting a
@@ -399,11 +552,19 @@ duct_wire_t *duct_wire_create_sealed(const duct_sealed_wire_cfg_t *cfg)
      * seals a header the inner parse then reads a missing count out of, with
      * neither side able to tell. The probe takes an empty frame, pack_header
      * being a pure function of the frame it is given. */
+    bool env_ok = !cfg->dgram_env
+               || (dgram && inner && duct_has(inner->flags, fl_wire_frame_flags)
+                   && inner->header_size > 0u);
+    duct_do_if(!env_ok, return nullptr);
     if (inner) {
         duct_do_if(!inner->pack_header, return nullptr);
         uint8_t probe[16];
         size_t writes = inner->pack_header(inner, &(duct_frame_t){}, probe);
         duct_do_if(writes != inner->header_size, return nullptr);
+        duct_do_if(cfg->dgram_env
+                  && ((probe[0] & (uint8_t)fl_frame_env)
+                      || inner->header_size + sizeof(duct_dgram_env_t) > engine->pdu_ct_max),
+                  return nullptr);
     }
     /* Frame flags and the stream id both travel in the inner wire header,
      * which s_tls_on_pack seals alongside the payload — so a sealed wire
@@ -437,9 +598,11 @@ duct_wire_t *duct_wire_create_sealed(const duct_sealed_wire_cfg_t *cfg)
             .destroy = s_tls_wire_destroy,
             .on_parse = s_tls_on_parse,
             .on_pack = s_tls_on_pack,
-            .create_parser = s_tls_create_parser,
-            .destroy_parser = s_tls_destroy_parser,
-            .create_codec = s_tls_create_codec,
+            .parser_max = 0u,
+            .codec_max = sizeof(duct_wire_codec_t),
+            .ct_buf_max = s_tls_ct_cap(inner, engine),
+            .init_parser = s_tls_init_parser,
+            .init_codec = s_tls_init_codec,
             .unseal = s_tls_unseal,
         },
         .engine_vtbl = engine, .engine_cfg = cfg->engine_cfg,
@@ -447,6 +610,7 @@ duct_wire_t *duct_wire_create_sealed(const duct_sealed_wire_cfg_t *cfg)
         .framing = cfg->framing,
         .tx_prefix_len = cfg->tx_prefix_len,
         .lead_state = cfg->join_lead && initiator ? lead_state_unkeyed : lead_state_none,
+        .dgram_env = cfg->dgram_env,
         .rx_ctl = cfg->rx_ctl,
         .rx_ctl_ctx = cfg->rx_ctl_ctx,
         .opening_ceiling = cfg->opening_ceiling,

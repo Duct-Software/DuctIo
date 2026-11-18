@@ -36,10 +36,18 @@ duct_wire_t *duct_wire_create_dgram_batch(size_t max_dgram, bool framed);
 static constexpr size_t   record_size   = 39000u;
 static constexpr unsigned record_count  = 50u;
 static constexpr size_t   max_response  = 40000u;
-/** @brief Records the host keeps in flight past what the client took.
- *  Their bytes sit well inside any receive buffer the client socket gets, the
- *  208 KB an unprivileged Linux host caps it at among them. */
-static constexpr unsigned window        = 4u;
+/** @brief Records the host keeps in flight past what the client took: one.
+ *  The bytes of a windowed burst would still sit inside any receive buffer
+ *  the client socket gets — the 208 KB an unprivileged Linux host caps it at
+ *  among them — but the server's park is the constraint now: a record the
+ *  egress lane refuses parks in its conn block's TX retry copy units, whose
+ *  pair spans just past one 40000-byte max_response record. A wider window
+ *  could park a second record while the first still holds the units, and a
+ *  park past the copy budget is the allocation-failure drop the
+ *  every-record-arrives contract forbids. One record in flight keeps at most
+ *  one parked, inside the units' span, and the kernel-overflow property
+ *  trivially. */
+static constexpr unsigned window        = 1u;
 /** @brief Longest wait for the client to take a record, ms. */
 static constexpr unsigned wait_ms       = 3000u;
 

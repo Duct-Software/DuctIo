@@ -265,39 +265,6 @@ duct_nonnull(1) static inline bool duct_str_endpoint_valid(const char *text)
     return duct_str_endpoint_host(text).text[0] != '\0';
 }
 
-/** @brief Capacity of the buffer that holds the error text of a log line, bytes.
- *  Holds every Winsock and WFP text; a Windows text longer than this renders as @c error @c N.
- */
-static constexpr size_t duct_err_text_max = 256u;
-
-/** @brief Render error code @p err as text into @p buf, NUL-terminated.
- *  Thread-safe on every platform. @p err is an @c errno value, or on Windows a Win32, WSA,
- *  HRESULT or WFP code; a Windows code the system has no text for, or whose text is longer
- *  than @p cap, renders as @c error @c N.
- *  @return @p buf, or "" when @p cap is 0.
- */
-duct_nonnull(2) static inline const char *duct_strerr(int err, char *buf, size_t cap)
-{
-    duct_do_if(cap == 0u, return "");
-#ifdef _WIN32
-    if (0 == FormatMessageA(FORMAT_MESSAGE_FROM_SYSTEM
-                            | FORMAT_MESSAGE_IGNORE_INSERTS
-                            | FORMAT_MESSAGE_MAX_WIDTH_MASK,
-                            nullptr, (DWORD)err,
-                            MAKELANGID(LANG_ENGLISH, SUBLANG_ENGLISH_US),
-                            buf, (DWORD)cap, nullptr))
-        duct_discard snprintf(buf, cap, "error %d", err);
-#else
-    auto r = strerror_r(err, buf, cap);
-    const char *s = _Generic(r, char *: r, default: r == 0 ? buf : nullptr);
-    if (!s)
-        duct_discard snprintf(buf, cap, "error %d", err);
-    else if (s != buf)
-        duct_discard snprintf(buf, cap, "%s", s);
-#endif
-    return buf;
-}
-
 /** @brief Pointer to the first element of the array @p a.
  *  Any other pointer stops the build: only an array carries its size in its type, which the hex
  *  macros below read.

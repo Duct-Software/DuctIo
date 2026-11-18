@@ -7,8 +7,10 @@
  *  A pool owns one address range of @c n slots behind a lock-free free list, cut into chunks. A chunk
  *  becomes usable when demand reaches it and goes back to the system when a sweep finds it idle, so
  *  memory follows load. The pool's hooks hand each chunk to a backend that must know it, such as a
- *  registered-I/O buffer or a page lock. Slot @c i lies at @c range.base + i * slot_bytes and its payload
- *  @c lead bytes in; its free-list link sits in an array of its own, so a pop reads a link while another
+ *  registered-I/O buffer or a page lock. Slot @c i lies at @c range.base + i * slot_bytes; its first
+ *  @c lead bytes are the backend's own, the slot word follows them, and the payload behind the word
+ *  and the record header a rec pool carries; its free-list link sits in an array of its own, so a pop
+ *  reads a link while another
  *  thread writes the slot.
  *
  *  Any thread takes and returns slots, one at a time or several with one exchange of the list head. One
@@ -54,6 +56,13 @@ typedef struct duct_x_slot {
     uint32_t _Atomic holders; /**< Holds on a taken slot: 0 while the lane alone holds it, 2 from the first claim, one more for each further claim. */
 } duct_x_slot_t;
 
+/** @brief Bytes of the slot word, every slot of an engaged pool carries ahead
+ *  of its slot object. The word names the slot's owner: the address of its
+ *  pool's @c release member, so a release takes the object alone and derives
+ *  the pool by the member's offset — no table, no pool id, no way to name a
+ *  pool the object is not of. */
+static constexpr uint32_t duct_x_slot_word = sizeof(void *);
+
 /** @brief Chunks a sweep never retires, the lowest indices.
  *  A pool at rest keeps one, so the first read after a lull finds slots with no grow and no registration.
  */
@@ -98,6 +107,17 @@ typedef struct duct_x_slot_chunk {
     uintptr_t        cookie; /**< Handle the up hook stored for the chunk, 0 for none. */
 } duct_x_slot_chunk_t;
 
+/** @brief Life of a pool itself, held in @c retire_state.
+ *  A live pool serves takes; a retired one waits for its last slot to come
+ *  back, its mapping and id held for the holders; a reaped pool's free has
+ *  run and the state never moves again.
+ */
+enum : uint32_t {
+    pool_retire_live,    /**< Serving takes and returns. */
+    pool_retire_retired, /**< Owner gone, slots still out: reaped at the last return. */
+    pool_retire_reaped,  /**< Final free run; terminal. */
+};
+
 /** @brief Elastic pool of equal slots over one address range.
  *  Made by @ref duct_x_slot_pool_init and freed by @ref duct_x_slot_pool_free; a pool of no slots
  *  answers every take empty. Each group of fields below owns a cache line.
@@ -113,18 +133,29 @@ typedef struct duct_x_slot_pool {
         duct_ptr_t(duct_x_slot_chunk_t) chunks; /**< Record of each chunk, @c n_chunks of them. */
         duct_vm_handle_t  range;     /**< Address range of the @c n slots, null for a pool of none. */
         uint32_t          slot_bytes,  /**< Bytes of one slot, @c lead included. */
-                          lead,        /**< Bytes ahead of a slot's payload, where the caller writes a header. */
+                          lead,        /**< Bytes ahead of the slot word, the backend's own area. */
+                          payload_off, /**< Byte offset of the payload in a slot: the lead, the slot
+                                            *  word, and the record header a rec pool carries. */
                           chunk_slots, /**< Slots of a chunk, the last chunk taking the remainder. */
                           n_chunks;    /**< Chunks the range divides into, the most that go live. */
         unsigned          reader;    /**< Io id of the thread that reads the socket, the target of a resume. */
     );
-    /* The consumer's: its worker moves claims and pins, and reads stalled at every return. */
+    /* The consumer's: its worker moves claims and reads stalled at every return.
+     *  @c release leads the line so the stamped owner word reads zero in its
+     *  low six bits — the one bit pattern no heap or arena header carries. */
     duct_cacheline_struct(
+        void (*release)(void *obj);  /**< The pool's slot release, taking the slot
+                                      *  object alone; every slot's owner word
+                                      *  names this member's address. Set once by
+                                      *  @ref duct_x_slot_pool_engage, before any
+                                      *  slot of the pool goes out. */
         uint32_t _Atomic  claims;    /**< Claims standing on taken slots, bounded by the slot count less one read batch. */
-        uint32_t _Atomic  pins;      /**< Conns whose lane a worker holds behind a parked answer. */
+        uint32_t _Atomic  outstanding; /**< Slots a take has out: the last return of a retired pool reaps it. */
+        uint32_t _Atomic  retire_state; /**< Lifetime of the pool itself: @c pool_retire_live, @c pool_retire_retired, @c pool_retire_reaped. */
         bool _Atomic      stalled;   /**< The reader parked its socket for want of a slot; set on receive pools alone. */
+        void (*on_reap)(struct duct_x_slot_pool *); /**< The free the pool's reap runs. */
     );
-    /* Written at a grow, a retire, a dry take and a sweep, none on the path of a datagram. */
+    /* Written at a grow, a dry take and a sweep, none on the path of a datagram. */
     duct_cacheline_struct(
         duct_x_slot_hooks_t hooks;   /**< Backend hooks. */
         uint32_t _Atomic  live;      /**< Chunks live. */
@@ -138,9 +169,47 @@ typedef struct duct_x_slot_pool {
 static_assert(sizeof(duct_x_slot_pool_t) == 4u * duct_cacheline_size,
               "a pool is four cache lines: the list head, the fields fixed at init, the consumer's, the grow and sweep state");
 static_assert(offsetof(duct_x_slot_pool_t, slots) == duct_cacheline_size
-              && offsetof(duct_x_slot_pool_t, claims) == 2u * duct_cacheline_size
+              && offsetof(duct_x_slot_pool_t, release) == 2u * duct_cacheline_size
               && offsetof(duct_x_slot_pool_t, hooks) == 3u * duct_cacheline_size,
-              "each group of a pool starts a cache line");
+              "each group of a pool starts a cache line, release leading the consumer's");
+
+/** @brief The owner word of @p obj's slot: the address of its pool's
+ *  @c release member. */
+duct_nonnull(1) static inline void *const *
+duct_x_slot_owner(const void *obj)
+{
+    return (void *const *)((const uint8_t *)obj - duct_x_slot_word);
+}
+
+/** @brief True when @p obj's preceding word is a pool's owner word — the
+ *  pattern of the depolymorphized block kinds: the word holds the address of
+ *  a pool's @c release member, which leads its cache line, so its low six
+ *  bits read zero, while every heap block's header counts @c back ≥ 1 in
+ *  bits 3 and up and every arena slot carries its class in the low three. */
+duct_nonnull(1) static inline bool
+duct_x_slot_obj_is(const void *obj)
+{
+    return (*(const uintptr_t *)duct_x_slot_owner(obj) & (duct_cacheline_size - 1u)) == 0u;
+}
+
+/** @brief The pool @p obj's owner word names. @p obj is a slot object of an
+ *  engaged pool, as @ref duct_x_slot_obj_is tests. */
+duct_nonnull(1) static inline duct_x_slot_pool_t *
+duct_x_slot_pool_of(const void *obj)
+{
+    return (duct_x_slot_pool_t *)((char *)*duct_x_slot_owner(obj)
+                                  - offsetof(duct_x_slot_pool_t, release));
+}
+
+/** @brief Payload capacity of the slot @p obj names, by its owner word. */
+duct_nonnull(1) static inline size_t
+duct_x_slot_obj_cap(const void *obj);
+
+/** @brief Return @p obj's slot to its pool through the owner word, taking
+ *  @p obj alone: the pool the word names, the slot by address. The plain
+ *  return a lane hold takes — a holder that must respect a claim drops
+ *  through @c duct_io_rx_slot_drop instead. */
+duct_nonnull(1) void duct_x_slot_release_obj(void *obj);
 
 /** @name Treiber pop, push and seed over @c duct_x_slot_t::next
  *  Instantiated as @c duct_x_slot_free_pop, @c _push and @c _seed.
@@ -156,17 +225,56 @@ duct_x_slot_data(const duct_x_slot_pool_t *pool, uint32_t idx)
     return (uint8_t *)pool->range.base + (size_t)idx * pool->slot_bytes;
 }
 
-/** @brief Address of slot @p idx's payload, @c lead bytes in. */
+/** @brief The owner word of slot @p idx, the @c lead bytes in. */
+duct_nonnull(1) static inline void *const *
+duct_x_slot_hdr(const duct_x_slot_pool_t *pool, uint32_t idx)
+{
+    return (void *const *)(duct_x_slot_data(pool, idx) + pool->lead);
+}
+
+/** @brief Slot object of slot @p idx: the byte behind the slot word, a @c duct_ptr_t names it. */
+duct_nonnull(1) static inline uint8_t *
+duct_x_slot_obj(const duct_x_slot_pool_t *pool, uint32_t idx)
+{
+    return duct_x_slot_data(pool, idx) + pool->lead + duct_x_slot_word;
+}
+
+/** @brief Address of slot @p idx's payload, @c payload_off bytes in. */
 duct_nonnull(1) static inline uint8_t *
 duct_x_slot_payload(const duct_x_slot_pool_t *pool, uint32_t idx)
 {
-    return duct_x_slot_data(pool, idx) + pool->lead;
+    return duct_x_slot_data(pool, idx) + pool->payload_off;
 }
 
 /** @brief Payload bytes of one slot. */
 duct_nonnull(1) static inline size_t duct_x_slot_cap(const duct_x_slot_pool_t *pool)
 {
-    return pool->slot_bytes - pool->lead;
+    return pool->slot_bytes - pool->payload_off;
+}
+
+/** @brief Payload capacity of the slot @p obj names, by its owner word. */
+duct_nonnull(1) static inline size_t
+duct_x_slot_obj_cap(const void *obj)
+{
+    return duct_x_slot_cap(duct_x_slot_pool_of(obj));
+}
+
+/** @brief Stamp @p pool's slot @p idx's owner word: the address of its
+ *  @c release member. Runs at a chunk's go-live, before the chunk's slots
+ *  reach the free list, on the growing thread alone. */
+duct_nonnull(1) static inline void
+duct_x_slot_stamp(duct_x_slot_pool_t *pool, uint32_t idx)
+{
+    *(void **)duct_x_slot_owner(duct_x_slot_obj(pool, idx)) = &pool->release;
+}
+
+/** @brief Bytes of a slot that serves @p payload payload bytes behind @p lead backend bytes and a
+ *  record header of @p rec bytes flush ahead of the payload, the word between the lead and the
+ *  record padded so the payload stays 8-aligned. */
+static inline uint32_t duct_x_slot_span_bytes(uint32_t lead, uint32_t rec, uint32_t payload)
+{
+    return (uint32_t)duct_align_up(
+        (size_t)lead + duct_align_up((size_t)duct_x_slot_word + rec, 8u) + payload, 8u);
 }
 
 /** @brief Test whether @p ptr lies inside slot @p idx. */
@@ -237,7 +345,11 @@ duct_nonnull(1) static inline uint32_t duct_x_slot_acquire(duct_x_slot_pool_t *p
 {
     duct_do_if(!pool->range.base, return treiber_empty);
     uint32_t idx = duct_x_slot_free_pop(&pool->free_head, duct_at(pool->slots));
-    return idx != treiber_empty ? idx : duct_x_slot_refill(pool);
+    if (idx == treiber_empty)
+        idx = duct_x_slot_refill(pool);
+    if (idx != treiber_empty)
+        duct_atomic_fetch(add, &pool->outstanding, 1u, relaxed);
+    return idx;
 }
 
 /** @brief Take up to @p n slots off the top of the free list with one compare-exchange.
@@ -283,12 +395,16 @@ duct_x_slot_acquire_n(duct_x_slot_pool_t *pool, uint32_t *out, uint32_t n)
         out[got++] = idx;
         got += duct_x_slot_free_pop_n(pool, out + got, n - got);
     }
+    if (got)
+        duct_atomic_fetch(add, &pool->outstanding, got, relaxed);
     return got;
 }
 
 /** @brief Return the @p n taken slots in @p idx to the free list with one compare-exchange, from any thread.
  *  The first of @p idx ends on top. Each index names a slot the caller holds, none twice. The exchange is
- *  seq_cst, which the stall test after a return relies on.
+ *  seq_cst, which the stall test after a return relies on. The outstanding count drops by @p n; a retired
+ *  pool whose count reaches zero is reaped by the caller that owns the pool's return path, through
+ *  @ref duct_x_slot_pool_reap.
  */
 duct_nonnull(1, 2) static inline void
 duct_x_slot_release_n(duct_x_slot_pool_t *pool, const uint32_t *idx, uint32_t n)
@@ -301,8 +417,10 @@ duct_x_slot_release_n(duct_x_slot_pool_t *pool, const uint32_t *idx, uint32_t n)
     for (;; duct_cpu_relax()) {
         duct_atomic_store(&links[idx[n - 1u]].next, treiber_head_idx(head), relaxed);
         uint64_t next = treiber_head_pack(treiber_head_ver(head) + 1u, idx[0]);
-        if (duct_atomic_cas(weak, &pool->free_head, &head, next, seq_cst, relaxed))
+        if (duct_atomic_cas(weak, &pool->free_head, &head, next, seq_cst, relaxed)) {
+            duct_atomic_fetch(sub, &pool->outstanding, n, release);
             return;
+        }
     }
 }
 
@@ -333,8 +451,8 @@ duct_nonnull(1) static inline bool duct_x_slot_pool_avail(const duct_x_slot_pool
 }
 
 /** @brief Take back the stall of @p pool.
- *  The caller's last step before the call is a seq_cst step on the pool, a return to the free list or
- *  a pin, which pairs with the fence the reader takes between setting @c stalled and its re-check.
+ *  The caller's last step before the call is a seq_cst step on the pool, a return to the free list,
+ *  which pairs with the fence the reader takes between setting @c stalled and its re-check.
  *  @return true for the caller that cleared it, who owes the reader a resume.
  */
 duct_nonnull(1) static inline bool duct_x_slot_unstall(duct_x_slot_pool_t *pool)
@@ -378,20 +496,75 @@ duct_x_slot_drop(duct_x_slot_pool_t *pool, uint32_t idx, bool claim)
     return duct_atomic_fetch(sub, holders, 1u, acq_rel) == 1u;
 }
 
-/** @brief Set up @p pool for @p n slots of @p slot_bytes each, @p lead of them ahead of the payload.
- *  Chunks of @p chunk_slots slots, @p n when it is 0; the range is mapped usable at once, or reserved
+/** @brief Holds standing on the taken slot @p idx's record, 0 while its lane
+ *  alone holds it. */
+duct_nonnull(1) static inline uint32_t
+duct_x_slot_hold_count(const duct_x_slot_pool_t *pool, uint32_t idx)
+{
+    return duct_atomic_load(&duct_at(pool->slots)[idx].holders, relaxed);
+}
+
+/** @brief Take one pin on the taken slot @p idx, the hold that outlives its
+ *  lane: the record's count leaves its lane-alone zero and one more pin adds
+ *  one, without the claim counter's bound — the cleartext chunk's pin form,
+ *  a pool whose pins never race a reader's batch. */
+duct_nonnull(1) static inline void
+duct_x_slot_pin(duct_x_slot_pool_t *pool, uint32_t idx)
+{
+    auto holders = &duct_at(pool->slots)[idx].holders;
+    if (!duct_atomic_load(holders, relaxed))
+        duct_atomic_store(holders, 2u, relaxed);
+    else
+        duct_atomic_fetch(add, holders, 1u, relaxed);
+}
+
+/** @brief Drop one pin of @ref duct_x_slot_pin.
+ *  @return true for the drop that leaves no holder, whose caller releases
+ *          the slot — the lane's own drop answers the same. */
+duct_nonnull(1) static inline bool
+duct_x_slot_unpin(duct_x_slot_pool_t *pool, uint32_t idx)
+{
+    return duct_atomic_fetch(sub, &duct_at(pool->slots)[idx].holders, 1u, acq_rel) == 1u;
+}
+
+/** @brief Set up @p pool for @p n slots of @p slot_bytes each, @p lead of them the backend's own
+ *  area ahead of the slot word and @p rec of them a record header flush ahead of the payload.
+ *  Chunks of @p chunk_slots slots, @c n when it is 0; the range is mapped usable at once, or reserved
  *  when @p hooks.reserve is set. No chunk is live yet. A pool of no slots is valid and answers
  *  every take empty.
- *  @return false when @p lead exceeds @p slot_bytes, the size overflows or memory is short.
+ *  @return false when @p lead or @p slot_bytes is not 8-aligned, the sizes exceed the slot or
+ *          memory is short.
  */
 [[nodiscard]] duct_nonnull(1) bool
 duct_x_slot_pool_init(duct_x_slot_pool_t *pool, uint32_t n, uint32_t slot_bytes, uint32_t lead,
-                      uint32_t chunk_slots, duct_x_slot_hooks_t hooks);
+                      uint32_t rec, uint32_t chunk_slots, duct_x_slot_hooks_t hooks);
+
+/** @brief Arm @p pool's owner words: set its @c release member and stamp the
+ *  slots of every chunk already live.
+ *  Every chunk that goes live from here on stamps its slots as it grows, so
+ *  a slot object names its pool through its owner word alone. A pool of no
+ *  slots engages nothing and stays valid. A pool the secret arena reserved
+ *  stays out: its slots carry the arena's own header and release through
+ *  @c duct_secret_release.
+ */
+duct_nonnull(1) void duct_x_slot_pool_engage(duct_x_slot_pool_t *pool);
 
 /** @brief Free @p pool: withdraw every chunk that has a cookie, unmap the range and drop the records.
  *  Every slot is back, and no other thread uses the pool.
  */
 duct_nonnull(1) void duct_x_slot_pool_free(duct_x_slot_pool_t *pool);
+
+/** @brief Retire @p pool for @p on_reap, the free that runs once every slot is back.
+ *  A pool with no slot out reaps at once; one with slots out keeps its mapping and its
+ *  id until the last return's path calls @ref duct_x_slot_pool_reap, so a slot held past
+ *  its owner's close keeps the pool mapped.
+ */
+duct_nonnull(1, 2) void
+duct_x_slot_pool_retire(duct_x_slot_pool_t *pool, void (*on_reap)(duct_x_slot_pool_t *));
+
+/** @brief Reap @p pool where it is retired with every slot back, a no-op otherwise.
+ *  Exactly one caller runs the pool's @c on_reap free, whatever races reach here. */
+duct_nonnull(1) void duct_x_slot_pool_reap(duct_x_slot_pool_t *pool);
 
 /** @brief Store @p fresh in the shared @p slot unless another thread stored a pool there first.
  *  The loser frees its own pool.

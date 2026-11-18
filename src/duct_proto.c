@@ -18,7 +18,36 @@
 
 #include "duct_core.h"
 #include "duct_wire.h"
-#include "duct_worker.h"
+
+#include <assert.h>
+#include <stdatomic.h>
+
+static constexpr unsigned proto_state_shift = 56u;
+static constexpr uint64_t proto_hold_mask   = (1ull << proto_state_shift) - 1ull;
+
+typedef enum : uint8_t {
+    proto_on = 0,
+} duct_proto_state_t;
+
+bool duct_proto_hold_root(duct_proto_t *p)
+{
+    duct_do_if(!p, return false);
+    uint64_t cur = duct_atomic_load(&p->life, acquire);
+    for (;;) {
+        duct_do_if((cur >> proto_state_shift) != proto_on, return false);
+        duct_do_if((cur & proto_hold_mask) == proto_hold_mask, return false);
+        if (duct_atomic_cas(weak, &p->life, &cur, cur + 1ull, acq_rel, acquire))
+            return true;
+    }
+}
+
+void duct_proto_release(duct_proto_t *p)
+{
+    duct_do_if(!p, return);
+    uint64_t prev = duct_atomic_fetch(sub, &p->life, 1ull, acq_rel);
+    assert((prev & proto_hold_mask) > 0u);
+    duct_discard prev;
+}
 
 /** @brief Bytes to reserve for the next callback transaction on one leg,
  *  scaled by @p reserve response slots.
@@ -62,25 +91,36 @@ static size_t s_compute_admit_need(const duct_proto_cfg_t *cfg, unsigned reserve
 duct_proto_t *duct_proto_create(const duct_proto_cfg_t *cfg)
 {
     duct_do_if(!cfg, return nullptr);
-    duct_do_if(!cfg->on_frame, return nullptr);
-    /* preparse without a mode is a config error; mode without preparse is ignored. */
-    duct_do_if(cfg->preparse && cfg->preparse_mode == resolve_none, return nullptr);
-    duct_do_if(cfg->preparse && cfg->preparse_mode >= resolve_mode_count, return nullptr);
-    /* Handler requires multiplexed flag. */
-    if (cfg->handler_kind != handler_none) {
-        duct_do_if(cfg->handler_kind >= handler_count, return nullptr);
-        duct_do_if(!duct_has(cfg->flags, fl_proto_multiplexed), return nullptr);
-        duct_do_if(cfg->handler_kind == handler_async && !cfg->handler_async, return nullptr);
-        duct_do_if(cfg->handler_kind == handler_coro && !cfg->handler_coro, return nullptr);
+    duct_do_if(!cfg->on_frame && !cfg->on_work && !cfg->on_timer, return nullptr);
+    duct_fatal(cfg->tx_olb_cap > duct_conn_tx_olb_cap);
+    if (cfg->on_frame) {
+        /* preparse without a mode is a config error; mode without preparse is ignored. */
+        duct_do_if(cfg->preparse && cfg->preparse_mode == resolve_none, return nullptr);
+        duct_do_if(cfg->preparse && cfg->preparse_mode >= resolve_mode_count, return nullptr);
+        /* Handler requires multiplexed flag. */
+        if (cfg->handler_kind != handler_none) {
+            duct_do_if(cfg->handler_kind >= handler_count, return nullptr);
+            duct_do_if(!duct_has(cfg->flags, fl_proto_multiplexed), return nullptr);
+            duct_do_if(cfg->handler_kind == handler_async && !cfg->handler_async, return nullptr);
+            duct_do_if(cfg->handler_kind == handler_coro && !cfg->handler_coro, return nullptr);
+        }
+        /* Raw response-producing protocols must declare a finite per-response cap. */
+        duct_do_if(!cfg->wire && cfg->max_response == 0u, return nullptr);
+    } else {
+        duct_do_if(cfg->preparse != nullptr || cfg->handler_kind != handler_none, return nullptr);
     }
-    /* Raw response-producing protocols must declare a finite per-response cap. */
-    duct_do_if(!cfg->wire && cfg->max_response == 0u, return nullptr);
     auto p = duct_new(duct_proto_t);
     duct_do_if(!p, return nullptr);
     p->cfg = *cfg;
     p->owned_wire = nullptr;
-    p->admit_need[0] = s_compute_admit_need(&p->cfg, admit_reserve_response);
-    p->admit_need[1] = s_compute_admit_need(&p->cfg, admit_reserve_with_push);
+    atomic_init(&p->life, (uint64_t)proto_on << proto_state_shift);
+    if (cfg->on_frame) {
+        p->admit_need[0] = s_compute_admit_need(&p->cfg, admit_reserve_response);
+        p->admit_need[1] = s_compute_admit_need(&p->cfg, admit_reserve_with_push);
+    } else {
+        p->admit_need[0] = 0u;
+        p->admit_need[1] = 0u;
+    }
     return p;
 }
 
@@ -103,6 +143,7 @@ void duct_proto_destroy(duct_proto_t *proto)
 {
     if (!proto)
         return;
+    assert((duct_atomic_load(&proto->life, acquire) & proto_hold_mask) == 0u);
     if (proto->owned_wire)
         duct_wire_destroy(proto->owned_wire);
     duct_del(proto);

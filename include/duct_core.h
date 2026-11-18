@@ -452,7 +452,38 @@ static inline size_t duct_page_size(void)
  */
 typedef bool (*duct_socket_prepare_fn)(void *ctx, duct_sock_t fd, int family);
 
-#include "duct_str.h"
+/** @brief Capacity of the buffer that holds the error text of a log line, bytes.
+ *  Holds every Winsock and WFP text; a Windows text longer than this renders as @c error @c N.
+ */
+static constexpr size_t duct_err_text_max = 256u;
+
+/** @brief Render error code @p err as text into @p buf, NUL-terminated.
+ *  Thread-safe on every platform. @p err is an @c errno value, or on Windows a Win32, WSA,
+ *  HRESULT or WFP code; a Windows code the system has no text for, or whose text is longer
+ *  than @p cap, renders as @c error @c N.
+ *  @return @p buf, or "" when @p cap is 0.
+ */
+duct_nonnull(2) static inline const char *duct_strerr(int err, char *buf, size_t cap)
+{
+    duct_do_if(cap == 0u, return "");
+#ifdef _WIN32
+    if (0 == FormatMessageA(FORMAT_MESSAGE_FROM_SYSTEM
+                            | FORMAT_MESSAGE_IGNORE_INSERTS
+                            | FORMAT_MESSAGE_MAX_WIDTH_MASK,
+                            nullptr, (DWORD)err,
+                            MAKELANGID(LANG_ENGLISH, SUBLANG_ENGLISH_US),
+                            buf, (DWORD)cap, nullptr))
+        duct_discard snprintf(buf, cap, "error %d", err);
+#else
+    auto r = strerror_r(err, buf, cap);
+    const char *s = _Generic(r, char *: r, default: r == 0 ? buf : nullptr);
+    if (!s)
+        duct_discard snprintf(buf, cap, "error %d", err);
+    else if (s != buf)
+        duct_discard snprintf(buf, cap, "%s", s);
+#endif
+    return buf;
+}
 
 /** @brief Stamped log line to @p out: the message @p fmt formats, a colon and the text of error code @p err.
  *  @p fmt is a printf format without its newline and has to be a string literal: the macro
@@ -500,13 +531,46 @@ duct_nonnull(1) static inline void duct_store_be32(void *p, uint32_t v)
     b[2] = (uint8_t)(v >> 8u);
     b[3] = (uint8_t)v;
 }
+
+duct_nonnull(1) static inline uint32_t duct_load_le32(const void *p)
+{
+    auto b = (const uint8_t *)p;
+    return (uint32_t)b[0] | ((uint32_t)b[1] << 8u)
+         | ((uint32_t)b[2] << 16u) | ((uint32_t)b[3] << 24u);
+}
+
+duct_nonnull(1) static inline void duct_store_le32(void *p, uint32_t v)
+{
+    auto b = (uint8_t *)p;
+    b[0] = (uint8_t)v;
+    b[1] = (uint8_t)(v >> 8u);
+    b[2] = (uint8_t)(v >> 16u);
+    b[3] = (uint8_t)(v >> 24u);
+}
 /** @} */
+
+/** @brief Header of the block @p p points at, in the 8 bytes below it. */
+#define duct_block_hdr(p)                                                                   \
+    ({                                                                                      \
+        auto _ah = (p);                                                                     \
+        (duct_alloc_hdr_t *)((uintptr_t)_ah - sizeof(duct_alloc_hdr_t));                    \
+    })
 
 enum : unsigned { alloc_back_bits = 10 /**< Width of @c duct_alloc_hdr_t::back, bits. */ };
 enum : unsigned { alloc_arena_bits = 3 /**< Width of @c duct_alloc_hdr_t::arena, bits. */ };
+enum : unsigned { alloc_touched_bits = 12 /**< Width of the touched field, bits. */ };
+enum : unsigned { alloc_size_bits = 40u - alloc_touched_bits /**< Width of @c duct_alloc_hdr_t::size, bits. */ };
+enum : unsigned { alloc_slot_bits = 18 /**< Width of a slot index, the handle index width. */ };
 
 /** @brief Header in the 8 bytes below the object of every block @c duct_new and @c duct_new_secret answer.
  *  Written once at allocation, @c holders alone changing after. A free bit reads zero.
+ *  The layout is set by storage units, not by the 64-bit view: the touched halves sit in byte 3
+ *  and the low nibble of byte 4, behind @ref duct_alloc_touched and @ref duct_alloc_touched_set,
+ *  so no @c touched or @c size write ever covers @c holders.
+ *
+ *  A pool slot carries no header of this kind: its 8 bytes below the object
+ *  are its pool's owner word, and no @c duct_del, @c duct_len or share ever
+ *  reaches a slot object — the pool's own api releases it.
  */
 typedef struct duct_alloc_hdr {
     uint16_t arena         : alloc_arena_bits; /**< Slot class of a secret in the secret arena, 1 to 7, and 0 for a block on the heap.
@@ -516,10 +580,11 @@ typedef struct duct_alloc_hdr {
                                                 *  1 in a slot of the arena, which starts at the header. */
     uint16_t secret        : 1;               /**< Mark of a @c duct_new_secret block. */
     uint16_t               : 2;               /**< Free 2 bits. */
-    uint8_t _Atomic holders;                  /**< Holder count: 0 for one holder, 2 after the first
-                                                *  @c duct_share. */
-    uint8_t                : 8;               /**< Free byte. */
-    uint32_t size;                            /**< Bytes asked for, count times element size. */
+    uint8_t _Atomic holders;                  /**< Holder count: 0 free or in the pool, 1 one live holder,
+                                                *  n n holders. */
+    uint8_t touched_lo;
+    uint32_t touched_hi    : 4;
+    uint32_t size          : alloc_size_bits; /**< Bytes asked for, count times element size. */
 } duct_alloc_hdr_t;
 
 /** @brief Largest alignment @c duct_new accepts, bytes. */
@@ -527,9 +592,39 @@ static constexpr size_t duct_alloc_align_max = 4096u;
 static_assert(sizeof(duct_alloc_hdr_t) == 8u, "one header on every target");
 static_assert(alignof(max_align_t) >= sizeof(duct_alloc_hdr_t), "calloc aligns to the header");
 static_assert(offsetof(duct_alloc_hdr_t, holders) == 2u, "the count sits in the byte after the bit-fields");
-static_assert(offsetof(duct_alloc_hdr_t, size) == 4u, "size takes the last word");
+static_assert(offsetof(duct_alloc_hdr_t, touched_lo) == 3u, "the touched low half takes the byte after the count");
 static_assert(duct_alloc_align_max / sizeof(duct_alloc_hdr_t) < 1u << alloc_back_bits,
               "the offset to the base fits its field");
+
+/** @brief Touched high-water of @p h's block, as the one value its two
+ *  storage halves carry. */
+duct_nonnull(1) static inline unsigned duct_alloc_touched(const duct_alloc_hdr_t *h)
+{
+    return (unsigned)h->touched_lo | (unsigned)h->touched_hi << 8u;
+}
+
+/** @brief Encode @p used of @p capacity bytes into the touched field: the
+ *  identity below the field's width, else the proportional round, exact at
+ *  both edges. */
+static inline unsigned duct_alloc_touched_encode(size_t used, size_t capacity)
+{
+    constexpr size_t field_max = (1u << alloc_touched_bits) - 1u;
+    size_t out = 0u;
+    if (capacity <= field_max)
+        out = used;
+    else if (used)
+        out = (used * field_max + capacity / 2u) / capacity;
+    return (unsigned)duct_min(out, field_max);
+}
+
+/** @brief Store @p touched into @p h's two storage halves, holders and the
+ *  bit-field word untouched. */
+duct_nonnull(1) static inline void duct_alloc_touched_set(duct_alloc_hdr_t *h, unsigned touched)
+{
+    h->touched_lo = (uint8_t)touched;
+    h->touched_hi = (touched >> 8u) & 0xfu;
+}
+
 
 /** @brief Move a fresh secret block into the secret arena and mark it secret.
  *  The step of @ref duct_new_secret after the allocation, taken on a block nothing has written
@@ -589,9 +684,9 @@ static constexpr uint64_t duct_ptr_bound_bytes =
  *              is @c alignof(T), and one under 8 is raised to 8. A third argument stops the build.
  *
  *  @warning Release only with @ref duct_del or @ref duct_del_fn.
- *  @return @c nullptr on allocation failure, a size of 4 GiB or more, a count of 0, or an
- *          alignment that is no power of two or is past @c duct_alloc_align_max, whether the
- *          count and the alignment are constants or not.
+ *  @return @c nullptr on allocation failure, a size of @c 1 << alloc_size_bits or more, a count
+ *          of 0, or an alignment that is no power of two or is past @c duct_alloc_align_max,
+ *          whether the count and the alignment are constants or not.
  *
  *  @code
  *  auto p   = duct_new(duct_timer_t);         // a duct_timer_t *
@@ -611,7 +706,8 @@ static constexpr uint64_t duct_ptr_bound_bytes =
         uint32_t _bytes = 0u;                                                               \
         unsigned char *_p = nullptr;                                                        \
         if (_n != 0u && (_req & (_req - 1u)) == 0u && _al <= duct_alloc_align_max           \
-            && !duct_ckd_mul(&_bytes, _n, sizeof(T)) && !duct_ckd_add(&_total, _bytes, _al)) { \
+            && !duct_ckd_mul(&_bytes, _n, sizeof(T)) && _bytes < (1u << alloc_size_bits)   \
+            && !duct_ckd_add(&_total, _bytes, _al)) {                                       \
             auto _raw = (unsigned char *)calloc(1u, _total);                                \
             if (_raw) {                                                                     \
                 /* _al is a power of two: the round-up is a mask. */                        \
@@ -620,6 +716,7 @@ static constexpr uint64_t duct_ptr_bound_bytes =
                 auto _h = duct_block_hdr(_p);                                               \
                 _h->back = (size_t)(_p - _raw) / sizeof(duct_alloc_hdr_t);                  \
                 _h->size = _bytes;                                                          \
+                duct_atomic_store(&_h->holders, (uint8_t)1u, relaxed);                      \
             }                                                                               \
         }                                                                                   \
         _Generic((char (*)[_vc + 1u])nullptr, char (*)[1]: (T *)_p, default: (duct_ptr_t(T))_p); \
@@ -662,8 +759,11 @@ static constexpr uint64_t duct_ptr_bound_bytes =
     })
 
 /** @brief Bytes of the array @p p, read from its header.
- *  The count times @c sizeof(T) that @c duct_new was given. Takes a @c duct_ptr_t only; any
- *  other pointer stops the build. @p p is not nullptr, a null array having no header.
+ *  The count times @c sizeof(T) that @c duct_new was given. Takes a @c duct_ptr_t
+ *  only; any other pointer stops the build. @p p is not nullptr, a null array
+ *  having no header. A pool slot's array never passes here: its 8 bytes below
+ *  the object are its pool's owner word, and the pool's own api answers its
+ *  capacity.
  */
 #define duct_byte_len(p)                                                                    \
     ({                                                                                      \
@@ -739,34 +839,43 @@ static constexpr uint64_t duct_ptr_bound_bytes =
 #define duct_view_byte_len(v) ({ auto _vb = (v); _vb.size * sizeof(*_vb.data); })
 #define duct_view_at(v, i) ({ auto _vat = (v); assert((i) < _vat.size); _vat.data[(i)]; })
 
-#define duct_block_hdr(p)                                                                   \
-    ({                                                                                      \
-        auto _ah = (p);                                                                     \
-        (duct_alloc_hdr_t *)((uintptr_t)_ah - sizeof(duct_alloc_hdr_t));                    \
-    })
-
 /** @brief Add a holder to the block @p p points at, and answer @p p.
  *  Written where @p p passes to the thread that becomes the holder, ahead of the hand-over, whose
  *  post publishes the count. Every holder ends with its own @ref duct_del, in any order on any
- *  thread. A block holds 255 at most; one more aborts. @p p is not nullptr.
+ *  thread. A block whose holders can pass the ceiling of 255 takes @ref duct_try_share instead.
+ *  @p p is not nullptr.
  */
 #define duct_share(p)                                                                       \
     ({                                                                                      \
         auto _sp = (p);                                                                     \
-        auto _sh = &duct_block_hdr(_sp)->holders;                                           \
-        if (duct_atomic_load(_sh, relaxed) == 0u)                                           \
-            duct_atomic_store(_sh, (uint8_t)2u, relaxed);                                   \
-        else {                                                                              \
-            uint8_t _old = duct_atomic_fetch(add, _sh, (uint8_t)1u, relaxed);               \
-            duct_fatal(_old == UINT8_MAX);                                                  \
-        }                                                                                   \
+        duct_atomic_fetch(add, &duct_block_hdr(_sp)->holders, (uint8_t)1u, relaxed);        \
         _sp;                                                                                \
+    })
+
+/** @brief Add a holder to the block @p p points at, and answer @p p or
+ *  @c nullptr at the ceiling.
+ *  Composes where @ref duct_share composes; the claimant that gets
+ *  @c nullptr — the count already at 255, a ceiling a flood of claims can
+ *  reach through one shared slot — degrades to a copy instead of a hold,
+ *  and no holder is added on that path. @p p is not nullptr.
+ */
+#define duct_try_share(p)                                                                   \
+    ({                                                                                      \
+        auto _tp = (p);                                                                     \
+        auto _th = &duct_block_hdr(_tp)->holders;                                           \
+        if (duct_atomic_fetch(add, _th, (uint8_t)1u, relaxed) == UINT8_MAX) {               \
+            duct_atomic_fetch(sub, _th, (uint8_t)1u, relaxed);                              \
+            _tp = nullptr;                                                                  \
+        }                                                                                   \
+        _tp;                                                                                \
     })
 
 /** @brief Drop this holder's hold on the block @p ptr points at, and null @p ptr.
  *  The drop that leaves no holder wipes a @ref duct_new_secret block, then frees it or gives its
  *  slot back to the arena; the others only drop. A pointer copied without @ref duct_share holds
  *  nothing, and a @c duct_del through it is a second release. nullptr is ignored.
+ *  A pool slot never passes here: its owner word is no header, and the pool's
+ *  own api releases it.
  *  @param ptr  Pointer lvalue from @ref duct_new or @ref duct_new_secret, or nullptr.
  *  @code
  *  duct_del(p);
@@ -774,16 +883,20 @@ static constexpr uint64_t duct_ptr_bound_bytes =
  */
 #define duct_del(ptr)                                                                       \
     do {                                                                                    \
-        auto _d = (unsigned char *)(uintptr_t)(ptr);                                        \
+        auto _dp = &(ptr);                                                                  \
+        auto _d = (unsigned char *)(uintptr_t)*_dp;                                         \
         if (_d) {                                                                           \
             auto _h = duct_block_hdr(_d);                                                   \
-            if (duct_atomic_load(&_h->holders, relaxed) == 0u                               \
-                || duct_atomic_fetch(sub, &_h->holders, (uint8_t)1u, acq_rel) == 1u) {      \
+            if (_h->arena) {                                                                \
+                if (duct_atomic_fetch(sub, &_h->holders, (uint8_t)1u, acq_rel) == 1u)       \
+                    duct_discard duct_secret_release(_d);                                   \
+            } else if (duct_atomic_load(&_h->holders, acquire) == 1u                        \
+                       || duct_atomic_fetch(sub, &_h->holders, (uint8_t)1u, acq_rel) == 1u) { \
                 if (!_h->secret || duct_secret_release(_d))                                 \
                     free(_d - (size_t)_h->back * sizeof(duct_alloc_hdr_t));                 \
             }                                                                               \
         }                                                                                   \
-        (ptr) = nullptr;                                                                    \
+        *_dp = nullptr;                                                                     \
     } while (0)
 
 /** @brief Callback form of @c duct_del, for a @c void (*)(void *) slot.
@@ -896,6 +1009,12 @@ duct_nonnull(1) void duct_vm_del(duct_vm_handle_t *h);
  *  read before its next write is undefined. @p base and @p size cover whole
  *  pages; a @p size of 0 does nothing. */
 duct_nonnull(1) void duct_vm_discard(void *base, size_t size);
+
+[[nodiscard]] duct_vm_handle_t duct_vm_reserve_lazy(size_t size);
+
+[[nodiscard]] duct_nonnull(1) duct_result_t duct_vm_commit(void *base, size_t size);
+
+duct_nonnull(1) void duct_vm_reuse(void *base, size_t size);
 
 /** @brief Infinite timeout for @c duct_futex_wait. */
 #define DUCT_TIMEOUT_INFINITE 0u

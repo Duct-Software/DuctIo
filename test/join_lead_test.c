@@ -98,7 +98,7 @@ static const char *s_siphash(void)
 static duct_session_t *s_keyed(const fake_engine_t *engine, const void *proto,
                                uint8_t id_byte)
 {
-    auto s = duct_session_acquire();
+    auto s = duct_session_acquire(0u);
     if (!s)
         return nullptr;
     s->proto = (const duct_proto_t *)proto;
@@ -255,7 +255,7 @@ static const char *s_leads(void)
         err = "a released session still took a lead";
         goto done;
     }
-    auto plain = duct_session_acquire();
+    auto plain = duct_session_acquire(0u);
     if (!plain) {
         err = "session acquire failed";
         goto done;

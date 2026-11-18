@@ -35,7 +35,7 @@ void duct_io_dgram_rx_drain(duct_listener_t *listener)
             want = duct_io_rx_slots_acquire(listener, bufs);
         }
         if (!want) {
-            /* A pool with no slots, or one a held lane pins: one datagram into
+            /* A pool with no slots: one datagram into
              * the io thread's scratch block, which the route then copies.
              * Where the block cannot be made the read still happens, into one
              * byte: the datagram is reported truncated and dropped, where a

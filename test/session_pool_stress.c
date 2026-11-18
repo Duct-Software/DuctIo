@@ -3,34 +3,28 @@
 
 /**
  * @file session_pool_stress.c
- * @brief Isolate the session-pool alloc/free/close/resolve/drain race from io/engine.
+ * @brief Isolate the session-pool alloc/release/close machine from io/engine.
  *
- * N hammer threads + two independent drainers hammer one shared session pool:
- *   - alloc (Treiber pop + leg-array alloc)
+ * N hammer threads race the pool's shared face alone — the free bitmap:
+ *   - acquire (block take + body/page-0 reset) with the thread's own
+ *     worker_id, the id stored inside the acquire
  *   - resolve with correct + wrong generation (gen-guard check)
- *   - both release paths: duct_session_release (direct quarantine, rollback
- *     semantics) and duct_session_request_close (closing → quarantine, the real
- *     production close path with the EBR grace window)
- *   - two drainers advance separate epoch counters + call drain_quarantine, so
- *     closing→quarantine and quarantine→free race on the same slot across
- *     drain_epoch values — the exact window that the pre-CAS until publication
- *     + monotonic max must close
- * All paths feed the same free stack that alloc pops from. Detects:
- *   - double-acquire (two threads holding the same slot) via gen re-read
- *   - stale proto, proto_state, flags or per-leg counters after reuse (acquire
- *     must reset every one of them)
- *   - gen-guard violation (resolve with wrong gen returns non-null)
- *   - leak (final stack not full) or duplicate (final stack has repeats)
- * No io threads, no epoll, no real protocol callbacks (proto stays null so the
- * close path fires no callback). Mirrors @c conn_pool_stress.c.
- *
- * A last single-threaded step gives a protocol a close callback, releases one
- * session through the rollback path and leaves another attached, then runs the
- * shutdown walk: it fires the attached session's close and the released one's
- * never, that session's open having never run.
+ *   - the rollback path: duct_session_release returns the block straight to
+ *     the pool, no worker list, no epoch
+ * The closing path is owner-side by contract, so the close arm runs
+ * exclusively on each slot's holder: request_close drives the state merge
+ * (attached → closing → dead, the flags byte folded into the enum), the
+ * dead session's token must stop resolving, and duct_session_dead_tick
+ * counts the grace down before the block returns.
+ * A last single-threaded step gives a protocol a close callback, releases
+ * one session through the rollback path and leaves another attached, then
+ * runs the shutdown walk over the free bitmap's complement: it fires the
+ * attached session's close and the released one's never, that session's
+ * open having never run.
  */
 
 #include "duct_session.h"
+#include "duct_session_block.h"
 
 #include <limits.h>
 #include <stdatomic.h>
@@ -44,7 +38,6 @@
 
 static constexpr unsigned stress_threads = 16u;
 static constexpr unsigned stress_iters  = 50000u;
-static constexpr unsigned drain_iters   = stress_iters / 2u;
 
 /** @brief Counters block of a freshly acquired session slot. */
 static const duct_conn_counters_t s_no_counts[duct_session_max_legs] = {};
@@ -53,8 +46,8 @@ static atomic_uint s_double_acquire = 0u;
 static atomic_uint s_stale_reset    = 0u;
 static atomic_uint s_gen_guard_hit  = 0u;
 static atomic_uint s_acquire_fail   = 0u;
-static atomic_uint s_drain_epoch_a  = 0u;
-static atomic_uint s_drain_epoch_b  = 0u;
+static atomic_uint s_dead_early     = 0u;
+static atomic_uint s_grace_wrong    = 0u;
 static atomic_bool s_done           = false;
 static atomic_uint s_closes_fired   = 0u;
 
@@ -88,8 +81,8 @@ static unsigned s_shutdown_closes(void)
         return UINT_MAX;
     }
     proto->owned_wire = wire;
-    auto live = duct_session_acquire();
-    auto dead = duct_session_acquire();
+    auto live = duct_session_acquire(0u);
+    auto dead = duct_session_acquire(0u);
     if (!live || !dead)
         return UINT_MAX;
     live->proto = proto;
@@ -104,28 +97,28 @@ static void *s_hammer(void *arg)
 {
     unsigned tid = (unsigned)(uintptr_t)arg;
     for (unsigned i = 0u; i < stress_iters; ++i) {
-        auto s = duct_session_acquire();
+        auto s = duct_session_acquire(tid % duct_runtime_max_workers);
         if (!s) {
             duct_atomic_fetch(add, &s_acquire_fail, 1u, relaxed);
             continue;
         }
         /* Acquire must reset proto, proto_state, flags and the counters block.
-           The flags check catches a stale fl_session_teardown_done left by the
-           close path; the marker written into the counters below reaches the
-           slot's next acquirer if the block is not zeroed. */
-        auto flags = duct_atomic_load(&s->flags, relaxed);
-        auto counts = duct_session_counters(s);
-        bool dirty = memcmp(counts, s_no_counts, sizeof s_no_counts) != 0;
-        if (s->proto != nullptr || s->proto_state != nullptr || flags != 0u || dirty) {
+           The flags check catches a stale fl_session_multiplexed left by a
+           multiplexed life; the marker written into the counters below
+           reaches the slot's next acquirer if the block reset misses it. */
+        bool dirty = memcmp(duct_session_counters(s), s_no_counts,
+                            sizeof s_no_counts) != 0;
+        if (s->proto != nullptr || s->proto_state != nullptr
+            || s->flags != fl_session_none || dirty) {
             fprintf(stderr, "sess_stress: tid=%u sid=%u stale reset "
-                            "(proto=%p proto_state=%p conns=%p flags=%u counters dirty=%d)\n",
-                    tid, s->session_id, (const void *)s->proto,
-                    s->proto_state, (const void *)s->conns, flags, dirty);
+                            "(proto=%p proto_state=%p flags=%u counters dirty=%d)\n",
+                    tid, duct_session_idx_get(s), (const void *)s->proto,
+                    s->proto_state, (unsigned)s->flags, dirty);
             duct_atomic_fetch(add, &s_stale_reset, 1u, relaxed);
         }
-        counts[tid % duct_session_max_legs].tx_refused = i + 1u;
+        duct_session_counters(s)[tid % duct_session_max_legs].tx_refused = i + 1u;
         uint32_t my_gen = duct_atomic_load(&s->generation, acquire);
-        duct_session_id_t sid = s->session_id;
+        duct_session_id_t sid = duct_session_idx_get(s);
         s->proto_state = (void *)(uintptr_t)(tid + 1u);
 
         /* Resolve with the wrong generation must never succeed. */
@@ -136,30 +129,28 @@ static void *s_hammer(void *arg)
             duct_atomic_fetch(add, &s_gen_guard_hit, 1u, relaxed);
 
         /* Re-read gen; a change means another thread acquired this slot. */
-        uint32_t cur_gen = duct_atomic_load(&s->generation, acquire);
-        if (cur_gen != my_gen)
+        if (duct_atomic_load(&s->generation, acquire) != my_gen)
             duct_atomic_fetch(add, &s_double_acquire, 1u, relaxed);
 
-        /* Clear the marker, then alternate release paths so the closing→
-           quarantine transition is exercised under concurrent drain. proto is
-           null, so request_close fires no on_session_close callback. */
         s->proto_state = nullptr;
-        if (i & 1u)
+        if (i & 1u) {
             duct_session_release(s);
-        else
-            duct_session_request_close(s, close_normal);
-    }
-    return nullptr;
-}
-
-static void *s_drainer(void *arg)
-{
-    auto counter = (atomic_uint *)arg;
-    struct timespec ts = { .tv_nsec = 100L };
-    for (unsigned i = 0u; i < drain_iters; ++i) {
-        uint64_t ep = duct_atomic_fetch(add, counter, 1u, relaxed) + 1u;
-        duct_sessions_reclaim(ep);
-        nanosleep(&ts, nullptr);
+            continue;
+        }
+        /* The owner-shaped close arm, exclusive on this thread's slot: the
+           state merge runs attached → closing → dead with no flags byte, a
+           token captured live must stop resolving in dead, and the grace
+           counts down before the block returns. */
+        auto tok = duct_session_handle_from_live(s);
+        duct_session_request_close(s, close_normal);
+        if (duct_session_by_handle(tok) != nullptr) {
+            fprintf(stderr, "sess_stress: tid=%u a dead session's token resolved\n", tid);
+            duct_atomic_fetch(add, &s_dead_early, 1u, relaxed);
+        }
+        if (duct_session_dead_tick(s) || duct_session_dead_tick(s))
+            duct_atomic_fetch(add, &s_grace_wrong, 1u, relaxed);
+        if (!duct_session_dead_tick(s))
+            duct_atomic_fetch(add, &s_grace_wrong, 1u, relaxed);
     }
     return nullptr;
 }
@@ -183,46 +174,46 @@ int main(void)
     pthread_t watchdog;
     pthread_create(&watchdog, nullptr, s_watchdog, nullptr);
     pthread_detach(watchdog);
-    pthread_t drainer_a, drainer_b;
-    pthread_create(&drainer_a, nullptr, s_drainer, &s_drain_epoch_a);
-    pthread_create(&drainer_b, nullptr, s_drainer, &s_drain_epoch_b);
     pthread_t th[stress_threads];
     for (unsigned i = 0u; i < stress_threads; ++i)
         pthread_create(&th[i], nullptr, s_hammer, (void *)(uintptr_t)i);
     for (unsigned i = 0u; i < stress_threads; ++i)
         pthread_join(th[i], nullptr);
-    pthread_join(drainer_a, nullptr);
-    pthread_join(drainer_b, nullptr);
     atomic_store(&s_done, true);
 
     unsigned da = duct_atomic_load(&s_double_acquire, acquire);
     unsigned sr = duct_atomic_load(&s_stale_reset, acquire);
     unsigned gg = duct_atomic_load(&s_gen_guard_hit, acquire);
     unsigned af = duct_atomic_load(&s_acquire_fail, acquire);
+    unsigned de = duct_atomic_load(&s_dead_early, acquire);
+    unsigned gw = duct_atomic_load(&s_grace_wrong, acquire);
 
-    /* Final invariant: drain every remaining closing/quarantined slot at
-       near-max epoch, then the free stack must yield every slot exactly once.
-       A leak (drain push broken) surfaces as a missing idx; a double-push as
-       a dup. Two drains cover both the closing and quarantine tail. */
-    duct_sessions_reclaim(UINT64_MAX - 1u);
-    duct_sessions_reclaim(UINT64_MAX - 1u);
+    /* Final invariant: the shutdown walk returns every block still held,
+       then the pool must yield every slot exactly once — held, so the
+       rollback release cannot hand the same warm block straight back. A
+       leak surfaces as a missing idx; a double-return as a dup. */
+    duct_sessions_reclaim_shutdown();
     unsigned seen = 0u;
+    auto held = (duct_session_t **)calloc(duct_max_conns, sizeof(duct_session_t *));
     bool idx_seen[duct_max_conns] = {};
+    if (!held)
+        return 1;
     for (;;) {
-        auto s = duct_session_acquire();
+        auto s = duct_session_acquire(0u);
         if (!s)
             break;
-        unsigned idx = s->session_id;
+        unsigned idx = duct_session_idx_get(s);
         if (idx_seen[idx]) {
-            fprintf(stderr, "sess_stress: FAIL duplicate idx %u in final stack\n", idx);
+            fprintf(stderr, "sess_stress: FAIL duplicate idx %u in final pool\n", idx);
             return 1;
         }
         idx_seen[idx] = true;
-        ++seen;
-        /* alloc gave us a leg array; return it via the rollback path. */
-        duct_session_release(s);
+        held[seen++] = s;
     }
-    duct_sessions_reclaim(UINT64_MAX - 1u);
+    for (unsigned i = 0u; i < seen; ++i)
+        duct_session_release(held[i]);
+    free(held);
+    duct_sessions_reclaim_shutdown();
 
     if (da != 0u) {
         fprintf(stderr, "sess_stress: FAIL double_acquire=%u\n", da);
@@ -236,8 +227,16 @@ int main(void)
         fprintf(stderr, "sess_stress: FAIL gen_guard_hit=%u\n", gg);
         return 1;
     }
+    if (de != 0u) {
+        fprintf(stderr, "sess_stress: FAIL dead_early=%u\n", de);
+        return 1;
+    }
+    if (gw != 0u) {
+        fprintf(stderr, "sess_stress: FAIL grace_wrong=%u\n", gw);
+        return 1;
+    }
     if (seen != duct_max_conns) {
-        fprintf(stderr, "sess_stress: FAIL final stack=%u expected=%u (leak)\n",
+        fprintf(stderr, "sess_stress: FAIL final pool=%u expected=%u (leak)\n",
                 seen, duct_max_conns);
         return 1;
     }
@@ -247,11 +246,11 @@ int main(void)
                         "expected 1: the attached session's alone\n", closes);
         return 1;
     }
-    /* acquire_fail is a transient pile-up signal (free stack momentarily empty
-       while slots sit in closing/quarantine awaiting drain), not a bug. */
-    printf("sess_stress: OK (%u threads x %u iters, 2 drainers, closing+rollback, "
-           "no double-acquire, final stack=%u, transient fail=%u, shutdown closes "
-           "the attached session alone)\n",
+    /* acquire_fail is a transient pile-up signal (free bitmap momentarily
+       empty while slots sit dead awaiting their grace), not a bug. */
+    printf("sess_stress: OK (%u threads x %u iters, rollback + owner close with "
+           "grace ticks, no double-acquire, final pool=%u, transient fail=%u, "
+           "shutdown closes the attached session alone)\n",
            stress_threads, stress_iters, seen, af);
     return 0;
 }

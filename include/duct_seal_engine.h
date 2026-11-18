@@ -312,6 +312,9 @@ typedef struct duct_sealed_wire_cfg {
      *  @ref duct_conn_set_tx_prefix replaces them on a leg already up.
      */
     uint8_t                        tx_prefix[duct_seal_prefix_max];
+    bool                           dgram_env; /**< Reserve 8 tail bytes on every
+                                 *  datagram for the @c duct_dgram_env_t
+                                 *  trailer, carried under @c fl_frame_env. */
 } duct_sealed_wire_cfg_t;
 
 /** @brief Build a sealed wire from @p cfg.

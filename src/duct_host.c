@@ -16,11 +16,12 @@
 
 #include "duct_relay.h"
 #include "duct_host.h"
+#include "duct_conn_block.h"
 #include "duct_ticks.h"
 #include "duct_session.h"
 #include "duct_vmq.h"
 #include "duct_wfq.h"
-#include "duct.h"
+#include "duct_stream.h"
 
 #include <string.h>
 
@@ -247,7 +248,7 @@ duct_result_t duct_io_inter_batch(duct_engine_t *e, duct_handle_t tok,
      * id, never unmapped, so a full close and reuse by a brand-new session
      * between the resolve above and this conns[] read silently repoints
      * conn_id at the new session's leg. generation advances only on that
-     * exact closing -> quarantine -> free -> re-acquire transition, so
+     * exact closing -> dead -> free -> re-acquire transition, so
      * re-checking it against the token's snapshot proves the read did not
      * race a reuse; a mismatch means it did, and h must be discarded. */
     duct_do_if(duct_atomic_load(&s->generation, acquire) != stok.gen, return rc_closed);
@@ -263,32 +264,17 @@ duct_result_t duct_io_inter_batch(duct_engine_t *e, duct_handle_t tok,
         duct_do_if(duct_ckd_add(&total, total, batch->pkts[i].payload.size), return rc_invalid_arg);
     duct_do_if(total > (size_t)UINT32_MAX, return rc_invalid_arg);
 
-    /* Re-resolve by handle right before the mutate: conn above was captured
-     * before the size math, and a close racing that window reclaims and
-     * reissues the slot. This re-check is the safety step — the initial
-     * resolve is fail-fast validation only. */
-    auto live = duct_conn_by_handle(h);
-    duct_do_if(!live, return rc_closed);
-    /* host_pins: this thread is an unregistered reader the close-fence
-     * protocol never enumerates — that protocol proves no worker/io
-     * reference remains, nothing about host threads. Pin before touching
-     * inter_lane, then re-check below. A mismatch means duct_conn_reclaim's
-     * generation bump already landed, so its host_pins spin either passed
-     * this conn before the pin or waits for the decrement below; either way
-     * inter_lane stays untouched past this point. */
-    duct_atomic_fetch(add, &live->host_pins, 1u, relaxed);
-    /* Dekker-shaped store-then-load across two different atomics: host_pins
-     * here, gen_req in duct_conn_reclaim. Acquire/release gives no StoreLoad
-     * barrier, so a weakly-ordered arch reorders the later load ahead of
-     * this store — AArch64 pre-LSE ldaxr/stlxr among them. The full fence
-     * closes that window. */
-    atomic_thread_fence(memory_order_seq_cst);
-    if (!duct_conn_by_handle(h)) {
-        duct_atomic_fetch(sub, &live->host_pins, 1u, release);
-        return rc_closed;
-    }
-    auto lane = live->inter_lane;
-    auto ln = duct_mpsc_lane(lane, 0u);
+    /* The §5 pin is the whole revalidate-and-hold: one CAS on the lifecycle
+     * word checks the handle's generation and the phase gate and raises the
+     * pin nibble in the same atomic operation conn close and release finish
+     * serialize through — the initial resolve above is fail-fast validation
+     * only, and nothing between it and here can hand the slot out while the
+     * word still matches. A pinned word cannot reach the generation bump
+     * (the count's finish marks it spent instead), so the lane below stays
+     * this generation's until the unpin past the notify. */
+    duct_result_t pinned = duct_conn_pin(conn, h.gen);
+    duct_do_if(pinned != rc_ok, return pinned);
+    auto ln = duct_mpsc_lane(duct_conn_lane(conn), 0u);
     duct_vmq_reserve_pos_t pos;
     duct_vmq_push_rc_t push_rc;
     /* Reserve space directly in the lane: payload bytes copy once from host
@@ -296,7 +282,7 @@ duct_result_t duct_io_inter_batch(duct_engine_t *e, duct_handle_t tok,
     auto stage = (duct_msg_inter_batch_t *)
         duct_vmq_reserve(&ln, inter_msg_batch, 0u, total, &pos, &push_rc);
     if (!stage) {
-        duct_atomic_fetch(sub, &live->host_pins, 1u, release);
+        duct_conn_unpin(conn);
         return push_rc == vmq_push_too_large ? rc_invalid_arg : rc_defer;
     }
     stage->conn = h.word;
@@ -320,14 +306,15 @@ duct_result_t duct_io_inter_batch(duct_engine_t *e, duct_handle_t tok,
         cursor += pkt->payload.size;
     }
     duct_vmq_publish(&ln, &pos);
-    /* Mark then notify, both still pinned: duct_vmq_notify derefs ln.ctrl,
-     * which lives inside the inter_lane allocation, and duct_conn_reclaim
-     * frees that once host_pins hits zero. Bit before wake, and
-     * live->worker_id read here while the pin holds. s_inter_drain worker_id
-     * check stays as backstop. */
-    duct_worker_inter_arm(live->worker_id, duct_conn_idx_get(live));
+    duct_conn_lane_staged(conn, pos.aligned);
+    /* Mark then notify, both still pinned: the teardown half may drain this
+     * lane concurrently — MPSC-safe, and the block cannot be reused while
+     * the word carries the pin. Bit before wake, and conn->worker_id read
+     * here is stable per generation. s_inter_drain's worker_id check stays
+     * as backstop. */
+    duct_worker_inter_arm(conn->worker_id, duct_conn_idx_get(conn));
     duct_vmq_notify(ln.ctrl);
-    duct_atomic_fetch(sub, &live->host_pins, 1u, release);
+    duct_conn_unpin(conn);
     return rc_ok;
 }
 

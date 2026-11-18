@@ -164,11 +164,28 @@ duct_olb_decl(duct_olb_rx,
          */
         uint32_t _Atomic dispatch_frontier;
 
-        /** @brief Ack total at which a latched read resumes.
-         *  Stored by the io thread from @ref duct_olb_rx_resume_total before
-         *  it latches @c fl_conn_rx_full; the worker ack that brings
-         *  @c acked to it reposts the read. Read only while that latch is
-         *  set.
+        /** @brief The author's rx_op_pause request, 1 while the conn's input
+         *  stands paused. Worker-written (plain store — the one writer), read
+         *  at the io thread's RX gates as a stale-tolerant bit: the resume
+         *  side posts @c fl_req_rx_resume after clearing it, so io either
+         *  sees the clear or re-reads it on that post's drive. Resident on
+         *  this line for every conn — a lane conn's ring words stay zero
+         *  while its device gate still reads this bit.
+         */
+        uint8_t _Atomic suspended;
+
+        /** @brief Ack total at which a latched read resumes; 0 while
+         *  unarmed. Io's single-writer value latch: the io thread stores the
+         *  @ref duct_olb_rx_resume_total target (release) ahead of a
+         *  @c seq_cst fence and re-checks @c acked — a target the worker
+         *  already passed disarms at once (0 again), so an armed word always
+         *  holds a target strictly past @c acked. The worker, on each ack
+         *  shift @c prev_acked → @c new_acked, stores @c acked (release),
+         *  fences, loads this word and posts @c fl_req_rx_resume strictly on
+         *  the crossing edge @c prev_acked < R ≤ @c new_acked — exactly one
+         *  post per latch, no bit, no clear, no RMW on either side. Io
+         *  disarms on the wake (plain 0 store) before re-driving. The gate
+         *  both sides derive: stalled means @c acked < resume_at.
          */
         uint64_t _Atomic resume_at;
 
@@ -192,6 +209,25 @@ duct_olb_decl(duct_olb_rx,
          */
         duct_tx_hold_t tx_hold;
     );
+
+    duct_cacheline_struct(
+        /** @brief Live rx-span references riding TX descriptors of any leg
+         *  (duct_span_t, §2.3): the worker raises one strictly before the
+         *  descriptor is published into a foreign leg's ring — the 0 → 1
+         *  edge taking a unit of the conn's release count — and any thread
+         *  drops one at delivery; the 1 → 0 edge re-checks @c resume_at by
+         *  level, posts the read, and releases last. On its own line, off
+         *  the worker's ack line: a foreign io thread's fetch_sub here must
+         *  not invalidate the worker's hottest line, and the worker's ack
+         *  stores must not invalidate theirs.
+         *
+         *  While nonzero, no compaction runs and no second pass opens: a
+         *  pinned span holds the ring's wrap/read window (@c pass_free),
+         *  never the ack cursor — @c acked advances with the frames as
+         *  normal, and the block reuse the pins gate is the free bitmap's,
+         *  through the refs unit, not any scan's. */
+        uint32_t _Atomic pins;
+    );
 );
 
 static_assert(offsetof(duct_olb_rx_t, acked) % duct_cacheline_size == 0u,
@@ -206,12 +242,6 @@ duct_nonnull(1) static inline void duct_olb_rx_cold_init(duct_olb_rx_t *rx)
     duct_atomic_store(&rx->recv_threshold,
                       rx->h.buf_size / olb_rx_compact_div,
                       relaxed);
-}
-
-/** @brief Allocate a new receive buffer of the given @p capacity. */
-static inline duct_olb_rx_t *duct_olb_rx_new(size_t capacity)
-{
-    return duct_olb_new(duct_olb_rx_t, capacity, duct_olb_rx_cold_init);
 }
 
 /** @brief Current compaction threshold, bytes. */
@@ -313,46 +343,15 @@ duct_olb_rx_posted_total(const duct_olb_rx_t *rx)
     return duct_olb_rx_total_at(rx, rx->posted_off);
 }
 
-/** @brief Compact the buffer.
- *  Discards everything before @p boundary and slides the rest down. Every
- *  byte before @p boundary is consumed, as @ref duct_olb_rx_consumed answers,
- *  and @p boundary is at or before @c posted_off, so no relocated byte is
- *  still referenced. The pass accounting restarts as one pass at the current
- *  ack total. @p out_ptr is set to the write position after compaction.
- *
- *  @return Free bytes available at @p out_ptr.
- */
-duct_nonnull(1, 3) static inline size_t
-duct_olb_rx_compact(duct_olb_rx_t *rx, uint64_t boundary, uint8_t **out_ptr)
-{
-    auto h = &rx->h;
-    size_t partial = h->stage > boundary ? (size_t)(h->stage - boundary) : 0u;
-    if (partial && boundary) {
-        memmove(rx->data, rx->data + (size_t)boundary, partial);
-        duct_rtstat_inc(rx->memmove_compacts, 1u);
-    }
-    h->stage = partial;
-    rx->recv_hint = 0u;
-    rx->posted_off = 0u;
-    /* group_off slides by boundary distance. */
-    if (rx->group_bytes)
-        rx->group_off -= (uint32_t)boundary;
-    rx->pass_base = duct_atomic_load(&h->head, relaxed);
-    rx->pass_end = 0u;
-    rx->skip = 0u;
-    duct_atomic_store(&rx->dispatch_frontier, 0u, relaxed);
-    duct_atomic_store(&h->tail, partial, release);
-    *out_ptr = rx->data + partial;
-    return h->buf_size - partial; /* partial <= stage <= buf_size always */
-}
-
 /** @brief Tell whether the worker is done with every posted frame.
- *  Folds the worker's acks into @c head first, then needs all three: every
+ *  Folds the worker's acks into @c head first, then needs all four: every
  *  posted byte acked; no @c held_frames pin, which @c s_hctx_rx_ack_only
- *  keeps past its ack; and @c dispatch_frontier at @c posted_off less the
- *  bytes @c skip counts, a frontier a handler reading its frame across yields
- *  holds back until it is done. Compaction moves or reuses posted bytes only
- *  then.
+ *  keeps past its ack; no live @c pins span, which may ride TX descriptors
+ *  of any leg well past the ack — its bytes are exactly the ones compaction
+ *  would move or a new pass would overwrite; and @c dispatch_frontier at
+ *  @c posted_off less the bytes @c skip counts, a frontier a handler
+ *  reading its frame across yields holds back until it is done. Compaction
+ *  moves or reuses posted bytes only then.
  */
 duct_nonnull(1) static inline bool
 duct_olb_rx_consumed(duct_olb_rx_t *rx)
@@ -360,6 +359,7 @@ duct_olb_rx_consumed(duct_olb_rx_t *rx)
     duct_discard duct_olb_rx_ack_apply(rx);
     return duct_atomic_load(&rx->h.head, relaxed) >= duct_olb_rx_posted_total(rx)
         && duct_atomic_load(&rx->held_frames, acquire) == 0u
+        && duct_atomic_load(&rx->pins, acquire) == 0u
         && (size_t)duct_atomic_load(&rx->dispatch_frontier, acquire) + rx->skip >= rx->posted_off;
 }
 
@@ -368,7 +368,9 @@ duct_olb_rx_consumed(duct_olb_rx_t *rx)
  *  The count is of acked bytes, at most the buffer offset it reaches: bytes a
  *  discard skipped behind that point leave it short.
  *  @return false while a held frame pins bytes the ack total already covers,
- *          since acks then stop mapping onto the front of the pass. On true,
+ *          and while a live @c pins span holds the older pass — the wrap/
+ *          read window it governs is the second pass's footprint — since
+ *          acks then stop mapping onto the front of the pass. On true,
  *          the second pass takes over once the count passes the end of the
  *          older one, and @p out_done counts from its start.
  */
@@ -377,7 +379,8 @@ duct_olb_rx_done(duct_olb_rx_t *rx, size_t *out_done)
 {
     duct_discard duct_olb_rx_ack_apply(rx);
     uint64_t head = duct_atomic_load(&rx->h.head, relaxed);
-    if (duct_atomic_load(&rx->held_frames, acquire) != 0u)
+    if (duct_atomic_load(&rx->held_frames, acquire) != 0u
+        || duct_atomic_load(&rx->pins, acquire) != 0u)
         return false;
     uint64_t done = head - rx->pass_base;
     if (rx->pass_end && done >= rx->pass_end) {
@@ -406,14 +409,17 @@ duct_olb_rx_room(const duct_olb_rx_t *rx)
  *  released, and the worker down to one read of backlog, so the worker stays
  *  fed through the resume and each resume brings room for more than one
  *  read. The full drain, every posted byte acked, is the target without
- *  @p restart, with a coalesced tail pending, a frame held, or unposted bytes
- *  in a single pass, and caps the target otherwise.
+ *  @p restart, with a coalesced tail pending, a frame held, a live span pin
+ *  holding the wrap window (§2.3: the last pin's level check is the wake,
+ *  no ack edge is left to cross), or unposted bytes in a single pass, and
+ *  caps the target otherwise.
  */
 duct_nonnull(1) static inline uint64_t
 duct_olb_rx_resume_total(const duct_olb_rx_t *rx, size_t min_avail, bool restart)
 {
     uint64_t posted = duct_olb_rx_posted_total(rx);
     if (!restart || rx->group_bytes || duct_atomic_load(&rx->held_frames, relaxed)
+        || duct_atomic_load(&rx->pins, relaxed)
         || (!rx->pass_end && rx->h.stage != rx->posted_off))
         return posted;
     uint64_t at = rx->pass_base + (rx->pass_end
@@ -421,109 +427,6 @@ duct_olb_rx_resume_total(const duct_olb_rx_t *rx, size_t min_avail, bool restart
                 : min_avail),
              low = posted > min_avail ? posted - min_avail : 0u;
     return duct_min(duct_max(at, low), posted);
-}
-
-/** @brief Find room in the buffer for the io thread's next read.
- *
- *  Low free space compacts the buffer once every posted frame is
- *  acknowledged, unheld and dispatched, and @p restart otherwise opens a
- *  second pass at offset 0 once the worker has released @p min_avail bytes
- *  from the front and every staged byte is posted; while two passes are live,
- *  only the room below the older pass's release point counts.
- *
- *  @p min_avail is the span the caller cannot proceed without. No success
- *  answer falls below it, the pending-frame hint and the relaxed
- *  half-threshold included.
- *
- *  @return @c olb_rx_ok when the free span sufficed,
- *          @c olb_rx_compacted when compaction or a new pass produced it,
- *          @c olb_rx_full when neither did. @p out_avail is written on every
- *          path; @p out_ptr, the stage cursor, on every path but the early
- *          @c olb_rx_full taken when @c buf_size minus @c stage underflows.
- */
-duct_nonnull(1, 4, 5) static inline duct_olb_rx_result_t
-duct_olb_rx_try_space(duct_olb_rx_t *rx, size_t min_avail, bool restart,
-                      uint8_t **out_ptr, size_t *out_avail)
-{
-    assert(min_avail);
-    auto h = &rx->h;
-    size_t done = 0u;
-    bool known = duct_olb_rx_done(rx, &done);
-    if (rx->pass_end) {
-        if (known && done > rx->pass_free)
-            rx->pass_free = (uint32_t)done;
-        *out_ptr = rx->data + h->stage;
-        *out_avail = duct_olb_rx_room(rx);
-        return *out_avail >= min_avail ? olb_rx_ok : olb_rx_full;
-    }
-    size_t threshold = duct_max(duct_olb_rx_threshold_get(rx), min_avail),
-           hint = duct_olb_rx_recv_hint_get(rx);
-    *out_avail = 0u;
-    if (duct_ckd_sub(out_avail, h->buf_size, h->stage))
-        return olb_rx_full;
-    *out_ptr = rx->data + h->stage;
-    if (*out_avail >= threshold)
-        return olb_rx_ok;
-
-    if (h->stage && duct_olb_rx_consumed(rx)) {
-        *out_avail = duct_olb_rx_compact(rx, rx->posted_off, out_ptr);
-        duct_rtstat_inc(rx->early_compacts, 1u);
-        return *out_avail >= min_avail ? olb_rx_compacted : olb_rx_full;
-    }
-
-    if (hint && *out_avail >= duct_max(hint, min_avail))
-        return olb_rx_ok;
-
-    if (*out_avail >= duct_max(threshold / olb_rx_relax_div, min_avail))
-        return olb_rx_ok;
-
-    if (restart && known && done >= min_avail && h->stage == rx->posted_off
-        && !rx->group_bytes) {
-        rx->pass_end = h->stage;
-        rx->pass_free = (uint32_t)done;
-        h->stage = 0u;
-        rx->posted_off = 0u;
-        rx->recv_hint = 0u;
-        duct_atomic_store(&h->tail, 0u, release);
-        *out_ptr = rx->data;
-        *out_avail = done;
-        return olb_rx_compacted;
-    }
-    return olb_rx_full;
-}
-
-/** @brief Return a fully consumed buffer to offset 0.
- *  Acts only once every staged byte is posted and the worker is done with all
- *  of them, so no byte moves. A record-framed reserve calls it before each
- *  read, which keeps the whole buffer free for the next burst whenever the
- *  worker keeps up.
- */
-duct_nonnull(1) static inline void
-duct_olb_rx_rewind(duct_olb_rx_t *rx)
-{
-    auto h = &rx->h;
-    if (!h->stage || rx->posted_off != h->stage || !duct_olb_rx_consumed(rx))
-        return;
-    uint8_t *ptr = nullptr;
-    duct_discard duct_olb_rx_compact(rx, rx->posted_off, &ptr);
-}
-
-/** @brief Append @p len raw bytes at the stage cursor.
- *
- *  Carries bytes captured during accept-time protocol sniffing, which must
- *  be replayed into the buffer. The caller verifies the space beforehand
- *  through @ref duct_olb_rx_try_space; @ref duct_dgram_rx_append builds on
- *  this to add datagram framing.
- */
-duct_nonnull(1) static inline void
-duct_olb_rx_append_raw(duct_olb_rx_t *rx, const void *data, size_t len)
-{
-    if (!len)
-        return;
-    auto h = &rx->h;
-    memcpy(rx->data + h->stage, data, len);
-    duct_atomic_store(&h->tail, h->stage + len, release);
-    h->stage += len;
 }
 
 /** @brief Add @p nbytes to the running total of consumed bytes.
@@ -540,6 +443,29 @@ duct_olb_rx_ack(duct_olb_rx_t *rx, size_t nbytes)
     uint64_t ack = duct_atomic_load(&rx->acked, relaxed) + (uint64_t)nbytes;
     duct_atomic_store(&rx->acked, ack, release);
     return ack;
+}
+
+/** @brief True while @p rx's read stands latched: the worker has not acked
+ *  up to the resume target @c resume_at names.
+ *  Io's derived RX stall gate — an unarmed word (0) never stalls, and an
+ *  armed one is disarmed the moment its target is behind @c acked.
+ */
+duct_nonnull(1) static inline bool
+duct_olb_rx_stalled(const duct_olb_rx_t *rx)
+{
+    return duct_atomic_load(&rx->acked, acquire)
+         < duct_atomic_load(&rx->resume_at, relaxed);
+}
+
+/** @brief True when the ack shift @p prev_acked → @p new_acked crosses the
+ *  armed resume target @p target: strictly the edge @c prev_acked < R ≤
+ *  @c new_acked, the unarmed zero never crossing. The one expression the
+ *  worker's post-on-ack check and the edge tests answer the crossing by.
+ */
+static inline bool
+duct_olb_rx_resume_crossed(uint64_t prev_acked, uint64_t new_acked, uint64_t target)
+{
+    return target != 0u && prev_acked < target && new_acked >= target;
 }
 
 #ifdef __cplusplus

@@ -94,6 +94,15 @@ typedef struct duct_msg_frame_batch {
                                       *  sizeof(duct_msg_frame_t). */
 } duct_msg_frame_batch_t;
 
+/** @brief WFQ-full batch retry node: inline batch copy + push cursor, at most
+ *  one live per conn and carried by that conn block's retry region — the
+ *  link form stays a message, the storage is the region. */
+duct_msg_chain_decl(batch_retry_node_t,
+    unsigned worker_id;
+    uint32_t from;
+    alignas(alignof(duct_handle_t)) duct_msg_frame_batch_t batch;
+);
+
 /** @brief One host-pushed inter packet. */
 typedef struct duct_msg_inter_pkt {
     uint32_t           offset,       /**< Byte offset from whichever base the
@@ -250,6 +259,18 @@ typedef uint64_t _Atomic duct_wfq_io_waiters_t;
  *  The width of @ref duct_wfq_io_waiters_t.
  */
 static constexpr unsigned duct_wfq_io_waiters_max = 64u;
+
+/** @brief Wire-rebind fence node.
+ *
+ *  Pushed by the I/O thread directly onto the owner worker's normal WFQ lane
+ *  (not the ctrl_stack) so it drains after every frame batch this conn
+ *  already posted under the old wire. @c session is the token captured at
+ *  post time; the worker finds the leg via
+ *  @ref duct_session_conn_id_by_handle, a stale/absent leg is idempotent.
+ */
+duct_msg_decl(duct_msg_wire_fence,
+    uint64_t      conn;
+    duct_handle_t session);
 
 #ifdef __cplusplus
 }

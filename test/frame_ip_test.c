@@ -120,6 +120,12 @@ static uint64_t s_key(const duct_frame_t *f)
     return duct_frame_flow_key(&ip);
 }
 
+static bool s_control(const duct_frame_t *f)
+{
+    auto ip = duct_frame_ip(f->payload, f->flags);
+    return duct_frame_is_control(&ip);
+}
+
 /** @brief The volume on the IP view of @p payload with @p flags. */
 static duct_frame_volume_t s_vol(duct_view_u8 payload, duct_frame_flags_t flags)
 {
@@ -419,15 +425,69 @@ static const char *sc_view(void)
     return nullptr;
 }
 
+static const char *sc_control(void)
+{
+    auto f = s_packet(4u, s_tcp, 1000u, 100u, s_ack, false);
+    expect(!s_control(&f), "TCP data packet is marked control");
+    f = s_packet(4u, s_udp, 1000u, 10u, 0u, false);
+    expect(!s_control(&f), "UDP data packet is marked control");
+    f = s_packet(6u, s_tcp, 1000u, 100u, s_ack, false);
+    expect(!s_control(&f), "IPv6 TCP data packet is marked control");
+    f = s_packet(4u, s_tcp, 1000u, 100u, s_ack, true);
+    s_pkt[0] = 0x05u;
+    s_pkt[1] = 0xa8u;
+    expect(!s_control(&f), "GSO TCP data packet is marked control");
+
+    f = s_packet(4u, s_tcp, 1000u, 0u, s_ack, false);
+    expect(s_control(&f), "IPv4 pure TCP ACK is not marked control");
+    f = s_packet(6u, s_tcp, 1000u, 0u, s_ack, false);
+    expect(s_control(&f), "IPv6 pure TCP ACK is not marked control");
+    f = s_packet(4u, s_tcp, 1000u, 0u, s_ack, false);
+    s_pkt[6] = 0x20u;
+    expect(s_control(&f), "first-fragment pure TCP ACK is not marked control");
+    f = s_packet(4u, s_tcp, 1000u, 0u, s_ack, false);
+    s_pkt[7] = 0x10u;
+    expect(!s_control(&f), "non-first TCP fragment is marked control");
+
+    f = s_packet(4u, s_tcp, 1000u, 0u, s_ack | s_syn, false);
+    expect(!s_control(&f), "SYN+ACK is marked control");
+    f = s_packet(4u, s_tcp, 1000u, 0u, s_ack | s_fin, false);
+    expect(!s_control(&f), "FIN+ACK is marked control");
+    f = s_packet(4u, s_tcp, 1000u, 0u, s_ack | s_rst, false);
+    expect(!s_control(&f), "RST+ACK is marked control");
+
+    f = s_packet(4u, s_icmp4, 0u, 0u, 0u, false);
+    expect(s_control(&f), "ICMPv4 is not marked control");
+    f = s_packet(6u, s_icmp6, 0u, 0u, 0u, false);
+    expect(s_control(&f), "ICMPv6 is not marked control");
+
+    f = s_packet(4u, s_udp, 1000u, 40u, 0u, false);
+    f.payload.size -= 10u;
+    expect(s_control(&f), "truncated IPv4 packet is not marked control");
+    f = s_packet(4u, s_udp, 1000u, 40u, 0u, false);
+    s_pkt[2] = 0u;
+    s_pkt[3] = 10u;
+    expect(s_control(&f), "malformed short IPv4 tot_len is not marked control");
+    s_pkt[0] = 0x25u;
+    expect(s_control(&f), "unknown IP version is not marked control");
+    f.payload.size = 19u;
+    s_pkt[0] = 0x45u;
+    expect(s_control(&f), "short packet is not marked control");
+    f = (duct_frame_t){};
+    expect(s_control(&f), "empty frame is not marked control");
+    return nullptr;
+}
+
 int main(void)
 {
     static const struct { const char *name; const char *(*fn)(void); } cases[] = {
-        { "view",   sc_view },
-        { "header", sc_header },
-        { "group",  sc_group },
-        { "peer",   sc_peer },
-        { "volume", sc_volume },
-        { "key",    sc_key },
+        { "view",    sc_view },
+        { "header",  sc_header },
+        { "group",   sc_group },
+        { "peer",    sc_peer },
+        { "volume",  sc_volume },
+        { "key",     sc_key },
+        { "control", sc_control },
     };
     for (size_t i = 0u; i < sizeof cases / sizeof cases[0]; ++i) {
         auto err = cases[i].fn();

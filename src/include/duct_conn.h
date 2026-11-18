@@ -31,6 +31,7 @@ typedef struct duct_olb_rx duct_olb_rx_t;
 typedef struct duct_olb_tx duct_olb_tx_t;
 typedef struct duct_wire_parser duct_wire_parser_t;
 typedef struct duct_wire_codec duct_wire_codec_t;
+typedef struct duct_wfq_route duct_wfq_route_t;
 
 /** @brief Sentinel for @c io_id.
  *  Conn is outside every io thread's registry.
@@ -43,7 +44,7 @@ static constexpr auto conn_io_none = UINT32_MAX;
 static constexpr auto conn_worker_none = UINT32_MAX;
 
 /** @brief Bit width of @c duct_conn_handle_t's @c idx sub-field. */
-static constexpr unsigned hconn_idx_bits = 18u;
+static constexpr unsigned hconn_idx_bits = alloc_slot_bits;
 
 /** @brief Mask for @c duct_conn_handle_t's @c gen sub-field. */
 static constexpr uint64_t hconn_gen_mask =
@@ -74,7 +75,14 @@ static_assert(sizeof(duct_conn_handle_t) == sizeof(duct_handle_t),
 /** @brief Zero-valued connection handle. */
 static constexpr duct_conn_handle_t conn_handle_null = {};
 
-/** @brief Connection state flags.
+/** @brief Connection state flags — the io thread's gate bits, plus the two
+ *  sticky TX hints the shared grouped-send helper records from whichever
+ *  thread met the kernel's refusal.
+ *  The latch bits this word once carried are single-writer values now:
+ *  the RX read stall is the rx header's @c resume_at edge (§6), the TX room
+ *  wait the tx header's own @c resume_at, the author's RX pause a bit on the
+ *  rx header's ack line, and the write-interest state lives on the tx
+ *  header's io line.
  *  Atomically manipulated via @ref duct_conn_state_set and
  *  @ref duct_conn_state_clear helpers.
  */
@@ -86,81 +94,41 @@ typedef enum duct_conn_flags : uint16_t {
                                      *  @ref duct_conn_acquire's state
                                      *  reset. */
 
-    fl_conn_suspended   = 1u << 1,  /**< RX paused by an author's rx_op_pause
-                                      *  request. Written by the worker, read
-                                      *  at the io thread's RX gate. */
-
-    fl_conn_in_wfq      = 1u << 2, /**< An in-flight ctrl message for this
-                                     *  conn is posted on the WFQ. Set on the
-                                     *  worker before a ctrl post, cleared
-                                     *  there on post failure and in
-                                     *  @ref duct_conn_release; read at the io
-                                     *  thread's pre-open reclaim gate. */
-
-    fl_conn_rx_full     = 1u << 3, /**< RX OLB out of space; reads paused
-                                     *  until the worker acks resume. Set and
-                                     *  cleared by the io thread's RX-reserve
-                                     *  path and by the worker's resume
-                                     *  request; read by both. */
-
-    fl_conn_closing     = 1u << 4, /**< Worker requested close; quiesce once
+    fl_conn_closing     = 1u << 1, /**< Worker requested close; quiesce once
                                      *  TX drains. Set once by the io thread;
                                      *  read at the close fence and at the io
                                      *  thread's drain and quiesce gates;
                                      *  cleared only by the next @ref
                                      *  duct_conn_acquire's state reset. */
 
-    fl_conn_tx_wait     = 1u << 5, /**< A worker turn was refused TX room on
-                                     *  this conn, or a retry node is parked
-                                     *  waiting for some to free. Set by the
-                                     *  worker; read and cleared by the io
-                                     *  thread after each TX head advance and
-                                     *  device signal, which wakes the assigned
-                                     *  worker only when set. */
-    fl_conn_write_armed = 1u << 6, /**< Current write-interest state for
-                                     *  reactive backend registration — same
-                                     *  contract as @c duct_listener_t::dgram_tx_write_armed:
-                                     *  updated exclusively by the assigned
-                                     *  I/O thread, gates the worker-side TX
-                                     *  fast path (@c x_udp_peer, @c x_tcp,
-                                     *  @c x_raw) as a stale-tolerant hint.
-                                     *  iocp never touches it — its dgram TX
-                                     *  has no reactive readiness concept. */
-    fl_conn_roaming     = 1u << 7,  /**< An @c x_udp_peer leg whose listener
+    fl_conn_roaming     = 1u << 2,  /**< An @c x_udp_peer leg whose listener
                                       *  holds a candidate address for it, put
                                       *  there by a datagram that arrived from
                                       *  somewhere other than where this socket
                                       *  is connected. Written by I/O thread,
-                                      *  read by worker thread under the same
-                                      *  contract as @c fl_conn_write_armed:
-                                      *  the worker posts @c fl_req_peer_roam
-                                      *  for an accepted frame whose ack total
-                                      *  reaches the RX ring's @c roam_at, and
-                                      *  io moves the socket from there. A
-                                      *  stale read costs one post io then
-                                      *  finds nothing to do. */
-    fl_conn_reclaim_held = 1u << 8, /**< A reclaim found this conn's request
-                                      *  node posted and not yet run, and
-                                      *  waits for it. Set by
-                                      *  @ref duct_conn_reclaim; read and
-                                      *  cleared by the io thread as it runs
-                                      *  that node, which then reclaims. */
-    fl_conn_rx_eof      = 1u << 9,  /**< End of the conn's input, read off the
+                                      *  read by worker thread as a
+                                      *  stale-tolerant hint: the worker posts
+                                      *  @c fl_req_peer_roam for an accepted
+                                      *  frame whose ack total reaches the RX
+                                      *  ring's @c roam_at, and io moves the
+                                      *  socket from there. A stale read costs
+                                      *  one post io then finds nothing to do. */
+    fl_conn_rx_eof      = 1u << 3,  /**< End of the conn's input, read off the
                                       *  peer. Set by the io thread on the
                                       *  zero-length read, and every later read
                                       *  stops at its RX gates; cleared only by
-                                      *  the next @ref duct_conn_acquire's state
-                                      *  reset. */
-    fl_conn_vnet_uso    = 1u << 10, /**< Conn whose tun took the USO flags at its open.
+                                      *  the next @ref duct_conn_acquire's
+                                      *  state reset. */
+    fl_conn_vnet_uso    = 1u << 4, /**< Conn whose tun took the USO flags at its open.
                                       *  Set once by the io thread in
                                       *  @ref duct_conn_setup; read by the worker's
                                       *  vnet write train, which merges UDP
                                       *  datagrams for a conn that carries it.
                                       *  Cleared only by the next
                                       *  @ref duct_conn_acquire's state reset. */
-    fl_conn_dgram_gro   = 1u << 11,
-    fl_conn_gso_off     = 1u << 12,
-    fl_conn_vnet_uso_tx = 1u << 13,
+    fl_conn_dgram_gro   = 1u << 5,
+    fl_conn_gso_off     = 1u << 6,
+    fl_conn_vnet_uso_tx = 1u << 7,
 } duct_conn_flags_t;
 
 static_assert(sizeof(duct_conn_flags_t) == sizeof(uint16_t),
@@ -178,17 +146,14 @@ typedef enum duct_conn_req_flags : uint8_t {
 
     fl_req_rx_resume   = 1u << 2,   /**< Resume paused RX drives. */
 
-    fl_req_retire      = 1u << 3,   /**< Worker confirmed retire-ready;
-                                      *  run the physical retire scan. */
-
-    fl_req_fence_retry = 1u << 4,   /**< Retry a previously failed
+    fl_req_fence_retry = 1u << 3,   /**< Retry a previously failed
                                       *  close-fence publish.*/
 
-    fl_req_wire_rebind = 1u << 5,   /**< Rebind @c conn->wire for a
+    fl_req_wire_rebind = 1u << 4,   /**< Rebind @c conn->wire for a
                                       *  wire-changing proto switch.
                                       *  @see duct_proto_switch */
 
-    fl_req_peer_roam   = 1u << 6,   /**< Point this @c x_udp_peer conn's
+    fl_req_peer_roam   = 1u << 5,   /**< Point this @c x_udp_peer conn's
                                       *  connected socket at the candidate
                                       *  address its listener holds.
                                       *  @see fl_conn_roaming */
@@ -197,13 +162,37 @@ typedef enum duct_conn_req_flags : uint8_t {
 static_assert(sizeof(duct_conn_req_flags_t) == sizeof(uint8_t),
               "duct_conn_req_flags_t width must be 1 byte");
 
+/** @brief Per-conn lifecycle phase, the low three bits of the @c gen_req
+ *  lifecycle byte.
+ *  Monotonic per generation; a close whose lane slot is refused leaves the
+ *  conn at @c conn_quiesced with @c fl_req_fence_retry armed, so
+ *  @c conn_lost_posted is reached only once and never walked back.
+ *  The worker CAS @c conn_unbound → @c conn_bound and the io CAS
+ *  @c phase < conn_quiesced → @c conn_quiesced are the critical
+ *  synchronization points, preventing:
+ *  — a session bind from publishing author callbacks on a quiesced conn,
+ *  — io from destroying a conn the worker still references.
+ */
+typedef enum duct_conn_phase : uint8_t {
+    conn_unbound,      /**< No session attached yet. */
+    conn_bound,        /**< Bound to a session. */
+    conn_quiesced,     /**< io stopped the conn; lost not yet posted. */
+    conn_lost_posted,  /**< @c conn_lost published to normal WFQ lane. */
+    conn_retire_done,  /**< Session unbound / teardown done; refs == 0 pending. */
+    conn_spent,        /**< refs == 0 with host pins; §5. */
+} duct_conn_phase_t;
+
+static_assert(sizeof(duct_conn_phase_t) == sizeof(uint8_t),
+              "duct_conn_phase_t width must be 1 byte");
+
 /** @name @c Generation-request word bit layout.
- *  Generation, request-flags and close-request reason share one 64-bit
- *  atomic so a poster's "does my handle's generation still match" check
- *  and "set my request bit" are written at the same CAS, preventing a
- *  race between the two.
+ *  Generation, request-flags, close-request reason and the lifecycle byte
+ *  share one 64-bit atomic so a poster's "does my handle's generation still
+ *  match" check and "set my request bit" are written at the same CAS,
+ *  preventing a race between the two.
  *  Layout (low to high): [6:0] req_flags, [9:7] close reason, [55:10]
- *  generation (46 bits match @ref hconn_gen_mask), [63:56] unused.
+ *  generation (46 bits match @ref hconn_gen_mask), [58:56] phase,
+ *  [59] rel_pend, [63:60] host pin count (§5).
  *  @{
  */
 static constexpr unsigned gen_req_flags_shift   = 0u;
@@ -211,6 +200,11 @@ static constexpr uint64_t gen_req_flags_mask    = 0x7Full;
 static constexpr unsigned gen_req_reason_shift  = 7u;
 static constexpr uint64_t gen_req_reason_mask   = 0x7ull;
 static constexpr unsigned gen_req_gen_shift     = 10u;
+static constexpr unsigned gen_req_phase_shift   = 56u;
+static constexpr uint64_t gen_req_phase_mask    = 7ull << gen_req_phase_shift;
+static constexpr uint64_t gen_req_rel_pend      = 1ull << 59u;
+static constexpr unsigned gen_req_pins_shift    = 60u;
+static constexpr uint64_t gen_req_pins_mask     = 15ull << gen_req_pins_shift;
 
 /** @brief Pack generation + request flags + close reason into a word. */
 static inline uint64_t
@@ -243,32 +237,16 @@ duct_gen_req_reason(uint64_t word)
     return (duct_close_reason_t)
         ((word >> gen_req_reason_shift) & gen_req_reason_mask);
 }
+
+/** @brief Extract the lifecycle phase from a @c gen_req word. */
+static inline duct_conn_phase_t
+duct_gen_req_phase(uint64_t word)
+{
+    return (duct_conn_phase_t)
+        ((word >> gen_req_phase_shift)
+         & (gen_req_phase_mask >> gen_req_phase_shift));
+}
 /** @} */
-
-/** @brief Per-conn close-fence state machine.
- *
- *  Monotonic. A fence publication that cannot reserve its lane slot leaves
- *  the conn at @c fence_quiescing and asks for a retry, so @c fence_posted is
- *  reached only once and never walked back.
- *  The worker CAS @c fence_unbound → @c fence_open and the io CAS
- *  @c fence_unbound / @c fence_open → @c fence_quiescing are the critical
- *  synchronization points, preventing:
- *  — a session bind from publishing author callbacks on a quiesced conn,
- *  — io from destroying a conn the worker still references.
- */
-typedef enum duct_conn_fence : uint8_t {
-    fence_unbound,      /**< No session attached yet. */
-    fence_open,         /**< Bound to a session. */
-    fence_quiescing,    /**< io stopped the conn; fence unposted yet. */
-    fence_posted,       /**< @c conn_lost published to normal WFQ lane. */
-    fence_retire_ready, /**< Worker confirmed no further access;
-                          *  ready for destroy by io. */
-    fence_retired,      /**< io destroyed the conn;
-                          * slot is about to be released. */
-} duct_conn_fence_t;
-
-static_assert(sizeof(duct_conn_fence_t) == sizeof(uint8_t),
-              "duct_conn_fence_t width must be 1 byte");
 
 /** @brief Sealed-wire state for one conn.
  *  Outlives @c codec, which a wire rebind destroys while a task parsed under
@@ -278,9 +256,9 @@ typedef struct duct_sealed_conn_ctx {
 
     /** @brief Worker codec instance.
      *  Nullptr until the first sealed-wire task on this conn
-     *  creates it via @c wire->create_codec; destroyed via
-     *  @c codec->destroy at conn-lost consume, wire-rebind fence
-     *  or final teardown.
+     *  builds it via @c wire->init_codec in the conn block's codec
+     *  slot; released via @c codec->release at conn-lost consume,
+     *  wire-rebind fence or final teardown.
      */
     duct_wire_codec_t *codec;
 
@@ -296,7 +274,7 @@ typedef struct duct_sealed_conn_ctx {
 
 /** @brief L4 connection, cacheline-aligned.
  *
- *  L4 ⟷ L5 bind is attach-layer: @c session_token plus a @c conn_fence CAS
+ *  L4 ⟷ L5 bind is attach-layer: @c session_token plus a lifecycle phase CAS
  *  is the L4-side half, @ref duct_conn_session_bind.
  *  Attach-side state
  *  (leg and session choice) resides in the session @c conns[] array.
@@ -305,8 +283,6 @@ typedef struct duct_sealed_conn_ctx {
 typedef struct duct_conn {
     duct_cacheline_struct(
         duct_conn_flags_t _Atomic state;      /**< Lifecycle/gate bits. */
-
-        duct_conn_fence_t _Atomic conn_fence; /**< Close-fence stage. */
 
         duct_close_reason_t close_reason;     /**< Close reason carried to the
                                                 *  worker with the fence.
@@ -319,41 +295,32 @@ typedef struct duct_conn {
 
         uint32_t io_id;     /**< Assigned I/O thread id;
                               *  @c conn_io_none if unset. */
-                              
+
         uint32_t worker_id; /**< Worker thread id the conn's WFQ lane, ctrl
                               *  posts, wakes and inter bit are addressed to,
                               *  assigned by io before the first post. */
 
-        /** @brief Id plus 1 of the worker holding the conn from its bind to
-         *  its unbind, 0 otherwise.
-         *  Stored by @ref duct_conn_session_bind, cleared by
-         *  @ref duct_conn_session_unbind and reset by @ref duct_conn_acquire.
-         *  While bound, only that worker writes it; an I/O thread retires the
-         *  connection only after worker confirmation.
+        /** @brief Release count over the conn's named participants: the io
+         *  owner (1 at @ref duct_conn_acquire), a posted ctrl (+1 at
+         *  @c s_post_ctrl, converted at bind), and every armed async kernel
+         *  I/O submission (+1 before submit, -1 in @c duct_olb_io_done).
+         *  The 0-crossing fetch_sub finalizes the slot: @c rel_pend when
+         *  request flags are live, @c conn_spent when a host pin rides the
+         *  word (§5), else the generation bump and the push back to the
+         *  block pool.
          */
-        uint32_t _Atomic bound_worker;
+        uint32_t _Atomic refs;
 
         /** @brief Bound session handle, @c handle_null if unbound.
-         *  Set before worker's release-CAS @c fence_unbound → @c fence_open;
-         *  io thread that wins the acquire-CAS to @c fence_quiescing
+         *  Set before worker's release-CAS @c conn_unbound → @c conn_bound;
+         *  io thread that wins the acquire-CAS to @c conn_quiesced
          *  observes it complete.
          */
-        duct_handle_t   session_token;
-
-        uint32_t _Atomic  next_free; /**< Free-list link for Treiber stack. */
-
-        /** @brief Host-thread readers currently pinning this conn.
-         *  Unregistered readers, e.g. @ref duct_io_inter_batch,
-         *  hold a pin between their generation re-check and their
-         *  last touch of @c inter_lane.
-         *  @ref duct_conn_reclaim spins on this, reaching 0 before
-         *  tearing down @c inter_lane.
-         */
-        uint32_t _Atomic  host_pins;
+        duct_handle_t _Atomic session_token;
 
         /** @brief Next / prev links in io thread's live-conn list.
          *  Linked by @ref duct_conn_io_list_link, unlinked by
-         *  @ref duct_conn_io_list_unlink / @ref duct_conn_fence_retire.
+         *  @ref duct_conn_io_list_unlink at the close decision.
          */
         struct duct_conn *io_next,
                          *io_prev;
@@ -367,37 +334,11 @@ typedef struct duct_conn {
     );  /* CL0 — lifecycle + io thread registry */
 
     duct_cacheline_struct(
-        duct_sock_t fd; /**< Conn socket descriptor. */
-        union {
-            struct {
-                duct_olb_rx_t *rx_buf; /**< Receive buffer. */
-                duct_olb_tx_t *tx_buf; /**< Transmit buffer. */
-            };
-
-            /** @brief What a leg with no OLB pair carries in their place.
-             *  Live exactly when @c rx_buf / @c tx_buf are not, decided by
-             *  @c xport.
-             */
-            struct {
-                /** @brief Dedicated MPSC ingress queue.
-                 *  A single lane carrying @c x_inter packets — pushed by a
-                 *  host thread, or by the io thread draining a device leg —
-                 *  and @c x_udp_shared classified datagrams.
-                 */
-                duct_vmq_mpsc_t *inter_lane;
-
-                /** @brief Commit ordering for a leg with no TX OLB to hold
-                 *  it, over @c tx_buf's word.
-                 *  @c duct_olb_tx_t keeps the same pair for the legs that do
-                 *  have one, so which word a ticket lives in follows the
-                 *  xport and nothing reads either as the other. Zeroed by
-                 *  @ref duct_conn_acquire @c tx_buf reset, enabling immediate
-                 *  ticket issuance on newly acquired slots.
-                 */
-                struct { uint32_t next,
-                                  serve; } tx_seq;
-            };
-        };
+        duct_sock_t fd; /**< Conn socket descriptor. The rx and tx rings, an
+                          *  inter lane and the small ctx live at fixed
+                          *  page-0 offsets of the conn's block, addressed
+                          *  through @ref duct_conn_block.h; the xport alone
+                          *  decides which of them is live. */
 
         const duct_wire_t  *wire; /**< Bound wire for RX parse + TX pack.
                                     *  Set by @ref duct_conn_bind_wire at
@@ -418,16 +359,6 @@ typedef struct duct_conn {
          *  which has no other synchronization with the worker's write.
          */
         const duct_proto_t * _Atomic wire_rebind_next;
-        
-        /** @brief Xport-specific context, keyed by @c xport_type.
-         *  @ref duct_dgram_shared_ctx_t on @c x_udp_shared and
-         *  @ref duct_device_ops_t on a device-backed @c x_inter, each
-         *  allocated at attach and freed with the conn; the borrowed
-         *  @c duct_listener_t of an accepted @c x_local conn, set by
-         *  @ref duct_local_listener_take and cleared by its drop. Nullptr
-         *  for every other xport.
-         */
-        void *ctx;
 
         /** @brief Transport kind of @c fd.
          *  Drives per-conn I/O dispatch across the OS backends;
@@ -468,6 +399,15 @@ static_assert(sizeof(duct_conn_t) == 2 * duct_cacheline_size,
 duct_nonnull(1) uint64_t _Atomic *
 duct_conn_gen_req(const duct_conn_t *conn);
 
+/** @brief Load @p conn's lifecycle phase with one acquire read of the
+ *  @c gen_req word. */
+duct_nonnull(1) static inline duct_conn_phase_t
+duct_conn_phase(const duct_conn_t *conn)
+{
+    return duct_gen_req_phase(
+        duct_atomic_load(duct_conn_gen_req(conn), acquire));
+}
+
 /** @brief Worker→io wake message for @p conn's coalesced @c gen_req requests.
  *  Resident, one per pool slot, indexed 1:1 with @c conns[] the same way
  *  @c gen_req is. Keeping it out of @ref duct_conn_t holds that struct at
@@ -501,10 +441,6 @@ typedef struct duct_dgram_shared_ctx {
     duct_listener_t *listener; /**< Listener back-reference. */
     duct_peer_t      peer;     /**< This leg's current peer address,
                                  *  updated on every migration. */
-    struct duct_x_slot_pool *rx_pin; /**< Pool whose @c pins count this conn's
-                                 *  lane as held behind a parked answer, null
-                                 *  for none. Written by the conn's worker;
-                                 *  teardown takes a standing pin back. */
 } duct_dgram_shared_ctx_t;
 
 /** @brief True when @p conn's live union arm is @c rx_buf / @c tx_buf.
@@ -576,24 +512,6 @@ duct_nonnull(1) static inline bool duct_conn_peer_socket(const duct_conn_t *conn
     return false;
 }
 
-/** @brief @p conn's RX ring; nullptr on an xport without one. */
-duct_nonnull(1) static inline duct_olb_rx_t *duct_conn_rx_olb(const duct_conn_t *conn)
-{
-    return duct_conn_has_olb(conn) ? conn->rx_buf : nullptr;
-}
-
-/** @brief @p conn's TX ring; nullptr on an xport without one. */
-duct_nonnull(1) static inline duct_olb_tx_t *duct_conn_tx_olb(const duct_conn_t *conn)
-{
-    return duct_conn_has_olb(conn) ? conn->tx_buf : nullptr;
-}
-
-/** @brief @p conn's inter lane; nullptr on an xport without one. */
-duct_nonnull(1) static inline duct_vmq_mpsc_t *duct_conn_lane(const duct_conn_t *conn)
-{
-    return duct_conn_has_olb(conn) ? nullptr : conn->inter_lane;
-}
-
 /** @brief Resolve @p conn's sealed-wire state.
  *  @return @c &conn->seal for an xport a sealed wire runs on — the four
  *  holding an OLB pair, plus @c x_udp_shared, whose RX uses the shared
@@ -619,9 +537,6 @@ duct_nonnull(1) void duct_conn_sealed_codec_detach(duct_conn_t *conn);
 duct_nonnull(1) duct_result_t
 duct_conn_setup(duct_conn_t *conn, duct_sock_t fd,
                 duct_xport_t xport, size_t tx_cap);
-
-/** @brief Release OLBs, close fd, and reset connection fields. */
-duct_nonnull(1) void duct_conn_teardown(duct_conn_t *conn);
 
 /** @brief Return the RX slot an undrained inter batch still references.
  *
@@ -671,10 +586,10 @@ duct_gen_req_reason_set(duct_conn_t *conn,
     }
 }
 
-/** @brief Bind conn to a session, gated by the close-fence.
+/** @brief Bind conn to a session, gated by the lifecycle phase.
  *
- *  Writes @c session_token and release-CASes @c fence_unbound
- *  → @c fence_open, then stores @c bound_worker. On success the
+ *  Writes @c session_token and release-CASes the @c gen_req word's phase
+ *  @c conn_unbound → @c conn_bound. On success the
  *  caller may publish the leg
  *  and invoke the author callback. On failure, e.g. if io
  *  already quiesced this conn, the token is cleared and the
@@ -683,80 +598,123 @@ duct_gen_req_reason_set(duct_conn_t *conn,
 duct_nonnull(1) static inline bool
 duct_conn_session_bind(duct_conn_t *conn, duct_handle_t tok)
 {
-    conn->session_token = tok;
-    duct_conn_fence_t expected = fence_unbound;
-    if (duct_atomic_cas(strong, &conn->conn_fence, &expected,
-                        fence_open, release, acquire)) {
-        duct_atomic_store(&conn->bound_worker, conn->worker_id + 1u, relaxed);
-        return true;
+    duct_atomic_store(&conn->session_token, tok, release);
+    auto slot = duct_conn_gen_req(conn);
+    uint64_t old = duct_atomic_load(slot, acquire);
+    for (;; duct_cpu_relax()) {
+        if (duct_gen_req_phase(old) != conn_unbound)
+            break;
+        uint64_t want = (old & ~gen_req_phase_mask)
+                      | ((uint64_t)conn_bound << gen_req_phase_shift);
+        if (duct_atomic_cas(weak, slot, &old, want, release, acquire))
+            return true;
     }
-    conn->session_token = handle_null;
+    duct_atomic_store(&conn->session_token, handle_null, release);
     return false;
 }
 
-/** @brief Clear the session bind: @c session_token and @c bound_worker.
- *  Called from conn-lost consume on detachment, ahead of the retire confirm,
- *  after which @c s_inter_drain no longer matches the conn.
- */
+/** @brief Take one unit of @p conn's release count for a borrower about to
+ *  touch the conn past its owner's own unit. */
 duct_nonnull(1) static inline void
-duct_conn_session_unbind(duct_conn_t *conn)
+duct_conn_ref_take(duct_conn_t *conn)
 {
-    conn->session_token = handle_null;
-    duct_atomic_store(&conn->bound_worker, 0u, relaxed);
+    duct_atomic_fetch(add, &conn->refs, 1u, acquire);
 }
 
-/** @brief Claim the close-fence for @p conn.
+/** @brief Claim the close for @p conn: CAS the phase below @c conn_quiesced
+ *  to @c conn_quiesced, clearing @c fl_req_close in the same word.
  *
  *  Both io @c s_conn_close, an ordinary close, and worker
  *  @c s_worker_retire_pre_open, rejecting a conn that never
  *  got a session, can reach here for the same conn — whichever
- *  side wins, makes the transition into @c fence_quiescing.
+ *  side wins, makes the transition into @c conn_quiesced.
  *
- *  @retval fence_unbound  No session was ever attached, nothing to detach —
- *                         the caller can retire @p conn.
- *  @retval fence_open     A live session must still be told via @c conn_lost
- *                         before retire.
+ *  The bit clear rides the phase CAS so a word reader never sees
+ *  @c fl_req_close gone while the phase still reads @c conn_unbound:
+ *  that intermediate would let a dispatch defer a frame to a conn
+ *  whose close request already consumed the last release unit.
  *
- *  Any other returned value means this call lost the race — @p conn is
- *  already being quiesced elsewhere.
+ *  @retval true   This call won the transition; @c *pre holds the prior
+ *                 phase — @c conn_unbound means no session was ever
+ *                 attached, nothing to detach, @c conn_bound means a live
+ *                 session must still be told via @c conn_lost.
+ *  @retval false  This call lost the race — @p conn is already being
+ *                 quiesced elsewhere.
  */
-duct_nonnull(1) static inline duct_conn_fence_t
-duct_conn_fence_quiesce(duct_conn_t *conn)
+duct_nonnull(1, 2) static inline bool
+duct_conn_close_claim(duct_conn_t *conn, duct_conn_phase_t *pre)
 {
-    duct_conn_fence_t expected = fence_unbound;
-    if (duct_atomic_cas(strong, &conn->conn_fence, &expected,
-                        fence_quiescing, acq_rel, acquire))
-        return fence_unbound;
-    expected = fence_open;
-    if (duct_atomic_cas(strong, &conn->conn_fence, &expected,
-                        fence_quiescing, acq_rel, acquire))
-        return fence_open;
-    return expected;
+    auto slot = duct_conn_gen_req(conn);
+    uint64_t old = duct_atomic_load(slot, acquire);
+    for (;; duct_cpu_relax()) {
+        auto phase = duct_gen_req_phase(old);
+        if (phase >= conn_quiesced)
+            return false;
+        uint64_t want = (old & ~(gen_req_phase_mask | (uint64_t)fl_req_close))
+                      | ((uint64_t)conn_quiesced << gen_req_phase_shift);
+        *pre = phase;
+        if (duct_atomic_cas(weak, slot, &old, want, acq_rel, acquire))
+            return true;
+    }
 }
 
-/** @brief Worker hands @p conn back to io for physical retire.
- *
- *  Called once worker-side cleanup completes on either valid path:
- *  a pre-open reject before any session ever bound — @c fence_quiescing,
- *  or an ordinary conn-lost consume right after detaching a bound
- *  session leg — @c fence_posted.
- *
- *  @retval true   This call won the transition — the caller must then ask
- *                 the assigned io thread to retire the conn, which
- *                 @c duct_io_retire_request does by posting one request bit.
- *  @retval false  Retire was already claimed by a consumer or the dispatch
- *                 was stale/duplicate.
+/** @brief Advance @p conn's phase from @p from to @p to inside the word,
+ *  leaving every other sub-field untouched.
+ *  @return true when this call made the transition.
  */
 duct_nonnull(1) static inline bool
-duct_conn_fence_confirm_retire(duct_conn_t *conn)
+duct_conn_phase_move(duct_conn_t *conn, duct_conn_phase_t from,
+                     duct_conn_phase_t to)
 {
-    duct_conn_fence_t expected = fence_posted;
-    if (duct_atomic_cas(strong, &conn->conn_fence, &expected,
-                        fence_retire_ready, release, acquire))
-        return true;
-    expected = fence_quiescing;
-    return duct_atomic_cas(strong, &conn->conn_fence, &expected,
-                           fence_retire_ready, release, acquire);
+    auto slot = duct_conn_gen_req(conn);
+    uint64_t old = duct_atomic_load(slot, relaxed);
+    for (;; duct_cpu_relax()) {
+        if (duct_gen_req_phase(old) != from)
+            return false;
+        uint64_t want = (old & ~gen_req_phase_mask)
+                      | ((uint64_t)to << gen_req_phase_shift);
+        if (duct_atomic_cas(weak, slot, &old, want, release, relaxed))
+            return true;
+    }
+}
+
+/** @brief Take one host pin on @p conn's lifecycle word, §5.
+ *
+ *  A host thread — one the release count never enumerates — resolves the
+ *  conn by handle and pins it in the same CAS: the generation check, the
+ *  phase gate and the pin increment are one atomic operation on @c gen_req,
+ *  so no Dekker store/load pair and no second resolve are needed. The pin
+ *  never touches @c conn->refs: a pinned word cannot reach the generation
+ *  bump (the count's finish marks it @c conn_spent instead), so the slot
+ *  stays put until @ref duct_conn_unpin's 1→0 drop finishes it.
+ *
+ *  @retval rc_ok     Pinned: @c pins went up by one. The word still matches
+ *                    @p gen, and the phase is a live bind.
+ *  @retval rc_closed The handle is stale — @p gen no longer matches — or the
+ *                    phase reached @c conn_quiesced: the close shut the door
+ *                    on new pins, nothing was taken.
+ *  @retval rc_defer  The conn is still @c conn_unbound (nothing to deliver
+ *                    a batch to), or the pin nibble is saturated at 15.
+ */
+duct_nonnull(1) static inline duct_result_t
+duct_conn_pin(duct_conn_t *conn, uint64_t gen)
+{
+    auto slot = duct_conn_gen_req(conn);
+    uint64_t old = duct_atomic_load(slot, acquire);
+    for (;; duct_cpu_relax()) {
+        if (duct_gen_req_gen(old) != gen)
+            return rc_closed;
+        auto phase = duct_gen_req_phase(old);
+        if (phase >= conn_quiesced)
+            return rc_closed;
+        if (phase == conn_unbound || (old & gen_req_pins_mask) == gen_req_pins_mask)
+            return rc_defer;
+        /* +1 on the nibble: the saturation check above keeps the carry out
+         * of bit 63 from ever being attempted. */
+        if (duct_atomic_cas(weak, slot, &old,
+                            old + (1ull << gen_req_pins_shift), acquire, relaxed))
+            return rc_ok;
+    }
 }
 
 /** @brief Return conn's slot index within the pool. */
@@ -813,34 +771,86 @@ duct_conn_t *duct_conn_by_handle(duct_conn_handle_t handle);
  */
 duct_conn_t *duct_conn_acquire(void);
 
-/** @brief Push @p conn back onto the free stack.
- *  Bumps @c gen_req's generation. Caller must tear down conn
- *  resources before — by the time @ref duct_conn_fence_retire
- *  reaches this, the close-fence already proved no worker
- *  or io reference remains, so the slot is now reusable.
+/** @brief Drop one unit of @p conn's release count.
+ *  The 0-crossing fetch_sub finalizes the slot: with live request flags it
+ *  arms @c rel_pend inside the word and returns — @c s_req_exec finishes the
+ *  release as it runs the posted node — with a live host pin it CASes the
+ *  word to @c conn_spent and returns, handing the finish to the last
+ *  @ref duct_conn_unpin — otherwise it bumps the generation and pushes the
+ *  slot back to the block pool (or retires it for good at the generation
+ *  ceiling).
  */
 duct_nonnull(1) void duct_conn_release(duct_conn_t *conn);
 
-/** @brief Tear down @p conn's resources and release its slot, or retire
- *  it for good at the generation ceiling.
- *  Safe only once nothing in flight can still deref @p conn: the
- *  close-fence's terminal CAS in @ref duct_conn_fence_retire, a quiesce
- *  finding it unbound with no ctrl on the WFQ, a conn never published,
- *  or a shutdown path with no consumer left. A slot whose request node
- *  is posted and not yet run is held instead, @c fl_conn_reclaim_held
- *  set and nothing torn down: the io thread reclaims it as it runs that
- *  node, so no next occupant reposts a node io still walks.
+/** @brief Finish a release whose 0-crossing armed @c rel_pend: the posted
+ *  request node's run calls this with the generation it resolved the conn
+ *  under, clearing the bit, bumping the generation and pushing the slot —
+ *  or re-arming @c rel_pend when a racing poster re-posted the node.
+ *  A generation mismatch means another cycle owns the slot: no-op.
  */
-duct_nonnull(1) void duct_conn_reclaim(duct_conn_t *conn);
+duct_nonnull(1) void duct_conn_release_finish(duct_conn_t *conn, uint64_t gen);
+
+/** @brief Run @p conn's io-side teardown half: the per-xport ctx work with
+ *  no queued worker work behind it — the @c x_local listener drop.
+ *  Called at the close decision, ahead of the physical half.
+ */
+duct_nonnull(1) void duct_conn_teardown_io(duct_conn_t *conn);
+
+/** @brief Run @p conn's per-xport ctx finish: the @c x_udp_shared listener
+ *  pre_conn_ref release (any-thread posted form) with the datagram ctx
+ *  clear, and the @c x_inter device holds + @c ops->release. Must run past
+ *  the lane drain — batches queued ahead of the consume can still carry
+ *  device-lent payloads and reserve into the listener outbox — and the
+ *  device arm only on the owning io thread (or joined threads).
+ */
+duct_nonnull(1) void duct_conn_teardown_ctx(duct_conn_t *conn);
+
+/** @brief Drop one host pin taken by @ref duct_conn_pin.
+ *  The 1→0 fetch_sub on the word's pin nibble is the pin side's whole
+ *  protocol: on a word the count's finish already marked @c conn_spent, this
+ *  last unpin is the completing one — it bumps the generation and pushes the
+ *  slot (or arms @c rel_pend over live request flags); on any other word the
+ *  release count still holds the slot and its own finish observes
+ *  @c pins == 0 and completes.
+ */
+duct_nonnull(1) void duct_conn_unpin(duct_conn_t *conn);
+
+/** @brief Run @p conn's physical teardown half: sealed codec detach, inter
+ *  lane drain, fd close and @ref duct_io_accept_resume. Safe against io
+ *  completions still in flight: each holds its own @c refs unit and only
+ *  touches page-0 words. A host pin still riding the word (§5) is equally
+ *  bounded: its in-flight push into the lane is one more MPSC producer the
+ *  drain pairs with, and the pinned word keeps the slot from any reuse.
+ */
+duct_nonnull(1) void duct_conn_teardown_worker(duct_conn_t *conn);
+
+/** @brief Run both teardown halves and drop the io unit of @p conn.
+ *  For a conn nothing else references — never published, unbound at its
+ *  close, or engine shutdown — this returns the slot once @c refs drains.
+ */
+duct_nonnull(1) void duct_conn_discard(duct_conn_t *conn);
 
 /** @brief Force every still-live conn slot back to free stack,
- *  bypassing the close-fence entirely.
- *  Recovers slots remaining unclosed during shutdown (such as entries
- *  at @c fence_retire_ready after I/O thread exit).
+ *  bypassing the release count entirely.
+ *  Recovers slots remaining unclosed during shutdown (such as conns whose
+ *  consuming worker exited before its conn_lost drained).
  *  Called once during engine shutdown before proto/wire teardown.
  *  Idempotent.
  */
 void duct_conn_pool_reclaim(void);
+
+/** @brief Rebind @p conn's wire for a wire-changing @c duct_proto_switch.
+ *
+ *  A peer unaware of the switch may still be mid-frame under the old wire,
+ *  so the rebind waits for the unparsed leftover to drain or prove discardable
+ *  before swapping. On drain, swaps @c conn->wire / @c wire_parser to
+ *  @c wire_rebind_next's and posts the completion fence.
+ *  No-op if @c wire_rebind_next is already clear, and for a conn at
+ *  @c conn_quiesced or past: it keeps its sentinel and posts no fence, its
+ *  @c conn_lost paying the leg's share of the switch.
+ */
+duct_nonnull(1, 2) void
+duct_conn_wire_rebind(const duct_wfq_route_t *route, duct_conn_t *conn);
 
 /** @brief Bind @p conn to a wire and create its parser.
  *  @p leg_wire binds when provided; @p proto->wire is used otherwise;

@@ -43,7 +43,14 @@ static atomic_int g_attempts   = 0;
 static unsigned g_left = pkt_total;
 static unsigned g_seq  = 0u;
 static constexpr unsigned read_batch = 32u;
-static uint8_t g_pkt[read_batch][pkt_bytes];
+/* One row per packet of the whole run, not one per read batch: the echo
+ * hands the row on as fl_send_static, and a parked answer must keep reading
+ * its bytes while later batches arrive — the conn block's TX retry copy
+ * region parks a bounded number of copy-mode payloads
+ * (DUCT_CONN_RETRY_TX_COPIES), while this run parks one answer per refused
+ * reservation. A row is written once and read until its packet commits,
+ * exactly what fl_send_static promises. */
+static uint8_t g_pkt[pkt_total][pkt_bytes];
 
 static char     g_ring[ring_slots][pkt_bytes];
 static unsigned g_ring_next = 0u;
@@ -79,8 +86,9 @@ static duct_result_t device_read([[maybe_unused]] void *ctx, duct_view_u8 *out,
 {
     unsigned produced = 0u;
     while (produced < max && produced < read_batch && g_left > 0u) {
-        memcpy(g_pkt[produced], &g_seq, sizeof g_seq);
-        out[produced] = duct_view(duct_view_u8, g_pkt[produced], pkt_bytes);
+        auto row = g_pkt[g_seq];
+        memcpy(row, &g_seq, sizeof g_seq);
+        out[produced] = duct_view(duct_view_u8, row, pkt_bytes);
         ++produced;
         ++g_seq;
         --g_left;
@@ -159,7 +167,10 @@ on_frame([[maybe_unused]] duct_session_t *s, duct_conn_id_t conn_id,
 {
     if (conn_id != 1u)
         return rc_ok;
-    duct_response_echo(out, frame);
+    /* Echo on the row's own static bytes (see g_pkt): each row belongs to one
+     * packet for the whole run, so a parked answer keeps valid bytes without
+     * a copy. */
+    duct_response_same(out, frame->payload, fl_send_static, frame->flags);
     return rc_ok;
 }
 

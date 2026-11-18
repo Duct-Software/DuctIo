@@ -63,14 +63,12 @@ static void s_release(void *arg)
     duct_atomic_fetch(add, &g_released, 1, release);
 }
 
-/** @brief Take every frame and answer none. */
-static duct_result_t on_frame([[maybe_unused]] duct_session_t *s,
-                              [[maybe_unused]] duct_conn_id_t conn_id,
-                              [[maybe_unused]] const duct_frame_t *frame,
-                              [[maybe_unused]] duct_response_t *out,
-                              [[maybe_unused]] void *proto_state)
+/** @brief Ignore work calls; bare test protocol never posts work. */
+static void on_work([[maybe_unused]] duct_engine_t *e,
+                    [[maybe_unused]] unsigned worker,
+                    [[maybe_unused]] void *user_ctx,
+                    [[maybe_unused]] uintptr_t arg)
 {
-    return rc_ok;
 }
 
 /** @brief Log the fire, stage an owned payload for the @c owned token, and under @c g_chain start the next step.
@@ -184,8 +182,7 @@ static const char *sc_args(void)
     expect(duct_timer_start(g_io, nullptr, &g_ctx, 10u, 0u) == rc_invalid_arg, "a null protocol was taken");
     expect(duct_timer_start(g_io, g_proto, &g_ctx, UINT64_MAX, 0u) == rc_invalid_arg,
            "a delay that overflows was taken");
-    auto bare = duct_proto_create(&(duct_proto_cfg_t){ .name = "timer-start-bare", .on_frame = on_frame,
-                                                       .max_response = 64u });
+    auto bare = duct_proto_create(&(duct_proto_cfg_t){ .name = "timer-start-bare", .on_work = on_work });
     expect(bare, "proto create failed");
     auto rc = duct_timer_start(g_io, bare, &g_ctx, 10u, 0u);
     duct_proto_destroy(bare);
@@ -209,7 +206,7 @@ int main(void)
 {
     setvbuf(stdout, nullptr, _IOLBF, 0);
     g_proto = duct_proto_create(&(duct_proto_cfg_t){
-        .name = "timer-start", .on_frame = on_frame, .on_timer = on_timer, .max_response = 64u,
+        .name = "timer-start", .on_timer = on_timer,
     });
     g_io = g_proto ? duct_engine_launch(&(duct_engine_cfg_t){ .io_threads = 1, .workers = 2 }) : nullptr;
     if (!g_io) {

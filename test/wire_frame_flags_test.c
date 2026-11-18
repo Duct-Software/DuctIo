@@ -346,7 +346,9 @@ static const char *sc_dgram_record_gso(void)
 {
     auto w = duct_wire_create_dgram_batch(0u, false);
     if (!w) return "wire create failed";
-    auto parser = duct_wire_parser_create(w);
+    alignas(duct_cacheline_size) uint8_t parser_buf[duct_wire_parser_slot] = {};
+    auto parser = (duct_wire_parser_t *)parser_buf;
+    duct_wire_parser_init(w, parser);
     uint8_t buf[duct_dgram_record_hdr_size + 5u] = { 0u, 0u, 0u, 0u, 'r', 'e', 'c', 'o', 'r' };
     duct_dgram_rec_hdr_encode(buf, 5u | duct_dgram_rec_gso);
     duct_frame_t frame = {};
@@ -358,7 +360,6 @@ static const char *sc_dgram_record_gso(void)
         err = "a record prefix carrying the GSO bit did not parse as its own length";
     else if (frame.flags != fl_frame_gso)
         err = "the record prefix's GSO bit did not reach the frame";
-    duct_wire_parser_destroy(w, parser);
     duct_wire_destroy(w);
     return err;
 }

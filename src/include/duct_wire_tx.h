@@ -39,19 +39,15 @@ extern "C" {
 duct_nonnull(1) void *duct_wire_tx_span_open(duct_wire_tx_t *stage, size_t n);
 
 /** @brief One-shot staging view over a flat buffer the caller already sized.
- *  No ring and no wrap, so overflow past @c capacity is terminal. Two of its
- *  three users hand it a @c duct_tx_pool_acquire block and the third a
- *  datagram lane reservation; the view itself reads neither.
+ *  No ring and no wrap, so overflow past @c capacity is terminal. Its users
+ *  hand it a heap staging block or a datagram lane reservation; the view
+ *  itself reads neither.
  */
 typedef struct duct_vmq_tx_view {
     uint8_t *data;    /**< The caller's buffer, written from offset 0. */
     size_t stage;     /**< Bytes written so far. */
     size_t capacity;  /**< Bytes @c data holds, set by whoever sized it. */
 } duct_vmq_tx_view_t;
-
-/** @brief Header bytes one @c pack_header call can write, the width of the
- *  @c uint8_t[16] every one of them takes. */
-static constexpr size_t wire_tx_hdr_max = 16u;
 
 /** @brief Which member of @c duct_wire_tx_t's union is live. */
 typedef enum : uint8_t {

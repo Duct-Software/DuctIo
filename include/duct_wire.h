@@ -29,15 +29,48 @@ extern "C" {
 
 /** @brief Per-conn wire parse state — defined and brand-casted by each wire
  *  implementation; owned by i/o thread, mutated only inside @c on_parse.
+ *  The state lives in a conn block parser slot the binder hands the wire,
+ *  never in storage of the wire's own.
  */
 typedef struct duct_wire_parser duct_wire_parser_t;
 
+/** @brief The per-worker cleartext chunk pool a sealed wire's @c init_codec
+ *  takes its conn's cleartext buffer from, one engaged slot per sealed conn.
+ */
+typedef struct duct_x_slot_pool duct_x_slot_pool_t;
+
+/** @brief Bytes of a conn block parser slot: the most any built wire's parse
+ *  state demands, asserted inside each wire implementation against its own
+ *  @c duct_wire_t::parser_max. A wire declaring a larger @c parser_max is
+ *  refused at bind.
+ */
+static constexpr size_t duct_wire_parser_slot = 64u;
+
+/** @brief Bytes of a conn block codec slot: the ceiling the sealed codec
+ *  struct is asserted against where the type is complete. The conn block
+ *  carves its codec region from this ceiling alone, never from the type.
+ */
+static constexpr size_t duct_wire_codec_slot = 256u;
+
+/** @brief Most bytes of TX header a wire's @c on_pack stages ahead of the
+ *  payload, the gather target's reserved lead.
+ */
+static constexpr size_t wire_tx_hdr_max = 16u;
+
 /** @brief Per-conn sealed-wire reassembly state — cleartext buffer,
  *  parse/ack cursors, crypto engine handle.
- *  Constructed by sealed wire's @c create_codec, read and advanced
- *  by RX drain and @c unseal, freed at conn/session teardown.
+ *  Initialized by sealed wire's @c init_codec in the conn block's codec slot,
+ *  read and advanced by RX drain and @c unseal, released at conn/session
+ *  teardown.
  */
 typedef struct duct_wire_codec duct_wire_codec_t;
+
+/** @brief Release @p codec's resources through its vtable.
+ *  The one call consumers holding a codec by pointer make — the conn's
+ *  sealed-codec detach and the worker's build-abort path — since the codec
+ *  struct is wire-internal and they never see its members.
+ */
+duct_nonnull(1) void duct_wire_codec_destroy(duct_wire_codec_t *codec);
 
 /** @brief TX staging handle for @c on_pack.
  *  Opaque: either a conn's internal @ref duct_olb_tx_t ring or a
@@ -165,6 +198,12 @@ duct_nonnull(1) duct_frame_volume_t duct_frame_volume(const duct_frame_ip_t *ip)
  *          view with no packet.
  */
 duct_nonnull(1) uint64_t duct_frame_flow_key(const duct_frame_ip_t *ip);
+
+/** @brief True when the frame carries no payload data: a missing or
+ *  truncated/malformed IP packet, ICMP, or a first-fragment TCP pure ACK.
+ *  GSO bundles are data.
+ */
+duct_nonnull(1) bool duct_frame_is_control(const duct_frame_ip_t *ip);
 
 /** @brief Ephemeral wire context.
  *
@@ -305,8 +344,8 @@ static constexpr size_t duct_wire_cover_key_size = 16u;
 /** @brief Base wire type; derived types embed this as the first field.
  *
  *  @c on_parse must support replay; @c on_pack staging is atomic.
- *  @c create_parser and @c destroy_parser manage the per-conn
- *  @c duct_wire_parser_t.
+ *  @c init_parser sets up the per-conn @c duct_wire_parser_t in the conn
+ *  block's parser slot, which the binder has zeroed.
  */
 typedef struct duct_wire {
     const char *name;               /**< Diagnostic label; borrowed string literal. */
@@ -332,6 +371,15 @@ typedef struct duct_wire {
                                      *   clamped to scheduler ceiling. 0 = no
                                      *   wire preference, use scheduler
                                      *   ceiling only. */
+    /** @brief Wire-declared ceilings the conn block and the per-worker chunk
+     *  pool reserve against: bytes of per-conn parser state, bytes of per-conn
+     *  codec state, bytes of cleartext buffer. Each wire implementation
+     *  @c static_asserts its own structures under its declared numbers; a wire
+     *  whose @c parser_max or @c codec_max exceeds the block's slots is
+     *  refused at bind with @c duct_fatal. 0 for a wire that keeps none. */
+    size_t parser_max,
+           codec_max,
+           ct_buf_max;
     /** @brief Non-null marks a sealed (layered) wire: io-side @c on_parse
      *  emits whole sealed PDUs (e.g. TLS records) and the worker unseals
      *  each into inner frames parsed by @c inner's own @c on_parse.
@@ -389,18 +437,30 @@ typedef struct duct_wire {
                              const duct_frame_t *frame,
                              duct_wire_tx_t *stage,
                              duct_wire_codec_t *codec);
-    /** @brief Allocate per-conn wire parser state. */
-    duct_wire_parser_t *(*create_parser)(const struct duct_wire *self);
-    /** @brief Release per-conn wire parser state. */
-    void (*destroy_parser)(const struct duct_wire *self,
-                           duct_wire_parser_t *parser);
-    /** @brief Allocate worker-owned codec state for a conn on @p xport;
-     *  nullptr (default) for a non-sealed wire, where @c unseal is nullptr too and
-     *  this is never called.
-     *  The codec of an @c x_udp_shared conn has no cleartext buffer: its datagrams
-     *  are unsealed one at a time into the worker cleartext ring.
+    /** @brief Initialize per-conn wire parse state in @p storage, a conn
+     *  block parser slot the binder has zeroed.
+     *  Storage is block-carved for the conn's life and re-zeroed on every
+     *  rebind, so a parser with resources of its own — state whose release
+     *  needs a call — does not fit the block model.
      */
-    duct_wire_codec_t *(*create_codec)(const struct duct_wire *self, duct_xport_t xport);
+    void (*init_parser)(const struct duct_wire *self, duct_wire_parser_t *storage);
+    /** @brief Initialize worker-owned codec state for a conn on @p xport in
+     *  @p codec, a conn block codec slot the caller has zeroed, with @p
+     *  inner_parser, a second parser slot, for @c inner's parse state, taking
+     *  the conn's cleartext chunk out of @p ct_chunks, the building worker's
+     *  per-worker chunk pool.
+     *  nullptr (default) for a non-sealed wire, where @c unseal is nullptr
+     *  too and this is never called.
+     *  Answers @p codec on success and @c nullptr on failure, leaving both
+     *  slots zeroed for the caller.
+     *  The codec of an @c x_udp_shared conn has no cleartext buffer: its datagrams
+     *  are unsealed one at a time into the worker cleartext ring, and it takes
+     *  no chunk.
+     */
+    duct_wire_codec_t *(*init_codec)(const struct duct_wire *self, duct_xport_t xport,
+                                     duct_wire_codec_t *codec,
+                                     duct_wire_parser_t *inner_parser,
+                                     duct_x_slot_pool_t *ct_chunks);
     /** @brief Consume one sealed PDU — exactly the bytes of one io-side
      *  frame, header included — appending 0+ cleartext bytes to @p ctx and
      *  optionally emitting egress through it (handshake replies, alerts).
@@ -527,27 +587,17 @@ duct_nonnull(1) static inline void duct_wire_destroy(duct_wire_t *w)
         w->destroy(w);
 }
 
-/** @brief Allocate per-conn wire parser state via the wire's @c create_parser.
+/** @brief Initialize per-conn wire parse state in @p parser, a zeroed conn
+ *  block parser slot, via the wire's @c init_parser.
  *
- *  Caller stores the result in @c conn->wire_parser.
+ *  Both must be non-null (@ref duct_nonnull); a wire that keeps no parse
+ *  state leaves the slot zeroed.
  */
-duct_nonnull(1) static inline duct_wire_parser_t *
-duct_wire_parser_create(const duct_wire_t *w)
+duct_nonnull(1, 2) static inline void
+duct_wire_parser_init(const duct_wire_t *w, duct_wire_parser_t *parser)
 {
-    return w->create_parser ? w->create_parser(w) : nullptr;
-}
-
-/** @brief Destroy per-conn wire parser state via the wire's @c destroy_parser
- *  vtbl.
- *
- *  @p w must be non-null (@ref duct_nonnull); @p parser alone may be
- *  @c nullptr — the wire's own @c destroy_parser decides what that means.
- */
-duct_nonnull(1) static inline void
-duct_wire_parser_destroy(const duct_wire_t *w, duct_wire_parser_t *parser)
-{
-    if (w->destroy_parser)
-        w->destroy_parser(w, parser);
+    if (w->init_parser)
+        w->init_parser(w, parser);
 }
 
 #ifdef __cplusplus

@@ -9,7 +9,7 @@
 #include "duct_io.h"
 #include "duct_bits.h"
 #include "duct_conn.h"
-#include "duct_conn_fence.h"
+#include "duct_conn_block.h"
 #include "duct_dgram_rec.h"
 #include "duct_olb_rx.h"
 #include "duct_relay.h"
@@ -25,18 +25,6 @@
  *  admitted even alone over budget; its length then closes the batch.
  */
 static constexpr size_t frame_rx_batch_byte_budget = duct_wfq_byte_quota_norm;
-
-/** @brief WFQ-full batch retry node: inline batch copy + push cursor. */
-duct_msg_chain_decl(batch_retry_node_t,
-    unsigned worker_id;
-    uint32_t from;
-    alignas(alignof(duct_conn_handle_t)) duct_msg_frame_batch_t batch;
-);
-
-static inline size_t s_batch_retry_node_size(uint32_t n)
-{
-    return sizeof(batch_retry_node_t) + (size_t)n * sizeof(duct_msg_frame_t);
-}
 
 /** @brief Derive the frame ceiling from the NORM lane's actual byte capacity:
  *  the most @c duct_msg_frame_t entries any one batch message can carry
@@ -74,11 +62,9 @@ bool duct_frame_rx_ctx_init(duct_frame_rx_ctx_t *ctx, duct_vmq_mpsc_t *wfq,
 
 void duct_frame_rx_ctx_destroy(duct_frame_rx_ctx_t *ctx)
 {
-    for (auto m = ctx->retry_q.head; m; ) {
-        auto next = duct_msg_next(m);
-        duct_del(m);
-        m = next;
-    }
+    /* The retry nodes left are their conns' own block regions: the conns'
+     * close path discarded each as it went, so the list is empty; what a
+     * belt finds here dies with the block pool anyway. */
     ctx->retry_q.head = nullptr;
     ctx->retry_q.tail = nullptr;
     memset(ctx->retry_pending, 0, sizeof ctx->retry_pending);
@@ -172,17 +158,18 @@ static uint32_t s_batch_retry_push(const duct_wfq_route_t *route, batch_retry_no
 
 /** @brief Save unpushed frame descriptors for @p handle into the retry queue
  *  and arm the reverse wait. Caller must have already verified no node exists
- *  for this conn (@ref s_retry_find).
+ *  for this conn (@ref s_retry_find): the node is the conn block's own retry
+ *  region, one node per conn, so a free region is the caller's guarantee.
+ *  A batch the region cannot carry answers false, the caller's OOM path.
  */
 static bool
 s_retry_save(const duct_wfq_route_t *route, duct_frame_rx_ctx_t *ctx,
              duct_conn_handle_t handle, unsigned worker_id,
              const duct_msg_frame_t *frames, uint32_t n)
 {
-    auto node = (batch_retry_node_t *)duct_at(duct_new(uint8_t, s_batch_retry_node_size(n),
-                                                         alignof(batch_retry_node_t)));
-    if (!node)
-        return false;
+    auto conn = duct_conn_by_handle(handle);
+    duct_do_if(!conn || n > duct_wfq_quota_norm, return false);
+    auto node = duct_conn_retry_node(conn);
     node->worker_id = worker_id;
     node->from = 0u;
     node->batch.conn = handle.word;
@@ -213,7 +200,6 @@ void duct_frame_rx_retry_drain(const duct_wfq_route_t *route, duct_frame_rx_ctx_
             if (node->worker_id < duct_wfq_io_waiters_max)
                 freed_workers |= 1ull << node->worker_id;
             duct_bits_clear_plain(ctx->retry_pending, (uint32_t)h.idx);
-            duct_del(node);
         } else if (node->from >= node->batch.n) {
             if (node->worker_id < duct_wfq_io_waiters_max)
                 freed_workers |= 1ull << node->worker_id;
@@ -251,7 +237,6 @@ void duct_frame_rx_retry_drain(const duct_wfq_route_t *route, duct_frame_rx_ctx_
          * end now, behind them; a node carrying the end is its conn's last
          * post. */
         bool ended = duct_has(node->batch.frames[node->batch.n - 1u].flags, duct_frame_end);
-        duct_del(node);
         if (conn) {
             duct_frame_rx_post(route, ctx, conn);
             if (!ended)
@@ -275,7 +260,6 @@ void duct_frame_rx_retry_discard(duct_frame_rx_ctx_t *ctx, const duct_conn_t *co
         if (((duct_conn_handle_t){ .word = node->batch.conn }).idx == idx) {
             freed = true;
             duct_bits_clear_plain(ctx->retry_pending, idx);
-            duct_del(node);
         } else {
             duct_msg_next(m) = nullptr;
             if (kept_tail)
@@ -346,10 +330,11 @@ s_frame_rx_post_wire(const duct_wfq_route_t *route, duct_frame_rx_ctx_t *ctx, du
      * duct_msg_frame_t doc. */
     uint16_t hdr_size = (uint16_t)conn->wire->header_size;
     uint8_t sealed_epoch = conn->wire->unseal ? conn->wire_epoch : 0u;
+    uint8_t *data = duct_conn_rx_data(conn);
 
     for (size_t remain; 0 != (remain = tail > off ? tail - off : 0);) {
         uint32_t raw = padded && remain >= sizeof(duct_dgram_rec_hdr_t)
-                     ? (uint32_t)duct_dgram_rec_hdr_decode(rx->data + off) : 0u;
+                     ? (uint32_t)duct_dgram_rec_hdr_decode(data + off) : 0u;
         /* The tail of a coalesced read: staged with no record prefix, so its
          * datagrams are cut directly by segment size;
          * header_size is zero because the only per-datagram header such a wire
@@ -378,9 +363,9 @@ s_frame_rx_post_wire(const duct_wfq_route_t *route, duct_frame_rx_ctx_t *ctx, du
              * so the next pass still finds the unit's remainder padded. */
             size_t unit_end = raw & duct_dgram_rec_padded ? off + rx->read_unit : 0u;
             if (unit_end)
-                duct_dgram_rec_hdr_encode(rx->data + off, raw & ~duct_dgram_rec_padded);
+                duct_dgram_rec_hdr_encode(data + off, raw & ~duct_dgram_rec_padded);
             duct_view_u8 input = {
-                .data = rx->data + off,
+                .data = data + off,
                 .size = remain,
             };
             duct_frame_t frame = {};
@@ -445,7 +430,7 @@ s_frame_rx_post_wire(const duct_wfq_route_t *route, duct_frame_rx_ctx_t *ctx, du
             }
             if (stop) {
                 if (unit_end)
-                    duct_dgram_rec_hdr_encode(rx->data + off, raw);
+                    duct_dgram_rec_hdr_encode(data + off, raw);
                 break;
             }
         }
@@ -511,7 +496,7 @@ s_frame_rx_post_wire(const duct_wfq_route_t *route, duct_frame_rx_ctx_t *ctx, du
 
 void duct_frame_rx_post(const duct_wfq_route_t *route, duct_frame_rx_ctx_t *ctx, duct_conn_t *conn)
 {
-    auto rx = conn->rx_buf;
+    auto rx = duct_conn_rx_olb(conn);
     auto h = &rx->h;
     size_t tail = duct_atomic_load(&h->tail, relaxed),
            off = rx->posted_off,
@@ -520,8 +505,8 @@ void duct_frame_rx_post(const duct_wfq_route_t *route, duct_frame_rx_ctx_t *ctx,
         return;
     /* Quiesced: no new frames past this
      * point. The worker's conn-lost consume sees every frame published before
-     * the fence, so this guard cannot drop input the fence promised to deliver. */
-    if (duct_atomic_load(&conn->conn_fence, acquire) >= fence_quiescing)
+     * the quiesce, so this guard cannot drop input the close promised to deliver. */
+    if (duct_conn_phase(conn) >= conn_quiesced)
         return;
 
     auto handle = duct_conn_handle_get(conn);
@@ -554,12 +539,12 @@ void duct_frame_rx_post(const duct_wfq_route_t *route, duct_frame_rx_ctx_t *ctx,
 void duct_frame_rx_end(const duct_wfq_route_t *route, duct_frame_rx_ctx_t *ctx, duct_conn_t *conn)
 {
     if (!duct_has(duct_conn_state(conn), fl_conn_rx_eof)
-        || duct_atomic_load(&conn->conn_fence, acquire) >= fence_quiescing)
+        || duct_conn_phase(conn) >= conn_quiesced)
         return;
     auto handle = duct_conn_handle_get(conn);
     if (ctx->retry_q.head && s_retry_find(ctx, handle))
         return;
-    auto rx = conn->rx_buf;
+    auto rx = duct_conn_rx_olb(conn);
     duct_olb_rx_discard(rx, duct_atomic_load(&rx->h.tail, relaxed));
     duct_msg_frame_t end = { .offset = rx->posted_off, .flags = duct_frame_end };
     auto lane = duct_wfq_pri_lane(wfq_pri_norm, conn->worker_id, route->n_workers,

@@ -74,6 +74,11 @@ duct_vm_handle_t duct_vm_reserve(size_t size)
     return s_vm_map(size, PROT_NONE);
 }
 
+duct_vm_handle_t duct_vm_reserve_lazy(size_t size)
+{
+    return s_vm_map(size, PROT_READ | PROT_WRITE);
+}
+
 /* mprotect read-write and mlock, then MADV_ZERO_WIRED_PAGES, whose answer is not read. A failure of
  * the first two unlocks the range and makes it inaccessible again. */
 duct_result_t duct_vm_lock(void *base, size_t size)
@@ -101,6 +106,17 @@ void duct_vm_discard(void *base, size_t size)
 {
     if (size)
         duct_discard madvise(base, size, MADV_FREE_REUSABLE);
+}
+
+duct_result_t duct_vm_commit([[maybe_unused]] void *base, [[maybe_unused]] size_t size)
+{
+    return rc_ok;
+}
+
+void duct_vm_reuse(void *base, size_t size)
+{
+    if (size)
+        duct_discard madvise(base, size, MADV_FREE_REUSE);
 }
 
 int duct_thread_bind_cpu([[maybe_unused]] unsigned cpu_index)

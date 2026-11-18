@@ -128,7 +128,7 @@ int main(void)
     auto s = duct_session_open(proto, duct_conn_id_primary,
                                handle, nullptr, 0u, &out);
     assert(s);
-    assert(s->streams); /* fl_proto_multiplexed → table allocated */
+    assert(duct_has(s->flags, fl_session_multiplexed)); /* fl_proto_multiplexed → region initialized */
 
     duct_stream_admit_t why = stream_admit_unusable;
 
@@ -200,7 +200,7 @@ int main(void)
     auto s2 = duct_session_open(plain, duct_conn_id_primary,
                                 h2, nullptr, 0u, &out);
     assert(s2);
-    assert(!s2->streams); /* no table → claim returns nullptr */
+    assert(!duct_has(s2->flags, fl_session_multiplexed)); /* no region → claim returns nullptr */
     auto claim_notable = duct_session_stream_claim(s2, 5u, &out, &why);
     assert(!claim_notable && why == stream_admit_unusable);
     assert(!duct_stream_state(s2, 5u));

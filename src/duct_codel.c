@@ -185,13 +185,15 @@ duct_codel_verdict_t duct_conn_codel(duct_session_t *s, duct_conn_id_t conn_id, 
 uint64_t duct_conn_codel_delay(duct_session_t *s, duct_conn_id_t conn_id, duct_codel_t *q,
                                const duct_codel_law_t *law, uint64_t now)
 {
+    uint64_t remote_q = duct_conn_dgram_remote_q(s, conn_id, now);
     duct_tx_pos_t end;
     size_t ring = 0u;
     if (duct_conn_tx_end(s, conn_id, &end, &ring) != rc_ok)
-        return 0u;
+        return remote_q;
     uint64_t left_at = duct_codel_left(q, law, end, ring, duct_conn_tx_quantum(s, conn_id),
                                        duct_conn_tx_unsent, s, conn_id, now);
-    return s_track(q, end, ring + (size_t)q->unsent, left_at, now);
+    uint64_t local_q = s_track(q, end, ring + (size_t)q->unsent, left_at, now);
+    return duct_max(local_q, remote_q);
 }
 
 duct_codel_action_t duct_codel_act(duct_response_t *out, const duct_frame_t *frame,
