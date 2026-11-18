@@ -32,10 +32,13 @@
 #include "duct_olb_rx.h"
 #include "duct_olb_tx.h"
 #include "duct_protocol.h"
+#include "duct_relay.h"
+#include "duct_span.h"
 #include "duct_vmq.h"
 #include "duct_vnet.h"
 #include "duct_wire.h"
 #include "duct_wfq_msg.h"
+#include "duct_x_slot.h"
 #include "duct_xport.h"
 
 #include <stdatomic.h>
@@ -736,6 +739,55 @@ duct_dgram_rx_append(duct_olb_rx_t *rx, const void *data, size_t len)
         memcpy(duct_olb_rx_data(rx) + rx->h.stage
                + sizeof(duct_dgram_rec_hdr_t), data, len);
     duct_dgram_rx_header_commit(rx, len);
+}
+
+/** @brief The span's payload view: its bytes where they live.
+ *
+ *  The one resolver every descriptor site shares — the worker's stage, the
+ *  io thread's gather, a park's replay — each reading the same 16 bytes into
+ *  the window the send posts. A @c span_rx names the conn block itself, its
+ *  data region reached through the fixed page-0 geometry this header owns.
+ */
+duct_nonnull(1) static inline duct_view_u8
+duct_span_body(duct_span_t *span)
+{
+    const uint8_t *base;
+    if (duct_span_kind_of(span) == span_rx)
+        base = duct_conn_rx_data((duct_conn_t *)duct_span_base(span));
+    else
+        base = (const uint8_t *)duct_span_base(span);
+    return (duct_view_u8){
+        .data = (void *)(uintptr_t)(base + duct_span_off(span)),
+        .size = duct_span_len(span),
+    };
+}
+
+/** @brief Drop a span's payload reference at whichever point resolved it —
+ *  send, lane copy, a park's takeover or a terminal discard.
+ *
+ *  The §5.1 matrix unpin with the one substrate whose lifetime authority is
+ *  not the alloc header special-cased: a slot-object @c span_ptr's drop is
+ *  the claim it took (@c duct_io_rx_slot_drop), never a @c duct_del — the
+ *  slot's free list answers its pool's claim counter, and a plain delete
+ *  would push it back past every claim.
+ */
+duct_nonnull(1) static inline void
+duct_span_payload_drop(duct_span_t *span)
+{
+    if (duct_span_kind_of(span) == span_rx) {
+        auto conn = (duct_conn_t *)duct_span_base(span);
+        duct_span_unpin(span, duct_conn_rx_hdr(conn));
+        return;
+    }
+    if (duct_span_kind_of(span) == span_ptr) {
+        auto base = duct_span_base(span);
+        if (duct_x_slot_obj_is(base)) {
+            auto pool = duct_x_slot_pool_of(base);
+            duct_io_rx_slot_drop(pool, duct_x_slot_index(pool, base), true);
+            return;
+        }
+    }
+    duct_span_unpin(span, nullptr);
 }
 
 /** @brief Block index of @p conn: its offset into the pool's range. */

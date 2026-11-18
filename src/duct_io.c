@@ -28,6 +28,7 @@
 #include "duct_protocol.h"
 #include "duct_relay.h"
 #include "duct_session.h"
+#include "duct_span.h"
 #include "duct_stats.h"
 #include "duct_timer.h"
 #include "duct_vmq.h"
@@ -1418,16 +1419,16 @@ static void s_preparse_reply_write(const duct_proto_t *proto, duct_sock_t fd, du
  */
 static bool s_classify_stream(const duct_wfq_route_t *route, duct_listener_t *listener,
                                  duct_sock_t fd, const duct_peer_t *peer,
-                                 uint8_t *peek, size_t n, bool allow_wait,
+                                 duct_view_u8 peek, bool allow_wait,
                                  duct_pre_conn_t *probe, bool more)
 {
-    duct_view_u8 peek_buf = { .data = (void *)peek, .size = n };
-    if (allow_wait && n < listener->peek_min && s_probe_wait_begin(listener, fd, peer, peek_buf))
+    size_t n = peek.size;
+    if (allow_wait && n < listener->peek_min && s_probe_wait_begin(listener, fd, peer, peek))
         return true;
 
-    auto r = s_resolve_lead(listener, peek, n);
+    auto r = s_resolve_lead(listener, (const uint8_t *)peek.data, n);
     if (r.disp == resolve_not_me)
-        r = s_resolve_sync(listener, peer, &peek_buf);
+        r = s_resolve_sync(listener, peer, &peek);
     if (r.disp == resolve_hold) {
         /* A wait is granted only while more bytes can still arrive and the probe
          * read span still has room for them: the span's last byte ends the hold,
@@ -1446,7 +1447,7 @@ static bool s_classify_stream(const duct_wfq_route_t *route, duct_listener_t *li
             return false;
         }
         if (room && allow_wait && listener->probe_wait_ms
-            && s_probe_wait_begin(listener, fd, peer, peek_buf)) {
+            && s_probe_wait_begin(listener, fd, peer, peek)) {
             s_preparse_reply_write(r.proto, fd, listener->xport_type, peer);
             return true;
         }
@@ -1469,9 +1470,9 @@ static bool s_classify_stream(const duct_wfq_route_t *route, duct_listener_t *li
     }
 
     /* On empty reads, waits once for initial peer bytes when @p allow_wait is
-     * set before falling back to async/fallback/reject. */
+     *  set before falling back to async/fallback/reject. */
     if (r.disp == resolve_not_me && n == 0u && allow_wait && listener->probe_wait_ms
-        && s_probe_wait_begin(listener, fd, peer, peek_buf))
+        && s_probe_wait_begin(listener, fd, peer, peek))
         return true;
 
     r = s_resolve_tail(listener, r);
@@ -1483,8 +1484,7 @@ static bool s_classify_stream(const duct_wfq_route_t *route, duct_listener_t *li
     if (r.disp == resolve_not_me && r.want_async) {
         if (!allow_wait)
             duct_events_unwatch(s_io_this->trunk.events, fd, nullptr);
-        duct_view_u8 pk = { .data = peek, .size = n };
-        if (!s_preparse_post(listener, fd, peer, pk, false))
+        if (!s_preparse_post(listener, fd, peer, peek, false))
             s_close_fd(fd, false);
         return true;
     }
@@ -1494,8 +1494,8 @@ static bool s_classify_stream(const duct_wfq_route_t *route, duct_listener_t *li
         return true;
     }
 
-    peek_buf = n > r.lead
-        ? (duct_view_u8){ .data = (void *)(peek + r.lead), .size = n - r.lead }
+    duct_view_u8 peek_buf = n > r.lead
+        ? (duct_view_u8){ .data = (uint8_t *)peek.data + r.lead, .size = n - r.lead }
         : (duct_view_u8){};
     if (r.disp == resolve_join) {
         auto tok = (duct_session_handle_t){ .word = r.tok };
@@ -1622,8 +1622,9 @@ void duct_io_on_accept(duct_listener_t *listener, duct_sock_t fd, const duct_pee
         duct_sock_close(fd);
         return;
     );
-    s_classify_stream(route, listener, fd, peer, peek, n, /* allow_wait */ true, nullptr,
-                      /* more */ true);
+    s_classify_stream(route, listener, fd, peer,
+                      (duct_view_u8){ .data = peek, .size = n },
+                      /* allow_wait */ true, nullptr, /* more */ true);
 }
 
 /** @brief Open, create, bind, seed and register one conn for the session layer.
@@ -2701,8 +2702,9 @@ static bool s_pre_conn_resolve_probe(duct_io_t *t, duct_pre_conn_t *pre_conn, bo
     auto listener = pre_conn->probe.listener;
     auto fd = pre_conn->fd;
     auto peer = pre_conn->probe.peer;
-    if (!s_classify_stream(&t->route, listener, fd, &peer, duct_at(pre_conn->probe.peek),
-                           pre_conn->probe.peek_len,
+    if (!s_classify_stream(&t->route, listener, fd, &peer,
+                           (duct_view_u8){ .data = duct_at(pre_conn->probe.peek),
+                                           .size = pre_conn->probe.peek_len },
                            /* allow_wait */ false, pre_conn, more))
         return true;
     /* The park's slot goes back here, where the park's reference keeps the
@@ -4009,21 +4011,40 @@ void duct_io_wake(unsigned io_id)
     duct_events_kick(s_imod.xports[io_id].trunk.events);
 }
 
+/** @brief The two halves of one outbox entry's descriptor form: its inline
+ *  wire header span and its payload span. */
+static void s_dgram_tx_desc_parts(const duct_dgram_tx_entry_t *e,
+                                  duct_view_u8 *out_hdr, duct_span_t *out_span)
+{
+    static_assert(wire_tx_hdr_max == dgram_tx_desc_half,
+                  "the descriptor's inline header half is the wire header ceiling");
+    static_assert(sizeof(duct_span_t) == dgram_tx_desc_half,
+                  "the descriptor's span half is one span");
+    auto span = (const duct_span_t *)(const void *)(e->desc + dgram_tx_desc_half);
+    *out_hdr = (duct_view_u8){ .data = (void *)(uintptr_t)e->desc,
+                               .size = duct_span_hdr_len(span) };
+    *out_span = *span;
+}
+
 /** @brief Sends one queued datagram. @p arg is the owning listener. A
  *  closed listener, with listen_fd already duct_sock_bad, is terminal,
- *  treated as sent — nothing left to retry it against.
+ *  treated as sent — nothing left to retry it against, and a descriptor
+ *  entry's payload reference drops here.
  *  @return false only on EAGAIN or EWOULDBLOCK; the drain loop stops
  *  there and leaves this entry, and the rest of the lane, queued.
  */
 static bool s_dgram_tx_send(duct_vmq_hdr_t *hdr, void *arg)
 {
     auto listener = (duct_listener_t *)arg;
-    duct_do_if(listener->listen_fd == duct_sock_bad, return true);
-    auto entry = (duct_dgram_tx_entry_t *)&hdr->payload[0];
-    struct sockaddr_storage ss;
-    auto ss_len = duct_io_sockaddr_from_peer(&entry->peer, &ss);
-    return duct_xsend_dgram(listener->listen_fd, (struct sockaddr *)&ss, ss_len,
-                            (duct_view_u8){ .data = entry->data, .size = entry->len });
+    duct_do_if(listener->listen_fd != duct_sock_bad, return false);
+    if (!listener->tx_slots) {
+        auto entry = (duct_dgram_tx_entry_t *)&hdr->payload[0];
+        duct_view_u8 h;
+        duct_span_t span;
+        s_dgram_tx_desc_parts(entry, &h, &span);
+        duct_span_payload_drop(&span);
+    }
+    return true;
 }
 
 /* The batch goes through s_peer_send_grouped: each group of one peer's equal-sized
@@ -4203,7 +4224,10 @@ static bool s_dgram_tx_lane_drain_single(duct_vmq_lane_t *ln, duct_listener_t *l
  *  @c duct_xsend_peers sizes by its count, and still holds the longest group one
  *  segmented write takes. The lane head commits once, past the last entry
  *  sent; a chunk sent short or answered @c rc_again stops the lane with the
- *  rest queued.
+ *  rest queued. Every entry this path addresses carries the §2.4 descriptor
+ *  form — a proactive backend owns a staged entry's send — and a sent
+ *  entry's payload pin drops right after the send: the bytes have left for
+ *  the kernel, the reference has nothing left to hold.
  *  @return true once the snapshot drained whole.
  */
 static bool s_dgram_tx_lane_drain_batch(duct_vmq_lane_t *ln, duct_listener_t *listener,
@@ -4217,14 +4241,18 @@ static bool s_dgram_tx_lane_drain_batch(duct_vmq_lane_t *ln, duct_listener_t *li
     bool clean = true;
     for (;;) {
         duct_dgram_out_t outs[duct_x_gso_segs_max];
+        duct_span_t spans[duct_x_gso_segs_max];
         size_t heads[duct_x_gso_segs_max];
         unsigned n = 0u;
         duct_vmq_hdr_t *hdr;
         while (n < duct_x_gso_segs_max && (hdr = duct_vmq_drain_peek(ln, &pos)) != nullptr) {
             auto entry = (duct_dgram_tx_entry_t *)&hdr->payload[0];
+            duct_view_u8 h;
+            s_dgram_tx_desc_parts(entry, &h, &spans[n]);
             outs[n] = (duct_dgram_out_t){
                 .peer = entry->peer,
-                .body = { .data = entry->data, .size = entry->len },
+                .hdr = h,
+                .body = duct_span_body(&spans[n]),
             };
             pos.head += pos.step;
             heads[n++] = pos.head;
@@ -4239,8 +4267,11 @@ static bool s_dgram_tx_lane_drain_batch(duct_vmq_lane_t *ln, duct_listener_t *li
         if (!gso)
             duct_atomic_store(&listener->dgram_tx_gso_off, 1u, relaxed);
         resolved += sent;
-        if (sent)
+        if (sent) {
+            for (unsigned i = 0u; i < sent; ++i)
+                duct_span_payload_drop(&spans[i]);
             head = heads[sent - 1u];
+        }
         if (rc != rc_ok || sent < n) {
             clean = false;
             break;

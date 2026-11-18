@@ -41,7 +41,10 @@
 #     taker's materialize copy and vmq_view staging block, the sealed
 #     datagram's decrypt block and the vnet train's homeless-packet copy —
 #     the TX/CT pool arenas' replacements, whole duct_new blocks every pin
-#     (share, claim, §2.3) can hold, per duct-zerocopy-payload.md §2.
+#     (share, claim, §2.3) can hold, per duct-zerocopy-payload.md §2; plus
+#     B/4-5's §2.4 outbox descriptor form's two materializations — the
+#     control fin's packed record and the sealed engine's outbox egress,
+#     sub-threshold copy classes both.
 #
 # The session-path zero invariant (Step 2b): src/session/*.c names exactly the
 # pool-owned allocations — the session pool struct, the join index and the
@@ -158,7 +161,7 @@ endfunction()
 
 duct_count(n_heap_retry_node "duct_new\\(retry_node_t\\)")
 duct_count(n_heap_emit_copy "duct_new\\(uint8_t, out->payload\\.size\\)")
-duct_count(n_heap_emit_pin "duct_new\\(duct_frame_ack_t\\)")
+duct_count(n_heap_emit_pin "duct_new\\(s_slot_pin_t\\)")
 duct_count(n_heap_claim_hold "duct_new\\(uint8_t, frame\\.payload\\.size\\)")
 duct_count(n_heap_defer_node "duct_new\\(uint8_t, node_sz")
 duct_count(n_heap_hctx "duct_new\\(duct_stream_ctx_t\\)")
@@ -167,6 +170,7 @@ duct_count(n_heap_pass_scratch "duct_new\\(duct_worker_dgram_batch_entry_t|duct_
 duct_count(n_heap_worker_arrays "duct_new\\(duct_worker_t, n_workers\\)|duct_new\\(pthread_t, n_workers\\)")
 duct_count(n_heap_span_copy "duct_new\\(uint8_t, len\\)")
 duct_count(n_heap_dgram_stage "duct_new\\(uint8_t, need\\)")
+duct_count(n_heap_egress_mat "duct_new\\(uint8_t, pre \\+ bytes\\.size\\)")
 duct_count(n_heap_ct_block "duct_new\\(uint8_t, room\\)")
 duct_count(n_heap_vnet_copy "duct_new\\(uint8_t, span->size\\)")
 duct_count(n_duct_new_all "duct_new\\(")
@@ -231,8 +235,11 @@ endif()
 if(NOT n_heap_span_copy EQUAL 1)
     list(APPEND violations "the dgram span taker's materialize copy (foreign, sub-threshold or at the share ceiling) is the descriptor path's one such copy (${n_heap_span_copy} sites)")
 endif()
-if(NOT n_heap_dgram_stage EQUAL 2)
-    list(APPEND violations "the dgram vmq_view staging block takes its two shapes alone: the first allocation and the post-flush retry (${n_heap_dgram_stage} sites)")
+if(NOT n_heap_dgram_stage EQUAL 3)
+    list(APPEND violations "the dgram vmq_view staging block takes its two shapes alone plus the control fin's materialize copy on a descriptor-form listener (${n_heap_dgram_stage} sites)")
+endif()
+if(NOT n_heap_egress_mat EQUAL 1)
+    list(APPEND violations "the sealed engine's outbox egress materializes into one block the entry's span names (${n_heap_egress_mat} sites)")
 endif()
 if(NOT n_heap_ct_block EQUAL 1)
     list(APPEND violations "a sealed datagram's cleartext decrypts into one duct_new block per packet (${n_heap_ct_block} sites)")
@@ -241,7 +248,7 @@ if(NOT n_heap_vnet_copy EQUAL 1)
     list(APPEND violations "the vnet train's copy of a homeless packet is the train's one heap copy (${n_heap_vnet_copy} sites)")
 endif()
 math(EXPR n_whitelisted
-     "${n_heap_retry_node} + ${n_heap_emit_copy} + ${n_heap_emit_pin} + ${n_heap_claim_hold} + ${n_heap_defer_node} + ${n_heap_hctx} + ${n_heap_timer_ctx} + ${n_heap_pass_scratch} + ${n_heap_worker_arrays} + ${n_heap_span_copy} + ${n_heap_dgram_stage} + ${n_heap_ct_block} + ${n_heap_vnet_copy}")
+     "${n_heap_retry_node} + ${n_heap_emit_copy} + ${n_heap_emit_pin} + ${n_heap_claim_hold} + ${n_heap_defer_node} + ${n_heap_hctx} + ${n_heap_timer_ctx} + ${n_heap_pass_scratch} + ${n_heap_worker_arrays} + ${n_heap_span_copy} + ${n_heap_dgram_stage} + ${n_heap_egress_mat} + ${n_heap_ct_block} + ${n_heap_vnet_copy}")
 if(NOT n_duct_new_all EQUAL n_whitelisted)
     list(APPEND violations "duct_worker.c carries duct_new sites beyond the named allowances (${n_duct_new_all} total, ${n_whitelisted} whitelisted)")
 endif()

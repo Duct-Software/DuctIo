@@ -222,7 +222,7 @@ int main(void)
                avail_want = buf * 3u / 10u;
         duct_olb_rx_threshold_set(rx, unit);
         CHECK(s_stage(rx, 'L', buf - avail_want), "stage up to the relaxed window");
-        duct_atomic_store(&rx->held_frames, 1u, relaxed);
+        duct_atomic_store(&rx->pins, 1u, relaxed);
 
         uint8_t *ptr = nullptr;
         size_t avail = 0u;
@@ -270,10 +270,10 @@ int main(void)
         duct_olb_rx_rewind(rx);
         CHECK(rx->h.stage == lead_len, "an unacked frame holds the rewind");
         s_post(rx, lead_len);
-        duct_atomic_store(&rx->held_frames, 1u, relaxed);
+        duct_atomic_store(&rx->pins, 1u, relaxed);
         duct_olb_rx_rewind(rx);
-        CHECK(rx->h.stage == lead_len, "a held frame holds the rewind");
-        duct_atomic_store(&rx->held_frames, 0u, relaxed);
+        CHECK(rx->h.stage == lead_len, "a held frame pin holds the rewind");
+        duct_atomic_store(&rx->pins, 0u, relaxed);
         duct_atomic_store(&rx->dispatch_frontier, 0u, relaxed);
         duct_olb_rx_rewind(rx);
         CHECK(rx->h.stage == lead_len, "an undispatched frame holds the rewind");
@@ -376,13 +376,13 @@ int main(void)
         CHECK(duct_olb_rx_resume_total(rx, p, true) == staged - p,
               "unposted bytes leave only the full drain to resume the read");
         rx->posted_off = (uint32_t)staged;
-        duct_atomic_store(&rx->held_frames, 1u, relaxed);
+        duct_atomic_store(&rx->pins, 1u, relaxed);
         CHECK(duct_olb_rx_try_space(rx, p, true, &ptr, &avail) == olb_rx_full
                   && rx->pass_end == 0u,
               "a held frame holds the second pass");
         CHECK(duct_olb_rx_resume_total(rx, p, true) == staged,
               "with a frame held only a full drain resumes the read");
-        duct_atomic_store(&rx->held_frames, 0u, relaxed);
+        duct_atomic_store(&rx->pins, 0u, relaxed);
         CHECK(duct_olb_rx_resume_total(rx, p, true) == staged - p,
               "otherwise the read resumes once the worker is down to one read of backlog");
         CHECK(duct_olb_rx_resume_total(rx, p, false) == staged,

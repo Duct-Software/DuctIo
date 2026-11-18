@@ -1142,10 +1142,10 @@ static unsigned s_dgram_tx_post(void *arg, const duct_dgram_tx_entry_t *const *e
     duct_dgram_out_t msgs[duct_x_gso_segs_max];
     unsigned scan = gso_ok ? n : 1u;
     for (unsigned i = 0u; i < scan; ++i) {
-        auto data = duct_x_slot_span(pools, entries[i]->slot);
+        auto data = duct_x_slot_span(pools, entries[i]->staged.slot);
         msgs[i] = (duct_dgram_out_t){
             .peer = entries[i]->peer,
-            .body = { .data = data.data, .size = entries[i]->len },
+            .body = { .data = data.data, .size = entries[i]->staged.len },
         };
     }
     unsigned group = gso_ok && scan > 1u ? duct_x_gso_group(msgs, scan) : 1u;
@@ -1168,12 +1168,12 @@ static unsigned s_dgram_tx_post(void *arg, const duct_dgram_tx_entry_t *const *e
     }
     if (err != NO_ERROR) {
         st->free_stack[st->free_count++] = at;
-        duct_x_slot_put(pools, entries[0]->slot);
+        duct_x_slot_put(pools, entries[0]->staged.slot);
         return 1u;
     }
     ctl->nrefs = (uint8_t)group;
     for (unsigned i = 0u; i < group; ++i)
-        ctl->refs[i] = entries[i]->slot;
+        ctl->refs[i] = entries[i]->staged.slot;
     ++st->inflight;
     return group;
 }

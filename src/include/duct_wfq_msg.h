@@ -171,15 +171,35 @@ duct_msg_inter_holds(duct_msg_inter_batch_t *b)
  */
 static constexpr uint8_t inter_msg_batch = 0u;
 
+/** @brief Bytes of each flat half of a @c duct_dgram_tx_entry's descriptor
+ *  form: the inline wire header and the @c duct_span_t, both 16. The entry
+ *  carries them as bytes — the channels tier cannot name the span type — and
+ *  the io-tier writer and reader cast, the arrangement @c tx_hold already
+ *  uses. */
+static constexpr unsigned dgram_tx_desc_half = 16u;
+
 /** @brief One queued send in a listener's @c dgram_tx_outbox.
  *  Worker-filled, drained by that listener's I/O thread.
+ *
+ *  Which member of the union is live is constructive: a listener holding TX
+ *  slot pools (RIO, overlapped @c WSASendMsg) takes the staged form — its
+ *  sends read registered memory the pools own — and every other listener the
+ *  descriptor form, the §2.4 zero-copy outbox: the inline wire header and a
+ *  flat 16-byte @c duct_span_t naming the payload where its author built it,
+ *  the span's pin held from staging until the io thread's send drops it.
  */
 typedef struct duct_dgram_tx_entry {
     duct_peer_t peer;       /**< Destination address. */
-    uint32_t    len;        /**< Payload length, bytes. */
-    uint32_t    slot;       /**< Reference of the TX slot holding the payload; @c treiber_empty when the
-                              *  payload follows in @c data. */
-    alignas(8) uint8_t data[]; /**< Inline datagram payload bytes, present only when @c slot is @c treiber_empty. */
+    union {
+        struct {
+            uint32_t len;   /**< Staged form: payload length, bytes. */
+            uint32_t slot;  /**< Staged form: reference of the TX slot holding the
+                             *  payload. */
+        } staged;
+        alignas(8) uint8_t desc[2u * dgram_tx_desc_half]; /**< Descriptor form:
+            * flat @c { hdr[16], duct_span_t } in that order, the span's
+            * @c hdr_len naming the header bytes the entry carries. */
+    };
 } duct_dgram_tx_entry_t;
 
 /** @brief Outbox tag for a datagram TX entry.

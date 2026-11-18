@@ -31,6 +31,7 @@
 #include "duct_conn.h"
 #include "duct_olb_rx.h"
 #include "duct_relay.h"
+#include "duct_x_slot.h"
 
 #include <stdatomic.h>
 #include <stddef.h>

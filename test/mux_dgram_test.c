@@ -445,8 +445,8 @@ static const char *test_mux_dgram(duct_engine_t *io, uint16_t port)
      * mid-flight, then deliver the same stream_id's next frame from the
      * inter leg. Before this fix that frame bypassed the parked handler
      * entirely and went to on_frame; now s_dispatch_stream_claim must wake
-     * the SAME hctx instead, threading the inter-sourced ack_owned copy
-     * through hctx->frame/hctx->ack. */
+     * the SAME hctx instead, threading the inter-sourced owned copy
+     * through hctx->frame/hctx->span. */
     static const char p1[] = "park-first", p2[] = "park-wake";
     if (uc_send_mux(fd, parking_sid, p1, sizeof p1 - 1u) != 0) {
         close(fd); return "parking sid send failed";
