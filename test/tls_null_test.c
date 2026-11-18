@@ -587,15 +587,14 @@ static const char *sc_ct_chunk(void)
         auto sc = duct_conn_sealed_ctx(conn);
         if (!sc || !sc->codec || !sc->codec->ct_buf)
             continue;
-        auto h = duct_block_hdr(sc->codec->ct_buf);
-        if (h->back != 0u || h->secret || h->arena)
+        auto buf = duct_at(sc->codec->ct_buf);
+        if (!duct_x_slot_obj_is(buf))
             return "the cleartext buffer is not a pool chunk";
-        if (duct_byte_len(sc->codec->ct_buf) != duct_wire_ct_buf_max
+        if (duct_x_slot_obj_cap(buf) != duct_wire_ct_buf_max
             || conn->wire->ct_buf_max > duct_wire_ct_buf_max)
             return "the chunk does not answer the wire-declared ceiling";
-        if (duct_alloc_pool_id(h) == alloc_pool_none
-            || duct_alloc_slot_index(h) >= duct_wire_ct_chunks)
-            return "the chunk carries no worker-pool id";
+        if (duct_x_slot_index(duct_x_slot_pool_of(buf), buf) >= duct_wire_ct_chunks)
+            return "the chunk names no worker-pool slot";
         return nullptr;
     }
     return "no sealed conn found carrying a cleartext chunk";

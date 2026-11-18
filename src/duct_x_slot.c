@@ -64,9 +64,9 @@ static bool s_grow(duct_x_slot_pool_t *pool)
         uint32_t base = c * pool->chunk_slots,
                  cnt = s_chunk_count(pool, c);
         auto links = duct_at(pool->slots);
-        if (pool->pool_id != alloc_pool_none)
+        if (pool->release)
             for (uint32_t k = 0u; k < cnt; ++k)
-                duct_slot_stamp(duct_x_slot_obj(pool, base + k), pool->pool_id, base + k);
+                duct_x_slot_stamp(pool, base + k);
         for (uint32_t k = 1u; k < cnt; ++k)
             duct_atomic_store(&links[base + k - 1u].next, base + k, relaxed);
         uint64_t head = duct_atomic_load(&pool->free_head, relaxed);
@@ -161,7 +161,6 @@ bool duct_x_slot_pool_init(duct_x_slot_pool_t *pool, uint32_t n, uint32_t slot_b
 {
     *pool = (duct_x_slot_pool_t){};
     atomic_init(&pool->free_head, treiber_head_pack(0u, treiber_empty));
-    pool->pool_id = alloc_pool_none;
     duct_do_if(!n || !slot_bytes, return true);
     size_t word_off = duct_align_up((size_t)lead + duct_x_slot_word + rec, 8u);
     duct_do_if(lead % 8u || slot_bytes % 8u, return false);
@@ -190,14 +189,25 @@ bool duct_x_slot_pool_init(duct_x_slot_pool_t *pool, uint32_t n, uint32_t slot_b
     return true;
 }
 
-bool duct_x_slot_pool_engage(duct_x_slot_pool_t *pool)
+void duct_x_slot_release_obj(void *obj)
 {
-    duct_do_if(!pool->range.base, return true);
-    duct_do_if(duct_len(pool->slots) > 1u << alloc_slot_bits, return false);
-    unsigned id = duct_slot_pool_register(pool);
-    duct_do_if(id == alloc_pool_none, return false);
-    pool->pool_id = id;
-    return true;
+    auto pool = duct_x_slot_pool_of(obj);
+    uint32_t idx = duct_x_slot_index(pool, obj);
+    /* the lane's plain return: a pin standing on the record holds the slot */
+    if (duct_x_slot_drop(pool, idx, false))
+        duct_x_slot_release(pool, idx);
+}
+
+void duct_x_slot_pool_engage(duct_x_slot_pool_t *pool)
+{
+    duct_do_if(!pool->range.base, return);
+    pool->release = duct_x_slot_release_obj;
+    for (uint32_t c = 0u; c < pool->n_chunks; ++c) {
+        duct_do_if(duct_atomic_load(&duct_at(pool->chunks)[c].state, relaxed) != chunk_live, continue);
+        uint32_t base = c * pool->chunk_slots;
+        for (uint32_t k = 0u, cnt = s_chunk_count(pool, c); k < cnt; ++k)
+            duct_x_slot_stamp(pool, base + k);
+    }
 }
 
 void duct_x_slot_pool_reap(duct_x_slot_pool_t *pool)
@@ -238,10 +248,6 @@ duct_x_slot_pool_publish(duct_x_slot_pool_t *_Atomic *slot, duct_x_slot_pool_t *
 
 void duct_x_slot_pool_free(duct_x_slot_pool_t *pool)
 {
-    if (pool->range.base && pool->pool_id != alloc_pool_none) {
-        duct_slot_pool_unregister(pool->pool_id);
-        pool->pool_id = alloc_pool_none;
-    }
     if (pool->range.base && pool->hooks.down)
         for (uint32_t c = 0u; c < pool->n_chunks; ++c)
             if (duct_at(pool->chunks)[c].cookie)
@@ -250,5 +256,4 @@ void duct_x_slot_pool_free(duct_x_slot_pool_t *pool)
     duct_del(pool->chunks);
     duct_del(pool->slots);
     *pool = (duct_x_slot_pool_t){};
-    pool->pool_id = alloc_pool_none;
 }

@@ -403,8 +403,6 @@ static int t_touched(void)
     CHECK(duct_alloc_touched(h) == (1u << alloc_touched_bits) - 1u, "the field cap reads back");
     CHECK(h->size == sizeof(obj_t) && s_holders(p) == 1u && h->back != 0u,
           "a touched write leaves the size word, the count and the back intact");
-    CHECK(duct_alloc_slot_word(3u, 5u) == (3u | 5u << alloc_slot_bits),
-          "the slot word packs the index low and the pool id high");
     duct_del(p);
     return 0;
 }

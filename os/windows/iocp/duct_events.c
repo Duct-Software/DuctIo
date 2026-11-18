@@ -730,7 +730,7 @@ static bool s_post_dgram(listener_ctx_t *ctx)
               : (duct_view_u8){ .data = ctx->rx_priv, .size = duct_listener_dgram_span(ctx->listener) };
     ctx->op = (iocp_op_t) {
         .packed = s_tag_pack(iocp_op_dgram, ctx),
-        .buf = { (ULONG)span.size, span.data },
+        .buf = { (ULONG)span.size, (char *)span.data },
     };
     auto recvmsg_fn = duct_x_wsa_recvmsg();
     int rc;

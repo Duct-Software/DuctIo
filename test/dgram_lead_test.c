@@ -221,13 +221,15 @@ static duct_x_slot_pool_t dl_ct_pool;
 
 static duct_x_slot_pool_t *dl_ct_chunks(void)
 {
-    if (!dl_ct_pool.range.base
-        && (!duct_x_slot_pool_init(&dl_ct_pool, 8u,
-                                   duct_x_slot_span_bytes(0u, 0u,
-                                                          (uint32_t)duct_wire_ct_buf_max),
-                                   0u, 0u, 4u, (duct_x_slot_hooks_t){})
-            || !duct_x_slot_pool_engage(&dl_ct_pool)))
-        duct_x_slot_pool_free(&dl_ct_pool);
+    if (!dl_ct_pool.range.base) {
+        if (duct_x_slot_pool_init(&dl_ct_pool, 8u,
+                                  duct_x_slot_span_bytes(0u, 0u,
+                                                         (uint32_t)duct_wire_ct_buf_max),
+                                  0u, 0u, 4u, (duct_x_slot_hooks_t){}))
+            duct_x_slot_pool_engage(&dl_ct_pool);
+        else
+            duct_x_slot_pool_free(&dl_ct_pool);
+    }
     return dl_ct_pool.range.base ? &dl_ct_pool : nullptr;
 }
 

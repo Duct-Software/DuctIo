@@ -74,13 +74,15 @@ static duct_x_slot_pool_t s_ct_pool;
 
 static duct_x_slot_pool_t *s_ct_chunks_test(void)
 {
-    if (!s_ct_pool.range.base
-        && (!duct_x_slot_pool_init(&s_ct_pool, 8u,
-                                   duct_x_slot_span_bytes(0u, 0u,
-                                                          (uint32_t)duct_wire_ct_buf_max),
-                                   0u, 0u, 4u, (duct_x_slot_hooks_t){})
-            || !duct_x_slot_pool_engage(&s_ct_pool)))
-        duct_x_slot_pool_free(&s_ct_pool);
+    if (!s_ct_pool.range.base) {
+        if (duct_x_slot_pool_init(&s_ct_pool, 8u,
+                                  duct_x_slot_span_bytes(0u, 0u,
+                                                         (uint32_t)duct_wire_ct_buf_max),
+                                  0u, 0u, 4u, (duct_x_slot_hooks_t){}))
+            duct_x_slot_pool_engage(&s_ct_pool);
+        else
+            duct_x_slot_pool_free(&s_ct_pool);
+    }
     return s_ct_pool.range.base ? &s_ct_pool : nullptr;
 }
 
@@ -1416,7 +1418,7 @@ static void test_frame_sealed_pre_ack_defer_stale_after_sealed_switch(void)
     codec = wire_a->init_codec(wire_a, x_tcp, codec, inner_parser, s_ct_chunks_test());
     assert(codec);
     sc->codec = codec;
-    codec->ct_len = (uint32_t)duct_byte_len(codec->ct_buf);
+    codec->ct_len = (uint32_t)duct_x_slot_obj_cap(duct_at(codec->ct_buf));
     unsigned unseal_a_before = s_fake_engine_a_unseal_calls;
 
     const char record[] = "one-more-record";
@@ -1511,8 +1513,9 @@ static void test_tls_ensure_started_creates_codec_and_starts_once(void)
  *  beside the codec. */
 static unsigned s_ct_holders(const duct_wire_codec_t *codec)
 {
-    auto hdr = (const duct_alloc_hdr_t *)((uintptr_t)codec->ct_buf - sizeof(duct_alloc_hdr_t));
-    return duct_atomic_load(&hdr->holders, relaxed);
+    auto buf = duct_at(codec->ct_buf);
+    auto pool = duct_x_slot_pool_of(buf);
+    return duct_x_slot_hold_count(pool, duct_x_slot_index(pool, buf));
 }
 
 /* ── T20: retry_frame_save_copies_ct_buf_and_frees_orphan ──────────── */

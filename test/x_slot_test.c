@@ -547,38 +547,35 @@ static void check_slot_word(void)
 {
     duct_x_slot_pool_t plain, rec;
     CHECK(duct_x_slot_pool_init(&plain, 4u, duct_x_slot_span_bytes(0u, 0u, 64u), 0u, 0u, 2u, k_no_hooks));
-    CHECK(duct_x_slot_pool_engage(&plain));
-    CHECK(plain.pool_id != alloc_pool_none);
+    duct_x_slot_pool_engage(&plain);
+    CHECK(plain.release == duct_x_slot_release_obj);
     uint32_t idx = duct_x_slot_acquire(&plain);
     CHECK(idx != treiber_empty);
     CHECK(duct_x_slot_obj(&plain, idx) == duct_x_slot_payload(&plain, idx));
-    auto h = duct_x_slot_hdr(&plain, idx);
-    CHECK(h == duct_block_hdr(duct_x_slot_obj(&plain, idx)));
-    CHECK(h->back == 0u && !h->secret && !h->arena);
-    CHECK(duct_alloc_slot_index(h) == idx && duct_alloc_pool_id(h) == plain.pool_id);
-    CHECK(duct_atomic_load(&h->holders, relaxed) == 1u);
+    auto obj = duct_x_slot_obj(&plain, idx);
+    CHECK(duct_x_slot_owner(obj) == (void *const *)duct_x_slot_data(&plain, idx));
+    CHECK(duct_x_slot_obj_is(obj));
+    CHECK(duct_x_slot_pool_of(obj) == &plain);
+    CHECK(duct_x_slot_obj_cap(obj) == 64u);
     uint32_t second = duct_x_slot_acquire(&plain);
     CHECK(second != treiber_empty && second != idx);
-    auto h2 = duct_x_slot_hdr(&plain, second);
-    CHECK(duct_alloc_slot_index(h2) == second && duct_alloc_pool_id(h2) == plain.pool_id);
+    CHECK(duct_x_slot_pool_of(duct_x_slot_obj(&plain, second)) == &plain);
     duct_x_slot_release(&plain, second);
-    duct_ptr_t(uint8_t) obj = (duct_ptr_t(uint8_t))duct_x_slot_obj(&plain, idx);
-    CHECK(duct_byte_len(obj) == 64u);
-    duct_del(obj);
+    duct_x_slot_release_obj(obj);
     CHECK(duct_x_slot_acquire(&plain) == idx);
     duct_x_slot_release(&plain, idx);
     duct_x_slot_pool_free(&plain);
-    CHECK(plain.pool_id == alloc_pool_none);
 
     CHECK(duct_x_slot_pool_init(&rec, 4u, duct_x_slot_span_bytes(0u, duct_dgram_record_hdr_size, 64u),
                                 0u, duct_dgram_record_hdr_size, 2u, k_no_hooks));
-    CHECK(duct_x_slot_pool_engage(&rec));
+    duct_x_slot_pool_engage(&rec);
     uint32_t ridx = duct_x_slot_acquire(&rec);
     CHECK(ridx != treiber_empty);
     CHECK(duct_x_slot_payload(&rec, ridx) == duct_x_slot_data(&rec, ridx) + 16u);
     CHECK(duct_x_slot_payload(&rec, ridx) - duct_dgram_record_hdr_size
           == duct_x_slot_data(&rec, ridx) + 12u);
-    CHECK(duct_x_slot_hdr(&rec, ridx) == (duct_alloc_hdr_t *)duct_x_slot_data(&rec, ridx));
+    CHECK((const void *)duct_x_slot_owner(duct_x_slot_obj(&rec, ridx))
+          == (const void *)duct_x_slot_data(&rec, ridx));
     duct_x_slot_release(&rec, ridx);
     duct_x_slot_pool_free(&rec);
     printf("  slot_word OK\n");
@@ -598,7 +595,7 @@ static void check_retire_reap(void)
     duct_x_slot_pool_t pool;
     CHECK(duct_x_slot_pool_init(&pool, 4u, duct_x_slot_span_bytes(0u, 0u, 64u), 0u, 0u, 2u,
                                 k_no_hooks));
-    CHECK(duct_x_slot_pool_engage(&pool));
+    duct_x_slot_pool_engage(&pool);
     uint32_t held = duct_x_slot_acquire(&pool);
     CHECK(held != treiber_empty);
     CHECK(duct_atomic_load(&pool.outstanding, relaxed) == 1u);
@@ -613,7 +610,7 @@ static void check_retire_reap(void)
     duct_x_slot_pool_t idle;
     CHECK(duct_x_slot_pool_init(&idle, 4u, duct_x_slot_span_bytes(0u, 0u, 64u), 0u, 0u, 2u,
                                 k_no_hooks));
-    CHECK(duct_x_slot_pool_engage(&idle));
+    duct_x_slot_pool_engage(&idle);
     duct_x_slot_pool_retire(&idle, s_reap_on_reap);
     CHECK(s_reaped);
     s_reaped = false;

@@ -207,8 +207,8 @@ static duct_x_slot_pool_t *s_rx_pool_new(const duct_listener_t *l)
                                     duct_x_slot_span_bytes(0u, duct_dgram_record_hdr_size,
                                                            DUCT_LISTENER_DGRAM_DEFAULT),
                                     0u, duct_dgram_record_hdr_size, duct_dgram_rx_batch,
-                                    duct_events_x_slot_hooks())
-           && duct_x_slot_pool_engage(pool);
+                                    duct_events_x_slot_hooks());
+    duct_x_slot_pool_engage(pool);
     duct_do_if(!ok, duct_x_slot_pool_free(pool); duct_del(pool); return nullptr);
     pool->reader = l->io_id;
     return pool;
@@ -239,8 +239,8 @@ bool duct_listener_tx_slots_new(duct_listener_t *l, uint32_t lead, uint32_t chun
     duct_do_if(!pools, return false);
     for (unsigned c = 0u; c < 2u; ++c) {
         bool ok = duct_x_slot_pool_init(&duct_at(pools)[c], count[c], slot_bytes[c], lead, 0u,
-                                        grain[c], duct_events_x_slot_hooks())
-               && duct_x_slot_pool_engage(&duct_at(pools)[c]);
+                                        grain[c], duct_events_x_slot_hooks());
+        duct_x_slot_pool_engage(&duct_at(pools)[c]);
         duct_do_if(!ok, duct_listener_tx_slots_free(duct_at(pools)); return false);
     }
     l->tx_slots = duct_at(pools);

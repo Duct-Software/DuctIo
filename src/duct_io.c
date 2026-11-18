@@ -4728,8 +4728,8 @@ static duct_x_slot_pool_t *s_device_rx_pool(duct_io_t *t)
                   &t->device_rx, duct_device_hold_cap,
                   duct_x_slot_span_bytes(0u, duct_dgram_record_hdr_size,
                                          (uint32_t)duct_device_rx_span_max * duct_device_rx_batch),
-                  0u, duct_dgram_record_hdr_size, 1u, (duct_x_slot_hooks_t){})
-           && duct_x_slot_pool_engage(&t->device_rx);
+                  0u, duct_dgram_record_hdr_size, 1u, (duct_x_slot_hooks_t){});
+    duct_x_slot_pool_engage(&t->device_rx);
     duct_do_if(!ok, duct_x_slot_pool_free(&t->device_rx); return nullptr);
     t->device_rx.reader = t->route.thread_id;
     t->device_rx_live = true;

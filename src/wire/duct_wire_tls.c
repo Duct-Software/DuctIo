@@ -126,11 +126,10 @@ s_tls_on_parse(const duct_wire_t *self, duct_view_u8 input, duct_frame_t *out,
 static void s_tls_codec_release(duct_wire_codec_t *self)
 {
     self->engine->vtbl->destroy(self->engine);
+    /* ct_buf is a chunk of the worker's cleartext pool: its owner word names
+     *  the pool, the plain lane return puts it back. */
     if (self->ct_buf)
-        duct_alloc_touched_set(duct_block_hdr(self->ct_buf),
-                               duct_alloc_touched_encode(self->ct_len,
-                                                         duct_byte_len(self->ct_buf)));
-    duct_del(self->ct_buf);
+        duct_x_slot_release_obj(duct_at(self->ct_buf));
     duct_secure_zero(self, sizeof *self);
 }
 

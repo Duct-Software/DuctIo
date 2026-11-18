@@ -560,40 +560,31 @@ enum : unsigned { alloc_back_bits = 10 /**< Width of @c duct_alloc_hdr_t::back, 
 enum : unsigned { alloc_arena_bits = 3 /**< Width of @c duct_alloc_hdr_t::arena, bits. */ };
 enum : unsigned { alloc_touched_bits = 12 /**< Width of the touched field, bits. */ };
 enum : unsigned { alloc_size_bits = 40u - alloc_touched_bits /**< Width of @c duct_alloc_hdr_t::size, bits. */ };
-enum : unsigned { alloc_pool_bits = 10 /**< Width of the pool id inside a slot word, bits. */ };
-enum : unsigned { alloc_slot_bits = 18 /**< Width of the slot index inside a slot word, the handle index width. */ };
-enum : unsigned { alloc_fixed_pools = 3 /**< Engine-owned pools of the id inventory beside the listener, worker and io ones. */ };
-
-static_assert(alloc_slot_bits + alloc_pool_bits <= alloc_size_bits,
-              "the slot word fits the size field");
-static_assert(3u * duct_runtime_max_listeners + duct_runtime_max_workers
-                  + duct_runtime_max_io_threads + alloc_fixed_pools
-              <= 1u << alloc_pool_bits,
-              "the pool inventory fits the pool id space");
+enum : unsigned { alloc_slot_bits = 18 /**< Width of a slot index, the handle index width. */ };
 
 /** @brief Header in the 8 bytes below the object of every block @c duct_new and @c duct_new_secret answer.
  *  Written once at allocation, @c holders alone changing after. A free bit reads zero.
  *  The layout is set by storage units, not by the 64-bit view: the touched halves sit in byte 3
  *  and the low nibble of byte 4, behind @ref duct_alloc_touched and @ref duct_alloc_touched_set,
  *  so no @c touched or @c size write ever covers @c holders.
+ *
+ *  A pool slot carries no header of this kind: its 8 bytes below the object
+ *  are its pool's owner word, and no @c duct_del, @c duct_len or share ever
+ *  reaches a slot object — the pool's own api releases it.
  */
 typedef struct duct_alloc_hdr {
     uint16_t arena         : alloc_arena_bits; /**< Slot class of a secret in the secret arena, 1 to 7, and 0 for a block on the heap.
                                                 *  Declared first, so that @c back sits at bits 3 to 12 and
                                                 *  its byte offset is one mask of the word. */
     uint16_t back          : alloc_back_bits; /**< Offset from the calloc base to the object, in 8-byte units.
-                                                *  1 in a slot of the arena, which starts at the header.
-                                                *  0 names a slot of a registered pool: the release goes
-                                                *  through @ref duct_slot_release, never the heap. */
+                                                *  1 in a slot of the arena, which starts at the header. */
     uint16_t secret        : 1;               /**< Mark of a @c duct_new_secret block. */
     uint16_t               : 2;               /**< Free 2 bits. */
     uint8_t _Atomic holders;                  /**< Holder count: 0 free or in the pool, 1 one live holder,
                                                 *  n n holders. */
     uint8_t touched_lo;
     uint32_t touched_hi    : 4;
-    uint32_t size          : alloc_size_bits; /**< Bytes asked for, count times element size, on a heap or
-                                                *  arena block; on a pool slot the word
-                                                *  @c slot_index : alloc_slot_bits | pool_id : alloc_pool_bits. */
+    uint32_t size          : alloc_size_bits; /**< Bytes asked for, count times element size. */
 } duct_alloc_hdr_t;
 
 /** @brief Largest alignment @c duct_new accepts, bytes. */
@@ -634,76 +625,6 @@ duct_nonnull(1) static inline void duct_alloc_touched_set(duct_alloc_hdr_t *h, u
     h->touched_hi = (touched >> 8u) & 0xfu;
 }
 
-/** @brief Slot word of @p slot_index in @p pool_id: the value a pool slot's
- *  @c size field carries. */
-static inline uint32_t duct_alloc_slot_word(unsigned slot_index, unsigned pool_id)
-{
-    return (uint32_t)slot_index | (uint32_t)pool_id << alloc_slot_bits;
-}
-
-/** @brief Slot index half of @p h's slot word. */
-duct_nonnull(1) static inline unsigned duct_alloc_slot_index(const duct_alloc_hdr_t *h)
-{
-    return h->size & ((1u << alloc_slot_bits) - 1u);
-}
-
-/** @brief Pool id half of @p h's slot word. */
-duct_nonnull(1) static inline unsigned duct_alloc_pool_id(const duct_alloc_hdr_t *h)
-{
-    return h->size >> alloc_slot_bits;
-}
-
-/** @brief Register answer when the id space holds no free id. */
-static constexpr unsigned alloc_pool_none = UINT32_MAX;
-
-typedef struct duct_x_slot_pool duct_x_slot_pool_t;
-
-/** @brief Claim a free pool id for @p pool in the slot-release table.
- *  The table is process-global; an id returns with
- *  @ref duct_slot_pool_unregister at the pool's final unmap, so listener
- *  churn spends and frees ids without exhausting the space.
- *  @return The id, or @ref alloc_pool_none when every id is taken.
- */
-[[nodiscard]] unsigned duct_slot_pool_register(duct_x_slot_pool_t *pool);
-
-/** @brief Drop @p pool_id's table entry and give the id back. */
-void duct_slot_pool_unregister(unsigned pool_id);
-
-/** @brief Return the slot @p obj names to its pool, by its header's slot
- *  word.
- *  The polymorphic half of @c duct_del: the header reads @c back == 0 and
- *  @c secret == 0, and the table resolves the pool; an engaged pool stamps
- *  the word ahead of any handout.
- */
-duct_nonnull(1) void duct_slot_release(void *obj);
-
-/** @brief Payload capacity of the slot @p obj names, by its header's slot
- *  word. */
-duct_nonnull(1) size_t duct_slot_byte_len(const void *obj);
-
-/** @brief The registered slot pool @p obj names, by its header's slot word.
- *
- *  The claim-aware release path's lookup: a slot's lifetime authority is its
- *  pool's claim count, which @c duct_slot_release bypasses — a holder that
- *  must respect a claim (an rx slot a descriptor pins) resolves the pool
- *  here and drops through the pool's own claim gate.
- */
-duct_nonnull(1) struct duct_x_slot_pool *duct_slot_pool_of(const void *obj);
-
-/** @brief Stamp @p obj's header as slot @p slot_index of @p pool_id, one
- *  live holder.
- *  The engage step of a slot's take; the payload's bytes are the caller's
- *  to write from here.
- */
-duct_nonnull(1) static inline void duct_slot_stamp(void *obj, unsigned pool_id, unsigned slot_index)
-{
-    auto h = duct_block_hdr(obj);
-    h->arena = 0u;
-    h->back = 0u;
-    h->secret = 0u;
-    h->size = duct_alloc_slot_word(slot_index, pool_id);
-    duct_atomic_store(&h->holders, (uint8_t)1u, relaxed);
-}
 
 /** @brief Move a fresh secret block into the secret arena and mark it secret.
  *  The step of @ref duct_new_secret after the allocation, taken on a block nothing has written
@@ -838,16 +759,17 @@ static constexpr uint64_t duct_ptr_bound_bytes =
     })
 
 /** @brief Bytes of the array @p p, read from its header.
- *  The count times @c sizeof(T) that @c duct_new was given, or the slot's capacity behind the
- *  header for an array a pool served. Takes a @c duct_ptr_t only; any other pointer stops the
- *  build. @p p is not nullptr, a null array having no header.
+ *  The count times @c sizeof(T) that @c duct_new was given. Takes a @c duct_ptr_t
+ *  only; any other pointer stops the build. @p p is not nullptr, a null array
+ *  having no header. A pool slot's array never passes here: its 8 bytes below
+ *  the object are its pool's owner word, and the pool's own api answers its
+ *  capacity.
  */
 #define duct_byte_len(p)                                                                    \
     ({                                                                                      \
         auto _bl = (p);                                                                     \
         static_assert(duct_is_ptr(_bl), "duct_byte_len takes a duct_ptr_t");                \
-        auto _bh = duct_block_hdr(_bl);                                                     \
-        !_bh->back && !_bh->secret ? duct_slot_byte_len(_bl) : (size_t)_bh->size;           \
+        (size_t)duct_block_hdr(_bl)->size;                                                  \
     })
 
 /** @brief Element count of the array @p p.
@@ -950,10 +872,11 @@ static constexpr uint64_t duct_ptr_bound_bytes =
 
 /** @brief Drop this holder's hold on the block @p ptr points at, and null @p ptr.
  *  The drop that leaves no holder wipes a @ref duct_new_secret block, then frees it or gives its
- *  slot back to the arena; a block of a registered pool goes back through @ref duct_slot_release;
- *  the others only drop. A pointer copied without @ref duct_share holds nothing, and a
- *  @c duct_del through it is a second release. nullptr is ignored.
- *  @param ptr  Pointer lvalue from @ref duct_new, @ref duct_new_secret or a pool slot, or nullptr.
+ *  slot back to the arena; the others only drop. A pointer copied without @ref duct_share holds
+ *  nothing, and a @c duct_del through it is a second release. nullptr is ignored.
+ *  A pool slot never passes here: its owner word is no header, and the pool's
+ *  own api releases it.
+ *  @param ptr  Pointer lvalue from @ref duct_new or @ref duct_new_secret, or nullptr.
  *  @code
  *  duct_del(p);
  *  @endcode
@@ -964,10 +887,7 @@ static constexpr uint64_t duct_ptr_bound_bytes =
         auto _d = (unsigned char *)(uintptr_t)*_dp;                                         \
         if (_d) {                                                                           \
             auto _h = duct_block_hdr(_d);                                                   \
-            if (!_h->back && !_h->secret) {                                                 \
-                if (duct_atomic_fetch(sub, &_h->holders, (uint8_t)1u, acq_rel) == 1u)       \
-                    duct_slot_release(_d);                                                  \
-            } else if (_h->arena) {                                                         \
+            if (_h->arena) {                                                                \
                 if (duct_atomic_fetch(sub, &_h->holders, (uint8_t)1u, acq_rel) == 1u)       \
                     duct_discard duct_secret_release(_d);                                   \
             } else if (duct_atomic_load(&_h->holders, acquire) == 1u                        \

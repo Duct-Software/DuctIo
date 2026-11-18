@@ -615,13 +615,15 @@ static const char *nd_ctl_framing(duct_noise_cfg_t *cfg)
     alignas(duct_cacheline_size) uint8_t parser_buf[duct_wire_parser_slot] = {};
     /* AI-generated test code. */
     static duct_x_slot_pool_t nd_ct_pool;
-    if (!nd_ct_pool.range.base
-        && (!duct_x_slot_pool_init(&nd_ct_pool, 8u,
-                                   duct_x_slot_span_bytes(0u, 0u,
-                                                          (uint32_t)duct_wire_ct_buf_max),
-                                   0u, 0u, 4u, (duct_x_slot_hooks_t){})
-            || !duct_x_slot_pool_engage(&nd_ct_pool)))
-        duct_x_slot_pool_free(&nd_ct_pool);
+    if (!nd_ct_pool.range.base) {
+        if (duct_x_slot_pool_init(&nd_ct_pool, 8u,
+                                  duct_x_slot_span_bytes(0u, 0u,
+                                                         (uint32_t)duct_wire_ct_buf_max),
+                                  0u, 0u, 4u, (duct_x_slot_hooks_t){}))
+            duct_x_slot_pool_engage(&nd_ct_pool);
+        else
+            duct_x_slot_pool_free(&nd_ct_pool);
+    }
     auto codec = w && nd_ct_pool.range.base
         ? w->init_codec(w, x_udp_peer, &codec_storage,
                         (duct_wire_parser_t *)parser_buf, &nd_ct_pool) : nullptr;

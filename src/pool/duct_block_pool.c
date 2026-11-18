@@ -2,69 +2,18 @@
 /* Copyright (c) 2026 Duct Software, author: Constantin Papizh */
 
 /** @file duct_block_pool.c
- *  @brief The block state machine and the slot-release table of the pool ids.
+ *  @brief The block state machine of the block pools.
  *
  *  Implements the acquire, release and sweep contract of
- *  @ref duct_block_pool.h over the three bitmaps, and the process-global
- *  table a stamped slot word resolves through: registration claims an id by
- *  compare-exchange on the id bitmap, and the polymorphic slot return and
- *  slot length read the pool pointer back by that id.
+ *  @ref duct_block_pool.h over the three bitmaps. The process-global
+ *  slot-return table with its pool ids is gone: a slot names its pool by
+ *  the owner word its pool stamps, resolved where the slot is released.
  */
 
 #include "duct_block_pool.h"
 #include "duct_x_slot.h"
 
 #include <assert.h>
-
-static_assert(alloc_pool_bits >= 6u, "the pool id bitmap words hold block_run_drop ids");
-
-/** @brief The release table: pool pointer per engaged pool id. */
-static duct_x_slot_pool_t *_Atomic s_slot_pools[1u << alloc_pool_bits];
-/** @brief Id bitmap of the table above, one bit per pool id. */
-static uint64_t _Atomic s_pool_ids[(1u << alloc_pool_bits) / block_run_drop];
-
-unsigned duct_slot_pool_register(duct_x_slot_pool_t *pool)
-{
-    for (uint32_t w = 0u; w < (1u << alloc_pool_bits) / block_run_drop; ++w) {
-        uint64_t word = duct_atomic_load(&s_pool_ids[w], relaxed);
-        while (word != UINT64_MAX) {
-            uint32_t id = (w << 6) + duct_ctz_ull(~word);
-            if (duct_atomic_cas(weak, &s_pool_ids[w], &word, word | 1ull << (id & 63u), relaxed, relaxed)) {
-                duct_atomic_store(&s_slot_pools[id], pool, release);
-                return id;
-            }
-        }
-    }
-    return alloc_pool_none;
-}
-
-void duct_slot_pool_unregister(unsigned pool_id)
-{
-    duct_atomic_store(&s_slot_pools[pool_id], (duct_x_slot_pool_t *)nullptr, release);
-    duct_atomic_fetch(and, &s_pool_ids[pool_id >> 6], ~(1ull << (pool_id & 63u)), relaxed);
-}
-
-void duct_slot_release(void *obj)
-{
-    auto h = duct_block_hdr(obj);
-    auto pool = duct_atomic_load(&s_slot_pools[duct_alloc_pool_id(h)], acquire);
-    assert(pool);
-    duct_x_slot_release(pool, duct_alloc_slot_index(h));
-}
-
-size_t duct_slot_byte_len(const void *obj)
-{
-    auto h = duct_block_hdr(obj);
-    auto pool = duct_atomic_load(&s_slot_pools[duct_alloc_pool_id(h)], acquire);
-    assert(pool);
-    return duct_x_slot_cap(pool);
-}
-
-struct duct_x_slot_pool *duct_slot_pool_of(const void *obj)
-{
-    auto h = duct_block_hdr(obj);
-    return duct_atomic_load(&s_slot_pools[duct_alloc_pool_id(h)], acquire);
-}
 
 /** @brief Lower the acquire hint to word @p w when it sat higher. */
 static void s_hint_lower(duct_block_pool_t *pool, uint32_t w)

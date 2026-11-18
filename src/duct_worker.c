@@ -239,6 +239,7 @@ typedef struct duct_deferred_queue {
     uint64_t _Atomic    mask[DUCT_BITMAP_WORDS];
 } duct_deferred_queue_t;
 
+#if !DUCT_EVENTS_MODEL_IOCP
 /** @brief Payload byte floor under which a batch entry copies its source
  *  instead of pinning it: the share/pin RMW pair costs more than staging a
  *  sub-MTU frame, and control datagrams live under it (§2.2's knob).
@@ -246,6 +247,7 @@ typedef struct duct_deferred_queue {
  *  nothing at all or ride a share the send's own release path already
  *  owed. */
 static constexpr uint32_t duct_tx_span_threshold = 128u;
+#endif
 
 /** @brief One @c x_udp_shared send this drain pass has staged but not yet
  *  handed to the kernel: the payload as one @c duct_span_t reference
@@ -567,6 +569,7 @@ typedef struct {
                                           *  @c ct, set ahead of the unseal. */
 } redirect_t;
 
+#if !DUCT_EVENTS_MODEL_IOCP
 /** @brief Build the payload span of one @c x_udp_shared batch entry
  *  (§2.4: @c { hdr[16], duct_span_t }): a recognized engine substrate rides
  *  a pinned reference, everything else copies into a block the entry owns.
@@ -673,6 +676,7 @@ static bool s_dgram_span_take(duct_response_t *out, redirect_t *redirect,
     *out_span = duct_span_of_ptr(copy, 0u, len);
     return true;
 }
+#endif
 
 /** @brief A span's payload view: its bytes where they live. */
 static duct_view_u8 s_dgram_span_body(const duct_span_t *span)
@@ -707,12 +711,10 @@ static void s_dgram_span_drop(duct_span_t *span)
         return;
     }
     if (duct_span_kind_of(span) == span_ptr) {
-        auto h = duct_block_hdr(duct_span_base(span));
-        if (!h->back && !h->secret) {
-            auto pool = duct_slot_pool_of(duct_span_base(span));
-            assert(pool);
-            duct_io_rx_slot_drop((duct_x_slot_pool_t *)pool,
-                                 duct_alloc_slot_index(h), true);
+        auto base = duct_span_base(span);
+        if (duct_x_slot_obj_is(base)) {
+            auto pool = duct_x_slot_pool_of(base);
+            duct_io_rx_slot_drop(pool, duct_x_slot_index(pool, base), true);
             return;
         }
     }
@@ -941,8 +943,11 @@ static inline void s_rx_ack(duct_conn_t *conn, size_t len, uint32_t end_off)
  */
 static void s_codec_compact(duct_wire_codec_t *codec)
 {
-    /* One holder reads 1: the codec alone. A pin beside the codec makes it 2 and up. */
-    if (duct_atomic_load(&duct_block_hdr(codec->ct_buf)->holders, relaxed) > 1u
+    /* The codec alone reads 0 or 1 on the chunk's record — the lane's own
+     * count. A pin beside the codec makes it 2 and up. */
+    auto buf = duct_at(codec->ct_buf);
+    auto pool = duct_x_slot_pool_of(buf);
+    if (duct_x_slot_hold_count(pool, duct_x_slot_index(pool, buf)) > 1u
         || codec->ct_ack_off != codec->ct_parse_off)
         return;
     size_t tail = codec->ct_len - codec->ct_parse_off;
@@ -965,17 +970,22 @@ static duct_wire_codec_t *s_ct_codec_of(duct_conn_t *conn, const void *block)
 
 /** @brief Drop one pin on cleartext buffer @p block, compacting the buffer where
  *  @p conn's codec still owns it.
- *  The last holder frees the block, which can be this pin once the codec is gone. */
+ *  The block is the codec's cleartext chunk — its pin drops on the chunk's
+ *  record, the last pin releasing the chunk once the codec is gone too — or
+ *  the record's decrypt block, a heap share. */
 static void s_ct_pin_release(duct_conn_t *conn, void *block)
 {
-    auto codec = s_ct_codec_of(conn, block);
-    auto h = duct_block_hdr(block);
-    duct_alloc_touched_set(h, codec
-        ? duct_alloc_touched_encode(codec->ct_len, duct_byte_len(codec->ct_buf))
-        : duct_alloc_touched_encode(duct_slot_byte_len(block), duct_slot_byte_len(block)));
-    duct_del(block);
-    if (codec)
-        s_codec_compact(codec);
+    if (duct_x_slot_obj_is(block)) {
+        auto pool = duct_x_slot_pool_of(block);
+        uint32_t idx = duct_x_slot_index(pool, block);
+        if (duct_x_slot_unpin(pool, idx))
+            duct_x_slot_release(pool, idx);
+    } else {
+        duct_del(block);
+    }
+    auto sc = conn ? duct_conn_sealed_ctx(conn) : nullptr;
+    if (sc && sc->codec)
+        s_codec_compact(sc->codec);
 }
 
 /** @brief One frame's ack, ring or sealed.
@@ -1027,9 +1037,12 @@ static void s_frame_hold_pin(duct_conn_t *conn, duct_frame_ack_t ack)
     case ack_ring:
         duct_discard duct_atomic_fetch(add, &duct_conn_rx_olb(conn)->held_frames, 1u, release);
         break;
-    case ack_ct:
-        duct_discard duct_share(ack.ct.data);
+    case ack_ct: {
+        /* the cleartext chunk's pin: the record's hold count, no header */
+        auto pool = duct_x_slot_pool_of(ack.ct.data);
+        duct_x_slot_pin(pool, duct_x_slot_index(pool, ack.ct.data));
         break;
+    }
     case ack_owned:
     case ack_slot:
         break;
@@ -2237,7 +2250,7 @@ static duct_exec_rc_t s_dispatch_one_frame(duct_worker_t *w, duct_conn_t *conn,
 static void *s_unseal_reserve(duct_unseal_ctx_t *self, size_t *out_cap)
 {
     auto codec = self->codec;
-    *out_cap = duct_byte_len(codec->ct_buf) - codec->ct_len;
+    *out_cap = duct_x_slot_obj_cap(duct_at(codec->ct_buf)) - codec->ct_len;
     return duct_at(codec->ct_buf) + codec->ct_len;
 }
 
@@ -2254,7 +2267,7 @@ static void *s_unseal_reserve(duct_unseal_ctx_t *self, size_t *out_cap)
 static bool s_unseal_commit(duct_unseal_ctx_t *self, size_t len)
 {
     auto codec = self->codec;
-    size_t room = duct_byte_len(codec->ct_buf) - codec->ct_len;
+    size_t room = duct_x_slot_obj_cap(duct_at(codec->ct_buf)) - codec->ct_len;
     duct_do_if(len > room, return false);
     codec->ct_len += (uint32_t)len;
     return true;
@@ -2790,8 +2803,8 @@ static duct_x_slot_pool_t *s_ct_chunks(duct_worker_t *w)
         bool ok = duct_x_slot_pool_init(&w->ct_chunks, duct_wire_ct_chunks,
                                         duct_x_slot_span_bytes(0u, 0u,
                                                                (uint32_t)duct_wire_ct_buf_max),
-                                        0u, 0u, 8u, (duct_x_slot_hooks_t){})
-               && duct_x_slot_pool_engage(&w->ct_chunks);
+                                        0u, 0u, 8u, (duct_x_slot_hooks_t){});
+        duct_x_slot_pool_engage(&w->ct_chunks);
         duct_do_if(!ok, duct_x_slot_pool_free(&w->ct_chunks); return nullptr);
         w->ct_chunks_live = true;
     }
@@ -3014,7 +3027,7 @@ static duct_exec_rc_t s_dispatch_sealed_frame(duct_worker_t *w, duct_conn_t *con
     }
     if (!sc->head_unsealed) {
         auto vt = codec->engine->vtbl;
-        if (duct_byte_len(codec->ct_buf) - codec->ct_len < vt->pdu_ct_max)
+        if (duct_x_slot_obj_cap(duct_at(codec->ct_buf)) - codec->ct_len < vt->pdu_ct_max)
             return exec_defer;
         if (codec->engine_park_len
             && duct_conn_park_cap - codec->engine_park_len < s_hs_need(conn, codec)
@@ -4753,7 +4766,7 @@ static alias_t s_rx_alias(const duct_olb_rx_t *rx, const duct_wire_codec_t *code
     if (delta >= 0 && (size_t)delta < rx->h.buf_size)
         return alias_ring;
     delta = codec && codec->ct_buf ? (const uint8_t *)p - duct_at(codec->ct_buf) : -1;
-    return delta >= 0 && (size_t)delta < duct_byte_len(codec->ct_buf) ? alias_ct : alias_none;
+    return delta >= 0 && (size_t)delta < duct_x_slot_obj_cap(duct_at(codec->ct_buf)) ? alias_ct : alias_none;
 }
 
 /** @brief Backpressure-hit response save, as a retry_frame node of @p conn's
@@ -4841,10 +4854,14 @@ static bool s_retry_frame_save(duct_worker_t *w, duct_session_t *s, duct_conn_id
         node->frame.ack_len = carry ? (uint32_t)ack->ring.task_len : 0u;
         node->frame.ack_end = carry ? ack->ring.end_off : 0u;
         break;
-    case alias_ct:
-        node->frame.ct_block = duct_share(codec->ct_buf);
+    case alias_ct: {
+        auto buf = duct_at(codec->ct_buf);
+        auto pool = duct_x_slot_pool_of(buf);
+        duct_x_slot_pin(pool, duct_x_slot_index(pool, buf));
+        node->frame.ct_block = buf;
         node->frame.ack_len = carry ? (uint32_t)ack->ct.size : 0u;
         break;
+    }
     case alias_none:
         break;
     }

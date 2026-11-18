@@ -199,33 +199,21 @@ static int t_slot_pool(void)
     duct_x_slot_pool_t xpool;
     CHECK(duct_x_slot_pool_init(&xpool, 16u, 256u, 0u, 0u, 16u, (duct_x_slot_hooks_t){}),
           "a slot pool comes up");
-    unsigned id = duct_slot_pool_register(&xpool);
-    CHECK(id != alloc_pool_none, "a pool id comes");
+    duct_x_slot_pool_engage(&xpool);
     uint32_t idx = duct_x_slot_acquire(&xpool);
     CHECK(idx != treiber_empty, "a slot comes");
     uint8_t *obj_at = duct_x_slot_obj(&xpool, idx);
-    duct_slot_stamp(obj_at, id, idx);
-    duct_ptr_t(uint8_t) one = (duct_ptr_t(uint8_t))obj_at;
-    CHECK(duct_byte_len(one) == 248u && duct_len(one) == 248u,
-          "the slot object answers its capacity behind the header");
-    auto hdr = duct_block_hdr(duct_at(one));
-    CHECK(hdr->back == 0u && !hdr->secret && duct_alloc_pool_id(hdr) == id
-          && duct_alloc_slot_index(hdr) == idx,
-          "the stamp names the pool and the slot with back zero");
-    duct_ptr_t(uint8_t) two = duct_try_share(one);
-    CHECK(two && duct_atomic_load(&hdr->holders, relaxed) == 2u, "a stamped slot takes a claim");
-    duct_del(one);
-    CHECK(duct_atomic_load(&hdr->holders, relaxed) == 1u, "a drop that leaves a holder holds the slot");
+    CHECK(duct_x_slot_obj_is(obj_at), "the owner word reads as a pool's");
+    CHECK(duct_x_slot_pool_of(obj_at) == &xpool, "the word names its own pool");
+    CHECK(duct_x_slot_obj_cap(obj_at) == duct_x_slot_cap(&xpool),
+          "the object answers its capacity through the word");
+    CHECK(duct_x_slot_index(&xpool, obj_at) == idx, "the slot reads back by address");
     uint32_t other = duct_x_slot_acquire(&xpool);
-    CHECK(other != idx, "a held slot stays out of its pool");
-    duct_x_slot_release(&xpool, other);
-    duct_del(two);
-    CHECK(duct_x_slot_acquire(&xpool) == idx, "the last holder returns the slot to its pool");
+    CHECK(other != idx, "an out slot stays out of its pool");
+    duct_x_slot_release_obj(obj_at);
+    CHECK(duct_x_slot_acquire(&xpool) == idx, "the object return puts the slot back");
     duct_x_slot_release(&xpool, idx);
-    duct_slot_pool_unregister(id);
-    unsigned again = duct_slot_pool_register(&xpool);
-    CHECK(again != alloc_pool_none, "an unregistered id returns to the space");
-    duct_slot_pool_unregister(again);
+    duct_x_slot_release(&xpool, other);
     duct_x_slot_pool_free(&xpool);
     return 0;
 }
