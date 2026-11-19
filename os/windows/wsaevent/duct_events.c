@@ -119,10 +119,10 @@ bool duct_events_dgram_shared_rio_capable(void)
 
 duct_events_env_t *duct_events_init(void)
 {
-    auto env = duct_new(duct_events_env_t);
+    duct_auto_del auto env = duct_new(duct_events_env_t);
     duct_do_if(!env, return nullptr);
     auto wake = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-    duct_do_if(!wake, duct_del(env); return nullptr);
+    duct_do_if(!wake, return nullptr);
     env->handles[0] = wake;
     env->slots[0] = (duct_events_slot){ .fd = duct_sock_bad, .kind = io_tag_wake, .handle = wake };
     env->n_entries = 1u;
@@ -153,7 +153,7 @@ duct_events_env_t *duct_events_init(void)
                 WSACloseEvent(rio_ev);
         }
     }
-    return env;
+    return duct_move(env);
 }
 
 void (*duct_events_cancel_io_of(duct_events_env_t *env))(duct_sock_t fd)
@@ -383,20 +383,19 @@ fail:
  */
 static bool s_listener_create_rio(duct_events_env_t *env, duct_listener_t *listener)
 {
-    auto ctx = duct_new(listener_ctx_t);
+    duct_auto_del auto ctx = duct_new(listener_ctx_t);
     duct_do_if(!ctx, return false);
     ctx->listener = listener;
     bool ok = s_rio_dgram_init(env, ctx);
-    duct_do_if(!ok, duct_del(ctx); return false);
+    duct_do_if(!ok, return false);
     bool posted = duct_rio_rx_prime(s_rio,ctx->rio_rx);
     duct_do_if(!posted,
         duct_rio_rx_destroy(s_rio,ctx->rio_rx);
         duct_events_dgram_tx_pool_free(listener);
-        duct_del(ctx);
         return false
     );
     ctx->next = env->rio_listeners;
-    env->rio_listeners = ctx;
+    env->rio_listeners = duct_move(ctx);
     return true;
 }
 
@@ -406,13 +405,13 @@ static bool s_probe_park_watch(duct_events_env_t *env, duct_sock_t fd, void *tag
     duct_do_if(!armed && env->n_entries >= events_max_handles, return false);
     auto ev = armed ? env->probe_event : WSACreateEvent();
     duct_do_if(!armed && ev == WSA_INVALID_EVENT, return false);
-    auto park = duct_new(probe_park_t);
+    duct_auto_del auto park = duct_new(probe_park_t);
     duct_do_if(!park, goto fail);
     *park = (probe_park_t){ .fd = fd, .pre_conn = (duct_pre_conn_t *)tag_ptr };
     int rc = WSAEventSelect(fd, ev, FD_READ | FD_CLOSE);
-    duct_do_if(rc == SOCKET_ERROR, duct_del(park); goto fail);
+    duct_do_if(rc == SOCKET_ERROR, goto fail);
     park->next = env->probe_parks;
-    env->probe_parks = park;
+    env->probe_parks = duct_move(park);
     duct_do_if(armed, return true);
     env->probe_event = ev;
     env->probe_slot = env->n_entries++;

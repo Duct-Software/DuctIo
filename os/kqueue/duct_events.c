@@ -259,17 +259,17 @@ static inline duct_io_ev_flags_t s_kev_flags(const struct kevent *kev,
 
 duct_events_env_t *duct_events_init(void)
 {
-    auto env = duct_new(duct_events_env_t);
+    duct_auto_del auto env = duct_new(duct_events_env_t);
     duct_do_if(!env, return nullptr);
 
     env->cancel_io = nullptr;
     env->kq = kqueue();
-    duct_do_if(env->kq < 0, duct_del(env); return nullptr);
+    duct_do_if(env->kq < 0, return nullptr);
     /* kqueue() predates O_CLOEXEC and has no flags argument on any dialect;
      * an I/O thread's kqueue has no business surviving into a child image. */
     int cloexec_rc = fcntl(env->kq, F_SETFD, FD_CLOEXEC);
     duct_do_if(cloexec_rc < 0,
-               close(env->kq); duct_del(env); return nullptr);
+               close(env->kq); return nullptr);
 
     /* EV_CLEAR so a NOTE_TRIGGER self-disarms once delivered — the eventfd
      * analog, minus the read-to-drain that os/linux/epoll/ needs. */
@@ -281,8 +281,8 @@ duct_events_env_t *duct_events_init(void)
     do {
         rc = kevent(env->kq, &kev, 1, nullptr, 0, nullptr);
     } while (rc < 0 && errno == EINTR);
-    duct_do_if(rc < 0, duct_events_fini(env); return nullptr);
-    return env;
+    duct_do_if(rc < 0, close(env->kq); return nullptr);
+    return duct_move(env);
 }
 
 void (*duct_events_cancel_io_of(duct_events_env_t *env))(duct_sock_t fd)

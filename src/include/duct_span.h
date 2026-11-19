@@ -65,7 +65,8 @@ typedef struct duct_span {
                              *  header's bytes); [26:0] the span's byte
                              *  offset into its substrate — a mat-arena or
                              *  ring offset. */
-    uint32_t  len;         /**< [31] the dgram gso flag; [30:0] span bytes.
+    uint32_t  len;         /**< [31] the dgram gso flag; [30:27] settled
+                             *  fl_send_done delta (0..15); [26:0] span bytes.
                              *  The wire record's length is hdr_len + len. */
 } duct_span_t;
 
@@ -80,6 +81,11 @@ static constexpr uint32_t duct_span_hdr_mask = (uint32_t)31u << 27;
 
 /** @brief The dgram gso flag's bit in @c len. */
 static constexpr uint32_t duct_span_gso_bit = (uint32_t)1u << 31;
+
+/** @brief Shift and mask of @c len's settled @c fl_send_done delta field. */
+static constexpr uint32_t duct_span_done_shift = 27u;
+static constexpr uint32_t duct_span_done_max = 15u;
+static constexpr uint32_t duct_span_done_mask = (uint32_t)0xFu << duct_span_done_shift;
 
 /** @brief A span's substrate. */
 duct_nonnull(1) static inline duct_span_kind_t
@@ -106,7 +112,7 @@ duct_span_off(const duct_span_t *s)
 duct_nonnull(1) static inline uint32_t
 duct_span_len(const duct_span_t *s)
 {
-    return s->len & ~duct_span_gso_bit;
+    return s->len & ~(duct_span_gso_bit | duct_span_done_mask);
 }
 
 /** @brief Bytes of the inline wire header this span's descriptor carries. */
@@ -121,6 +127,21 @@ duct_nonnull(1) static inline bool
 duct_span_gso(const duct_span_t *s)
 {
     return (s->len & duct_span_gso_bit) != 0u;
+}
+
+/** @brief Settled @c fl_send_done delta carried in @p s (0..15). */
+duct_nonnull(1) static inline uint32_t
+duct_span_done_delta(const duct_span_t *s)
+{
+    return (s->len & duct_span_done_mask) >> duct_span_done_shift;
+}
+
+/** @brief Pack @p delta (0..15) of settled @c fl_send_done responses into @p s. */
+duct_nonnull(1) static inline void
+duct_span_done_set(duct_span_t *s, uint32_t delta)
+{
+    assert(delta <= duct_span_done_max);
+    s->len = (s->len & ~duct_span_done_mask) | (delta << duct_span_done_shift);
 }
 
 /** @brief The wire record's whole length: inline header plus span. */

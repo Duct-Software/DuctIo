@@ -1214,6 +1214,7 @@ target_compile_features(ductio_handler_dispatch_test PRIVATE c_std_23)
 target_compile_options(ductio_handler_dispatch_test PRIVATE
     -Wall -Wextra -Wenum-conversion -Wformat=2
 )
+duct_apply_lto(ductio_handler_dispatch_test)
 if(DUCT_ENABLE_RUNTIME_STATS)
     target_compile_definitions(ductio_handler_dispatch_test PRIVATE DUCT_RUNTIME_STATS=1)
 else()
@@ -1241,6 +1242,7 @@ target_compile_features(ductio_retry_drain_quota_test PRIVATE c_std_23)
 target_compile_options(ductio_retry_drain_quota_test PRIVATE
     -Wall -Wextra -Wenum-conversion -Wformat=2
 )
+duct_apply_lto(ductio_retry_drain_quota_test)
 if(DUCT_ENABLE_RUNTIME_STATS)
     target_compile_definitions(ductio_retry_drain_quota_test PRIVATE DUCT_RUNTIME_STATS=1)
 else()
@@ -1268,6 +1270,7 @@ target_compile_features(ductio_retry_frame_ordering_test PRIVATE c_std_23)
 target_compile_options(ductio_retry_frame_ordering_test PRIVATE
     -Wall -Wextra -Wenum-conversion -Wformat=2
 )
+duct_apply_lto(ductio_retry_frame_ordering_test)
 if(DUCT_ENABLE_RUNTIME_STATS)
     target_compile_definitions(ductio_retry_frame_ordering_test PRIVATE DUCT_RUNTIME_STATS=1)
 else()
@@ -1295,6 +1298,7 @@ target_compile_features(ductio_tx_hold_multi_leg_test PRIVATE c_std_23)
 target_compile_options(ductio_tx_hold_multi_leg_test PRIVATE
     -Wall -Wextra -Wenum-conversion -Wformat=2
 )
+duct_apply_lto(ductio_tx_hold_multi_leg_test)
 if(DUCT_ENABLE_RUNTIME_STATS)
     target_compile_definitions(ductio_tx_hold_multi_leg_test PRIVATE DUCT_RUNTIME_STATS=1)
 else()
@@ -1302,6 +1306,36 @@ else()
 endif()
 add_test(NAME tx_hold_multi_leg COMMAND ductio_tx_hold_multi_leg_test)
 set_tests_properties(tx_hold_multi_leg PROPERTIES TIMEOUT 10)
+
+# sealed_vnet_tx_test includes ../src/duct_worker.c directly too (same
+# reason and exclusion as handler_dispatch_test above).
+add_executable(ductio_sealed_vnet_tx_test
+    sealed_vnet_tx_test.c
+    tls_engine_null.c
+    ${DUCTIO_SRC_DISPATCH}
+    ${DUCTIO_SRC_OS}
+)
+duct_platform_configure(ductio_sealed_vnet_tx_test)
+if(DUCT_WITH_OPENSSL OR DUCT_WITH_NOISE)
+    target_link_libraries(ductio_sealed_vnet_tx_test PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+endif()
+target_include_directories(ductio_sealed_vnet_tx_test PRIVATE
+    "${PROJECT_SOURCE_DIR}/include"
+    "${DUCT_GENERATED_INCLUDE_DIR}"
+    ${DUCT_INTERNAL_INCLUDE_DIRS}
+)
+target_compile_features(ductio_sealed_vnet_tx_test PRIVATE c_std_23)
+target_compile_options(ductio_sealed_vnet_tx_test PRIVATE
+    -Wall -Wextra -Wenum-conversion -Wformat=2
+)
+duct_apply_lto(ductio_sealed_vnet_tx_test)
+if(DUCT_ENABLE_RUNTIME_STATS)
+    target_compile_definitions(ductio_sealed_vnet_tx_test PRIVATE DUCT_RUNTIME_STATS=1)
+else()
+    target_compile_definitions(ductio_sealed_vnet_tx_test PRIVATE DUCT_RUNTIME_STATS=0)
+endif()
+add_test(NAME sealed_vnet_tx COMMAND ductio_sealed_vnet_tx_test)
+set_tests_properties(sealed_vnet_tx PROPERTIES TIMEOUT 10)
 
 add_executable(ductio_pmtu_test pmtu_test.c)
 target_link_libraries(ductio_pmtu_test PRIVATE DuctIo::ductio)
@@ -1337,6 +1371,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     target_compile_options(ductio_vnet_train_test PRIVATE
         -Wall -Wextra -Wenum-conversion -Wformat=2 -UNDEBUG
     )
+    duct_apply_lto(ductio_vnet_train_test)
     if(DUCT_ENABLE_RUNTIME_STATS)
         target_compile_definitions(ductio_vnet_train_test PRIVATE DUCT_RUNTIME_STATS=1)
     else()
@@ -1373,6 +1408,7 @@ if(NOT WIN32)
         target_compile_options(ductio_${_io_test}_test PRIVATE
             -Wall -Wextra -Wenum-conversion -Wformat=2 -UNDEBUG
         )
+        duct_apply_lto(ductio_${_io_test}_test)
         if(DUCT_ENABLE_RUNTIME_STATS)
             target_compile_definitions(ductio_${_io_test}_test PRIVATE DUCT_RUNTIME_STATS=1)
         else()

@@ -279,7 +279,7 @@ duct_nonnull(1) static inline bool duct_str_endpoint_valid(const char *text)
  *  @p out holds 2 * @p size + 1 bytes.
  *  @return @p out.
  */
-duct_nonnull(1, 3) static inline char *
+duct_nonnull(1, 3) duct_zero_regs static inline char *
 duct_hex_encode(const uint8_t *in, size_t size, char *out)
 {
     static const char digits[] = "0123456789abcdef";
@@ -306,7 +306,7 @@ duct_hex_encode(const uint8_t *in, size_t size, char *out)
  *  @return @c rc_ok, or @c rc_invalid_arg for another count of digits or a character that is no
  *          digit.
  */
-duct_nonnull(2) static inline duct_result_t
+duct_nonnull(2) duct_zero_regs static inline duct_result_t
 duct_hex_decode_into(duct_view_cc text, void *out, size_t size)
 {
     auto digits = (const unsigned char *)text.data;

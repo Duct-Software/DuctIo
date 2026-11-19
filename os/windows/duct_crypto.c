@@ -6,7 +6,7 @@
 #include <bcrypt.h>
 #include <limits.h>
 
-bool duct_random_bytes(void *out, size_t n)
+duct_zero_regs bool duct_random_bytes(void *out, size_t n)
 {
     auto at = (uint8_t *)out;
     while (n != 0u) {

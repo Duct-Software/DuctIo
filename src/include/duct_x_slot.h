@@ -461,6 +461,16 @@ duct_nonnull(1) static inline bool duct_x_slot_unstall(duct_x_slot_pool_t *pool)
         && duct_atomic_exchange(&pool->stalled, false, acq_rel);
 }
 
+duct_nonnull(1) static inline void
+s_duct_x_slot_hold_inc(duct_x_slot_pool_t *pool, uint32_t idx)
+{
+    auto holders = &duct_at(pool->slots)[idx].holders;
+    if (duct_atomic_load(holders, relaxed))
+        duct_atomic_fetch(add, holders, 1u, relaxed);
+    else
+        duct_atomic_store(holders, 2u, relaxed);
+}
+
 /** @brief Take a claim on the taken slot @p idx, so that it outlives the lane's hold.
  *  @return false past the bound of the slot count less @c duct_dgram_rx_batch, which leaves the
  *          reader one read batch.
@@ -474,11 +484,7 @@ duct_x_slot_claim(duct_x_slot_pool_t *pool, uint32_t idx)
         duct_atomic_fetch(sub, &pool->claims, 1u, relaxed);
         return false;
     }
-    auto holders = &duct_at(pool->slots)[idx].holders;
-    if (duct_atomic_load(holders, relaxed))
-        duct_atomic_fetch(add, holders, 1u, relaxed);
-    else
-        duct_atomic_store(holders, 2u, relaxed);
+    s_duct_x_slot_hold_inc(pool, idx);
     return true;
 }
 
@@ -511,11 +517,7 @@ duct_x_slot_hold_count(const duct_x_slot_pool_t *pool, uint32_t idx)
 duct_nonnull(1) static inline void
 duct_x_slot_pin(duct_x_slot_pool_t *pool, uint32_t idx)
 {
-    auto holders = &duct_at(pool->slots)[idx].holders;
-    if (!duct_atomic_load(holders, relaxed))
-        duct_atomic_store(holders, 2u, relaxed);
-    else
-        duct_atomic_fetch(add, holders, 1u, relaxed);
+    s_duct_x_slot_hold_inc(pool, idx);
 }
 
 /** @brief Drop one pin of @ref duct_x_slot_pin.

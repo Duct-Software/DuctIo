@@ -61,87 +61,33 @@ typedef enum duct_olb_rx_result : uint8_t {
  *  of cache.
  */
 duct_olb_decl(duct_olb_rx,
-    size_t _Atomic recv_threshold; /**< Free bytes the io thread wants
-                                     *  before it tries to compact / expand
-                                     *  the buffer. Set once at wire bind.
-                                     *  Io-thread only. */
+    duct_cacheline_struct(
+        uint64_t _Atomic resume_at;
 
-    size_t      recv_hint;   /**< Minimum bytes needed to finish the
-                               *  frame the wire is midway through parsing,
-                               *  or 0 if the wire has no such requirement.
-                               *  Io-thread only. */
+        uint64_t _Atomic roam_at;
 
-    uint32_t    posted_off;  /**< How far into the buffer the io thread has
-                               *  already posted frames to the worker.
-                               *  Bytes before this offset are never
-                               *  re-parsed. Resets to 0 on compaction and
-                               *  when a new pass opens. Io-thread only. */
+        size_t _Atomic recv_threshold;
 
-    uint32_t    read_unit;   /**< Largest span one read into this buffer needs,
-                               *  bytes: the record prefix plus whichever is
-                               *  bigger, the wire's own frame bound or the size
-                               *  the socket coalesces to. Fixed at wire bind,
-                               *  which is where the kernel's answer about
-                               *  coalescing is known. Zero until then, and for
-                               *  the whole life of a conn whose protocol
-                               *  carries no wire, which leaves its reader
-                               *  demanding the whole buffer. */
+        uint32_t    posted_off,
+                    read_unit,
+                    group_off,
+                    group_seg,
+                    group_bytes,
+                    pass_end;
+    );
 
-    uint32_t    group_off,   /**< Ring offset of a coalesced read's first
-                               *  undescribed byte. Those bytes are staged with
-                               *  no record prefix, so the parse loop cuts them
-                               *  into frames itself. */
+    duct_cacheline_struct(
+        uint64_t    pass_base;
+        uint32_t    pass_free,
+                    skip;
+        size_t      recv_hint;
+        duct_x_sock_rx_fields
+    );
 
-                group_seg,   /**< Segment size the coalesced read was cut at,
-                               *  bytes. Every datagram in that tail is this
-                               *  long, the last free to be shorter. */
-
-                group_bytes; /**< Bytes of that tail still undescribed. Zero
-                               *  means no coalesced tail is pending, and gates
-                               *  every read of @c group_off and
-                               *  @c group_seg. */
-
-    uint64_t    pass_base;   /**< Ack total at the start of the oldest live
-                               *  pass. Ack totals past it map onto buffer
-                               *  offsets from 0 while no held frame breaks
-                               *  their order, each short of its offset by
-                               *  the bytes @c skip counts before it.
-                               *  Io-thread only. */
-
-    uint32_t    pass_end,    /**< End of the older pass while a second one
-                               *  runs from offset 0; 0 when one pass is
-                               *  live. Io-thread only. */
-
-                pass_free;   /**< Bytes of the older pass the worker has
-                               *  released, the bound of the second pass.
-                               *  Meaningful only while @c pass_end is
-                               *  nonzero. Io-thread only. */
-
-    uint32_t    skip;        /**< Bytes a discard counted as posted without
-                               *  handing them to the worker, since the last
-                               *  compaction. Every ack total the buffer
-                               *  computes leaves them out. Io-thread only. */
-
-    duct_x_sock_rx_fields
-
-    /** @brief The remote address this ring's socket names as its peer, the
-     *  address a recvfrom reports, @c family 0 for a conn that names none.
-     *  Io writes it at the conn's admission, accept and dial alike, before
-     *  the conn is live; the worker reads it into every engine context it
-     *  builds. A roaming leg's re-point is the io thread's and stays
-     *  unstored, the address of the admission trailing there. A shared leg
-     *  holds no ring at all, its address living in the shared ctx. */
     duct_peer_t peer;
 #if DUCT_RUNTIME_STATS
-    uint64_t    memmove_compacts, /**< Number of compactions that
-                                    *  actually moved bytes, because some
-                                    *  unparsed tail was still in the
-                                    *  buffer. */
-
-                early_compacts;   /**< Number of compactions that ran
-                                    * opportunistically, while free
-                                    * space was low but not yet
-                                    * exhausted. */
+    uint64_t    memmove_compacts,
+                early_compacts;
 #endif
     duct_cacheline_struct(
         /** @brief Total bytes the worker has fully consumed.
@@ -167,31 +113,7 @@ duct_olb_decl(duct_olb_rx,
          */
         uint8_t _Atomic suspended;
 
-        /** @brief Ack total at which a latched read resumes; 0 while
-         *  unarmed. Io's single-writer value latch: the io thread stores the
-         *  @ref duct_olb_rx_resume_total target (release) ahead of a
-         *  @c seq_cst fence and re-checks @c acked — a target the worker
-         *  already passed disarms at once (0 again), so an armed word always
-         *  holds a target strictly past @c acked. The worker, on each ack
-         *  shift @c prev_acked → @c new_acked, stores @c acked (release),
-         *  fences, loads this word and posts @c fl_req_rx_resume strictly on
-         *  the crossing edge @c prev_acked < R ≤ @c new_acked — exactly one
-         *  post per latch, no bit, no clear, no RMW on either side. Io
-         *  disarms on the wake (plain 0 store) before re-driving. The gate
-         *  both sides derive: stalled means @c acked < resume_at.
-         */
-        uint64_t _Atomic resume_at;
-
-        uint64_t _Atomic roam_at,   /**< Ack total past the datagram that
-                                      *  proposed the conn's candidate
-                                      *  address. Stored by the io thread
-                                      *  before it raises @c fl_conn_roaming,
-                                      *  read by the worker under that flag.
-                                      *  A rewind, a compaction or a pass
-                                      *  change leaves it naming that
-                                      *  datagram. */
-
-                         accept_at; /**< @c acked as of the latest frame the
+        uint64_t _Atomic accept_at; /**< @c acked as of the latest frame the
                                       *  protocol accepted with @c acked at or
                                       *  past @c roam_at. Stored by the worker
                                       *  before it posts @c fl_req_peer_roam. */

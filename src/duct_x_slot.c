@@ -172,13 +172,13 @@ bool duct_x_slot_pool_init(duct_x_slot_pool_t *pool, uint32_t n, uint32_t slot_b
              chunks = (n + per - 1u) / per;
     /* The links start on a cache line, so the allocation header that duct_len reads shares none with
      * the first links, the slots a LIFO list reuses first. */
-    auto slots = duct_new(duct_x_slot_t, n, duct_cacheline_size);
-    auto info = slots ? duct_new(duct_x_slot_chunk_t, chunks) : nullptr;
+    duct_auto_del auto slots = duct_new(duct_x_slot_t, n, duct_cacheline_size);
+    duct_auto_del auto info = slots ? duct_new(duct_x_slot_chunk_t, chunks) : nullptr;
     assert(!hooks.reserve || hooks.up);
     auto range = !info ? (duct_vm_handle_t){} : hooks.reserve ? duct_vm_reserve(bytes) : duct_vm_new(bytes);
-    duct_do_if(!range.base, duct_del(info); duct_del(slots); return false);
-    pool->slots = slots;
-    pool->chunks = info;
+    duct_do_if(!range.base, return false);
+    pool->slots = duct_move(slots);
+    pool->chunks = duct_move(info);
     pool->range = range;
     pool->hooks = hooks;
     pool->slot_bytes = slot_bytes;

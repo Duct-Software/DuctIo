@@ -126,6 +126,7 @@ typedef enum duct_conn_flags : uint16_t {
                                       *  datagrams for a conn that carries it.
                                       *  Cleared only by the next
                                       *  @ref duct_conn_acquire's state reset. */
+    /* Cross-thread sticky path/setup hints (never flipped per batch): */
     fl_conn_dgram_gro   = 1u << 5,
     fl_conn_gso_off     = 1u << 6,
     fl_conn_vnet_uso_tx = 1u << 7,

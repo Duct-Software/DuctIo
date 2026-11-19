@@ -263,9 +263,14 @@ static bool s_dirty_drop(duct_block_pool_t *pool, duct_sweep_cursor_t *cur, uint
             ++cur->dirty_word;
             continue;
         }
+        uint64_t avail = dirty & duct_atomic_load(&duct_at(pool->free_bits)[w], acquire);
+        if (!avail) {
+            ++cur->dirty_word;
+            continue;
+        }
         uint32_t best = UINT32_MAX;
         for (uint32_t b = 0u; b < block_run_drop; ++b)
-            if (dirty & 1ull << b
+            if (avail & 1ull << b
                 && (best == UINT32_MAX
                     || duct_at(pool->meta)[w * block_run_drop + b].touched
                        > duct_at(pool->meta)[w * block_run_drop + best].touched))
@@ -279,22 +284,8 @@ static bool s_dirty_drop(duct_block_pool_t *pool, duct_sweep_cursor_t *cur, uint
             if (grabbed)
                 break;
         }
-        if (!grabbed) {
-            if (!word
-                || duct_atomic_load(&duct_at(pool->run_bits)[w >> 6], acquire)
-                   & 1ull << (w & 63u)) {
-                ++cur->dirty_word;
-                continue;
-            }
-            uint64_t was = duct_atomic_fetch(and, &duct_at(pool->dirty_bits)[w], ~bit, relaxed);
-            if ((was & bit) && duct_at(pool->meta)[w * block_run_drop + best].touched) {
-                uint64_t pages = (uint64_t)duct_at(pool->meta)[w * block_run_drop + best].touched
-                                 * duct_page_size();
-                duct_atomic_fetch(sub, &pool->dirty_bytes, pages, relaxed);
-                duct_atomic_fetch(add, &pool->live_bytes, pages, relaxed);
-            }
+        if (!grabbed)
             continue;
-        }
         uint32_t idx = w * block_run_drop + best;
         auto m = &duct_at(pool->meta)[idx];
         duct_atomic_store(&m->state, blk_discarding, relaxed);
@@ -371,11 +362,11 @@ void duct_block_pool_shutdown(duct_block_pool_t *pool)
     uint32_t words = duct_blk_words(pool->n_blocks);
     for (uint32_t w = 0u; w < words; ++w) {
         uint64_t live = ~duct_atomic_load(&duct_at(pool->free_bits)[w], acquire) & duct_blk_word_mask(pool, w);
-        bool claimed = duct_atomic_load(&duct_at(pool->run_bits)[w >> 6], acquire)
-                       & 1ull << (w & 63u);
+        [[maybe_unused]] bool claimed = duct_atomic_load(&duct_at(pool->run_bits)[w >> 6], acquire)
+                                        & 1ull << (w & 63u);
         for (; live; live &= live - 1u) {
             uint32_t idx = (w << 6) + duct_ctz_ull(live);
-            duct_blk_state_t state = duct_atomic_load(&duct_at(pool->meta)[idx].state, acquire);
+            [[maybe_unused]] duct_blk_state_t state = duct_atomic_load(&duct_at(pool->meta)[idx].state, acquire);
             assert(state == blk_active || claimed || state == blk_uncommitted);
         }
     }

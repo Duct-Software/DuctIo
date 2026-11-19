@@ -757,8 +757,9 @@ duct_xsend_peers(int fd, const duct_dgram_out_t *msgs_in, unsigned n, unsigned *
  *  connected socket's ring.
  *
  *  @param out_sent records the kernel took, a prefix of @p n.
- *  @return @c rc_ok on every path; @c rc_drop for a first record too large
- *          for the path; @c rc_fatal for a socket to close.
+ *  @return @c rc_ok with @p out_sent up to @p n; @c rc_again on a retryable
+ *          code; @c rc_drop for a first record too large for the path;
+ *          @c rc_fatal for a socket to close.
  */
 duct_nonnull(2, 4) static inline duct_result_t
 duct_xsend_recs(int fd, const duct_tx_rec_t *recs, unsigned n, unsigned *out_sent)
@@ -794,10 +795,14 @@ duct_xsend_recs(int fd, const duct_tx_rec_t *recs, unsigned n, unsigned *out_sen
         return rc_ok;
     }
     if (!duct_x_send_retryable(errno)) {
+        if (errno == EMSGSIZE) {
+            duct_dbg_errf("EMSGSIZE, %zu bytes", duct_x_dgram_len_rec(&recs[0]));
+            return rc_drop;
+        }
         duct_dbg_errf("errno %d", errno);
         return rc_fatal;
     }
-    return rc_ok;
+    return rc_again;
 }
 
 /** @brief Fill up to @p n of @p bufs from @p fd, reporting each datagram's

@@ -79,7 +79,7 @@ capture([[maybe_unused]] void *ctx, [[maybe_unused]] const duct_peer_t *peer, du
 
 static duct_proto_t g_proto = { .cfg = { .preparse = capture, .preparse_mode = resolve_sync } };
 
-static void fill(uint8_t *bytes, uint8_t seed)
+static void fill(uint8_t bytes[static sent_len], uint8_t seed)
 {
     for (unsigned i = 0u; i < sent_len; ++i)
         bytes[i] = (uint8_t)(seed + i);

@@ -45,9 +45,9 @@ static bool pair_open(pair_t *p, bool compact)
     size_t n1 = 0u, n2 = 0u, pn = 0u;
     *p = (pair_t){};
     bool ok = hi && hr
-           && duct_noise_hs_write_msg1(hi, (duct_view_u8){}, m1, sizeof m1, &n1)
-           && duct_noise_hs_read_msg1(hr, (duct_view_u8){ m1, n1 }, learned, pay, sizeof pay, &pn)
-           && duct_noise_hs_write_msg2(hr, (duct_view_u8){}, m2, sizeof m2, &n2)
+           && duct_noise_hs_write_msg1(hi, (duct_view_u8){}, sizeof m1, m1, &n1)
+           && duct_noise_hs_read_msg1(hr, (duct_view_u8){ m1, n1 }, learned, sizeof pay, pay, &pn)
+           && duct_noise_hs_write_msg2(hr, (duct_view_u8){}, sizeof m2, m2, &n2)
            && duct_noise_hs_read_msg2(hi, (duct_view_u8){ m2, n2 })
            && duct_noise_hs_split(hi, &p->cli)
            && duct_noise_hs_split(hr, &p->srv);
@@ -70,7 +70,7 @@ static size_t seal_msg(duct_noise_transport_t *from, unsigned i, uint8_t *out, s
     uint8_t plain[24];
     for (unsigned k = 0u; k < sizeof plain; ++k)
         plain[k] = (uint8_t)(i * 13u + k);
-    return duct_noise_transport_seal(from, &(duct_view_u8){ plain, sizeof plain }, 1u, out, cap);
+    return duct_noise_transport_seal(from, &(duct_view_u8){ plain, sizeof plain }, 1u, cap, out);
 }
 
 /** @brief Check that @p sealed unseals on @p to as message @p i. */
@@ -80,8 +80,8 @@ static bool takes(duct_noise_transport_t *to, const uint8_t *sealed, size_t len,
     size_t n = 0u;
     for (unsigned k = 0u; k < sizeof want; ++k)
         want[k] = (uint8_t)(i * 13u + k);
-    return duct_noise_transport_unseal(to, (duct_view_u8){ (void *)sealed, len }, plain,
-                                       sizeof plain, &n)
+    return duct_noise_transport_unseal(to, (duct_view_u8){ (void *)sealed, len }, sizeof plain,
+                                       plain, &n)
         && n == sizeof want && memcmp(plain, want, n) == 0;
 }
 
@@ -90,8 +90,8 @@ static bool refuses(duct_noise_transport_t *to, const uint8_t *sealed, size_t le
 {
     uint8_t plain[64];
     size_t n = 0u;
-    return !duct_noise_transport_unseal(to, (duct_view_u8){ (void *)sealed, len }, plain,
-                                        sizeof plain, &n);
+    return !duct_noise_transport_unseal(to, (duct_view_u8){ (void *)sealed, len }, sizeof plain,
+                                        plain, &n);
 }
 
 static const char *sc_size(void)
@@ -115,9 +115,9 @@ static const char *sc_size(void)
     else if (b[4] == 0xDDu && b[5] == 0xCCu && b[6] == 0xBBu && b[7] == 0xAAu)
         err = "the full counter's high half rode the wire uncovered";
     uint8_t tiny[4 + duct_noise_tag_size];
-    if (!err && duct_noise_transport_seal(&compact.cli, nullptr, 0u, tiny, sizeof tiny - 1u))
+    if (!err && duct_noise_transport_seal(&compact.cli, nullptr, 0u, sizeof tiny - 1u, tiny))
         err = "a compact seal wrote into a buffer a byte short of its own size";
-    if (!err && !duct_noise_transport_seal(&compact.cli, nullptr, 0u, tiny, sizeof tiny))
+    if (!err && !duct_noise_transport_seal(&compact.cli, nullptr, 0u, sizeof tiny, tiny))
         err = "a compact empty message did not fit the size it reports";
     pair_close(&full);
     pair_close(&compact);

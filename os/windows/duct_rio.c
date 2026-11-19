@@ -37,12 +37,10 @@ RIO_EXTENSION_FUNCTION_TABLE *duct_rio_resolve(void)
     auto probe = WSASocketW(AF_INET, SOCK_DGRAM, IPPROTO_UDP, nullptr, 0,
                             WSA_FLAG_OVERLAPPED | WSA_FLAG_REGISTERED_IO);
     duct_do_if(probe == duct_sock_bad, return nullptr);
-    auto table = duct_new(RIO_EXTENSION_FUNCTION_TABLE);
+    duct_auto_del auto table = duct_new(RIO_EXTENSION_FUNCTION_TABLE);
     bool ok = table && duct_rio_load(probe, table);
     closesocket(probe);
-    if (!ok)
-        duct_del(table);
-    return ok ? table : nullptr;
+    return ok ? duct_move(table) : nullptr;
 #endif
 }
 

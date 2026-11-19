@@ -114,6 +114,56 @@ option(DUCT_WITH_NOISE
     "Build the Noise protocol engines (IKpsk2, XKpsk3) and tests"
     OFF)
 
+include(CheckCSourceCompiles)
+set(_duct_saved_required_flags "${CMAKE_REQUIRED_FLAGS}")
+set(CMAKE_REQUIRED_FLAGS "${_duct_saved_required_flags} -Werror=attributes")
+check_c_source_compiles("
+struct duct_ptr_counted_by_probe {
+    unsigned n;
+    char *p __attribute__((counted_by(n)));
+};
+int main(void) {
+    struct duct_ptr_counted_by_probe v = { 0u, (char *)0 };
+    return (int)v.n + (v.p != (char *)0);
+}
+" DUCT_HAVE_PTR_COUNTED_BY)
+set(CMAKE_REQUIRED_FLAGS "${_duct_saved_required_flags} -O2 -Wall -Wextra -Werror")
+check_c_source_compiles("
+#include <stdint.h>
+__attribute__((zero_call_used_regs(\"used\")))
+static uint64_t duct_zero_regs_probe(uint64_t a, uint64_t b) { return a ^ (b + 1u); }
+__attribute__((noinline, zero_call_used_regs(\"used\")))
+uint64_t duct_zero_regs_entry(uint64_t a, uint64_t b) { return duct_zero_regs_probe(a, b); }
+int main(void) { return (int)duct_zero_regs_entry(1u, 2u); }
+" DUCT_HAVE_ZERO_CALL_USED_REGS)
+set(CMAKE_REQUIRED_FLAGS "${_duct_saved_required_flags}")
+if(DUCT_HAVE_PTR_COUNTED_BY)
+    set(DUCT_PTR_COUNTED_BY 1)
+else()
+    set(DUCT_PTR_COUNTED_BY 0)
+endif()
+if(DUCT_HAVE_ZERO_CALL_USED_REGS)
+    set(DUCT_ZERO_CALL_USED_REGS 1)
+else()
+    set(DUCT_ZERO_CALL_USED_REGS 0)
+endif()
+
+include(CheckSymbolExists)
+set(CMAKE_REQUIRED_FLAGS "${_duct_saved_required_flags} -std=gnu2x")
+check_symbol_exists(memset_explicit "string.h" DUCT_HAVE_MEMSET_EXPLICIT)
+check_symbol_exists(explicit_bzero  "string.h" DUCT_HAVE_EXPLICIT_BZERO)
+set(CMAKE_REQUIRED_FLAGS "${_duct_saved_required_flags}")
+if(DUCT_HAVE_MEMSET_EXPLICIT)
+    set(DUCT_MEMSET_EXPLICIT 1)
+else()
+    set(DUCT_MEMSET_EXPLICIT 0)
+endif()
+if(DUCT_HAVE_EXPLICIT_BZERO)
+    set(DUCT_EXPLICIT_BZERO 1)
+else()
+    set(DUCT_EXPLICIT_BZERO 0)
+endif()
+
 set(DUCT_BUILD_CONFIG_HEADER "${CMAKE_CURRENT_BINARY_DIR}/include/duct_build_config.h")
 configure_file(
     "${CMAKE_CURRENT_SOURCE_DIR}/cmake/duct_build_config.h.in"

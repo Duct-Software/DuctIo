@@ -314,7 +314,7 @@ static const char *dl_codec(void)
         }
         for (unsigned i = 0u; i < 2u; ++i) {
             const uint8_t *dg = i ? db : da;
-            uint64_t mac = duct_sip_le64(dg + 2u, 8u);
+            uint64_t mac = duct_sip_le64(8u, dg + 2u);
             uint8_t on_wire[2] = { dg[0], dg[1] };
             duct_dgram_lead_cover(on_wire, dl_cover, mac);
             if (memcmp(on_wire, name, 2u) != 0

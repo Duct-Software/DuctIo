@@ -178,7 +178,7 @@ static void pair_close(pair_t *p)
 }
 
 static duct_result_t deliver(const duct_seal_engine_vtbl_t *vt, duct_seal_engine_t *e, fake_t *f,
-                             const uint8_t *bytes, size_t n)
+                             size_t n, const uint8_t bytes[static n])
 {
     fake_reset(f);
     return vt->unseal(e, duct_view(duct_view_u8, (void *)bytes, n), &f->base);
@@ -224,7 +224,7 @@ static const char *flow_m1(flow_t *w)
 
 static const char *flow_m2(flow_t *w)
 {
-    if (deliver(w->pair.vt, w->pair.srv, &g_s, w->m1.bytes, w->m1.n) != rc_ok)
+    if (deliver(w->pair.vt, w->pair.srv, &g_s, w->m1.n, w->m1.bytes) != rc_ok)
         return "the responder refused message 1";
     if (g_s.appends != 1u || g_s.ct_len != 0u)
         return "message 1 did not draw exactly one message 2 and no cleartext";
@@ -234,7 +234,7 @@ static const char *flow_m2(flow_t *w)
 
 static const char *flow_m3(flow_t *w)
 {
-    if (deliver(w->pair.vt, w->pair.cli, &g_c, w->m2.bytes, w->m2.n) != rc_ok)
+    if (deliver(w->pair.vt, w->pair.cli, &g_c, w->m2.n, w->m2.bytes) != rc_ok)
         return "the initiator refused message 2";
     if (g_c.appends != 1u || g_c.ct_len != 0u)
         return "message 2 did not draw exactly one message 3 and no cleartext";
@@ -244,7 +244,7 @@ static const char *flow_m3(flow_t *w)
 
 static const char *flow_end(flow_t *w)
 {
-    if (deliver(w->pair.vt, w->pair.srv, &g_s, w->m3.bytes, w->m3.n) != rc_ok)
+    if (deliver(w->pair.vt, w->pair.srv, &g_s, w->m3.n, w->m3.bytes) != rc_ok)
         return "the responder refused message 3";
     return g_s.appends == 0u && g_s.ct_len == 0u ? nullptr : "message 3 drew bytes or cleartext";
 }
@@ -275,7 +275,7 @@ static const char *carry(const duct_seal_engine_vtbl_t *vt, duct_seal_engine_t *
         return "seal_size answered an unusable byte count";
     static uint8_t sealed[4096];
     vt->seal(from, &((duct_view_u8){ (void *)text, n }), 1u, sealed);
-    if (deliver(vt, to, f, sealed, need) != rc_ok)
+    if (deliver(vt, to, f, need, sealed) != rc_ok)
         return "a sealed message was refused";
     return f->ct_len == n && memcmp(f->ct, text, n) == 0 ? nullptr : "a sealed message did not round-trip";
 }
@@ -333,7 +333,7 @@ static const char *sc_hello(const duct_seal_engine_vtbl_t *vt)
         return "the setup did not open";
     s.hello_good = false;
     const char *err = flow_to(&w, vt, &s, 0u);
-    if (!err && deliver(vt, w.pair.srv, &g_s, w.m1.bytes, w.m1.n) != rc_invalid_arg)
+    if (!err && deliver(vt, w.pair.srv, &g_s, w.m1.n, w.m1.bytes) != rc_invalid_arg)
         err = "a hello that hello_ok refused was answered";
     if (!err && (g_s.appends != 0u || s.hello_asked != 1u || s.verify_asked != 0u))
         err = "a refused hello drew bytes or reached the peer policy";
@@ -349,7 +349,7 @@ static const char *sc_peer(const duct_seal_engine_vtbl_t *vt)
         return "the setup did not open";
     const char *err = flow_to(&w, vt, &s, 2u);
     s.peer_good = false;
-    if (!err && deliver(vt, w.pair.srv, &g_s, w.m3.bytes, w.m3.n) != rc_invalid_arg)
+    if (!err && deliver(vt, w.pair.srv, &g_s, w.m3.n, w.m3.bytes) != rc_invalid_arg)
         err = "a peer that verify_peer refused was taken";
     if (!err && (s.psk_asked != 0u || vt->peer_identity(w.pair.srv).size != 0u))
         err = "a refused peer reached the password lookup or was named";
@@ -370,7 +370,7 @@ static const char *sc_password(const duct_seal_engine_vtbl_t *vt)
         return "the setup did not open";
     s.cli.psk[0] ^= 0x01u;
     const char *err = flow_to(&w, vt, &s, 2u);
-    if (!err && deliver(vt, w.pair.srv, &g_s, w.m3.bytes, w.m3.n) != rc_invalid_arg)
+    if (!err && deliver(vt, w.pair.srv, &g_s, w.m3.n, w.m3.bytes) != rc_invalid_arg)
         err = "a message 3 made under another password was taken";
     if (!err && (s.psk_asked != 1u || vt->peer_identity(w.pair.srv).size != 0u))
         err = "a wrong password named the peer or skipped the lookup";
@@ -385,7 +385,7 @@ static const char *bent(const duct_seal_engine_vtbl_t *vt, duct_seal_engine_t *t
     msg_t bad = *msg;
     for (size_t at = vt->pdu_hdr_size; at < msg->n; ++at) {
         bad.bytes[at] ^= 0x01u;
-        if (deliver(vt, to, f, bad.bytes, bad.n) == rc_ok)
+        if (deliver(vt, to, f, bad.n, bad.bytes) == rc_ok)
             return "a message with one bit changed was taken";
         bad.bytes[at] ^= 0x01u;
     }
@@ -448,12 +448,12 @@ static const char *sc_reorder(const duct_seal_engine_vtbl_t *vt)
         err = "seal_size answered an unusable byte count";
     if (!err) {
         vt->seal(w.pair.cli, &((duct_view_u8){ (void *)text, n }), 1u, sealed);
-        if (deliver(vt, w.pair.srv, &g_s, sealed, need) != rc_invalid_arg || g_s.ct_len != 0u)
+        if (deliver(vt, w.pair.srv, &g_s, need, sealed) != rc_invalid_arg || g_s.ct_len != 0u)
             err = "a data PDU ahead of message 3 was taken";
     }
     if (!err)
         err = flow_end(&w);
-    if (!err && (deliver(vt, w.pair.srv, &g_s, sealed, need) != rc_ok || g_s.ct_len != n))
+    if (!err && (deliver(vt, w.pair.srv, &g_s, need, sealed) != rc_ok || g_s.ct_len != n))
         err = "the data PDU was refused once message 3 had read";
     pair_close(&w.pair);
     return err;
@@ -468,7 +468,7 @@ static const char *sc_repeat(const duct_seal_engine_vtbl_t *vt)
         return "the setup did not open";
     const char *err = flow_to(&w, vt, &s, 1u);
     for (unsigned i = 0u; !err && i < k_tries + 2u; ++i) {
-        duct_result_t rc = deliver(vt, w.pair.srv, &g_s, w.m1.bytes, w.m1.n);
+        duct_result_t rc = deliver(vt, w.pair.srv, &g_s, w.m1.n, w.m1.bytes);
         if (!dgram) {
             if (rc != rc_invalid_arg)
                 err = "a stream recognised a repeat of message 1";
@@ -484,35 +484,35 @@ static const char *sc_repeat(const duct_seal_engine_vtbl_t *vt)
     if (!err)
         err = flow_m3(&w);
     for (unsigned i = 0u; !err && dgram && i < k_tries + 2u; ++i) {
-        duct_result_t rc = deliver(vt, w.pair.cli, &g_c, w.m2.bytes, w.m2.n);
+        duct_result_t rc = deliver(vt, w.pair.cli, &g_c, w.m2.n, w.m2.bytes);
         bool resent = i < k_tries;
         if (rc != rc_ok || g_c.ct_len != 0u || g_c.appends != (resent ? 1u : 0u) || (resent && !same(&w.m3, &g_c)))
             err = resent ? "a repeat of message 2 did not draw message 3 again"
                          : "repeats of message 2 were answered past the cap";
     }
-    if (!err && !dgram && deliver(vt, w.pair.cli, &g_c, w.m2.bytes, w.m2.n) == rc_ok)
+    if (!err && !dgram && deliver(vt, w.pair.cli, &g_c, w.m2.n, w.m2.bytes) == rc_ok)
         err = "a stream initiator took message 2 twice";
     if (!err)
         err = flow_end(&w);
     if (!err && dgram) {
-        if (deliver(vt, w.pair.srv, &g_s, w.m3.bytes, w.m3.n) != rc_ok || g_s.appends != 0u || g_s.ct_len != 0u)
+        if (deliver(vt, w.pair.srv, &g_s, w.m3.n, w.m3.bytes) != rc_ok || g_s.appends != 0u || g_s.ct_len != 0u)
             err = "a repeat of message 3 after the end was not taken without a word";
-        else if (deliver(vt, w.pair.srv, &g_s, w.m1.bytes, w.m1.n) != rc_ok || g_s.appends != 0u)
+        else if (deliver(vt, w.pair.srv, &g_s, w.m1.n, w.m1.bytes) != rc_ok || g_s.appends != 0u)
             err = "a repeat of message 1 after the end was not taken without a word";
         else {
             msg_t bad = w.m1;
             bad.bytes[bad.n - 1u] ^= 0x01u;
-            if (deliver(vt, w.pair.srv, &g_s, bad.bytes, bad.n) == rc_ok)
+            if (deliver(vt, w.pair.srv, &g_s, bad.n, bad.bytes) == rc_ok)
                 err = "a forged copy of message 1 passed for a repeat";
         }
     }
     if (!err && dgram) {
         err = carry(vt, w.pair.cli, w.pair.srv, &g_s, "the first authentic PDU");
-        if (!err && deliver(vt, w.pair.srv, &g_s, w.m3.bytes, w.m3.n) == rc_ok)
+        if (!err && deliver(vt, w.pair.srv, &g_s, w.m3.n, w.m3.bytes) == rc_ok)
             err = "a repeat of message 3 was taken after the peer's first authentic PDU";
         if (!err)
             err = carry(vt, w.pair.srv, w.pair.cli, &g_c, "the responder's first");
-        if (!err && deliver(vt, w.pair.cli, &g_c, w.m2.bytes, w.m2.n) == rc_ok)
+        if (!err && deliver(vt, w.pair.cli, &g_c, w.m2.n, w.m2.bytes) == rc_ok)
             err = "a repeat of message 2 was taken after the peer's first authentic PDU";
     }
     pair_close(&w.pair);
@@ -538,11 +538,11 @@ static const char *rekey_after(const duct_seal_engine_vtbl_t *vt, bool settled)
             err = "the initiator did not offer a rekey";
         offer = take(&g_c);
     }
-    if (!err && (deliver(vt, w.pair.srv, &g_s, offer.bytes, offer.n) != rc_ok || g_s.appends != 1u))
+    if (!err && (deliver(vt, w.pair.srv, &g_s, offer.n, offer.bytes) != rc_ok || g_s.appends != 1u))
         err = "the responder did not answer the rekey offer";
     if (!err) {
         answer = take(&g_s);
-        if (deliver(vt, w.pair.cli, &g_c, answer.bytes, answer.n) != rc_ok)
+        if (deliver(vt, w.pair.cli, &g_c, answer.n, answer.bytes) != rc_ok)
             err = "the initiator did not take the answer";
     }
     duct_view_u8 id = vt->peer_identity(w.pair.srv);
@@ -670,7 +670,7 @@ static const char *lossy(const duct_seal_engine_vtbl_t *vt, unsigned lost, unsig
         err = flow_m2(&w);
     for (unsigned i = 0u; !err && lost == 2u && i < n; ++i) {
         if (!resent(&w, &w.m1)
-            || deliver(vt, w.pair.srv, &g_s, w.m1.bytes, w.m1.n) != rc_ok || g_s.appends != 1u || !same(&w.m2, &g_s))
+            || deliver(vt, w.pair.srv, &g_s, w.m1.n, w.m1.bytes) != rc_ok || g_s.appends != 1u || !same(&w.m2, &g_s))
             err = "a retry after a lost message 2 did not draw message 2 again";
     }
     if (!err)
@@ -724,7 +724,7 @@ static const char *sc_silent(const duct_seal_engine_vtbl_t *vt)
     for (unsigned i = 0u; !err && i < k_tries; ++i) {
         if (!resent(&w, &w.m3))
             err = "the initiator did not send message 3 again while the peer stayed silent";
-        else if (deliver(vt, w.pair.srv, &g_s, w.m3.bytes, w.m3.n) != rc_ok || g_s.appends != 0u || g_s.ct_len != 0u)
+        else if (deliver(vt, w.pair.srv, &g_s, w.m3.n, w.m3.bytes) != rc_ok || g_s.appends != 0u || g_s.ct_len != 0u)
             err = "a repeat of message 3 was not taken without a word";
     }
     if (!err) {
@@ -739,7 +739,7 @@ static const char *sc_silent(const duct_seal_engine_vtbl_t *vt)
             err = "the initiator did not offer a rekey";
         offer = take(&g_c);
     }
-    if (!err && (deliver(vt, w.pair.srv, &g_s, offer.bytes, offer.n) != rc_ok || g_s.appends != 1u))
+    if (!err && (deliver(vt, w.pair.srv, &g_s, offer.n, offer.bytes) != rc_ok || g_s.appends != 1u))
         err = "repeats of message 3 spent the responder's rekey budget";
     pair_close(&w.pair);
     return err;

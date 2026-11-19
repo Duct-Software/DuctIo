@@ -191,15 +191,15 @@ static const char *so_peer(duct_sock_t lfd, const so_case_t *c,
     hs = duct_noise_hs_create_for(pattern, srv_kp, nullptr, psk, false, (duct_view_u8){});
     if (!hs) { err = "responder handshake create failed"; goto done; }
     ok = pattern == noise_pattern_xkpsk3
-        ? duct_noise_hs_read_msg1_xk(hs, (duct_view_u8){ buf, len }, offer, sizeof offer, &offer_len)
-        : duct_noise_hs_read_msg1(hs, (duct_view_u8){ buf, len }, learned, offer, sizeof offer, &offer_len);
+        ? duct_noise_hs_read_msg1_xk(hs, (duct_view_u8){ buf, len }, sizeof offer, offer, &offer_len)
+        : duct_noise_hs_read_msg1(hs, (duct_view_u8){ buf, len }, learned, sizeof offer, offer, &offer_len);
     if (!ok) {
         err = "message 1 did not parse behind the opening";
         goto done;
     }
     ok = pattern == noise_pattern_xkpsk3
-        ? duct_noise_hs_write_msg2_xk(hs, (duct_view_u8){}, out + 2u, sizeof out - 2u, &len)
-        : duct_noise_hs_write_msg2(hs, (duct_view_u8){}, out + 2u, sizeof out - 2u, &len);
+        ? duct_noise_hs_write_msg2_xk(hs, (duct_view_u8){}, sizeof out - 2u, out + 2u, &len)
+        : duct_noise_hs_write_msg2(hs, (duct_view_u8){}, sizeof out - 2u, out + 2u, &len);
     if (!ok) {
         err = "write_msg2 failed";
         goto done;
@@ -217,7 +217,7 @@ static const char *so_peer(duct_sock_t lfd, const so_case_t *c,
             goto done;
         }
         if (!duct_noise_hs_read_msg3_xk(hs, (duct_view_u8){ buf, len }, so_psk_for, (void *)psk, learned,
-                                        offer, sizeof offer, &offer_len)) {
+                                        sizeof offer, offer, &offer_len)) {
             err = "message 3 did not read";
             goto done;
         }
@@ -230,7 +230,7 @@ static const char *so_peer(duct_sock_t lfd, const so_case_t *c,
         err = "the client's key confirmation never arrived";
         goto done;
     }
-    if (!duct_noise_transport_unseal(&tp, (duct_view_u8){ buf, len }, out, sizeof out, &plen))
+    if (!duct_noise_transport_unseal(&tp, (duct_view_u8){ buf, len }, sizeof out, out, &plen))
         err = "the key confirmation did not unseal";
 
 done:

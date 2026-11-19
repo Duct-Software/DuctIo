@@ -390,11 +390,11 @@ static void s_cancel_io(duct_sock_t fd)
 
 duct_events_env_t *duct_events_init(void)
 {
-    auto env = duct_new(duct_events_env_t);
+    duct_auto_del auto env = duct_new(duct_events_env_t);
     duct_do_if(!env, return nullptr);
     env->cancel_io = s_cancel_io;
     env->iocp = CreateIoCompletionPort(INVALID_HANDLE_VALUE, nullptr, 0, 1u);
-    duct_do_if(!env->iocp, duct_del(env); return nullptr);
+    duct_do_if(!env->iocp, return nullptr);
     if (s_rio) {
         env->rio_notify_op.packed = s_tag_pack(iocp_op_rio, nullptr);
         env->rio_cq = duct_rio_cq_create(s_rio,
@@ -405,7 +405,7 @@ duct_events_env_t *duct_events_init(void)
             &env->rio_cq_depth, &env->rio_cq_used);
     }
     s_port = env->iocp;
-    return env;
+    return duct_move(env);
 }
 
 void (*duct_events_cancel_io_of(duct_events_env_t *env))(duct_sock_t fd)
@@ -650,15 +650,19 @@ void duct_events_drive_tx(void *tag)
         switch (err) {
         case NO_ERROR:
             return;
-        case WSAEMSGSIZE:
-            duct_dbg_errf("WSAEMSGSIZE, %zu bytes", p.size);
+        case WSAEMSGSIZE: {
+            size_t drop_len = 0u;
+            for (unsigned i = 0u; i < p.iov_n; ++i)
+                drop_len += p.iov[i].size;
+            duct_dbg_errf("WSAEMSGSIZE, %zu bytes", drop_len);
             duct_olb_io_done(p.olb_hdr, conn);
             if (!duct_xport_delimited(p.xport_type)) {
                 duct_io_tx_done(tag, rc_fatal);
                 return;
             }
-            duct_discard duct_io_tx_advance(tag, p.size, 0u);
+            duct_discard duct_io_tx_advance(tag, drop_len, drop_len);
             continue;
+        }
         default:
             duct_dbg_errf("WSA error %d", err);
             duct_olb_io_done(p.olb_hdr, conn);
@@ -996,18 +1000,18 @@ bool duct_events_watch_device(duct_events_env_t *env, void *handle, void *tag_pt
     duct_do_if(!pfnNtCreateWaitCompletionPacket, return false);
     auto dup = s_device_find(env, handle);
     duct_do_if(dup, return false);
-    auto d = duct_new(iocp_device_t);
+    duct_auto_del auto d = duct_new(iocp_device_t);
     duct_do_if(!d, return false);
     d->ev = (HANDLE)handle;
     d->tag = tag_ptr;
     d->op.packed = s_tag_pack(iocp_op_device, d);
     auto made = pfnNtCreateWaitCompletionPacket(&d->packet, events_wait_packet_set_state, nullptr);
-    duct_do_if(made < 0, duct_del(d); return false);
+    duct_do_if(made < 0, return false);
     d->state = device_armed;
     auto armed = s_device_arm(d);
-    duct_do_if(!armed, s_device_free(d); return false);
+    duct_do_if(!armed, s_device_free(duct_move(d)); return false);
     d->next = env->devices;
-    env->devices = d;
+    env->devices = duct_move(d);
     return true;
 }
 
@@ -1102,13 +1106,10 @@ bool duct_events_dgram_tx_pool_alloc(duct_listener_t *listener)
     duct_do_if(!made, return false);
     if (s_rio)
         return true;
-    auto st = duct_new(iocp_dgram_tx_t);
-    auto ctls = duct_new(iocp_dgram_tx_ctl_t, iocp_dgram_tx_pool_depth);
-    auto free_stack = duct_at(duct_new(unsigned, iocp_dgram_tx_pool_depth));
+    duct_auto_del auto st = duct_new(iocp_dgram_tx_t);
+    duct_auto_del auto ctls = duct_new(iocp_dgram_tx_ctl_t, iocp_dgram_tx_pool_depth);
+    duct_auto_del auto free_stack = duct_at(duct_new(unsigned, iocp_dgram_tx_pool_depth));
     duct_do_if(!st || !ctls || !free_stack,
-        duct_del(st);
-        duct_del(ctls);
-        duct_del(free_stack);
         duct_listener_tx_slots_free(listener->tx_slots);
         listener->tx_slots = nullptr;
         return false
@@ -1118,9 +1119,9 @@ bool duct_events_dgram_tx_pool_alloc(duct_listener_t *listener)
     st->free_count = iocp_dgram_tx_pool_depth;
     st->listener = listener;
     st->pools = listener->tx_slots;
-    st->ctls = ctls;
-    st->free_stack = free_stack;
-    listener->dgram_tx_pool = st;
+    st->ctls = duct_move(ctls);
+    st->free_stack = duct_move(free_stack);
+    listener->dgram_tx_pool = duct_move(st);
     return true;
 }
 

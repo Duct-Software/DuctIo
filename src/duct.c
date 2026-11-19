@@ -211,6 +211,7 @@ static void s_engine_destroy(duct_engine_t *e)
        already joined by s_engine_halt_threads above, so this per-thread-list
        walk needs no lock, and module cleanups free late-arrival ctrl nodes
        without executing them, so no TLS borrow either. */
+    duct_host_egress_quiesce(e->n_workers, host_egress_quiesce_ms);
     auto listener_head = duct_io_listeners_detach();
     duct_io_cleanup();
     /* Pool-level safety net: a conn is still live if its consuming worker
@@ -227,10 +228,6 @@ static void s_engine_destroy(duct_engine_t *e)
        way. */
     duct_sessions_reclaim_shutdown();
     duct_listener_destroy_chain(listener_head);
-    /* Between the worker join far above and the lane free just below — the
-     * only window where no producer is left and the memory a scheduled drain
-     * reads is still alive. */
-    duct_host_egress_quiesce(e->n_workers, host_egress_quiesce_ms);
     duct_worker_module_cleanup();
     if (e->wfq) {
         duct_vmq_mpsc_del(e->wfq);

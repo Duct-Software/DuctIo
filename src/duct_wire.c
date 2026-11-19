@@ -42,7 +42,7 @@
 /** @brief The vtable release behind the api's opaque destroy: the codec
  *  struct is complete only here in the wire tier, consumers below hold it
  *  by pointer. */
-void duct_wire_codec_destroy(duct_wire_codec_t *codec)
+duct_zero_regs void duct_wire_codec_destroy(duct_wire_codec_t *codec)
 {
     codec->release(codec);
 }

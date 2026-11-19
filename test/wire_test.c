@@ -199,7 +199,8 @@ static const char *test_malformed(duct_engine_t *io, duct_proto_t *proto)
     struct pollfd pfd = { .fd = fd, .events = POLLIN };
     if (poll(&pfd, 1, TH_ROUNDTRIP_TIMEOUT_MS) > 0) {
         char tmp[4] = {};
-        read(fd, tmp, sizeof(tmp));
+        ssize_t dropped = read(fd, tmp, sizeof(tmp));
+        duct_discard dropped;
     }
     struct timespec ts = { .tv_nsec = 200L * 1000L * 1000L };
     nanosleep(&ts, nullptr);

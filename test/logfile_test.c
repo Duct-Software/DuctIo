@@ -697,7 +697,8 @@ static const char *sc_resolver_e2e(void)
     if (lines == 1u) {
         FILE *f = fopen(dir, "rb");
         if (f) {
-            duct_discard fgets(text, sizeof text, f);
+            char *line = fgets(text, sizeof text, f);
+            duct_discard line;
             fclose(f);
         }
     }

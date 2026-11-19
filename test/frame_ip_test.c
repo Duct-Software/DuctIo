@@ -40,7 +40,7 @@ static constexpr uint8_t s_ack = 0x10u;
 static uint8_t s_pkt[2048u * 40u];
 
 /** @brief Build an IPv4 packet header of 20 bytes stating @p len into @p p, the rest zero. */
-static void s_v4(uint8_t *p, size_t len)
+static void s_v4(size_t len, uint8_t p[static len])
 {
     memset(p, 0, len);
     p[0] = 0x45u;
@@ -49,7 +49,7 @@ static void s_v4(uint8_t *p, size_t len)
 }
 
 /** @brief Build an IPv6 packet header stating @p len into @p p, the rest zero. */
-static void s_v6(uint8_t *p, size_t len)
+static void s_v6(size_t len, uint8_t p[static len])
 {
     memset(p, 0, len);
     p[0] = 0x60u;
@@ -139,7 +139,7 @@ static duct_frame_volume_t s_vol(duct_view_u8 payload, duct_frame_flags_t flags)
 static const char *sc_header(void)
 {
     uint8_t *p = s_pkt;
-    s_v4(p, 100u);
+    s_v4(100u, p);
     expect(duct_ip_hdr_len(p, 100u) == 20u && duct_ip_len(p) == 100u && duct_ip_version(p, 100u) == 4u,
            "an IPv4 packet of 100 bytes is not read as one");
     expect(duct_ip_version(p, 99u) == 0u && duct_ip_version(p, 101u) == 0u && duct_ip_version(p, 0u) == 0u,
@@ -160,7 +160,7 @@ static const char *sc_header(void)
     expect(duct_ip_hdr_len(p, 100u) == 0u && duct_ip_version(p, 100u) == 0u, "version 5 is read");
     p[0] = 0u;
     expect(duct_ip_hdr_len(p, 100u) == 0u, "version 0 is read");
-    s_v6(p, 100u);
+    s_v6(100u, p);
     expect(duct_ip_hdr_len(p, 100u) == 40u && duct_ip_len(p) == 100u && duct_ip_version(p, 100u) == 6u,
            "an IPv6 packet of 100 bytes is not read as one");
     expect(duct_ip_version(p, 99u) == 0u && duct_ip_version(p, 101u) == 0u,

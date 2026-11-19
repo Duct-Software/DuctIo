@@ -92,16 +92,16 @@ static duct_sock_t s_make_wake_sock(void)
 
 duct_events_env_t *duct_events_init(void)
 {
-    auto env = duct_new(duct_events_env_t);
+    duct_auto_del auto env = duct_new(duct_events_env_t);
     duct_do_if(!env, return nullptr);
     env->cancel_io = nullptr;
     duct_sock_t wake_sock = s_make_wake_sock();
-    duct_do_if(wake_sock == duct_sock_bad, duct_del(env); return nullptr);
+    duct_do_if(wake_sock == duct_sock_bad, return nullptr);
     env->wake_sock = wake_sock;
     env->fds[0] = (duct_pollfd_t){ .fd = wake_sock, .events = POLLIN };
     env->slots[0] = (duct_events_slot_t){ .kind = io_tag_wake, .tag = nullptr };
     env->n_entries = env->n_polled = 1u;
-    return env;
+    return duct_move(env);
 }
 
 void (*duct_events_cancel_io_of(duct_events_env_t *env))(duct_sock_t fd)

@@ -179,8 +179,8 @@ static void vt_by_reference(void)
     redirect_t r = { .ct = home, .cap = room };
     vt_packet(home, 0u, vt_seg);
     vt_packet(home + vt_hdr + vt_seg, 1u, vt_seg);
-    CHECK(s_vnet_train_take(s_conn, (duct_view_u8){ home, vt_hdr + vt_seg }, 0u, &r));
-    CHECK(s_vnet_train_take(s_conn, (duct_view_u8){ home + vt_hdr + vt_seg, vt_hdr + vt_seg }, 0u, &r));
+    CHECK(s_vnet_train_take(s_conn, (duct_view_u8){ home, vt_hdr + vt_seg }, 0u, &r, fl_send_copy));
+    CHECK(s_vnet_train_take(s_conn, (duct_view_u8){ home + vt_hdr + vt_seg, vt_hdr + vt_seg }, 0u, &r, fl_send_copy));
     CHECK(duct_atomic_load(&duct_block_hdr(home)->holders, relaxed) == 3u);
     CHECK(s_w.vnet_train->gro.nspans == 2u);
     CHECK(s_w.vnet_train->gro.bufs[duct_vnet_gro_front].data == home + vt_hdr);
@@ -205,7 +205,7 @@ static void vt_copied_in(void)
     static uint8_t outside[2][vt_hdr + vt_seg];
     for (unsigned k = 0u; k < 2u; ++k) {
         vt_packet(outside[k], k, vt_seg);
-        CHECK(s_vnet_train_take(s_conn, (duct_view_u8){ outside[k], sizeof outside[k] }, 0u, nullptr));
+        CHECK(s_vnet_train_take(s_conn, (duct_view_u8){ outside[k], sizeof outside[k] }, 0u, nullptr, fl_send_copy));
     }
     for (unsigned k = 0u; k < 2u; ++k) {
         auto block = s_w.vnet_train->blocks[k];
@@ -229,7 +229,7 @@ static void vt_leg_change(void)
     static uint8_t p1[vt_hdr + vt_seg];
     vt_packet(p0, 0u, vt_seg);
     vt_packet(p1, 0u, vt_seg);
-    CHECK(s_vnet_train_take(s_conn, (duct_view_u8){ p0, sizeof p0 }, 0u, nullptr));
+    CHECK(s_vnet_train_take(s_conn, (duct_view_u8){ p0, sizeof p0 }, 0u, nullptr, fl_send_copy));
     CHECK(s_w.vnet_train->gro.segs == 1u);
 
     int sv[2];
@@ -239,7 +239,7 @@ static void vt_leg_change(void)
     other->fd = sv[0];
     other->xport_type = x_raw_packet;
     other->vnet_hdr_len = vt_vnet;
-    CHECK(s_vnet_train_take(other, (duct_view_u8){ p1, sizeof p1 }, 0u, nullptr));
+    CHECK(s_vnet_train_take(other, (duct_view_u8){ p1, sizeof p1 }, 0u, nullptr, fl_send_copy));
     uint8_t got[vt_vnet + vt_hdr + vt_seg + 16u];
     ssize_t n = recv(s_peer, got, sizeof got, MSG_DONTWAIT);
     CHECK(vt_payloads(got, n, vt_hdr, 1u, vt_seg));
@@ -263,7 +263,7 @@ static void vt_bound(unsigned count, size_t hdr, uint8_t type,
     uint8_t p[vt_hdr + pay];
     for (unsigned k = 0u; k < count; ++k) {
         build(p, k, pay);
-        CHECK(s_vnet_train_take(s_conn, (duct_view_u8){ p, hdr + pay }, 0u, nullptr));
+        CHECK(s_vnet_train_take(s_conn, (duct_view_u8){ p, hdr + pay }, 0u, nullptr, fl_send_copy));
     }
     CHECK(s_w.vnet_train->gro.segs == 0u);
     static uint8_t got[vt_vnet + vt_hdr + duct_vnet_gro_span_max * pay + 16u];
@@ -283,7 +283,7 @@ static void vt_datagrams(void)
         vt_datagram(d[k], k, pay);
     duct_conn_state_set(s_conn, fl_conn_vnet_uso);
     for (unsigned k = 0u; k < 3u; ++k)
-        CHECK(s_vnet_train_take(s_conn, (duct_view_u8){ d[k], sizeof d[k] }, 0u, nullptr));
+        CHECK(s_vnet_train_take(s_conn, (duct_view_u8){ d[k], sizeof d[k] }, 0u, nullptr, fl_send_copy));
     CHECK(s_w.vnet_train->gro.segs == 3u);
     s_vnet_train_flush(&s_w);
     uint8_t got[vt_vnet + vt_udp + 3u * pay + 16u];
@@ -300,7 +300,7 @@ static void vt_datagrams(void)
     vt_bound(duct_vnet_udp_segs_max, vt_udp, 5u, vt_datagram);
 
     duct_conn_state_clear(s_conn, fl_conn_vnet_uso);
-    CHECK(!s_vnet_train_take(s_conn, (duct_view_u8){ d[0], sizeof d[0] }, 0u, nullptr));
+    CHECK(!s_vnet_train_take(s_conn, (duct_view_u8){ d[0], sizeof d[0] }, 0u, nullptr, fl_send_copy));
     CHECK(s_w.vnet_train->gro.segs == 0u);
     CHECK(vt_drained());
 }

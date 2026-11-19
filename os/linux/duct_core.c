@@ -404,3 +404,18 @@ void duct_futex_wake(void *addr, uint32_t count)
                          count,
                          nullptr, nullptr, 0);
 }
+
+#if !DUCT_HAS_MEMSET_EXPLICIT
+void duct_secure_zero(void *p, size_t n)
+{
+    if (!p || !n)
+        return;
+#if DUCT_HAS_EXPLICIT_BZERO
+    explicit_bzero(p, n);
+#else
+    volatile uint8_t *vp = (volatile uint8_t *)p;
+    for (size_t i = 0u; i < n; ++i)
+        vp[i] = 0u;
+#endif
+}
+#endif

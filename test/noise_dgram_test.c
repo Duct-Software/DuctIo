@@ -384,16 +384,16 @@ static bool nd_resp_read1(duct_noise_hs_t *hs, duct_view_u8 msg)
             offer[duct_noise_hs_pad_max];
     size_t offer_len = 0u;
     return g_pattern == noise_pattern_xkpsk3
-         ? duct_noise_hs_read_msg1_xk(hs, msg, offer, sizeof offer, &offer_len)
-         : duct_noise_hs_read_msg1(hs, msg, learned, offer, sizeof offer, &offer_len);
+         ? duct_noise_hs_read_msg1_xk(hs, msg, sizeof offer, offer, &offer_len)
+         : duct_noise_hs_read_msg1(hs, msg, learned, sizeof offer, offer, &offer_len);
 }
 
 /** @brief The responder writes message 2 around no payload. */
 static bool nd_resp_write2(duct_noise_hs_t *hs, uint8_t *out, size_t cap, size_t *len)
 {
     return g_pattern == noise_pattern_xkpsk3
-         ? duct_noise_hs_write_msg2_xk(hs, (duct_view_u8){}, out, cap, len)
-         : duct_noise_hs_write_msg2(hs, (duct_view_u8){}, out, cap, len);
+         ? duct_noise_hs_write_msg2_xk(hs, (duct_view_u8){}, cap, out, len)
+         : duct_noise_hs_write_msg2(hs, (duct_view_u8){}, cap, out, len);
 }
 
 /** @brief Under XKpsk3 take message 3 off @p fd, each PDU leading with @p prefix
@@ -412,7 +412,7 @@ static const char *nd_resp_last(duct_sock_t fd, duct_noise_hs_t *hs, const uint8
     if (got < (ssize_t)prefix || (prefix != 0u && nd_get_len(buf) != (size_t)got - prefix))
         return "message 3 never arrived as one framed datagram";
     return duct_noise_hs_read_msg3_xk(hs, (duct_view_u8){ buf + prefix, (size_t)got - prefix },
-                                      nd_psk_for, (void *)psk, learned, offer, sizeof offer,
+                                      nd_psk_for, (void *)psk, learned, sizeof offer, offer,
                                       &offer_len)
          ? nullptr : "read_msg3 failed";
 }
@@ -524,7 +524,7 @@ static const char *nd_forgery(duct_engine_t *io, const duct_noise_keypair_t *srv
     {
         size_t sealed = duct_noise_transport_seal(&tp,
             &(duct_view_u8){ (void *)probe, sizeof probe - 1u }, 1u,
-            buf + 1u + nd_prefix, sizeof buf - 1u - nd_prefix);
+            sizeof buf - 1u - nd_prefix, buf + 1u + nd_prefix);
         if (!sealed) { err = "probe seal failed"; goto done; }
         buf[0] = 0u;
         nd_put_len(buf + 1u, sealed);
@@ -831,7 +831,7 @@ static bool nd_open_match(unsigned idx, const uint8_t *dgram, size_t len)
 }
 
 /** @brief Fill @p p with the frame's byte pattern. */
-static void nd_open_fill(uint8_t *p, size_t n)
+static void nd_open_fill(size_t n, uint8_t p[static n])
 {
     for (size_t i = 0u; i < n; ++i)
         p[i] = (uint8_t)(i * 7u + 3u);
@@ -844,7 +844,7 @@ nd_open_first([[maybe_unused]] duct_session_t *s, [[maybe_unused]] duct_handle_t
               [[maybe_unused]] void *proto_state)
 {
     static uint8_t body[nd_open_size];
-    nd_open_fill(body, sizeof body);
+    nd_open_fill(sizeof body, body);
     out->payload = (duct_view_u8){ body, sizeof body };
     out->flags = fl_send_copy;
     return rc_ok;
@@ -873,11 +873,11 @@ static const char *nd_open_recv(duct_sock_t fd, duct_noise_transport_t *tp)
             return "a datagram did not arrive as one framed PDU";
         size_t plen = 0u;
         if (!duct_noise_transport_unseal(tp, (duct_view_u8){ dgram + nd_prefix, (size_t)n - nd_prefix },
-                                         plain, sizeof plain, &plen))
+                                         sizeof plain, plain, &plen))
             return "a datagram did not unseal";
         if (!plen)
             continue;
-        nd_open_fill(want, sizeof want);
+        nd_open_fill(sizeof want, want);
         return plen == sizeof want && memcmp(plain, want, sizeof want) == 0
              ? nullptr : "the first frame arrived altered";
     }
@@ -1004,10 +1004,10 @@ static const char *nd_run(uint16_t port,
     auto hs = duct_noise_hs_create_for(g_pattern, cli_kp, srv_pub, psk, true, (duct_view_u8){});
     if (!hs) { err = "handshake create failed"; goto done; }
 
-    if (!(xk ? duct_noise_hs_write_msg1_xk(hs, (duct_view_u8){}, buf + nd_prefix,
-                                           sizeof buf - nd_prefix, &len)
-             : duct_noise_hs_write_msg1(hs, (duct_view_u8){}, buf + nd_prefix,
-                                        sizeof buf - nd_prefix, &len))) {
+    if (!(xk ? duct_noise_hs_write_msg1_xk(hs, (duct_view_u8){}, sizeof buf - nd_prefix,
+                                           buf + nd_prefix, &len)
+             : duct_noise_hs_write_msg1(hs, (duct_view_u8){}, sizeof buf - nd_prefix,
+                                        buf + nd_prefix, &len))) {
         err = "write_msg1 failed";
         goto done;
     }
@@ -1028,8 +1028,8 @@ static const char *nd_run(uint16_t port,
         }
     }
     if (xk) {
-        if (!duct_noise_hs_write_msg3_xk(hs, (duct_view_u8){}, buf + nd_prefix,
-                                         sizeof buf - nd_prefix, &len)) {
+        if (!duct_noise_hs_write_msg3_xk(hs, (duct_view_u8){}, sizeof buf - nd_prefix,
+                                         buf + nd_prefix, &len)) {
             err = "write_msg3 failed";
             goto done;
         }
@@ -1044,8 +1044,8 @@ static const char *nd_run(uint16_t port,
         char plain[32];
         int plen = snprintf(plain, sizeof plain, "dgram-round-%u", round);
         size_t sealed = duct_noise_transport_seal(&tp,
-            &(duct_view_u8){ plain, (size_t)plen }, 1u, buf + nd_prefix,
-            sizeof buf - nd_prefix);
+            &(duct_view_u8){ plain, (size_t)plen }, 1u, sizeof buf - nd_prefix,
+            buf + nd_prefix);
         if (!sealed) { err = "seal failed"; goto done; }
         nd_put_len(buf, sealed);
         if (uc_send(fd, buf, nd_prefix + sealed) != 0) {
@@ -1062,7 +1062,7 @@ static const char *nd_run(uint16_t port,
         size_t back_len = 0u;
         if (!duct_noise_transport_unseal(&tp,
                 (duct_view_u8){ buf + nd_prefix, (size_t)got - nd_prefix },
-                (uint8_t *)back, sizeof back, &back_len)) {
+                sizeof back, (uint8_t *)back, &back_len)) {
             err = "echo unseal failed";
             goto done;
         }
@@ -1105,7 +1105,7 @@ static const char *nd_run(uint16_t port,
         static const char after[] = "after-oversize";
         size_t sealed = duct_noise_transport_seal(&tp,
             &(duct_view_u8){ (void *)after, sizeof after - 1u }, 1u,
-            buf + nd_prefix, sizeof buf - nd_prefix);
+            sizeof buf - nd_prefix, buf + nd_prefix);
         if (!sealed) { err = "post-oversize seal failed"; goto done; }
         nd_put_len(buf, sealed);
         if (uc_send(fd, buf, nd_prefix + sealed) != 0) {
@@ -1239,7 +1239,7 @@ static const char *nd_dgram_hand(duct_engine_t *io, const duct_noise_keypair_t *
         got = nd_peer_recv(fd, buf, sizeof buf, &peer);
         if (got <= 0
             || !duct_noise_transport_unseal(&tp, (duct_view_u8){ buf, (size_t)got },
-                                            plain, sizeof plain, &plen)) {
+                                            sizeof plain, plain, &plen)) {
             err = "a datagram did not unseal as one bare PDU";
             goto done;
         }
@@ -1248,7 +1248,7 @@ static const char *nd_dgram_hand(duct_engine_t *io, const duct_noise_keypair_t *
         err = "the client's first payload came out altered";
         goto done;
     }
-    len = duct_noise_transport_seal(&tp, &(duct_view_u8){ plain, plen }, 1u, buf, sizeof buf);
+    len = duct_noise_transport_seal(&tp, &(duct_view_u8){ plain, plen }, 1u, sizeof buf, buf);
     if (!len || sendto(fd, (char *)buf, (int)len, 0, (struct sockaddr *)&peer,
                        sizeof peer) < 0) {
         err = "echo send failed";

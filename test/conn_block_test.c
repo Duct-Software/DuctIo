@@ -82,8 +82,6 @@ static void t_carve_shapes(void)
              "an OLB header resolves its data off its own address");
     s_expect(rx->h.buf_size == duct_conn_rx_olb_cap && tx->h.buf_size == duct_conn_tx_olb_cap,
              "carved caps not stamped");
-    s_expect(!rx->h.total_size && !tx->h.total_size,
-             "a carved OLB must not carry a vm mapping total");
     s_expect(duct_conn_lane(conn) == nullptr, "an OLB conn resolved a lane");
     s_stage_rx(rx, duct_conn_rx_olb_cap);
     s_expect(duct_atomic_load(&rx->h.stage, relaxed) == duct_conn_rx_olb_cap,

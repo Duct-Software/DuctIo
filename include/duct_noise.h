@@ -50,13 +50,13 @@ typedef struct duct_noise_keypair {
 /** @brief Generate a fresh X25519 keypair.
  *  @return false on an RNG or OpenSSL failure.
  */
-bool duct_noise_keypair_generate(duct_noise_keypair_t *out);
+duct_zero_regs bool duct_noise_keypair_generate(duct_noise_keypair_t *out);
 
 /** @brief Derive @p out from an already-chosen private key, filling both
  *  @c priv and the matching @c pub.
  *  @return false on an OpenSSL failure, i.e. malformed key material.
  */
-duct_nonnull(1, 2) bool
+duct_nonnull(1, 2) duct_zero_regs bool
 duct_noise_keypair_from_priv(duct_noise_keypair_t *out,
                              const uint8_t priv[duct_noise_key_size]);
 
@@ -66,7 +66,7 @@ duct_noise_keypair_from_priv(duct_noise_keypair_t *out,
  *  data, their pointers still non-null.
  *  @return false when @p key_len exceeds @c INT_MAX or OpenSSL fails.
  */
-[[nodiscard]] duct_nonnull(1, 3, 5) bool
+[[nodiscard]] duct_nonnull(1, 3, 5) duct_zero_regs bool
 duct_hmac_sha256(const void *key, size_t key_len, const void *data, size_t data_len,
                  uint8_t out[duct_hmac_sha256_size]);
 

@@ -201,7 +201,7 @@ static void s_close_fire_and_forget(duct_listener_route_t *route, duct_sock_t fd
  *  @return @c nullptr on an allocation failure. */
 static duct_x_slot_pool_t *s_rx_pool_new(const duct_listener_t *l)
 {
-    auto pool = duct_new(duct_x_slot_pool_t);
+    duct_auto_del auto pool = duct_new(duct_x_slot_pool_t);
     duct_do_if(!pool, return nullptr);
     bool ok = duct_x_slot_pool_init(pool, duct_dgram_rx_slots,
                                     duct_x_slot_span_bytes(0u, duct_dgram_record_hdr_size,
@@ -209,9 +209,9 @@ static duct_x_slot_pool_t *s_rx_pool_new(const duct_listener_t *l)
                                     0u, duct_dgram_record_hdr_size, duct_dgram_rx_batch,
                                     duct_events_x_slot_hooks());
     duct_x_slot_pool_engage(pool);
-    duct_do_if(!ok, duct_x_slot_pool_free(pool); duct_del(pool); return nullptr);
+    duct_do_if(!ok, duct_x_slot_pool_free(pool); return nullptr);
     pool->reader = l->io_id;
-    return pool;
+    return duct_move(pool);
 }
 
 /* The counts follow the outbox the slots stand behind. The small class holds the lanes' capacity in

@@ -281,6 +281,11 @@ duct_exec_rc_t duct_session_exec_conn_lost(void *self)
     if (s) {
         auto cid = duct_session_conn_id_by_handle(s, msg->conn);
         if (cid < duct_session_max_legs) {
+            /* Settle any unfinished fl_send_done frontier ahead of stream cancel
+             * and detach while s->proto is still live: an already-explicit
+             * stream cancel stays silent in done_skip, while responses parked
+             * on this dying leg resolve as rc_closed. */
+            duct_worker_conn_done_close(s, cid, conn);
             /* Cancel handlers and discard deferred frames for this leg
              * before detach: both may still reference the conn's rx OLB,
              * which retire can tear down once this executor finishes. */
@@ -563,6 +568,11 @@ void *duct_stream_state(duct_session_t *s, duct_stream_id_t stream_id)
                return nullptr);
     auto slot = s_stream_find(s, stream_id);
     return slot ? slot->proto_state : nullptr;
+}
+
+uint32_t duct_session_conn_count(const duct_session_t *s)
+{
+    return s->conn_count;
 }
 
 duct_conn_id_t duct_session_nth_live_leg(const duct_session_t *s, uint32_t ordinal)

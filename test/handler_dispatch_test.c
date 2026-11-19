@@ -2578,8 +2578,13 @@ static void test_switch_waits_for_parked_response(void)
     printf("  switch_waits_for_parked_response OK\n");
 }
 
-/** @brief A conn's inter bit leaves @c inter_pending equal to the bits set when
- *  the scan pops it, so the scan's zero skip keeps firing. */
+static bool s_inter_summary_has(const duct_worker_t *w, unsigned idx)
+{
+    unsigned word = idx >> bits_word_shift;
+    return (w->inter_summary[word >> bits_word_shift]
+            & (bits_word_one << (word & bits_index_mask))) != 0u;
+}
+
 static void test_inter_pending_follows_armed_bits(void)
 {
     duct_worker_t w = {};
@@ -2591,9 +2596,9 @@ static void test_inter_pending_follows_armed_bits(void)
 
     duct_worker_inter_arm(0u, idx);
     duct_worker_inter_arm(0u, idx);
-    assert(w.inter_pending == 1u);
+    assert(s_inter_summary_has(&w, idx));
     assert(s_inter_drain(&w) == 0u);
-    assert(w.inter_pending == 0u);
+    assert(!s_inter_summary_has(&w, idx));
 
     s_wmod.workers = nullptr;
     s_wmod.n_workers = 0u;
@@ -2639,9 +2644,9 @@ static void test_inter_drain_follows_the_bound_worker(void)
 
     /* Never bound: the ctrl that would bind it is still queued. */
     s_inter_conn_push(conn);
-    assert(w.inter_pending == 1u);
+    assert(s_inter_summary_has(&w, duct_conn_idx_get(conn)));
     assert(s_inter_drain(&w) == 0u);
-    assert(w.inter_pending == 0u);
+    assert(!s_inter_summary_has(&w, duct_conn_idx_get(conn)));
     assert(duct_vmq_unread(ln.ctrl));
 
     /* Bound to another worker. */
@@ -2655,7 +2660,7 @@ static void test_inter_drain_follows_the_bound_worker(void)
     /* Bound by this worker: the lane drains. */
     duct_worker_inter_arm(0u, duct_conn_idx_get(conn));
     assert(s_inter_drain(&w) == 1u);
-    assert(w.inter_pending == 0u);
+    assert(!s_inter_summary_has(&w, duct_conn_idx_get(conn)));
     assert(!duct_vmq_unread(ln.ctrl));
 
     /* Closed, lost posted and consumed: a push and an arm behind the
@@ -2665,7 +2670,7 @@ static void test_inter_drain_follows_the_bound_worker(void)
     assert(duct_conn_phase_move(conn, conn_lost_posted, conn_retire_done));
     s_inter_conn_push(conn);
     assert(s_inter_drain(&w) == 0u);
-    assert(w.inter_pending == 0u);
+    assert(!s_inter_summary_has(&w, duct_conn_idx_get(conn)));
     assert(duct_vmq_unread(ln.ctrl));
 
     duct_conn_discard(conn);
@@ -3583,6 +3588,117 @@ static void test_join_admits_without_callback_under_unrelated_tx_pressure(void)
     s_fixture_fini(&f);
 }
 
+static duct_async_rc_t s_reentrant_fin_step(void *state)
+{
+    auto hctx = (duct_stream_ctx_t *)state;
+    hctx->out = (duct_response_t){
+        .payload = hctx->frame.payload,
+        .conn_id = duct_conn_id_same,
+        .stream_id = duct_stream_id_same,
+        .control = {
+            .stream_op = stream_op_fin,
+            .stream_op_conn_id = duct_conn_id_same,
+            .stream_op_stream_id = hctx->stream_id,
+        },
+    };
+    return async_yield;
+}
+
+static duct_stream_id_t g_reentrant_err_sid;
+
+static duct_result_t s_reentrant_err_close(duct_session_t *s, duct_result_t error,
+    [[maybe_unused]] duct_response_t *out, [[maybe_unused]] void *proto_state)
+{
+    ++s_on_error_calls;
+    if (error == rc_invalid_arg && g_reentrant_err_sid != 0u)
+        duct_discard duct_stream_close(s, duct_conn_id_same, g_reentrant_err_sid);
+    return rc_ok;
+}
+
+static duct_async_rc_t s_reentrant_oversized_step(void *state)
+{
+    static uint8_t big[8192];
+    auto hctx = (duct_stream_ctx_t *)state;
+    hctx->out = (duct_response_t){
+        .payload = { .data = big, .size = sizeof big },
+        .flags = fl_send_static,
+        .conn_id = duct_conn_id_same,
+        .stream_id = duct_stream_id_same,
+    };
+    return async_yield;
+}
+
+static void s_reentrant_fin_coro(void *arg)
+{
+    auto hctx = (duct_stream_ctx_t *)arg;
+    hctx->out = (duct_response_t){
+        .payload = hctx->frame.payload,
+        .conn_id = duct_conn_id_same,
+        .stream_id = duct_stream_id_same,
+        .control = {
+            .stream_op = stream_op_fin,
+            .stream_op_conn_id = duct_conn_id_same,
+            .stream_op_stream_id = hctx->stream_id,
+        },
+    };
+    duct_coro_yield();
+}
+
+static void test_handler_reentrant_cancel_no_double_release(void)
+{
+    s_reset_counters();
+    {
+        auto p = s_make_proto_sl();
+        p->cfg.handler_async = s_reentrant_fin_step;
+        s_fixture_t f;
+        s_fixture_init(&f, p);
+        const char msg[] = "self-fin";
+        assert(s_post_frame(&f, 7u, msg, sizeof msg, 0u) == exec_done);
+        duct_coop_cycle(&f.w.coop);
+        assert(f.w.coop.async_pool.n_alive == 0u);
+        assert(!duct_session_stream_slot(f.s, 7u));
+        assert(s_close_calls == 1u);
+        assert(s_rx_acked(&f) == sizeof msg);
+        s_fixture_fini(&f);
+    }
+    s_reset_counters();
+    {
+        auto p = s_make_proto_sl();
+        p->cfg.handler_async = s_reentrant_oversized_step;
+        p->cfg.on_error = s_reentrant_err_close;
+        g_reentrant_err_sid = 9u;
+        s_fixture_t f;
+        s_fixture_init(&f, p);
+        const char msg[] = "err-close";
+        assert(s_post_frame(&f, 9u, msg, sizeof msg, 0u) == exec_done);
+        duct_coop_cycle(&f.w.coop);
+        assert(f.w.coop.async_pool.n_alive == 0u);
+        assert(!duct_session_stream_slot(f.s, 9u));
+        assert(s_on_error_calls == 2u && s_close_calls == 1u);
+        assert(s_rx_acked(&f) == sizeof msg);
+        g_reentrant_err_sid = 0u;
+        s_fixture_fini(&f);
+    }
+    s_reset_counters();
+    {
+        auto p = s_make_proto_sl();
+        p->cfg.handler_kind = handler_coro;
+        p->cfg.handler_async = nullptr;
+        p->cfg.handler_coro = s_reentrant_fin_coro;
+        s_fixture_t f;
+        s_fixture_init(&f, p);
+        const char msg[] = "coro-fin";
+        assert(s_post_frame(&f, 11u, msg, sizeof msg, 0u) == exec_done);
+        duct_coop_cycle(&f.w.coop);
+        assert(f.w.coop.pool.n_alive == 0u);
+        assert(!duct_session_stream_slot(f.s, 11u));
+        assert(s_close_calls == 1u);
+        assert(s_rx_acked(&f) == sizeof msg);
+        s_fixture_fini(&f);
+    }
+    printf("  handler_reentrant_cancel_no_double_release OK\n");
+}
+
 int main(void)
 {
     test_join_admits_without_callback_under_unrelated_tx_pressure();
@@ -3644,6 +3760,7 @@ int main(void)
     test_rx_latch_edge_posts_once_per_latch();
     test_tx_wait_target_forms();
     test_worker_frees_rings_vs_io_completion();
+    test_handler_reentrant_cancel_no_double_release();
     printf("All handler_dispatch tests passed.\n");
     return 0;
 }

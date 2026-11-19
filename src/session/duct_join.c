@@ -33,7 +33,7 @@ static_assert(s_mac_input + sizeof(uint64_t) == duct_join_lead_size,
     "a lead is its MAC input and the 8-byte MAC over it");
 
 /** @brief Read @p n big-endian bytes at @p p. */
-static uint32_t s_get_be(const uint8_t *p, unsigned n)
+static uint32_t s_get_be(unsigned n, const uint8_t p[static n])
 {
     uint32_t v = 0u;
     for (unsigned i = 0u; i < n; ++i)
@@ -42,7 +42,7 @@ static uint32_t s_get_be(const uint8_t *p, unsigned n)
 }
 
 /** @brief Write the low @p n bytes of @p v big-endian at @p p. */
-static void s_put_be(uint8_t *p, uint32_t v, unsigned n)
+static void s_put_be(size_t n, uint8_t p[static n], uint32_t v)
 {
     for (unsigned i = n; i > 0u; --i) {
         p[i - 1u] = (uint8_t)v;
@@ -88,7 +88,7 @@ static void s_index_drop(const duct_session_t *s)
     }
 }
 
-bool duct_join_derive(const duct_seal_engine_vtbl_t *vt, duct_seal_engine_t *engine,
+duct_zero_regs bool duct_join_derive(const duct_seal_engine_vtbl_t *vt, duct_seal_engine_t *engine,
                       uint8_t key[duct_siphash_key_size], uint8_t name[2])
 {
     duct_secret_array(uint8_t, okm, s_okm_size);
@@ -103,10 +103,9 @@ bool duct_join_derive(const duct_seal_engine_vtbl_t *vt, duct_seal_engine_t *eng
 void duct_join_forget(duct_session_t *s)
 {
     duct_del(s->join.id);
-    s->join.id = nullptr;
 }
 
-bool duct_join_install(duct_session_t *s, duct_view_u8 identity,
+duct_zero_regs bool duct_join_install(duct_session_t *s, duct_view_u8 identity,
                        const duct_seal_engine_vtbl_t *vt, duct_seal_engine_t *engine)
 {
     if (s->join.sent != 0u) {
@@ -120,7 +119,7 @@ bool duct_join_install(duct_session_t *s, duct_view_u8 identity,
     uint8_t name[2];
     if (!duct_join_derive(vt, engine, s->join.key, name))
         return true;
-    s->join.name = (uint16_t)s_get_be(name, 2u);
+    s->join.name = (uint16_t)s_get_be(2u, name);
     s->join.proto = s->proto;
     s->join.sent = 1u;
     duct_atomic_store(&s->join.window, 0u, relaxed);
@@ -128,7 +127,7 @@ bool duct_join_install(duct_session_t *s, duct_view_u8 identity,
     return true;
 }
 
-bool duct_join_same_peer(const duct_session_t *s, duct_view_u8 identity)
+duct_zero_regs bool duct_join_same_peer(const duct_session_t *s, duct_view_u8 identity)
 {
     auto id = s->join.id;
     return id && identity.size == duct_len(id)
@@ -143,18 +142,18 @@ static const uint8_t *s_cover_key(const duct_proto_t *proto)
     return proto && proto->cfg.wire ? proto->cfg.wire->cover_key : none;
 }
 
-bool duct_join_lead(duct_session_t *s, duct_conn_id_t conn_id,
+duct_zero_regs bool duct_join_lead(duct_session_t *s, duct_conn_id_t conn_id,
                     uint8_t out[duct_join_lead_size])
 {
     bool usable = s->join.sent != 0u && s->join.sent != UINT32_MAX
                && conn_id < duct_session_max_legs;
     duct_do_if(!usable, return false);
-    s_put_be(out, s->join.name, 2u);
-    s_put_be(out + 2u, s->join.sent++, 4u);
+    s_put_be(2u, out, s->join.name);
+    s_put_be(4u, out + 2u, s->join.sent++);
     out[6] = (uint8_t)conn_id;
     uint64_t mac = duct_siphash24(s->join.key, out, s_mac_input);
-    duct_siphash_cover(out, s_mac_input, s_cover_key(s->join.proto), mac);
-    duct_sip_put_le64(out + s_mac_input, sizeof mac, mac);
+    duct_siphash_cover(s_mac_input, out, s_cover_key(s->join.proto), mac);
+    duct_sip_put_le64(sizeof mac, out + s_mac_input, mac);
     return true;
 }
 
@@ -184,21 +183,21 @@ static bool s_window_admit(uint64_t _Atomic *window, uint32_t ctr)
     }
 }
 
-bool duct_join_match(const uint8_t lead[duct_join_lead_size],
+duct_zero_regs bool duct_join_match(const uint8_t lead[duct_join_lead_size],
                      const duct_proto_t *const *protos, unsigned n_protos,
                      duct_session_handle_t *tok, duct_conn_id_t *conn_id,
                      const duct_proto_t **proto)
 {
     auto index = duct_session_join_index();
-    uint64_t mac = duct_sip_le64(lead + s_mac_input, sizeof mac);
+    uint64_t mac = duct_sip_le64(sizeof mac, lead + s_mac_input);
     for (unsigned k = 0u; k < n_protos; ++k) {
         /* Each protocol's wire names its own cover key, so the bytes come off
          * once per candidate. */
         uint8_t plain[s_mac_input];
         memcpy(plain, lead, sizeof plain);
-        duct_siphash_cover(plain, sizeof plain, s_cover_key(protos[k]), mac);
-        auto name = (uint16_t)s_get_be(plain, 2u);
-        uint32_t ctr = s_get_be(plain + 2u, 4u);
+        duct_siphash_cover(sizeof plain, plain, s_cover_key(protos[k]), mac);
+        auto name = (uint16_t)s_get_be(2u, plain);
+        uint32_t ctr = s_get_be(4u, plain + 2u);
         duct_conn_id_t cid = plain[6];
         if (ctr == 0u || cid >= duct_session_max_legs)
             continue;
@@ -221,7 +220,7 @@ bool duct_join_match(const uint8_t lead[duct_join_lead_size],
     return false;
 }
 
-duct_session_handle_t duct_join_dgram_match(const uint8_t *dgram, size_t len,
+duct_zero_regs duct_session_handle_t duct_join_dgram_match(size_t len, const uint8_t dgram[static len],
                                             const duct_proto_t *proto)
 {
     size_t pdu_off = proto->cfg.wire->rx_prefix_len;
@@ -229,10 +228,10 @@ duct_session_handle_t duct_join_dgram_match(const uint8_t *dgram, size_t len,
     if (!duct_dgram_lead_fits(pdu_off, len))
         return none;
     auto index = duct_session_join_index();
-    uint64_t mac = duct_sip_le64(dgram + 2u, sizeof mac);
+    uint64_t mac = duct_sip_le64(sizeof mac, dgram + 2u);
     uint8_t bytes[2] = { dgram[0], dgram[1] };
     duct_dgram_lead_cover(bytes, s_cover_key(proto), mac);
-    auto name = (uint16_t)s_get_be(bytes, 2u);
+    auto name = (uint16_t)s_get_be(2u, bytes);
     for (unsigned i = 0u; i < s_index_probe; ++i) {
         auto h = (duct_session_handle_t){ .word = duct_atomic_load(s_slot(index, name, i), acquire) };
         auto s = h.word != handle_null ? duct_session_attached_by_handle(h) : nullptr;

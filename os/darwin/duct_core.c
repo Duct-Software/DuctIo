@@ -1,6 +1,8 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* Copyright (c) 2026 Duct Software, authors: Constantin Papizh, Dmitriy Puzyrkov, Olzhas Zharasbayev */
 
+#define __STDC_WANT_LIB_EXT1__ 1
+
 #include "duct_core.h"
 #include "duct_xport.h"
 
@@ -212,3 +214,20 @@ duct_cpu_time_t duct_process_cpu(void)
     duct_discard getrusage(RUSAGE_SELF, &ru);
     return (duct_cpu_time_t){ .user_ns = s_timeval_ns(ru.ru_utime), .kernel_ns = s_timeval_ns(ru.ru_stime) };
 }
+
+#if !DUCT_HAS_MEMSET_EXPLICIT
+void duct_secure_zero(void *p, size_t n)
+{
+    if (!p || !n)
+        return;
+#ifdef __STDC_LIB_EXT1__
+    duct_discard memset_s(p, n, 0, n);
+#elif DUCT_HAS_EXPLICIT_BZERO
+    explicit_bzero(p, n);
+#else
+    volatile uint8_t *vp = (volatile uint8_t *)p;
+    for (size_t i = 0u; i < n; ++i)
+        vp[i] = 0u;
+#endif
+}
+#endif

@@ -131,8 +131,8 @@ static void s_epoll_busy_poll_arm(int epoll_fd)
 
 duct_events_env_t *duct_events_init(void)
 {
-    auto env = duct_new(duct_events_env_t);
-    duct_do_if(!env, goto fail);
+    duct_auto_del auto env = duct_new(duct_events_env_t);
+    duct_do_if(!env, return nullptr);
 
     env->cancel_io = nullptr;
     env->epoll_fd = epoll_create1(EPOLL_CLOEXEC);
@@ -148,13 +148,12 @@ duct_events_env_t *duct_events_init(void)
     };
     int rc = epoll_ctl(env->epoll_fd, EPOLL_CTL_ADD, env->wake_fd, &kev);
     duct_do_if(rc < 0, goto fail);
-    return env;
+    return duct_move(env);
 fail:
     if (env->epoll_fd != duct_sock_bad)
         close(env->epoll_fd);
     if (env->wake_fd != duct_sock_bad)
         close(env->wake_fd);
-    duct_del(env);
     return nullptr;
 }
 
@@ -319,7 +318,8 @@ void duct_events_unwatch(duct_events_env_t *env, duct_sock_t fd,
 
 void duct_events_kick(duct_events_env_t *env)
 {
-    duct_discard write(env->wake_fd, &(uint64_t){ 1 }, sizeof(uint64_t));
+    ssize_t kicked = write(env->wake_fd, &(uint64_t){ 1 }, sizeof(uint64_t));
+    duct_discard kicked;
 }
 
 /** @brief Rewrite @p listener's level-triggered mask: EPOLLIN for @p rx,

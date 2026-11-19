@@ -59,7 +59,6 @@ static void duct_session_pool_dtor(void)
     duct_block_pool_shutdown(&s_pool->blocks);
     duct_del(s_pool->join_index);
     duct_del(s_pool);
-    s_pool = nullptr;
 }
 
 /** @brief Per-slot generation +1; skip 0 (never issued) and UINT32_MAX. */
@@ -170,7 +169,7 @@ duct_session_t *duct_session_acquire(uint32_t worker_id)
  *  Runs while @c s->proto still names the protocol of the live streams —
  *  the teardown clears it right after.
  */
-static void s_session_cold_free(duct_session_t *s)
+duct_zero_regs static void s_session_cold_free(duct_session_t *s)
 {
     duct_join_forget(s);
     /* Zeroed only once the state has left attached. A lead that io matches against the key in

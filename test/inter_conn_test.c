@@ -61,12 +61,13 @@ static _Atomic(duct_handle_t) g_tok;
 
 static const char s_close_sentinel[] = "close-me";
 static const char s_egress_marker[]  = "egress-echo-me";
+static const char s_span_prefix[]    = "egress-span:";
 
 typedef struct {
     duct_handle_t h;
     duct_conn_id_t       conn_id;
     size_t               len;
-    char                 data[64];
+    char                 data[2048];
 } packet_out_record_t;
 
 static packet_out_record_t g_packet_out;
@@ -111,8 +112,10 @@ on_dgram([[maybe_unused]] duct_session_t *s, duct_conn_id_t conn_id, const duct_
         duct_response_close_session(out, close_normal);
         return rc_ok;
     }
-    if (data.size == sizeof s_egress_marker - 1u
-        && memcmp(data.data, s_egress_marker, data.size) == 0) {
+    if ((data.size == sizeof s_egress_marker - 1u
+         && memcmp(data.data, s_egress_marker, data.size) == 0)
+        || (data.size >= sizeof s_span_prefix - 1u
+            && memcmp(data.data, s_span_prefix, sizeof s_span_prefix - 1u) == 0)) {
         /* conn_id_same/stream_id_same with no cfg->route resolves to this
          * frame's own in_conn — bounces straight back onto the inter leg,
          * exercising s_commit_response's xport_inter branch. */
@@ -305,6 +308,72 @@ static const char *sc_wrong_conn(duct_engine_t *io, duct_handle_t tok)
 }
 
 /** @brief rc_closed: push after the session has fully closed. */
+static const char *sc_held_zero_copy(duct_engine_t *io, duct_handle_t tok)
+{
+    static constexpr size_t pad = 8u;
+    static constexpr size_t span_len = 1024u;
+
+    alignas(8) char bbuf[duct_inter_batch_bytes(2u)];
+    auto batch = (duct_inter_batch_t *)bbuf;
+
+    auto oob = duct_new(uint8_t, 32u);
+    if (!oob)
+        return "duct_new(oob) failed";
+    batch->n = 1u;
+    *duct_inter_batch_pkt(batch, 0u) = (duct_inter_pkt_t){
+        .payload = { .data = duct_at(oob) + 16u, .size = 20u },
+        .hold = oob,
+        .stream_id = duct_stream_id_default,
+        .flags = fl_frame_none,
+    };
+    auto bad_rc = duct_io_inter_batch(io, tok, 1u, batch);
+    duct_del(oob);
+    if (bad_rc != rc_invalid_arg)
+        return "out-of-bounds held slice did not return rc_invalid_arg";
+
+    auto blk = duct_new(uint8_t, pad + span_len);
+    if (!blk)
+        return "duct_new(blk) failed";
+    auto p = duct_at(blk) + pad;
+    memcpy(p, s_span_prefix, sizeof s_span_prefix - 1u);
+    for (size_t i = sizeof s_span_prefix - 1u; i < span_len; ++i)
+        p[i] = (uint8_t)(i * 37u + 11u);
+
+    static const char tail_inline[] = "mixed-inline";
+    unsigned pub_before = duct_atomic_load(&g_published, acquire);
+    int out_before = duct_atomic_load(&g_packet_out_count, acquire);
+    batch->n = 2u;
+    *duct_inter_batch_pkt(batch, 0u) = (duct_inter_pkt_t){
+        .payload = { .data = p, .size = span_len },
+        .hold = blk,
+        .stream_id = duct_stream_id_default,
+        .flags = fl_frame_none,
+    };
+    *duct_inter_batch_pkt(batch, 1u) = (duct_inter_pkt_t){
+        .payload = { .data = (void *)tail_inline, .size = sizeof tail_inline - 1u },
+        .stream_id = duct_stream_id_default,
+        .flags = fl_frame_none,
+    };
+    if (duct_io_inter_batch(io, tok, 1u, batch) != rc_ok) {
+        duct_del(blk);
+        return "duct_io_inter_batch (held zero-copy) failed";
+    }
+    if (!th_wait_int(&g_packet_out_count, out_before + 1, wait_ms))
+        return "on_packet_out never fired for held zero-copy span";
+    if (g_packet_out.len != span_len
+        || memcmp(g_packet_out.data, s_span_prefix, sizeof s_span_prefix - 1u) != 0)
+        return "held zero-copy span egress payload mismatch";
+    for (size_t i = sizeof s_span_prefix - 1u; i < span_len; ++i)
+        if ((uint8_t)g_packet_out.data[i] != (uint8_t)(i * 37u + 11u))
+            return "held zero-copy span egress byte corruption";
+    if (!s_wait_uint(&g_published, pub_before + 1u, wait_ms))
+        return "mixed inline packet in held batch never reached on_dgram";
+    if (g_records[pub_before].len != sizeof tail_inline - 1u
+        || memcmp(g_records[pub_before].data, tail_inline, sizeof tail_inline - 1u) != 0)
+        return "mixed inline packet payload mismatch";
+    return nullptr;
+}
+
 static const char *sc_stale_token(duct_sock_t fd, duct_engine_t *io, duct_handle_t tok)
 {
     static const char p[] = "x";
@@ -334,6 +403,7 @@ static const char *test_inter_conn(duct_engine_t *io, uint16_t port)
     if (!err) err = sc_batch(io, tok);
     if (!err) err = sc_batch_multiplex(io, tok);
     if (!err) err = sc_egress(io, tok);
+    if (!err) err = sc_held_zero_copy(io, tok);
     if (!err) err = sc_defer_race(io, tok);
     if (!err) err = sc_wrong_conn(io, tok);
     if (!err) err = sc_stale_token(fd, io, tok);

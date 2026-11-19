@@ -178,7 +178,7 @@ static_assert(sizeof(duct_wire_codec_t) <= duct_wire_codec_slot,
  *  A datagram sealed before the engine can derive the key keeps the prefix it
  *  has. Callers go through @ref duct_wire_codec_lead, which has checked
  *  @c lead_state. */
-void duct_wire_codec_lead_write(duct_wire_codec_t *c, uint8_t *dgram, size_t len);
+void duct_wire_codec_lead_write(duct_wire_codec_t *c, size_t len, uint8_t dgram[static len]);
 
 /** @brief Lead datagram @p dgram with @p c's join lead.
  *
@@ -187,10 +187,10 @@ void duct_wire_codec_lead_write(duct_wire_codec_t *c, uint8_t *dgram, size_t len
  *  codec in @c lead_state_none keeps the prefix it has. The first call after the
  *  handshake derives the key.
  */
-static inline void duct_wire_codec_lead(duct_wire_codec_t *c, uint8_t *dgram, size_t len)
+static inline void duct_wire_codec_lead(duct_wire_codec_t *c, size_t len, uint8_t dgram[static len])
 {
     if (c->lead_state != lead_state_none)
-        duct_wire_codec_lead_write(c, dgram, len);
+        duct_wire_codec_lead_write(c, len, dgram);
 }
 
 /** @brief Advance @p pdu past this codec's RX prefix.

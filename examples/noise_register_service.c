@@ -192,14 +192,14 @@ s_handle_handshake(session_state_t *st, const duct_frame_t *frame, duct_response
     uint8_t remote_static[32],
             payload[64];
     size_t payload_len = 0u;
-    bool read = duct_noise_hs_read_msg1(st->hs, msg1, remote_static, payload, sizeof payload, &payload_len);
+    bool read = duct_noise_hs_read_msg1(st->hs, msg1, remote_static, sizeof payload, payload, &payload_len);
     duct_do_if(!read, return rc_drop);
 
     auto resp = duct_at(duct_new(uint8_t, 1u + duct_noise_msg2_size));
     duct_do_if(!resp, return rc_drop);
     resp[0] = msg_type_handshake;
     size_t msg2_len = 0u;
-    if (!duct_noise_hs_write_msg2(st->hs, (duct_view_u8){}, resp + 1u, duct_noise_msg2_size, &msg2_len)) {
+    if (!duct_noise_hs_write_msg2(st->hs, (duct_view_u8){}, duct_noise_msg2_size, resp + 1u, &msg2_len)) {
         duct_del(resp);
         return rc_drop;
     }
@@ -228,7 +228,7 @@ s_handle_command(session_state_t *st, const duct_frame_t *frame, duct_response_t
     char cmd[128];
     size_t cmd_len = 0u;
     bool opened = duct_noise_transport_unseal(&st->transport, sealed_in,
-                                              (uint8_t *)cmd, sizeof cmd, &cmd_len);
+                                              sizeof cmd, (uint8_t *)cmd, &cmd_len);
     duct_do_if(!opened, return rc_drop);
 
     char reply[128];
@@ -240,7 +240,7 @@ s_handle_command(session_state_t *st, const duct_frame_t *frame, duct_response_t
     sealed[0] = msg_type_command;
     duct_view_u8 plain = duct_view_bytes((duct_view_cc){ reply, reply_len });
     size_t sealed_len = duct_noise_transport_seal(&st->transport, &plain, 1u,
-                                                  sealed + 1u, sealed_cap);
+                                                  sealed_cap, sealed + 1u);
     if (!sealed_len) {
         duct_del(sealed);
         return rc_drop;
@@ -290,7 +290,7 @@ s_client_handshake(duct_sock_t fd, duct_noise_hs_t *hs, duct_noise_transport_t *
     uint8_t msg1[256];
     msg1[0] = msg_type_handshake;
     size_t msg1_len = 0u;
-    if (!duct_noise_hs_write_msg1(hs, (duct_view_u8){}, msg1 + 1u, sizeof(msg1) - 1u, &msg1_len))
+    if (!duct_noise_hs_write_msg1(hs, (duct_view_u8){}, sizeof(msg1) - 1u, msg1 + 1u, &msg1_len))
         return s_client_fail(hs, "write_msg1 failed");
     if (send(fd, (const char *)msg1, (int)(1u + msg1_len), 0) != (int)(1u + msg1_len))
         return s_client_fail(hs, "send msg1 failed");
@@ -317,7 +317,7 @@ s_client_command(duct_sock_t fd, duct_noise_transport_t *t, const char *cmd)
     sealed[0] = msg_type_command;
     duct_view_u8 plain = duct_view_bytes((duct_view_cc){ cmd, cmd_len });
     size_t sealed_len = duct_noise_transport_seal(t, &plain, 1u,
-                                                  sealed + 1u, sizeof(sealed) - 1u);
+                                                  sizeof(sealed) - 1u, sealed + 1u);
     if (!sealed_len) {
         fprintf(stderr, "client: seal failed for '%s'\n", cmd);
         return false;
@@ -337,7 +337,7 @@ s_client_command(duct_sock_t fd, duct_noise_transport_t *t, const char *cmd)
     char reply[128];
     size_t reply_len = 0u;
     if (!duct_noise_transport_unseal(t, (duct_view_u8){ rbuf + 1u, (size_t)got - 1u },
-                                     (uint8_t *)reply, sizeof reply, &reply_len)) {
+                                     sizeof reply, (uint8_t *)reply, &reply_len)) {
         fprintf(stderr, "client: unseal failed for '%s'\n", cmd);
         return false;
     }

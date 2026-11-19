@@ -111,4 +111,10 @@
 
 [[maybe_unused]] constexpr bool     duct_handshake_mask        = @DUCT_HANDSHAKE_MASK@ != 0;
 
+/* Compiler capability probes. */
+#define DUCT_HAS_PTR_COUNTED_BY      @DUCT_PTR_COUNTED_BY@
+#define DUCT_HAS_ZERO_CALL_USED_REGS @DUCT_ZERO_CALL_USED_REGS@
+#define DUCT_HAS_MEMSET_EXPLICIT     @DUCT_MEMSET_EXPLICIT@
+#define DUCT_HAS_EXPLICIT_BZERO      @DUCT_EXPLICIT_BZERO@
+
 #endif /* DUCT_BUILD_CONFIG_H */

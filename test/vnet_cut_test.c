@@ -51,15 +51,15 @@ static uint8_t s_out[duct_vnet_cut_max];
  *  record slot at @p out, the header stays apart, and the cut runs in place. The room past the
  *  packet is filled with a mark first, and a cut that leaves any of it changed past the bytes it
  *  returns, or past the packet it refuses, ends the test. */
-static size_t s_cut_uso(const uint8_t *in, size_t n, size_t rec_max, bool uso,
-                        uint8_t *out, size_t room, unsigned *pkts)
+static size_t s_cut_uso(size_t n, const uint8_t in[static n], size_t rec_max, bool uso,
+                        size_t room, uint8_t out[static room], unsigned *pkts)
 {
     size_t len = n - t_vnet,
            at = duct_dgram_record_hdr_size + len;
     memcpy(out + duct_dgram_record_hdr_size, in + t_vnet, len);
     if (room > at)
         memset(out + at, t_canary, room - at);
-    size_t cut = duct_vnet_cut(in, out, len, rec_max, uso, room, pkts);
+    size_t cut = duct_vnet_cut(in, room, out, len, rec_max, uso, pkts);
     for (size_t i = cut > at ? cut : at; i < room; ++i)
         if (out[i] != t_canary) {
             fprintf(stderr, "FAIL: the cut wrote past its packets, at byte %zu of %zu\n", i, room);
@@ -75,7 +75,7 @@ static size_t s_cut_uso(const uint8_t *in, size_t n, size_t rec_max, bool uso,
 static size_t s_cut(const uint8_t *in, size_t n, size_t rec_max, uint8_t *out, size_t room,
                     unsigned *pkts)
 {
-    return s_cut_uso(in, n, rec_max, false, out, room, pkts);
+    return s_cut_uso(n, in, rec_max, false, room, out, pkts);
 }
 
 static uint16_t s_n16(const uint8_t *p) { return (uint16_t)(p[0] << 8u | p[1]); }
@@ -388,7 +388,7 @@ static int s_merge_back(size_t n, duct_vnet_merge_t merge, duct_vnet_gro_rc_t la
     unsigned i = 0u;
     for (const uint8_t *o = s_first; o < s_first + firstn; ++i) {
         size_t plen = duct_dgram_rec_hdr_decode(o);
-        auto rc = duct_vnet_gro_offer(&s_gro, o + duct_dgram_record_hdr_size, plen, 0u, merge);
+        auto rc = duct_vnet_gro_offer(&s_gro, plen, o + duct_dgram_record_hdr_size, 0u, merge);
         CHECK(rc == (i + 1u < pkts ? vnet_gro_taken : last),
               "consecutive packets of one flow join one train, the last as the flow ends");
         o += duct_dgram_record_hdr_size + plen;
@@ -427,7 +427,7 @@ static int s_check_gro_spans(void)
     unsigned i = 0u;
     for (const uint8_t *o = many; o < many + cutn; ++i) {
         size_t plen = duct_dgram_rec_hdr_decode(o);
-        auto rc = duct_vnet_gro_offer(&s_gro, o + duct_dgram_record_hdr_size, plen, 0u,
+        auto rc = duct_vnet_gro_offer(&s_gro, plen, o + duct_dgram_record_hdr_size, 0u,
                                       vnet_merge_tcp);
         CHECK(rc == (i + 1u < pkts ? vnet_gro_taken : vnet_gro_taken_last),
               "the span bound closes the train, no sooner and no later");
@@ -492,35 +492,35 @@ static int s_check_udp_rules(void)
             alt[48u + seg + 1u];
     memcpy(a, s_first + duct_dgram_record_hdr_size, la);
     memcpy(b, s_first + 2u * duct_dgram_record_hdr_size + la, la);
-    CHECK(duct_vnet_gro_offer(&s_gro, a, la, 0u, vnet_merge_tcp) == vnet_gro_alone,
+    CHECK(duct_vnet_gro_offer(&s_gro, la, a, 0u, vnet_merge_tcp) == vnet_gro_alone,
           "a leg that took no USO flags merges no datagram");
-    CHECK(duct_vnet_gro_offer(&s_gro, a, la, 0u, vnet_merge_tcp_udp) == vnet_gro_taken,
+    CHECK(duct_vnet_gro_offer(&s_gro, la, a, 0u, vnet_merge_tcp_udp) == vnet_gro_taken,
           "a datagram opens a train");
     memcpy(alt, b, la);
     alt[20] ^= 1u;
     s_fix_udp4(alt, la);
-    CHECK(duct_vnet_gro_offer(&s_gro, alt, la, 0u, vnet_merge_tcp_udp) == vnet_gro_flush_first,
+    CHECK(duct_vnet_gro_offer(&s_gro, la, alt, 0u, vnet_merge_tcp_udp) == vnet_gro_flush_first,
           "another port flushes the train first");
     memcpy(alt, b, la);
     alt[19] ^= 1u;
     s_fix_ip4(alt);
     s_fix_udp4(alt, la);
-    CHECK(duct_vnet_gro_offer(&s_gro, alt, la, 0u, vnet_merge_tcp_udp) == vnet_gro_flush_first,
+    CHECK(duct_vnet_gro_offer(&s_gro, la, alt, 0u, vnet_merge_tcp_udp) == vnet_gro_flush_first,
           "another address flushes the train first");
     memcpy(alt, b, la);
     s_p16(alt + 4u, (uint16_t)(t_id0 + 5u));
     s_fix_ip4(alt);
-    CHECK(duct_vnet_gro_offer(&s_gro, alt, la, 0u, vnet_merge_tcp_udp) == vnet_gro_flush_first,
+    CHECK(duct_vnet_gro_offer(&s_gro, la, alt, 0u, vnet_merge_tcp_udp) == vnet_gro_flush_first,
           "an ipv4 id out of step flushes the train first");
     memcpy(alt, b, la);
     alt[8] ^= 1u;
     s_fix_ip4(alt);
-    CHECK(duct_vnet_gro_offer(&s_gro, alt, la, 0u, vnet_merge_tcp_udp) == vnet_gro_flush_first,
+    CHECK(duct_vnet_gro_offer(&s_gro, la, alt, 0u, vnet_merge_tcp_udp) == vnet_gro_flush_first,
           "another TTL flushes the train first");
     memcpy(alt, b, la);
     alt[1] ^= 4u;
     s_fix_ip4(alt);
-    CHECK(duct_vnet_gro_offer(&s_gro, alt, la, 0u, vnet_merge_tcp_udp) == vnet_gro_flush_first,
+    CHECK(duct_vnet_gro_offer(&s_gro, la, alt, 0u, vnet_merge_tcp_udp) == vnet_gro_flush_first,
           "another TOS flushes the train first");
     memcpy(alt, b, la);
     alt[la] = 0x5au;
@@ -528,48 +528,48 @@ static int s_check_udp_rules(void)
     s_p16(alt + 24u, (uint16_t)(la + 1u - 20u));
     s_fix_ip4(alt);
     s_fix_udp4(alt, la + 1u);
-    CHECK(duct_vnet_gro_offer(&s_gro, alt, la + 1u, 0u, vnet_merge_tcp_udp) == vnet_gro_flush_first,
+    CHECK(duct_vnet_gro_offer(&s_gro, la + 1u, alt, 0u, vnet_merge_tcp_udp) == vnet_gro_flush_first,
           "a datagram longer than the first flushes the train first");
     size_t tn = s_build(false, 0u, seg, 0u, t_ack, 0u, 0u) - t_vnet;
     uint8_t tcp[20u + 20u + seg];
     memcpy(tcp, s_in + t_vnet, tn);
     s_fix_ip4(tcp);
     s_fix_tcp4(tcp, tn);
-    CHECK(duct_vnet_gro_offer(&s_gro, tcp, tn, 0u, vnet_merge_tcp_udp) == vnet_gro_flush_first,
+    CHECK(duct_vnet_gro_offer(&s_gro, tn, tcp, 0u, vnet_merge_tcp_udp) == vnet_gro_flush_first,
           "a TCP segment flushes a UDP train first");
     memcpy(alt, b, la);
     alt[hdr + 3u] ^= 1u;
-    CHECK(duct_vnet_gro_offer(&s_gro, alt, la, 0u, vnet_merge_tcp_udp) == vnet_gro_alone,
+    CHECK(duct_vnet_gro_offer(&s_gro, la, alt, 0u, vnet_merge_tcp_udp) == vnet_gro_alone,
           "a datagram failing its checksum stays alone");
     memcpy(alt, b, la);
     alt[26] = alt[27] = 0u;
-    CHECK(duct_vnet_gro_offer(&s_gro, alt, la, 0u, vnet_merge_tcp_udp) == vnet_gro_alone,
+    CHECK(duct_vnet_gro_offer(&s_gro, la, alt, 0u, vnet_merge_tcp_udp) == vnet_gro_alone,
           "a datagram with no checksum stays alone");
     memcpy(alt, b, la);
     s_p16(alt + 24u, (uint16_t)(la - 20u - 1u));
-    CHECK(duct_vnet_gro_offer(&s_gro, alt, la, 0u, vnet_merge_tcp_udp) == vnet_gro_alone,
+    CHECK(duct_vnet_gro_offer(&s_gro, la, alt, 0u, vnet_merge_tcp_udp) == vnet_gro_alone,
           "a UDP length off the IP length stays alone");
     memcpy(alt, b, la);
     alt[10] ^= 1u;
-    CHECK(duct_vnet_gro_offer(&s_gro, alt, la, 0u, vnet_merge_tcp_udp) == vnet_gro_alone,
+    CHECK(duct_vnet_gro_offer(&s_gro, la, alt, 0u, vnet_merge_tcp_udp) == vnet_gro_alone,
           "a datagram failing its ipv4 header checksum stays alone");
     memcpy(alt, b, la);
     alt[6] = 0u;
     s_fix_ip4(alt);
-    CHECK(duct_vnet_gro_offer(&s_gro, alt, la, 0u, vnet_merge_tcp_udp) == vnet_gro_alone,
+    CHECK(duct_vnet_gro_offer(&s_gro, la, alt, 0u, vnet_merge_tcp_udp) == vnet_gro_alone,
           "a datagram without DF stays alone");
     memcpy(alt, b, la);
     alt[0] = 0x46u;
-    CHECK(duct_vnet_gro_offer(&s_gro, alt, la, 0u, vnet_merge_tcp_udp) == vnet_gro_alone,
+    CHECK(duct_vnet_gro_offer(&s_gro, la, alt, 0u, vnet_merge_tcp_udp) == vnet_gro_alone,
           "a datagram under ipv4 options stays alone");
     memcpy(alt, b, hdr);
     s_p16(alt + 2u, hdr);
     s_p16(alt + 24u, duct_udp_hdr_size);
     s_fix_ip4(alt);
     s_fix_udp4(alt, hdr);
-    CHECK(duct_vnet_gro_offer(&s_gro, alt, hdr, 0u, vnet_merge_tcp_udp) == vnet_gro_alone,
+    CHECK(duct_vnet_gro_offer(&s_gro, hdr, alt, 0u, vnet_merge_tcp_udp) == vnet_gro_alone,
           "a datagram with no payload stays alone");
-    CHECK(duct_vnet_gro_offer(&s_gro, b, la, 0u, vnet_merge_tcp_udp) == vnet_gro_taken,
+    CHECK(duct_vnet_gro_offer(&s_gro, la, b, 0u, vnet_merge_tcp_udp) == vnet_gro_taken,
           "the next datagram of the flow joins");
     memcpy(alt, b, la);
     s_p16(alt + 4u, (uint16_t)(t_id0 + 2u));
@@ -577,7 +577,7 @@ static int s_check_udp_rules(void)
     s_p16(alt + 24u, (uint16_t)(duct_udp_hdr_size + 800u));
     s_fix_ip4(alt);
     s_fix_udp4(alt, hdr + 800u);
-    CHECK(duct_vnet_gro_offer(&s_gro, alt, hdr + 800u, 0u, vnet_merge_tcp_udp) == vnet_gro_taken_last,
+    CHECK(duct_vnet_gro_offer(&s_gro, hdr + 800u, alt, 0u, vnet_merge_tcp_udp) == vnet_gro_taken_last,
           "a shorter datagram joins and closes the train");
     uint8_t vh[duct_vnet_hdr_max];
     duct_vnet_gro_finish(&s_gro, vh);
@@ -585,14 +585,14 @@ static int s_check_udp_rules(void)
     memcpy(f16, vh + 2u, sizeof f16);
     CHECK(s_gro.len == hdr + 2u * seg + 800u && s_gro.nspans == 3u, "three datagrams make the train");
     CHECK(vh[1] == t_gso_udp && f16[1] == seg, "the segment size is the first datagram's");
-    CHECK(duct_vnet_gro_offer(&s_gro, a, la, 0u, vnet_merge_tcp_udp) == vnet_gro_taken,
+    CHECK(duct_vnet_gro_offer(&s_gro, la, a, 0u, vnet_merge_tcp_udp) == vnet_gro_taken,
           "a datagram opens a train again");
     memcpy(alt, b, la);
     alt[20] ^= 1u;
-    CHECK(duct_vnet_gro_offer(&s_gro, alt, la, 0u, vnet_merge_tcp_udp) == vnet_gro_flush_first,
+    CHECK(duct_vnet_gro_offer(&s_gro, la, alt, 0u, vnet_merge_tcp_udp) == vnet_gro_flush_first,
           "a datagram of another flow flushes the train before its checksum is read");
     duct_vnet_gro_finish(&s_gro, vh);
-    CHECK(duct_vnet_gro_offer(&s_gro, alt, la, 0u, vnet_merge_tcp_udp) == vnet_gro_alone,
+    CHECK(duct_vnet_gro_offer(&s_gro, la, alt, 0u, vnet_merge_tcp_udp) == vnet_gro_alone,
           "offered again to the empty train, the same datagram fails its checksum");
 
     n = s_build_udp(true, 2u * seg, seg);
@@ -603,21 +603,21 @@ static int s_check_udp_rules(void)
     memcpy(a6, s_first + duct_dgram_record_hdr_size, la);
     memcpy(b6, s_first + 2u * duct_dgram_record_hdr_size + la, la);
     CHECK(firstn && pkts == 2u && la == 48u + seg, "two ipv6 datagrams to play with");
-    CHECK(duct_vnet_gro_offer(&s_gro, a6, la, 0u, vnet_merge_tcp_udp) == vnet_gro_taken,
+    CHECK(duct_vnet_gro_offer(&s_gro, la, a6, 0u, vnet_merge_tcp_udp) == vnet_gro_taken,
           "an ipv6 datagram opens a train");
     memcpy(alt, b6, la);
     alt[7] ^= 1u;
-    CHECK(duct_vnet_gro_offer(&s_gro, alt, la, 0u, vnet_merge_tcp_udp) == vnet_gro_flush_first,
+    CHECK(duct_vnet_gro_offer(&s_gro, la, alt, 0u, vnet_merge_tcp_udp) == vnet_gro_flush_first,
           "another hop limit flushes the train first");
     memcpy(alt, b6, la);
     alt[1] ^= 0x10u;
-    CHECK(duct_vnet_gro_offer(&s_gro, alt, la, 0u, vnet_merge_tcp_udp) == vnet_gro_flush_first,
+    CHECK(duct_vnet_gro_offer(&s_gro, la, alt, 0u, vnet_merge_tcp_udp) == vnet_gro_flush_first,
           "another traffic class flushes the train first");
     memcpy(alt, b6, la);
     alt[48u + 3u] ^= 1u;
-    CHECK(duct_vnet_gro_offer(&s_gro, alt, la, 0u, vnet_merge_tcp_udp) == vnet_gro_alone,
+    CHECK(duct_vnet_gro_offer(&s_gro, la, alt, 0u, vnet_merge_tcp_udp) == vnet_gro_alone,
           "an ipv6 datagram failing its checksum stays alone");
-    CHECK(duct_vnet_gro_offer(&s_gro, b6, la, 0u, vnet_merge_tcp_udp) == vnet_gro_taken,
+    CHECK(duct_vnet_gro_offer(&s_gro, la, b6, 0u, vnet_merge_tcp_udp) == vnet_gro_taken,
           "the next ipv6 datagram of the flow joins");
     duct_vnet_gro_finish(&s_gro, vh);
     return 0;
@@ -635,7 +635,7 @@ static int s_check_udp_cap(void)
     unsigned i = 0u;
     for (const uint8_t *o = s_first; o < s_first + firstn; ++i) {
         size_t plen = duct_dgram_rec_hdr_decode(o);
-        auto rc = duct_vnet_gro_offer(&s_gro, o + duct_dgram_record_hdr_size, plen, 0u,
+        auto rc = duct_vnet_gro_offer(&s_gro, plen, o + duct_dgram_record_hdr_size, 0u,
                                       vnet_merge_tcp_udp);
         if (i + 1u == duct_vnet_udp_segs_max) {
             CHECK(rc == vnet_gro_taken_last, "the bound closes the train");
@@ -665,7 +665,7 @@ static duct_vnet_gro_rc_t s_offer_all(const uint8_t *out, size_t n, duct_vnet_me
                            .size = raw & ~duct_dgram_rec_gso };
         uint8_t vh[duct_vnet_hdr_max];
         size_t mss = raw & duct_dgram_rec_gso ? duct_vnet_gso_open(&pkt, vh) : 0u;
-        rc = duct_vnet_gro_offer(&s_gro, pkt.data, pkt.size, mss, merge);
+        rc = duct_vnet_gro_offer(&s_gro, pkt.size, pkt.data, mss, merge);
         o += duct_dgram_record_hdr_size + (raw & ~duct_dgram_rec_gso);
     }
     return rc;
@@ -961,39 +961,39 @@ int main(void)
                       *b = a + 1448u + 52u + duct_dgram_record_hdr_size;
         size_t la = duct_dgram_rec_hdr_decode(s_first);
         CHECK(firstn && pkts == 2u, "two segments to play with");
-        CHECK(duct_vnet_gro_offer(&s_gro, a, la, 0u, vnet_merge_tcp) == vnet_gro_taken,
+        CHECK(duct_vnet_gro_offer(&s_gro, la, a, 0u, vnet_merge_tcp) == vnet_gro_taken,
               "a full segment opens a train");
         uint8_t alt[1600];
         memcpy(alt, b, la);
         alt[20] ^= 1u;
         s_fix_tcp4(alt, la);
-        CHECK(duct_vnet_gro_offer(&s_gro, alt, la, 0u, vnet_merge_tcp) == vnet_gro_flush_first,
+        CHECK(duct_vnet_gro_offer(&s_gro, la, alt, 0u, vnet_merge_tcp) == vnet_gro_flush_first,
               "another flow flushes the train first");
         memcpy(alt, b, la);
         alt[27] ^= 1u;
         s_fix_tcp4(alt, la);
-        CHECK(duct_vnet_gro_offer(&s_gro, alt, la, 0u, vnet_merge_tcp) == vnet_gro_flush_first,
+        CHECK(duct_vnet_gro_offer(&s_gro, la, alt, 0u, vnet_merge_tcp) == vnet_gro_flush_first,
               "a gap in the sequence flushes the train first");
         memcpy(alt, b, la);
         s_p16(alt + 4u, (uint16_t)(t_id0 + 5u));
         s_fix_ip4(alt);
-        CHECK(duct_vnet_gro_offer(&s_gro, alt, la, 0u, vnet_merge_tcp) == vnet_gro_flush_first,
+        CHECK(duct_vnet_gro_offer(&s_gro, la, alt, 0u, vnet_merge_tcp) == vnet_gro_flush_first,
               "an ipv4 id out of step flushes the train first");
         memcpy(alt, b, la);
         alt[20u + 16u] ^= 1u;
-        CHECK(duct_vnet_gro_offer(&s_gro, alt, la, 0u, vnet_merge_tcp) == vnet_gro_alone,
+        CHECK(duct_vnet_gro_offer(&s_gro, la, alt, 0u, vnet_merge_tcp) == vnet_gro_alone,
               "a segment failing its checksum stays alone");
         memcpy(alt, b, la);
         alt[10] ^= 1u;
-        CHECK(duct_vnet_gro_offer(&s_gro, alt, la, 0u, vnet_merge_tcp) == vnet_gro_alone,
+        CHECK(duct_vnet_gro_offer(&s_gro, la, alt, 0u, vnet_merge_tcp) == vnet_gro_alone,
               "a segment failing its ipv4 header checksum stays alone");
         memcpy(alt, a, 52u);
         s_p16(alt + 2u, 52u);
-        CHECK(duct_vnet_gro_offer(&s_gro, alt, 52u, 0u, vnet_merge_tcp) == vnet_gro_alone,
+        CHECK(duct_vnet_gro_offer(&s_gro, 52u, alt, 0u, vnet_merge_tcp) == vnet_gro_alone,
               "a packet with no payload stays alone");
         memcpy(alt, b, la);
         alt[33] |= 0x02u;
-        CHECK(duct_vnet_gro_offer(&s_gro, alt, la, 0u, vnet_merge_tcp) == vnet_gro_alone,
+        CHECK(duct_vnet_gro_offer(&s_gro, la, alt, 0u, vnet_merge_tcp) == vnet_gro_alone,
               "a syn stays alone");
         uint8_t vh[duct_vnet_hdr_max];
         duct_vnet_gro_finish(&s_gro, vh);
@@ -1042,7 +1042,7 @@ int main(void)
         memcpy(f16, vh + 2u, sizeof f16);
         CHECK(f16[0] == 52u && f16[1] == 1448u && f16[2] == 20u && f16[3] == 16u,
               "hdr_len, gso_size, csum_start and csum_offset come from the record");
-        CHECK(duct_vnet_gro_offer(&s_gro, rec.data, rec.size, mss, vnet_merge_tcp) == vnet_gro_alone,
+        CHECK(duct_vnet_gro_offer(&s_gro, rec.size, rec.data, mss, vnet_merge_tcp) == vnet_gro_alone,
               "a record carrying cwr stays alone");
         const uint8_t *o = s_out + duct_dgram_record_hdr_size + (raw & ~duct_dgram_rec_gso);
         raw = (uint32_t)duct_dgram_rec_hdr_decode(o);
@@ -1050,7 +1050,7 @@ int main(void)
         rec = (duct_view_u8){ .data = (void *)(o + duct_dgram_record_hdr_size), .size = rlen };
         mss = duct_vnet_gso_open(&rec, vh);
         CHECK(mss == 1448u && vh[1] == 1u, "a record carrying no cwr goes out without ecn");
-        CHECK(duct_vnet_gro_offer(&s_gro, rec.data, rec.size, mss, vnet_merge_tcp) == vnet_gro_alone,
+        CHECK(duct_vnet_gro_offer(&s_gro, rec.size, rec.data, mss, vnet_merge_tcp) == vnet_gro_alone,
               "a record carrying fin stays alone");
         uint8_t bad[3000];
         memcpy(bad, o + duct_dgram_record_hdr_size, rlen);
@@ -1191,10 +1191,10 @@ int main(void)
     {
         size_t n = s_build_udp(false, 10000u, 1400u);
         unsigned pkts = 0u;
-        size_t cut_off = s_cut_uso(s_in, n, 16380u, false, s_out, sizeof s_out, &pkts);
+        size_t cut_off = s_cut_uso(n, s_in, 16380u, false, sizeof s_out, s_out, &pkts);
         CHECK(cut_off && pkts == 8u, "without uso confirmation a udp superpacket cuts into datagrams");
 
-        size_t cut_on = s_cut_uso(s_in, n, 16380u, true, s_out, sizeof s_out, &pkts);
+        size_t cut_on = s_cut_uso(n, s_in, 16380u, true, sizeof s_out, s_out, &pkts);
         CHECK(cut_on && pkts == 1u, "with uso confirmation a udp superpacket packs into one gso record");
         uint32_t raw = (uint32_t)duct_dgram_rec_hdr_decode(s_out);
         CHECK(raw & duct_dgram_rec_gso, "udp gso record carries gso bit");
@@ -1204,10 +1204,10 @@ int main(void)
         size_t mss = duct_vnet_gso_open(&rec, vh);
         CHECK(mss == 1400u && duct_vnet_gso_is_udp(vh), "udp gso record opens with udp vnet header");
         s_gro = (duct_vnet_gro_t){};
-        CHECK(duct_vnet_gro_offer(&s_gro, rec.data, rec.size, mss, vnet_merge_tcp) == vnet_gro_alone,
+        CHECK(duct_vnet_gro_offer(&s_gro, rec.size, rec.data, mss, vnet_merge_tcp) == vnet_gro_alone,
               "udp gso record is refused without vnet_merge_tcp_udp");
         s_gro = (duct_vnet_gro_t){};
-        CHECK(duct_vnet_gro_offer(&s_gro, rec.data, rec.size, mss, vnet_merge_tcp_udp) == vnet_gro_taken_last,
+        CHECK(duct_vnet_gro_offer(&s_gro, rec.size, rec.data, mss, vnet_merge_tcp_udp) == vnet_gro_taken_last,
               "udp gso record with short tail completes train under vnet_merge_tcp_udp");
         duct_vnet_gro_finish(&s_gro, vh);
         CHECK(s_gro.nspans == 1u && duct_vnet_gso_is_udp(vh), "finished udp gso train produces udp vnet header");

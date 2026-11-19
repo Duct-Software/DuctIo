@@ -18,10 +18,33 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
+#if defined(__has_include)
+#if __has_include("duct_build_config.h")
+#include "duct_build_config.h"
+#endif
+#endif
 
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+/** @brief Byte bound of the array type a @c duct_ptr_t points to.
+ *  The smaller of @c PTRDIFF_MAX and 2^61 - 1, the largest array type every compiler of the tree
+ *  takes. No real array comes near it.
+ */
+static constexpr uint64_t duct_ptr_bound_bytes =
+    (uint64_t)PTRDIFF_MAX < (UINT64_MAX >> 3) ? (uint64_t)PTRDIFF_MAX : UINT64_MAX >> 3;
+
+/** @brief Pointer to the array of @c T that @c duct_new answers when given a count.
+ *  The type is @c T (*)[duct_ptr_bound_bytes / sizeof(T)], a bound only these pointers carry:
+ *  the compiler refuses one from another element type, from a plain @c T * and from the address
+ *  of a fixed-size array. The address of a variable length array converts without a word, and
+ *  @ref duct_is_ptr stops it at the accessors. The pointer is never dereferenced as an array:
+ *  @ref duct_at yields the elements, and @c p + off steps in whole arrays.
+ *  A read-only view is @c duct_ptr_t(const T), which a writable array converts to;
+ *  @c duct_ptr_t(T) a, b; declares two pointers.
+ */
+#define duct_ptr_t(T) typeof(T (*)[duct_ptr_bound_bytes / sizeof(T)])
 
 /** @brief Runtime engine; owns I/O threads, workers and session table. */
 typedef struct duct_engine duct_engine_t;
@@ -176,7 +199,38 @@ typedef struct duct_tcp_stats {
  *  What @ref duct_conn_tx_unsent answers where it has none to give. */
 static constexpr uint64_t duct_tx_unsent_unread = UINT64_MAX;
 
-/** @brief Named views of the duct_view macros; the constructors live in duct_core.h. */
+/** @name Runtime-counted bounds
+ *  The count member names the array's element count, and
+ *  @c __builtin_dynamic_object_size reads it back wherever the toolchain
+ *  honors the attribute, making every fortify-bounded access through the
+ *  member a checked one.
+ *
+ *  Every branch spells the GNU form: the @c [[gnu::counted_by]] C23 spelling
+ *  is unknown to the compilers this tree builds on even where the feature
+ *  exists (clang 22 answers "unknown attribute ignored" for it). The two
+ *  macros split by what the toolchain accepts: @c counted_by on a trailing
+ *  flexible array member follows @c __has_attribute(counted_by), while
+ *  pointer-member @c counted_by shares that same attribute name in older
+ *  frontends that reject pointers, so CMake probes pointer support directly
+ *  with @c check_c_source_compiles into @c DUCT_HAS_PTR_COUNTED_BY.
+ *  @{
+ */
+#if defined(__has_attribute) && __has_attribute(counted_by)
+#define duct_counted_by(member) __attribute__((counted_by(member)))
+#else
+#define duct_counted_by(member)
+#endif
+#if defined(DUCT_HAS_PTR_COUNTED_BY) && DUCT_HAS_PTR_COUNTED_BY
+#define duct_ptr_counted_by(member) __attribute__((counted_by(member)))
+#else
+#define duct_ptr_counted_by(member)
+#endif
+/** @} */
+
+/** @brief Named views of the duct_view macros; the constructors live in
+ *  duct_core.h. The members lay out as @c struct iovec, the order the kernel
+ *  spans ride — the pointer-form counted_by wants the count first, so the
+ *  views carry none. */
 typedef struct { uint8_t *data; size_t size; } duct_view_u8;
 typedef struct { const uint8_t *data; size_t size; } duct_view_cu8;
 typedef struct { const char *data; size_t size; } duct_view_cc;
@@ -365,7 +419,8 @@ typedef enum duct_handler_kind : uint8_t {
  *  @c fl_frame_none respectively for opaque / single-stream case.
  */
 typedef struct duct_inter_pkt {
-    duct_view_u8         payload;   /**< Non-owning view into caller storage. */
+    duct_view_u8        payload;   /**< View into caller or held storage. */
+    duct_ptr_t(uint8_t) hold;      /**< Optional owning block moved on rc_ok. */
     duct_stream_id_t    stream_id; /**< Target stream; duct_stream_id_default for opaque. */
     duct_frame_flags_t  flags;     /**< @c fl_frame_fin and @c fl_frame_rst close stream
                                      * after this packet. */
@@ -379,7 +434,7 @@ typedef struct duct_inter_pkt {
  */
 typedef struct duct_inter_batch {
     unsigned n;                         /**< Number of packets in @c pkts. */
-    alignas(8) duct_inter_pkt_t pkts[]; /**< Packets; non-owning views into caller storage. */
+    alignas(8) duct_inter_pkt_t pkts[] duct_counted_by(n); /**< Packets; non-owning views into caller storage. */
 } duct_inter_batch_t;
 
 /** @brief Full size of an inter batch holding @p n packets. */

@@ -73,7 +73,7 @@ static void s_reset(void)
     duct_atomic_store(&g_have_b, false, release);
 }
 
-static void s_put(uint8_t *out, uint8_t flags, uint32_t sid, char tag)
+static void s_put(uint8_t out[static 6], uint8_t flags, uint32_t sid, char tag)
 {
     out[0] = flags;
     out[1] = (uint8_t)(sid >> 24u); out[2] = (uint8_t)(sid >> 16u);
@@ -119,7 +119,6 @@ on_frame([[maybe_unused]] duct_session_t *s, [[maybe_unused]] duct_conn_id_t cid
         out->payload = duct_view(duct_view_u8, held, held_n);
         out->flags = fl_send_static;
         out->stream_id = frame->stream_id;
-        out->send_token = (uintptr_t)held;
         return rc_ok;
     }
     if (kind == 'o' || kind == 'i') {
@@ -156,9 +155,9 @@ on_error([[maybe_unused]] duct_session_t *s, duct_result_t error,
 
 static duct_result_t
 on_send_done([[maybe_unused]] duct_session_t *s, const duct_send_done_info_t *info,
-             [[maybe_unused]] duct_response_t *out, [[maybe_unused]] void *proto_state)
+             duct_response_t *out, [[maybe_unused]] void *proto_state)
 {
-    if (info->stream_id == sid_recurse) {
+    if (info->result == rc_ok && info->frontier >= 1u) {
         duct_atomic_fetch(add, &g_done_fins, 1, relaxed);
         out->control.stream_op = stream_op_fin;
         out->control.stream_op_stream_id = (duct_stream_id_t)sid_recurse;

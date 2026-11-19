@@ -132,7 +132,7 @@ static const char *sc_roundtrip(duct_frame_flags_t sent, unsigned split_pause_ms
 
     if (th_send_flags(fd, m, sizeof m - 1u, (uint8_t)sent, split_pause_ms) != 0)
         err = "send failed";
-    else if (th_recv_flags(fd, buf, sizeof buf, &back) != (int64_t)(sizeof m - 1u)
+    else if (th_recv_flags(fd, sizeof buf, buf, &back) != (int64_t)(sizeof m - 1u)
              || memcmp(buf, m, sizeof m - 1u) != 0)
         err = "echo lost or corrupted";
     else if (duct_atomic_load(&g_seen_flags, acquire) != (int)sent)
@@ -160,7 +160,7 @@ static const char *sc_standalone(const char *op, duct_frame_flags_t want,
     int64_t want_len = is_rst ? 4 : 0;
 
     int64_t got = th_send(fd, op, 4u) != 0
-                ? -1 : th_recv_flags(fd, buf, sizeof buf, &back);
+                ? -1 : th_recv_flags(fd, sizeof buf, buf, &back);
     if (got < 0)
         err = "no control frame arrived";
     else if (got != want_len)

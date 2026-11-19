@@ -307,3 +307,11 @@ void duct_futex_wake(void *addr, uint32_t count)
 {
     count > 1u ? WakeByAddressAll(addr) : WakeByAddressSingle(addr);
 }
+
+#if !DUCT_HAS_MEMSET_EXPLICIT
+void duct_secure_zero(void *p, size_t n)
+{
+    if (p && n)
+        SecureZeroMemory(p, n);
+}
+#endif

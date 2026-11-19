@@ -124,24 +124,29 @@ int main(void)
         s_tx_del(tx);
     }
 
-    /* The materialize arena wraps: a run crossing the arena's end is refused
-     * even where the free bytes exist across it, and the front reopens only
-     * past the wrap. */
+    /* The materialize arena wraps: a run past the arena's end wraps to zero
+     * when the gap plus run fit the budget (even when the arena is empty near
+     * its end), is refused when live bytes block the wrap, and completion
+     * advances mat_head across the skipped gap. */
     {
         auto tx = s_tx_new(duct_conn_tx_olb_cap);
         CHECK(tx, "alloc (arena wrap)");
         size_t first = duct_conn_tx_mat_cap - 64u;
-        CHECK(s_stage_fill(tx, first) == olb_tx_ok, "stage up to the arena's end");
+        CHECK(s_stage_fill(tx, first) == olb_tx_ok, "stage up to near the arena's end");
         duct_olb_tx_publish(tx);
         duct_olb_tx_advance(tx, first + 4u, false);
-        CHECK(s_stage_fill(tx, 48u) == olb_tx_ok, "a run inside the freed tail fits");
-        CHECK(s_stage_fill(tx, 32u) == olb_tx_full,
-              "a run crossing the arena's end is refused");
-        CHECK(s_stage_fill(tx, 16u) == olb_tx_ok, "the tail's last bytes fill");
+        CHECK(s_stage_fill(tx, 128u) == olb_tx_ok,
+              "an empty arena near its end wraps cleanly instead of deadlocking");
+        CHECK(tx->mat_tail == duct_conn_tx_mat_cap + 128u,
+              "mat_tail skips the end gap on wrap");
         duct_olb_tx_publish(tx);
-        duct_olb_tx_advance(tx, 68u, false);
-        CHECK(s_stage_fill(tx, 32u) == olb_tx_ok,
-              "the wrap reopened the arena's front");
+        duct_olb_tx_advance(tx, 132u, false);
+        CHECK(duct_atomic_load(&tx->mat_head, relaxed) == duct_conn_tx_mat_cap + 128u,
+              "completion advances mat_head past the skipped gap");
+        CHECK(s_stage_fill(tx, duct_conn_tx_mat_cap - 192u) == olb_tx_ok,
+              "fill most of the arena");
+        CHECK(s_stage_fill(tx, 160u) == olb_tx_full,
+              "a wrap whose gap + run exceed free budget is refused");
         s_tx_del(tx);
     }
 

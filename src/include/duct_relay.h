@@ -35,6 +35,7 @@ typedef struct duct_dgram_out     duct_dgram_out_t;
 typedef struct duct_x_gso_tally   duct_x_gso_tally_t;
 typedef struct duct_x_slot_pool   duct_x_slot_pool_t;
 typedef struct duct_stream_ctx    duct_stream_ctx_t;
+typedef struct duct_span          duct_span_t;
 
 /** @name Message lists
  *  Each list is called with a macro @c X(name), where @c name completes the type @c duct_msg_NAME.
@@ -211,6 +212,9 @@ void duct_worker_wake_id(unsigned worker_id);
  */
 void duct_worker_inter_arm(unsigned worker_id, unsigned conn_idx);
 
+/** @brief Arm @p conn_idx's bit in @p worker_id's drain-completion frontier bitmap. */
+void duct_worker_done_arm(unsigned worker_id, unsigned conn_idx);
+
 /** @brief Flush the calling worker's @c x_udp_peer and vnet trains bound for
  *  @p conn.
  *  A close request runs it first, so the close finds those records published
@@ -252,6 +256,10 @@ uint32_t _Atomic *duct_worker_wake_latch(unsigned worker_id);
 duct_nonnull(1) duct_result_t
 duct_host_packet_out(const duct_session_handle_t *tok,
                      duct_conn_id_t conn_id, duct_view_u8 pkt);
+
+duct_nonnull(1, 3) duct_result_t
+duct_host_packet_out_span(const duct_session_handle_t *tok,
+                          duct_conn_id_t conn_id, const duct_span_t *span);
 
 /** @brief One egress slot carved and not yet resolved.
  *  Opaque to the holder: filled by @ref duct_host_egress_reserve, handed back
@@ -446,6 +454,10 @@ duct_worker_conn_defer_discard(const duct_conn_handle_t *conn);
  */
 duct_nonnull(1) void
 duct_worker_conn_retry_discard(const duct_conn_handle_t *conn);
+
+/** @brief Idempotently force-settle unfinished @c fl_send_done responses on closing @p conn. */
+duct_nonnull(1, 3) void
+duct_worker_conn_done_close(duct_session_t *s, duct_conn_id_t conn_id, duct_conn_t *conn);
 
 duct_nonnull(1) bool duct_worker_session_tx_parked(const duct_session_t *s);
 

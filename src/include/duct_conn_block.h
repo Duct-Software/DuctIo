@@ -55,9 +55,9 @@ typedef struct duct_block_pool duct_block_pool_t;
 
 static_assert(sizeof(duct_msg_conn_req) == 32u,
               "the gen word and the request node take their forty bytes of page 0");
-static_assert(sizeof(duct_olb_rx_t) == 7u * duct_cacheline_size,
-              "the rx header is the common three lines, its own staging and"
-              " ack lines, and the span-pin line C of duct-zerocopy §2.3");
+static_assert(sizeof(duct_olb_rx_t) == 8u * duct_cacheline_size,
+              "the rx header is the common three lines, three io/compaction/cold"
+              " lines, the worker's ack line, and the span-pin line C");
 static_assert(offsetof(duct_olb_tx_t, drained)
                   == sizeof(duct_olb_hdr_t) + duct_cacheline_size,
               "the tx header is the common three lines, the staging worker's"
@@ -70,11 +70,26 @@ static constexpr uint32_t conn_block_size = kbytes(512u);
 /** @brief Hard ceiling of page 0's fixed head, whatever the runtime page is. */
 static constexpr uint32_t conn_page0_hard = kbytes(16u);
 
+/** @brief The conn's worker-exclusive tx sequence & send-done frontier state. */
+typedef struct duct_conn_tx_seq {
+    uint32_t next,
+             serve,
+             done_skip,     /* cancelled fl_send_done retries awaiting carry */
+             done_ctl;      /* empty control-only fl_send_done awaiting earlier drain */
+    uint64_t done_posted,   /* accepted fl_send_done responses on this conn */
+             done_reported; /* highest frontier delivered to on_send_done */
+} duct_conn_tx_seq_t;
+
+/** @brief Cache-line-isolated monotonic counter of wire-drained fl_send_done deltas. */
+typedef struct duct_conn_tx_done {
+    alignas(duct_cacheline_size) uint64_t _Atomic seq;
+} duct_conn_tx_done_t;
+
 /** @name Page-0 offsets
  *  The fixed resident head in first-reach order: the body's two cache lines,
  *  the generation word, the request node, the rx and tx OLB headers, the
- *  inter lane header and control block, the tx sequence pair, the datagram
- *  context, the stats triple, the TX retry maps.
+ *  inter lane header and control block, the tx sequence state, the datagram
+ *  context, the stats triple, the isolated tx_done line, the TX retry maps.
  *  @{
  */
 static constexpr uint32_t conn_off_body = 0u;
@@ -85,14 +100,16 @@ static constexpr uint32_t conn_off_tx = conn_off_rx + sizeof(duct_olb_rx_t);
 static constexpr uint32_t conn_off_lane = conn_off_tx + sizeof(duct_olb_tx_t);
 static constexpr uint32_t conn_off_lane_ctrl = conn_off_lane + duct_cacheline_size;
 static constexpr uint32_t conn_off_tx_seq = conn_off_lane_ctrl + vmq_lane_ctrl_size;
-static constexpr uint32_t conn_off_ctx = conn_off_tx_seq + sizeof(uint32_t) * 2u;
+static constexpr uint32_t conn_off_ctx = conn_off_tx_seq + sizeof(duct_conn_tx_seq_t);
 static constexpr uint32_t conn_off_stats = conn_off_ctx + sizeof(duct_dgram_shared_ctx_t);
+static constexpr uint32_t conn_off_tx_done =
+    (conn_off_stats + 32u + duct_cacheline_size - 1u) & ~(uint32_t)(duct_cacheline_size - 1u);
 /** @} */
 
-/** @brief Fixed tail of page 0 past the stats block, 8-aligned: the TX retry
+/** @brief Fixed tail of page 0 past the tx_done line, 8-aligned: the TX retry
  *  region's allocation maps. */
 static constexpr uint32_t conn_off_retry_maps =
-    (conn_off_stats + 4u * sizeof(uint64_t) + sizeof(uint16_t) + 7u) & ~(uint32_t)7u;
+    conn_off_tx_done + sizeof(duct_conn_tx_done_t);
 
 /** @brief Ceiling of the rx region: the ring cap plus the larger of the GRO
  *  group shape and the vnet cut, which never coexist. */
@@ -114,7 +131,7 @@ static constexpr size_t conn_tx_region_max = duct_conn_tx_olb_cap + conn_tx_slac
 static constexpr size_t conn_wire_region_max =
     2u * duct_wire_parser_slot + duct_wire_codec_slot;
 
-static_assert(conn_off_stats + 4u * sizeof(uint64_t) + sizeof(uint16_t) <= conn_page0_hard,
+static_assert(conn_off_stats + 32u <= conn_page0_hard,
               "page 0's fixed part fits the hard page ceiling");
 
 /** @brief The conn's TX retry region allocation maps, page 0's cold tail:
@@ -183,12 +200,6 @@ static inline uint32_t duct_conn_page0(void)
                                    duct_page_size());
 }
 
-/** @brief The conn's tx ticket pair: next handed out and oldest unserved. */
-typedef struct duct_conn_tx_seq {
-    uint32_t next,
-             serve;
-} duct_conn_tx_seq_t;
-
 /** @brief The conn's rx OLB header in page 0, @c nullptr on a lane conn. */
 duct_nonnull(1) static inline duct_olb_rx_t *duct_conn_rx_olb(const duct_conn_t *conn)
 {
@@ -242,10 +253,16 @@ duct_conn_device_leg(const duct_conn_t *conn)
     return (duct_device_leg_t *)((uint8_t *)conn + duct_conn_page0() + duct_inter_lane_cap);
 }
 
-/** @brief The conn's tx ticket pair in page 0. */
+/** @brief The conn's tx ticket & send-done frontier state in page 0. */
 duct_nonnull(1) static inline duct_conn_tx_seq_t *duct_conn_tx_seq(const duct_conn_t *conn)
 {
     return (duct_conn_tx_seq_t *)((uintptr_t)conn + conn_off_tx_seq);
+}
+
+/** @brief The conn's drain-completion frontier atomic in page 0. */
+duct_nonnull(1) static inline duct_conn_tx_done_t *duct_conn_tx_done(const duct_conn_t *conn)
+{
+    return (duct_conn_tx_done_t *)((uintptr_t)conn + conn_off_tx_done);
 }
 
 /** @brief Base of the conn's rx ring data, right past page 0. */
@@ -336,7 +353,7 @@ duct_conn_retry_node(const duct_conn_t *conn)
 /** @brief One TX retry node slot's stride, bytes: the worker's private
  *  @c retry_node_t, pinned from outside by a static_assert in
  *  @c duct_worker.c so the two cannot drift apart. */
-static constexpr size_t conn_retry_tx_node_span = 272u;
+static constexpr size_t conn_retry_tx_node_span = 264u;
 
 /** @brief The conn's TX retry region, behind the batch retry node of the
  *  union tail: @c duct_conn_retry_tx_nodes fixed-stride node slots for the
@@ -575,51 +592,50 @@ duct_olb_rx_try_space(duct_olb_rx_t *rx, size_t min_avail, bool restart,
     assert(min_avail);
     auto h = &rx->h;
     uint8_t *data = duct_olb_rx_data(rx);
-    size_t done = 0u;
-    bool known = duct_olb_rx_done(rx, &done);
-    if (rx->pass_end) {
-        if (known && done > rx->pass_free)
+    uint32_t stage = duct_atomic_load(&h->stage, relaxed);
+    if (!rx->pass_end) {
+        size_t threshold = duct_max(duct_olb_rx_threshold_get(rx), min_avail);
+        *out_avail = 0u;
+        if (duct_ckd_sub(out_avail, h->buf_size, stage))
+            return olb_rx_full;
+        *out_ptr = data + stage;
+        if (*out_avail >= threshold)
+            return olb_rx_ok;
+
+        if (stage && duct_olb_rx_consumed(rx)) {
+            *out_avail = duct_olb_rx_compact(rx, rx->posted_off, out_ptr);
+            duct_rtstat_inc(rx->early_compacts, 1u);
+            return *out_avail >= min_avail ? olb_rx_compacted : olb_rx_full;
+        }
+
+        size_t hint = duct_olb_rx_recv_hint_get(rx);
+        if (hint && *out_avail >= duct_max(hint, min_avail))
+            return olb_rx_ok;
+
+        if (*out_avail >= duct_max(threshold / olb_rx_relax_div, min_avail))
+            return olb_rx_ok;
+
+        size_t done = 0u;
+        if (restart && duct_olb_rx_done(rx, &done) && done >= min_avail
+            && stage == rx->posted_off && !rx->group_bytes) {
+            rx->pass_end = stage;
             rx->pass_free = (uint32_t)done;
-        *out_ptr = data + duct_atomic_load(&h->stage, relaxed);
-        *out_avail = duct_olb_rx_room(rx);
-        return *out_avail >= min_avail ? olb_rx_ok : olb_rx_full;
-    }
-    size_t threshold = duct_max(duct_olb_rx_threshold_get(rx), min_avail),
-           hint = duct_olb_rx_recv_hint_get(rx);
-    *out_avail = 0u;
-    if (duct_ckd_sub(out_avail, h->buf_size, duct_atomic_load(&h->stage, relaxed)))
+            duct_atomic_store(&h->stage, 0u, relaxed);
+            rx->posted_off = 0u;
+            rx->recv_hint = 0u;
+            duct_atomic_store(&h->tail, 0u, release);
+            *out_ptr = data;
+            *out_avail = done;
+            return olb_rx_compacted;
+        }
         return olb_rx_full;
-    *out_ptr = data + duct_atomic_load(&h->stage, relaxed);
-    if (*out_avail >= threshold)
-        return olb_rx_ok;
-
-    if (duct_atomic_load(&h->stage, relaxed) && duct_olb_rx_consumed(rx)) {
-        *out_avail = duct_olb_rx_compact(rx, rx->posted_off, out_ptr);
-        duct_rtstat_inc(rx->early_compacts, 1u);
-        return *out_avail >= min_avail ? olb_rx_compacted : olb_rx_full;
     }
-
-    if (hint && *out_avail >= duct_max(hint, min_avail))
-        return olb_rx_ok;
-
-    if (*out_avail >= duct_max(threshold / olb_rx_relax_div, min_avail))
-        return olb_rx_ok;
-
-    if (restart && known && done >= min_avail
-        && duct_atomic_load(&h->stage, relaxed) == rx->posted_off
-        && !rx->group_bytes) {
-        uint32_t stage_all = duct_atomic_load(&h->stage, relaxed);
-        rx->pass_end = stage_all;
+    size_t done = 0u;
+    if (duct_olb_rx_done(rx, &done) && done > rx->pass_free)
         rx->pass_free = (uint32_t)done;
-        duct_atomic_store(&h->stage, 0u, relaxed);
-        rx->posted_off = 0u;
-        rx->recv_hint = 0u;
-        duct_atomic_store(&h->tail, 0u, release);
-        *out_ptr = data;
-        *out_avail = done;
-        return olb_rx_compacted;
-    }
-    return olb_rx_full;
+    *out_ptr = data + stage;
+    *out_avail = duct_olb_rx_room(rx);
+    return *out_avail >= min_avail ? olb_rx_ok : olb_rx_full;
 }
 
 /** @brief Return @p rx's fully consumed buffer to offset 0.
@@ -710,23 +726,25 @@ duct_olb_tx_desc_open(duct_olb_tx_t *tx)
  *  ciphertext (the encrypt destination a codec's seal writes into),
  *  sub-threshold copies and foreign buffers. The arena frees in record
  *  completion order, FIFO, so the returned span stays valid until its record
- *  completes. A run that would wrap past the arena's end is refused even
- *  where the free bytes exist across the wrap — the caller reads that as
- *  backpressure and retries, never as corruption.
+ *  completes. A run that would cross the arena's end wraps to offset zero
+ *  when the gap plus the run fit within the remaining budget.
  *
  *  @return The span's arena offset, @c SIZE_MAX when no contiguous free run
  *          of @p len exists. */
 duct_nonnull(1) static inline size_t
 duct_olb_tx_mat_open(duct_olb_tx_t *tx, size_t len)
 {
+    if (len > duct_conn_tx_mat_cap)
+        return SIZE_MAX;
     uint64_t tail = tx->mat_tail,
              head = duct_atomic_load(&tx->mat_head, acquire);
-    if (len > duct_conn_tx_mat_cap
-        || tail - head + len > duct_conn_tx_mat_cap
-        || (size_t)(tail % duct_conn_tx_mat_cap) + len > duct_conn_tx_mat_cap)
-        return SIZE_MAX;
     size_t off = (size_t)(tail % duct_conn_tx_mat_cap);
-    tx->mat_tail = tail + len;
+    size_t gap = off + len > duct_conn_tx_mat_cap
+               ? duct_conn_tx_mat_cap - off : 0u;
+    if (tail - head + gap + len > duct_conn_tx_mat_cap)
+        return SIZE_MAX;
+    off = gap ? 0u : off;
+    tx->mat_tail = tail + gap + len;
     return off;
 }
 
@@ -756,7 +774,7 @@ duct_olb_tx_stage(duct_olb_tx_t *tx, const uint8_t *hdr,
     uint64_t mat_was = tx->mat_tail;
     size_t off = duct_olb_tx_mat_open(tx, len);
     if (off == SIZE_MAX)
-        return total > duct_conn_tx_mat_cap ? olb_tx_too_large : olb_tx_full;
+        return len > duct_conn_tx_mat_cap ? olb_tx_too_large : olb_tx_full;
     auto d = duct_olb_tx_desc_open(tx);
     if (!d) {
         tx->mat_tail = mat_was;
@@ -977,20 +995,37 @@ duct_olb_tx_peek_staged_recs(duct_olb_tx_t *tx, duct_tx_rec_t *recs, unsigned ma
  *  completion.
  *  @return the completed record's wire bytes. */
 duct_nonnull(1) static inline uint32_t
-duct_olb_tx_complete_one(duct_olb_tx_t *tx)
+duct_olb_tx_complete_one_done(duct_olb_tx_t *tx, bool *out_done)
 {
     uint64_t head = duct_olb_tx_unrolled(duct_atomic_load(&tx->h.head, relaxed));
-    auto d = duct_conn_tx_desc(duct_conn_of_olb_tx(&tx->h),
-                               (uint32_t)(head % duct_conn_tx_desc_n));
+    auto conn = duct_conn_of_olb_tx(&tx->h);
+    auto d = duct_conn_tx_desc(conn, (uint32_t)(head % duct_conn_tx_desc_n));
     uint32_t wire = duct_span_wire_len(&d->span);
-    if (duct_span_kind_of(&d->span) == span_mat)
-        duct_atomic_fetch(add, &tx->mat_head,
-                          duct_span_len(&d->span), release);
+    uint32_t done_d = duct_span_done_delta(&d->span);
+    if (duct_span_kind_of(&d->span) == span_mat) {
+        uint64_t mhead = duct_atomic_load(&tx->mat_head, relaxed);
+        uint32_t h_off = (uint32_t)(mhead % duct_conn_tx_mat_cap);
+        uint32_t s_off = duct_span_off(&d->span);
+        uint64_t step = (s_off < h_off ? duct_conn_tx_mat_cap - h_off : 0u)
+                      + duct_span_len(&d->span);
+        duct_atomic_fetch(add, &tx->mat_head, step, release);
+    }
     duct_span_payload_drop(&d->span);
     d->span = (duct_span_t){};
+    if (done_d) {
+        duct_atomic_fetch(add, &duct_conn_tx_done(conn)->seq, done_d, release);
+        if (out_done)
+            *out_done = true;
+    }
     duct_atomic_fetch(add, &tx->drained, wire, release);
     duct_atomic_store(&tx->h.head, duct_olb_tx_packed(head + 1u), release);
     return wire;
+}
+
+duct_nonnull(1) static inline uint32_t
+duct_olb_tx_complete_one(duct_olb_tx_t *tx)
+{
+    return duct_olb_tx_complete_one_done(tx, nullptr);
 }
 
 /** @brief Complete every record the ring still holds — published or staged —
@@ -1032,7 +1067,7 @@ duct_olb_tx_purge(duct_olb_tx_t *tx)
  *  @return true when a zero-wire completion happened — an armed waiter
  *          cannot wait for a byte that never comes; false otherwise. */
 duct_nonnull(1) static inline bool
-duct_olb_tx_advance(duct_olb_tx_t *tx, size_t n, bool rec)
+duct_olb_tx_advance_done(duct_olb_tx_t *tx, size_t n, bool rec, bool *out_done)
 {
     bool zero = false;
     while (n) {
@@ -1052,13 +1087,19 @@ duct_olb_tx_advance(duct_olb_tx_t *tx, size_t n, bool rec)
              * means the datagram never left, and its bytes are not spent. */
             return false;
         }
-        duct_discard duct_olb_tx_complete_one(tx);
+        duct_discard duct_olb_tx_complete_one_done(tx, out_done);
         duct_atomic_store(&tx->cursor_off, 0u, relaxed);
         n -= rest;
         if (!wire)
             zero = true; /* the slot freed though no byte moved */
     }
     return zero;
+}
+
+duct_nonnull(1) static inline bool
+duct_olb_tx_advance(duct_olb_tx_t *tx, size_t n, bool rec)
+{
+    return duct_olb_tx_advance_done(tx, n, rec, nullptr);
 }
 
 /** @brief Account for the worker sending its whole staged, unpublished span

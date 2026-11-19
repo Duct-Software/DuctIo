@@ -204,9 +204,9 @@ duct_noise_ephemeral_mask(const uint8_t psk[duct_noise_key_size], uint8_t msg,
  *         @p hs as it was, or on an OpenSSL failure, which ends the attempt: the
  *         caller destroys @p hs.
  */
-duct_nonnull(1, 3) bool
-duct_noise_hs_write_msg1(duct_noise_hs_t *hs, duct_view_u8 payload,
-                         uint8_t *out, size_t out_cap, size_t *out_len);
+duct_nonnull(1, 4) bool
+duct_noise_hs_write_msg1(duct_noise_hs_t *hs, duct_view_u8 payload, size_t out_cap,
+                         uint8_t out[static out_cap], size_t *out_len);
 
 /** @brief Responder: read message 1, learning and authenticating the
  *  initiator's static public key as part of decryption (IK's own property —
@@ -227,10 +227,10 @@ duct_noise_hs_write_msg1(duct_noise_hs_t *hs, duct_view_u8 payload,
  *         is left unchanged on a false return, so a forged or truncated message
  *         leaves it reusable for the genuine one.
  */
-duct_nonnull(1, 3, 4, 6) bool
+duct_nonnull(1, 3, 5, 6) bool
 duct_noise_hs_read_msg1(duct_noise_hs_t *hs, duct_view_u8 msg,
-                        uint8_t remote_static_out[32],
-                        uint8_t *payload_out, size_t payload_cap,
+                        uint8_t remote_static_out[static 32], size_t payload_cap,
+                        uint8_t payload_out[static payload_cap],
                         size_t *payload_len_out);
 
 /** @brief Responder: write message 2 (`e, ee, se, psk` + encrypted @p payload)
@@ -242,9 +242,9 @@ duct_noise_hs_read_msg1(duct_noise_hs_t *hs, duct_view_u8 msg,
  *  @return false on @p out_cap too small, a wrong role/state call, or an
  *         OpenSSL failure.
  */
-duct_nonnull(1, 3) bool
-duct_noise_hs_write_msg2(duct_noise_hs_t *hs, duct_view_u8 payload,
-                         uint8_t *out, size_t out_cap, size_t *out_len);
+duct_nonnull(1, 4) bool
+duct_noise_hs_write_msg2(duct_noise_hs_t *hs, duct_view_u8 payload, size_t out_cap,
+                         uint8_t out[static out_cap], size_t *out_len);
 
 /** @brief Initiator: read message 2, completing mutual authentication (the
  *  `se` DH only succeeds if the responder holds the private key matching the
@@ -299,9 +299,9 @@ typedef bool (*duct_noise_psk_for_t)(void *ctx, const uint8_t remote_static[duct
  *         turn, which leave @p hs as it was, or on an OpenSSL failure, which
  *         ends the attempt: the caller destroys @p hs.
  */
-duct_nonnull(1, 3, 5) bool
-duct_noise_hs_write_msg1_xk(duct_noise_hs_t *hs, duct_view_u8 payload,
-                            uint8_t *out, size_t out_cap, size_t *out_len);
+duct_nonnull(1, 4, 5) bool
+duct_noise_hs_write_msg1_xk(duct_noise_hs_t *hs, duct_view_u8 payload, size_t out_cap,
+                            uint8_t out[static out_cap], size_t *out_len);
 
 /** @brief Responder: read XKpsk3 message 1. It names no peer: the initiator's
  *  static key arrives in message 3.
@@ -315,9 +315,9 @@ duct_noise_hs_write_msg1_xk(duct_noise_hs_t *hs, duct_view_u8 payload,
  *         a false return, so a forged or truncated message leaves it reusable for
  *         the genuine one.
  */
-duct_nonnull(1, 3, 5) bool
-duct_noise_hs_read_msg1_xk(duct_noise_hs_t *hs, duct_view_u8 msg,
-                           uint8_t *payload_out, size_t payload_cap,
+duct_nonnull(1, 4, 5) bool
+duct_noise_hs_read_msg1_xk(duct_noise_hs_t *hs, duct_view_u8 msg, size_t payload_cap,
+                           uint8_t payload_out[static payload_cap],
                            size_t *payload_len_out);
 
 /** @brief Responder: write XKpsk3 message 2 (`e, ee` + encrypted @p payload) into
@@ -330,9 +330,9 @@ duct_noise_hs_read_msg1_xk(duct_noise_hs_t *hs, duct_view_u8 msg,
  *         turn, which leave @p hs as it was, or on an OpenSSL failure, which
  *         ends the attempt: the caller destroys @p hs.
  */
-duct_nonnull(1, 3, 5) bool
-duct_noise_hs_write_msg2_xk(duct_noise_hs_t *hs, duct_view_u8 payload,
-                            uint8_t *out, size_t out_cap, size_t *out_len);
+duct_nonnull(1, 4, 5) bool
+duct_noise_hs_write_msg2_xk(duct_noise_hs_t *hs, duct_view_u8 payload, size_t out_cap,
+                            uint8_t out[static out_cap], size_t *out_len);
 
 /** @brief Initiator: read XKpsk3 message 2, authenticating the responder (the
  *  `ee` DH only succeeds for the holder of the ephemeral key message 1 was sent
@@ -359,9 +359,9 @@ duct_noise_hs_read_msg2_xk(duct_noise_hs_t *hs, duct_view_u8 msg);
  *         turn, which leave @p hs as it was, or on an OpenSSL failure, which
  *         ends the attempt: the caller destroys @p hs.
  */
-duct_nonnull(1, 3, 5) bool
-duct_noise_hs_write_msg3_xk(duct_noise_hs_t *hs, duct_view_u8 payload,
-                            uint8_t *out, size_t out_cap, size_t *out_len);
+duct_nonnull(1, 4, 5) bool
+duct_noise_hs_write_msg3_xk(duct_noise_hs_t *hs, duct_view_u8 payload, size_t out_cap,
+                            uint8_t out[static out_cap], size_t *out_len);
 
 /** @brief Responder: read XKpsk3 message 3, learning and authenticating the
  *  initiator's static public key and its password.
@@ -382,11 +382,11 @@ duct_noise_hs_write_msg3_xk(duct_noise_hs_t *hs, duct_view_u8 payload,
  *         exchange or tampered bytes. @p hs is left unchanged on a false return,
  *         so a forged or truncated message leaves it reusable for the genuine one.
  */
-duct_nonnull(1, 3, 5, 6, 8) bool
+duct_nonnull(1, 4, 5, 7, 8) bool
 duct_noise_hs_read_msg3_xk(duct_noise_hs_t *hs, duct_view_u8 msg,
                            duct_noise_psk_for_t psk_for, void *ctx,
-                           uint8_t remote_static_out[duct_noise_key_size],
-                           uint8_t *payload_out, size_t payload_cap,
+                           uint8_t remote_static_out[static duct_noise_key_size], size_t payload_cap,
+                           uint8_t payload_out[static payload_cap],
                            size_t *payload_len_out);
 
 /** @brief Sliding anti-replay window width, in bits. */
@@ -466,9 +466,9 @@ duct_noise_hs_exporter(const duct_noise_hs_t *hs, uint8_t out[duct_noise_key_siz
 
 /** @brief Write HKDF(@p key, @p label) into @p len bytes, 1 to 64.
  *  @return false outside that range or on an OpenSSL failure. */
-duct_nonnull(1, 2, 3) bool
-duct_noise_derive(const uint8_t key[duct_noise_key_size], const char *label,
-                  uint8_t *out, size_t len);
+duct_nonnull(1, 2, 4) bool
+duct_noise_derive(const uint8_t key[static duct_noise_key_size], const char *label,
+                  size_t len, uint8_t out[static len]);
 
 /** @brief Sealed transport-data body size for @p pt_len plaintext bytes under a
  *  transport with the full counter: 8-byte counter prefix + ciphertext +
@@ -499,9 +499,9 @@ duct_noise_transport_seal_size_of(const duct_noise_transport_t *t, size_t pt_len
  *         @ref duct_noise_seal_counter_max, which only a new handshake clears, or an
  *         OpenSSL failure. @c send_counter advances by one on success only.
  */
-duct_nonnull(1, 4) size_t
+duct_nonnull(1, 5) size_t
 duct_noise_transport_seal(duct_noise_transport_t *t, const duct_view_u8 *spans, size_t n,
-                          uint8_t *out, size_t out_cap);
+                          size_t out_cap, uint8_t out[static out_cap]);
 
 /** @brief Exclusive-or @p counter's first @p wide bytes with a SipHash draw of
  *  the twelve bytes the sealed message keeps at @p sample under @p key — the
@@ -509,9 +509,9 @@ duct_noise_transport_seal(duct_noise_transport_t *t, const duct_view_u8 *spans, 
  *  empty; both sides read the same bytes. The cover the seal writes and the
  *  read removes, exposed for the tests that drive the transport against
  *  known-answer vectors. */
-duct_nonnull(1, 2, 3) void
-duct_noise_counter_cover(const uint8_t key[duct_noise_key_size], uint8_t *counter,
-                         const uint8_t *sample, size_t wide);
+duct_nonnull(1, 3, 4) void
+duct_noise_counter_cover(const uint8_t key[static duct_noise_key_size], size_t wide,
+                         uint8_t counter[static wide], const uint8_t sample[static 12]);
 
 /** @brief Unseal one transport-data message, checking the sliding anti-replay
  *  window before accepting.
@@ -527,9 +527,9 @@ duct_noise_counter_cover(const uint8_t key[duct_noise_key_size], uint8_t *counte
  *         unchanged on any false return (the window only advances on a
  *         successful decrypt).
  */
-duct_nonnull(1, 3) bool
-duct_noise_transport_unseal(duct_noise_transport_t *t, duct_view_u8 sealed,
-                           uint8_t *out, size_t out_cap, size_t *out_len);
+duct_nonnull(1, 4) bool
+duct_noise_transport_unseal(duct_noise_transport_t *t, duct_view_u8 sealed, size_t out_cap,
+                           uint8_t out[static out_cap], size_t *out_len);
 
 #ifdef __cplusplus
 }

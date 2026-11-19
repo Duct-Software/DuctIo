@@ -50,7 +50,7 @@ typedef struct duct_wire_tls {
     uint8_t                         tx_prefix[duct_seal_prefix_max];
 } duct_wire_tls_t;
 
-static void s_tls_wire_destroy(duct_wire_t *self)
+duct_zero_regs static void s_tls_wire_destroy(duct_wire_t *self)
 {
     duct_del(self);
 }
@@ -123,11 +123,14 @@ s_tls_on_parse(const duct_wire_t *self, duct_view_u8 input, duct_frame_t *out,
  *  cleartext buffer with its last pin, and the carved codec slot is wiped —
  *  its storage belongs to the conn block, whose engine park region needs no
  *  release of its own. */
-static void s_tls_codec_release(duct_wire_codec_t *self)
+duct_zero_regs static void s_tls_codec_release(duct_wire_codec_t *self)
 {
     self->engine->vtbl->destroy(self->engine);
     /* ct_buf is a chunk of the worker's cleartext pool: its owner word names
-     *  the pool, the plain lane return puts it back. */
+     *  the pool, the plain lane return puts it back. The chunk's bytes stay
+     *  readable past this release — handlers hold them pinned — so the return
+     *  carries no wipe: the chunk's next codec writes its own cleartext before
+     *  anything reads the slot again. */
     if (self->ct_buf)
         duct_x_slot_release_obj(duct_at(self->ct_buf));
     duct_secure_zero(self, sizeof *self);
@@ -262,7 +265,7 @@ s_tls_on_pack(const duct_wire_t *self, [[maybe_unused]] duct_session_t *s,
     if (pre)
         memcpy(span, codec->prefix, pre);
     vt->seal(codec->engine, spans, n_spans, (uint8_t *)span + pre);
-    duct_wire_codec_lead(codec, span, pre + sealed_len);
+    duct_wire_codec_lead(codec, pre + sealed_len, span);
     return rc_ok;
 }
 
@@ -271,7 +274,7 @@ s_tls_on_pack(const duct_wire_t *self, [[maybe_unused]] duct_session_t *s,
  *  parser slot, for the inner wire.
  *  A conn on @c x_udp_shared gets no cleartext chunk, every other one a chunk
  *  of @p ct_chunks sized by the wire's declared @c ct_buf_max. */
-static duct_wire_codec_t *s_tls_init_codec(const duct_wire_t *self, duct_xport_t xport,
+duct_zero_regs static duct_wire_codec_t *s_tls_init_codec(const duct_wire_t *self, duct_xport_t xport,
                                            duct_wire_codec_t *codec,
                                            duct_wire_parser_t *inner_parser,
                                            duct_x_slot_pool_t *ct_chunks)
@@ -377,14 +380,14 @@ void duct_wire_codec_owd_rx(duct_wire_codec_t *c, const duct_dgram_env_t *env, u
     c->owd.rx_q_at = now_ns;
 }
 
-void duct_wire_codec_lead_write(duct_wire_codec_t *c, uint8_t *dgram, size_t len)
+void duct_wire_codec_lead_write(duct_wire_codec_t *c, size_t len, uint8_t dgram[static len])
 {
     if (c->lead_state == lead_state_unkeyed) {
         if (!duct_join_derive(c->engine->vtbl, c->engine, c->lead.key, c->lead.name))
             return;
         c->lead_state = lead_state_keyed;
     }
-    duct_dgram_lead_fill(dgram, c->tx_prefix_len, len, c->lead.key, c->lead.cover_key,
+    duct_dgram_lead_fill(c->tx_prefix_len, len, dgram, c->lead.key, c->lead.cover_key,
                          c->lead.name);
 }
 
@@ -494,7 +497,7 @@ s_tls_unseal(const duct_wire_t *self, duct_wire_codec_t *codec,
     return ctx->commit(ctx, hdr + pv.size) ? rc_ok : rc_invalid_arg;
 }
 
-duct_wire_t *duct_wire_create_sealed(const duct_sealed_wire_cfg_t *cfg)
+duct_zero_regs duct_wire_t *duct_wire_create_sealed(const duct_sealed_wire_cfg_t *cfg)
 {
     duct_do_if(!cfg, return nullptr);
     bool role_ok = duct_seal_role_valid(cfg->role);

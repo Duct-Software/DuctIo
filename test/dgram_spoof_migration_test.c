@@ -109,7 +109,7 @@ s_invoke_fn([[maybe_unused]] duct_session_t *s, duct_response_t *out,
     return rc_ok;
 }
 
-static void s_msg(uint8_t *out, char kind)
+static void s_msg(uint8_t out[static msg_size], char kind)
 {
     memcpy(out, &k_cid, sizeof k_cid);
     memset(out + sizeof k_cid, kind, msg_size - sizeof k_cid);

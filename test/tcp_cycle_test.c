@@ -83,19 +83,13 @@ static atomic_uint   g_bad[side_count];
 static duct_handle_t g_tok[side_count];
 static duct_session_t *g_sess[side_count];
 
-/* Posting window: a conn block's TX retry park is knob-bounded
- * (DUCT_CONN_RETRY_TX_NODES, its copy slots), so a side queuing a whole run
- * holds the run itself and hands the engine at most this many unresolved
- * sends. The window stays wider than the pinned path (the TX ring plus the
- * small socket buffers), so the run still keeps more queued than the path
- * holds; the rest of the queue rests in the posting loop. Every frame posts
- * from its own buffer and no buffer is ever reused: fl_send_static promises
- * the engine bytes valid for ever, and the send-done the window counts
- * resolves at the stage, not at the wire — a slot refilled on it would tear
- * a record the ring still holds. */
+/* Posting window: reusable ring of post_window buffers per side.
+ * on_send_done settles on drain (frontier = 1-based monotonic count of
+ * drained frames), so slot (i % post_window) is guaranteed free to refill
+ * once frontier > i - post_window without staging-vs-wire races. */
 static constexpr unsigned post_window = 12u;
-static uint8_t       g_post_buf[side_count][frame_count][frame_size];
-static atomic_uint   g_post_done[side_count];
+static uint8_t       g_post_buf[side_count][post_window][frame_size];
+static _Atomic uint64_t g_post_done[side_count];
 static atomic_uint   g_post_failed;
 
 #ifdef TCP_CYCLE_NOISE
@@ -177,27 +171,20 @@ static side_t s_side_of(const duct_session_t *s)
     return s == g_sess[side_dial] ? side_dial : side_accept;
 }
 
-/** @brief One frame of the run, its index in @p ctx, on its side's own
- *  buffer: posted fl_send_static with a send-done token, so the engine parks
- *  no copy. The buffer is that frame's alone for the whole run — static
- *  bytes stay valid for ever, and the window counts resolutions only to
- *  keep the engine's unresolved sends bounded. */
 static duct_result_t
 s_post(duct_session_t *s, duct_response_t *out, void *ctx)
 {
     auto i = (uint32_t)(uintptr_t)ctx;
     auto side = s_side_of(s);
-    auto b = g_post_buf[side][i];
+    auto b = g_post_buf[side][i % post_window];
     memcpy(b, &i, sizeof i);
     memset(b + sizeof i, s_fill_byte(i), frame_size - sizeof i);
     duct_response_same(out, duct_view(duct_view_u8, b, frame_size),
                        (duct_send_flags_t)(fl_send_static | fl_send_done), 0);
-    out->send_token = i;
     return rc_ok;
 }
 
-/** @brief Send-done: one window slot frees. A resolution that did not pack
- *  still frees its slot — the run's arrival checks catch the loss. */
+/** @brief Send-done: advance drained frontier, releasing slots up to info->frontier. */
 static duct_result_t
 s_on_send_done(duct_session_t *s, const duct_send_done_info_t *info,
                [[maybe_unused]] duct_response_t *out,
@@ -205,7 +192,7 @@ s_on_send_done(duct_session_t *s, const duct_send_done_info_t *info,
 {
     if (info->result != rc_ok)
         duct_atomic_fetch(add, &g_post_failed, 1u, relaxed);
-    duct_atomic_fetch(add, &g_post_done[s_side_of(s)], 1u, release);
+    duct_atomic_store(&g_post_done[s_side_of(s)], info->frontier, release);
     return rc_ok;
 }
 

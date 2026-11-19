@@ -413,7 +413,7 @@ static bool s_drain(duct_sock_t fd, unsigned n)
     char buf[65536];
     for (unsigned i = 0u; i < n; ++i) {
         uint8_t fl = 0u;
-        auto got = th_recv_flags(fd, buf, sizeof buf, &fl);
+        auto got = th_recv_flags(fd, sizeof buf, buf, &fl);
         if (got != (int64_t)sizeof buf) {
             fprintf(stderr, "drain: frame %u/%u short: %lld flags %u\n",
                     i, n, (long long)got, (unsigned)fl);

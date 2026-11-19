@@ -31,7 +31,7 @@ extern "C" {
  *
  *  Exactly one of fl_send_copy, fl_send_static, fl_send_owned per response.
  *  fl_send_copy is the default when @c flags == 0 — not a combinable bit.
- *  fl_send_done is orthogonal — requests proto_cfg.on_send_done with send_token.
+ *  fl_send_done is orthogonal — requests drain-completion frontier notifications via proto_cfg.on_send_done.
  *  Combining @c fl_send_static and @c fl_send_owned is asserted against in
  *  debug builds (@ref duct_response_commit); in release builds @c fl_send_owned
  *  silently wins.
@@ -40,7 +40,7 @@ typedef enum duct_send_flags : uint8_t {
     fl_send_copy     = 0u,        /**< Default: runtime copies buf when flags == 0. */
     fl_send_static   = 1u << 0,   /**< Zero-copy, immutable data. */
     fl_send_owned    = 1u << 1,   /**< Runtime takes ownership and releases the payload once staged or dropped. */
-    fl_send_done     = 1u << 2,   /**< on_send_done via proto_cfg; set send_token for correlation. */
+    fl_send_done     = 1u << 2,   /**< Notify @c proto_cfg.on_send_done when wire-drained (or on pre-stage refusal / conn close). */
 } duct_send_flags_t;
 
 static_assert(sizeof(duct_send_flags_t) == sizeof(uint8_t),
@@ -176,7 +176,6 @@ typedef struct duct_response {
     duct_stream_id_t    stream_id;     /**< duct_stream_id_same = proto->route. */
     void (*release)(void *);           /**< Release hook for fl_send_owned; nullptr takes the default @c duct_del. */
     void  *release_arg;                /**< Argument of @c release, or the @c duct_new block @c duct_del frees; nullptr names @c payload.data. */
-    uintptr_t           send_token;    /**< for on_send_done. */
     /* Control: session/conn side-effects, applied by the worker after return.
      * Each is a declaration, not a request — the runtime applies what the
      * session can take and absorbs what it cannot, so no failure reaches an
@@ -445,7 +444,7 @@ typedef void (*duct_session_close_fn)(duct_session_t *s,
  *  @c out is control-only: the framework applies @c out->control (stream
  *  fin/reset, timer, RX pause/resume, close) on @c rc_ok exactly like a frame
  *  callback's, via the same @c s_ctl_apply path — but @c
- *  out->payload / @c flags / @c release / @c send_token are ignored, no TX
+ *  out->payload / @c flags / @c release are ignored, no TX
  *  commit runs: error sites may fire from paths already mid-failure, where
  *  re-entering the TX machinery is unsafe. Any return other than @c rc_ok
  *  discards @c out->control entirely. Return @c rc_ok with @c *out left
@@ -1240,29 +1239,30 @@ typedef void (*duct_proto_work_fn)(duct_engine_t *e, unsigned worker,
 
 /** @brief Outcome passed to @c on_send_done. */
 typedef struct duct_send_done_info {
-    duct_conn_id_t   conn_id;     /**< Conn the send targeted. */
-    duct_stream_id_t stream_id;   /**< Logical stream the send targeted. */
-    uintptr_t        send_token;  /**< Response token, echoed back. */
-    duct_result_t    result;      /**< Pack and enqueue outcome. */
+    duct_conn_id_t conn_id;  /**< Conn whose frontier settled (or refused pre-stage). */
+    uint64_t       frontier; /**< 1-based monotonic count of settled @c fl_send_done
+                              *   responses on @p conn_id (unchanged on pre-stage refusal). */
+    duct_result_t  result;   /**< @c rc_ok once drained; @c rc_closed when conn close
+                              *   forces unfinished responses; refusal code on pre-stage error. */
 } duct_send_done_info_t;
 
-/** @brief Send-done callback; reports the pack/enqueue outcome, not a peer ACK.
+/** @brief Send-done callback; advances the per-conn @c fl_send_done frontier.
  *
  *  @c out is control-only — same contract as @ref duct_error_fn's @c out: the
  *  framework applies @c out->control on @c rc_ok, ignoring @c payload,
- *  @c flags, @c release and @c send_token; any other return discards it.
- *  Declaring @c rx_op_resume once a paused conn's held response is out is the
- *  case it exists for.
+ *  @c flags and @c release; any other return discards it.
  *
- *  Fires once for a response carrying @c fl_send_done, on whichever
- *  disposition resolves it: the send itself, a stage that failed for good, or
- *  a parked retry resolving later. A response still outstanding when its
- *  stream is cancelled or the engine stops fires nothing, teardown running no
- *  protocol callback at all. The stream emit API is closed here — this
- *  callback runs inside the send path it reports on.
+ *  Reports a 1-based monotonic frontier count per @c conn_id once accepted
+ *  responses up to that count have left the TX ring / queue for the wire (or
+ *  resolved immediately when the path takes them inline). Multiple completions
+ *  in one batch coalesce into a single callback at the latest frontier. A
+ *  response rejected before staging fires with the unchanged frontier and its
+ *  refusal @c result; a closing conn forces unfinished responses with @c rc_closed.
+ *  A response still parked when its stream is cancelled or when the session is
+ *  tearing down fires nothing.
  *
  *  @param s            Session that issued the send.
- *  @param info         Conn, stream, send token, and result of the send.
+ *  @param info         Conn, frontier, and result of the settlement.
  *  @param out          Control-only output, zero-init'd by the framework.
  *  @param proto_state  Per-session protocol state.
  */

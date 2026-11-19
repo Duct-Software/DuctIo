@@ -48,22 +48,22 @@ void duct_host_inter_resume_fire(void)
         s_host_cfg.run(s_host_cfg.on_inter_resume, s_host_cfg.ctx, s_host_cfg.queue_ctx);
 }
 
-/** @brief One packet queued on a worker's egress lane.
- *  Identity travels as values, not as a resolved conn: a message for a leg
- *  that died before the drain still reaches @c on_packet_out, since nothing
- *  re-validates the handle.
- */
 typedef struct {
     duct_handle_t  h;
     duct_conn_id_t conn_id;
     uint32_t       len;
     alignas(8)
-    uint8_t        data[];
+    uint8_t        data[] duct_counted_by(len);
 } egress_pkt_t;
 
-/** @brief Lane-local @c duct_vmq_hdr_t::type tag, outside the
- *  shared WFQ tag space this lane's messages never reach. */
-static constexpr uint8_t s_egress_msg = 0u;
+typedef struct {
+    duct_handle_t  h;
+    duct_conn_id_t conn_id;
+    duct_span_t    span;
+} egress_span_t;
+
+static constexpr uint8_t s_egress_msg_inline = 0u;
+static constexpr uint8_t s_egress_msg_span   = 1u;
 
 bool duct_host_egress_enabled(void)
 {
@@ -79,14 +79,20 @@ bool duct_host_egress_fits(size_t max_response)
     auto q = duct_worker_egress_lane(wid);
     duct_do_if(!q, return true);
     size_t need = 0u;
-    if (duct_ckd_add(&need, sizeof(egress_pkt_t), max_response))
-        return false;
+    duct_do_if(duct_ckd_add(&need, sizeof(egress_pkt_t), max_response), return false);
     auto ln = duct_mpsc_lane(q, 0u);
-    return vmq_msg_aligned(need) <= ln.capacity;
+    return vmq_msg_aligned(duct_max(need, sizeof(egress_span_t))) <= ln.capacity;
 }
 
 static void s_egress_dispatch(duct_vmq_hdr_t *hdr, [[maybe_unused]] void *arg)
 {
+    if (hdr->type == s_egress_msg_span) {
+        auto p = (egress_span_t *)&hdr->payload[0];
+        s_host_cfg.on_packet_out(s_host_cfg.ctx, p->h, p->conn_id,
+                                 duct_span_body(&p->span));
+        duct_span_payload_drop(&p->span);
+        return;
+    }
     auto p = (const egress_pkt_t *)&hdr->payload[0];
     s_host_cfg.on_packet_out(s_host_cfg.ctx, p->h, p->conn_id,
                              duct_view(duct_view_u8, (void *)p->data, p->len));
@@ -158,31 +164,73 @@ void duct_host_egress_quiesce(unsigned n_workers, uint32_t timeout_ms)
         s_egress_quiesce_one(i, deadline);
 }
 
+static inline bool s_egress_lane_take(unsigned *out_wid, duct_vmq_lane_t *out_ln,
+                                      duct_result_t *out_rc)
+{
+    if (!duct_host_egress_enabled()) {
+        *out_rc = rc_ok;
+        return false;
+    }
+    unsigned wid = duct_worker_egress_self();
+    duct_do_if(wid == conn_worker_none, *out_rc = rc_invalid_order; return false);
+    auto q = duct_worker_egress_lane(wid);
+    duct_do_if(!q, *out_rc = rc_invalid_order; return false);
+    *out_wid = wid;
+    *out_ln = duct_mpsc_lane(q, 0u);
+    return true;
+}
+
+static inline void s_egress_drain_kick(duct_vmq_lane_t ln, unsigned wid)
+{
+    if (duct_vmq_drain_arm(ln.ctrl))
+        s_host_cfg.run(s_host_egress_run, (void *)(uintptr_t)wid, s_host_cfg.queue_ctx);
+}
+
 duct_result_t duct_host_packet_out(const duct_session_handle_t *tok,
                                    duct_conn_id_t conn_id, duct_view_u8 pkt)
 {
-    /* No host bridge configured: drop the packet and return rc_ok. */
-    if (!duct_host_egress_enabled())
-        return rc_ok;
-    unsigned wid = duct_worker_egress_self();
-    duct_do_if(wid == conn_worker_none, return rc_invalid_order);
-    auto q = duct_worker_egress_lane(wid);
-    auto ln = duct_mpsc_lane(q, 0u);
+    unsigned wid;
+    duct_vmq_lane_t ln;
+    duct_result_t err;
+    if (!s_egress_lane_take(&wid, &ln, &err))
+        return err;
     size_t need = 0u;
-    if (duct_ckd_add(&need, sizeof(egress_pkt_t), pkt.size))
-        return rc_invalid_arg;
+    duct_do_if(duct_ckd_add(&need, sizeof(egress_pkt_t), pkt.size), return rc_invalid_arg);
     duct_vmq_reserve_pos_t pos;
     duct_vmq_push_rc_t push_rc;
     auto stage = (egress_pkt_t *)
-        duct_vmq_reserve_armed(&ln, s_egress_msg, 0u, need, &pos, &push_rc);
+        duct_vmq_reserve_armed(&ln, s_egress_msg_inline, 0u, need, &pos, &push_rc);
+    duct_do_if(!stage && push_rc == vmq_push_too_large, return rc_invalid_arg);
     if (!stage)
-        return push_rc == vmq_push_too_large ? rc_invalid_arg : rc_again;
+        return rc_again;
     *stage = (egress_pkt_t){ .h = tok->word,
                                .conn_id = conn_id, .len = (uint32_t)pkt.size };
     memcpy(stage->data, pkt.data, pkt.size);
     duct_vmq_publish(&ln, &pos);
-    if (duct_vmq_drain_arm(ln.ctrl))
-        s_host_cfg.run(s_host_egress_run, (void *)(uintptr_t)wid, s_host_cfg.queue_ctx);
+    s_egress_drain_kick(ln, wid);
+    return rc_ok;
+}
+
+duct_result_t duct_host_packet_out_span(const duct_session_handle_t *tok,
+                                        duct_conn_id_t conn_id,
+                                        const duct_span_t *span)
+{
+    unsigned wid;
+    duct_vmq_lane_t ln;
+    duct_result_t err;
+    if (!s_egress_lane_take(&wid, &ln, &err))
+        return err;
+    duct_vmq_reserve_pos_t pos;
+    duct_vmq_push_rc_t push_rc;
+    auto stage = (egress_span_t *)
+        duct_vmq_reserve_armed(&ln, s_egress_msg_span, 0u,
+                               sizeof(egress_span_t), &pos, &push_rc);
+    duct_do_if(!stage && push_rc == vmq_push_too_large, return rc_invalid_arg);
+    if (!stage)
+        return rc_again;
+    *stage = (egress_span_t){ .h = tok->word, .conn_id = conn_id, .span = *span };
+    duct_vmq_publish(&ln, &pos);
+    s_egress_drain_kick(ln, wid);
     return rc_ok;
 }
 
@@ -190,23 +238,21 @@ void *duct_host_egress_reserve(const duct_session_handle_t *tok,
                                duct_conn_id_t conn_id, size_t size,
                                duct_host_egress_hold_t *out)
 {
-    bool bridged = duct_host_egress_enabled();
-    duct_do_if(!bridged, return nullptr);
-    unsigned wid = duct_worker_egress_self();
-    duct_do_if(wid == conn_worker_none, return nullptr);
-    auto q = duct_worker_egress_lane(wid);
-    duct_do_if(!q, return nullptr);
+    unsigned wid;
+    duct_vmq_lane_t ln;
+    duct_result_t err = rc_ok;
+    duct_do_if(!s_egress_lane_take(&wid, &ln, &err) || err != rc_ok, return nullptr);
+    /* note: duct_host_egress_enabled() false sets err = rc_ok AND returns false */
     size_t need = 0u;
-    if (duct_ckd_add(&need, sizeof(egress_pkt_t), size))
-        return nullptr;
-    auto ln = duct_mpsc_lane(q, 0u);
-    duct_vmq_push_rc_t push_rc;
+    duct_do_if(duct_ckd_add(&need, sizeof(egress_pkt_t), size), return nullptr);
     duct_vmq_reserve_pos_t pos;
+    duct_vmq_push_rc_t push_rc;
     auto stage = (egress_pkt_t *)
-        duct_vmq_reserve_held(&ln, s_egress_msg, 0u, need, &pos, &push_rc);
+        duct_vmq_reserve_held(&ln, s_egress_msg_inline, 0u, need, &pos, &push_rc);
     duct_do_if(!stage, return nullptr);
     *stage = (egress_pkt_t){ .h = tok->word,
-                               .conn_id = conn_id };
+                               .conn_id = conn_id,
+                               .len = (uint32_t)size };
     *out = (duct_host_egress_hold_t){ .ln = ln, .pos = pos, .pkt = stage,
                                       .worker_id = wid };
     return stage->data;
@@ -217,9 +263,7 @@ void duct_host_egress_publish(duct_host_egress_hold_t *hold, size_t len)
     auto p = (egress_pkt_t *)hold->pkt;
     p->len = (uint32_t)len;
     duct_vmq_publish_held(&hold->ln, &hold->pos, sizeof(egress_pkt_t) + len);
-    if (duct_vmq_drain_arm(hold->ln.ctrl))
-        s_host_cfg.run(s_host_egress_run, (void *)(uintptr_t)hold->worker_id,
-                       s_host_cfg.queue_ctx);
+    s_egress_drain_kick(hold->ln, hold->worker_id);
 }
 
 void duct_host_egress_abandon(duct_host_egress_hold_t *hold)
@@ -229,9 +273,8 @@ void duct_host_egress_abandon(duct_host_egress_hold_t *hold)
      * consumer, so the drain that push armed has already run and found nothing.
      * Moving the tail here exposes those bytes, and the schedule rides
      * with it. */
-    if (duct_vmq_unread(hold->ln.ctrl) && duct_vmq_drain_arm(hold->ln.ctrl))
-        s_host_cfg.run(s_host_egress_run, (void *)(uintptr_t)hold->worker_id,
-                       s_host_cfg.queue_ctx);
+    if (duct_vmq_unread(hold->ln.ctrl))
+        s_egress_drain_kick(hold->ln, hold->worker_id);
 }
 
 duct_result_t duct_io_inter_batch(duct_engine_t *e, duct_handle_t tok,
@@ -253,32 +296,49 @@ duct_result_t duct_io_inter_batch(duct_engine_t *e, duct_handle_t tok,
      * race a reuse; a mismatch means it did, and h must be discarded. */
     duct_do_if(duct_atomic_load(&s->generation, acquire) != stok.gen, return rc_closed);
     auto conn = duct_conn_by_handle(h);
-    duct_do_if(!conn || conn->xport_type != x_inter, return rc_invalid_arg);
+    duct_do_if(!conn || conn->xport_type != x_inter || duct_conn_device_ops(conn),
+               return rc_invalid_arg);
 
     size_t desc_bytes = 0u;
     duct_do_if(duct_ckd_mul(&desc_bytes, (size_t)batch->n, sizeof(duct_msg_inter_pkt_t))
                || duct_ckd_add(&desc_bytes, desc_bytes, sizeof(duct_msg_inter_batch_t)),
         return rc_invalid_arg);
-    size_t total = desc_bytes;
-    for (unsigned i = 0u; i < batch->n; ++i)
-        duct_do_if(duct_ckd_add(&total, total, batch->pkts[i].payload.size), return rc_invalid_arg);
-    duct_do_if(total > (size_t)UINT32_MAX, return rc_invalid_arg);
+    size_t inline_bytes = 0u;
+    bool any_hold = false;
+    for (unsigned i = 0u; i < batch->n; ++i) {
+        auto pkt = &batch->pkts[i];
+        if (pkt->hold) {
+            any_hold = true;
+            auto base = (const uint8_t *)duct_at(pkt->hold);
+            size_t cap = duct_byte_len(pkt->hold);
+            duct_do_if(pkt->payload.size
+                       && (!pkt->payload.data
+                           || (const uint8_t *)pkt->payload.data < base
+                           || (size_t)((const uint8_t *)pkt->payload.data - base) > cap
+                           || pkt->payload.size > cap - (size_t)((const uint8_t *)pkt->payload.data - base)),
+                return rc_invalid_arg);
+        } else {
+            duct_do_if(pkt->payload.size && !pkt->payload.data, return rc_invalid_arg);
+            duct_do_if(duct_ckd_add(&inline_bytes, inline_bytes, pkt->payload.size),
+                       return rc_invalid_arg);
+        }
+    }
+    size_t holds_bytes = 0u,
+           cursor_base = desc_bytes;
+    if (any_hold)
+        duct_do_if(duct_ckd_mul(&holds_bytes, (size_t)batch->n, sizeof(void *))
+                   || duct_ckd_add(&cursor_base, desc_bytes, holds_bytes),
+            return rc_invalid_arg);
+    size_t total = 0u;
+    duct_do_if(duct_ckd_add(&total, cursor_base, inline_bytes)
+               || total > (size_t)UINT32_MAX,
+        return rc_invalid_arg);
 
-    /* The §5 pin is the whole revalidate-and-hold: one CAS on the lifecycle
-     * word checks the handle's generation and the phase gate and raises the
-     * pin nibble in the same atomic operation conn close and release finish
-     * serialize through — the initial resolve above is fail-fast validation
-     * only, and nothing between it and here can hand the slot out while the
-     * word still matches. A pinned word cannot reach the generation bump
-     * (the count's finish marks it spent instead), so the lane below stays
-     * this generation's until the unpin past the notify. */
     duct_result_t pinned = duct_conn_pin(conn, h.gen);
     duct_do_if(pinned != rc_ok, return pinned);
     auto ln = duct_mpsc_lane(duct_conn_lane(conn), 0u);
     duct_vmq_reserve_pos_t pos;
     duct_vmq_push_rc_t push_rc;
-    /* Reserve space directly in the lane: payload bytes copy once from host
-     * buffers into ring memory. */
     auto stage = (duct_msg_inter_batch_t *)
         duct_vmq_reserve(&ln, inter_msg_batch, 0u, total, &pos, &push_rc);
     if (!stage) {
@@ -287,20 +347,35 @@ duct_result_t duct_io_inter_batch(duct_engine_t *e, duct_handle_t tok,
     }
     stage->conn = h.word;
     stage->n = batch->n;
-    stage->peer = (duct_peer_t){}; /* x_udp_shared-only field; unused here */
+    stage->peer = (duct_peer_t){};
     stage->rx_pool = nullptr;
     stage->pkts_off = (uint32_t)sizeof(duct_msg_inter_batch_t);
-    stage->holds_off = 0u;
+    stage->holds_off = any_hold ? (uint32_t)desc_bytes : 0u;
     auto stage_pkts = duct_msg_inter_pkts(stage);
-    size_t cursor = desc_bytes;
+    auto held = duct_msg_inter_holds(stage);
+    size_t cursor = cursor_base;
     for (unsigned i = 0u; i < batch->n; ++i) {
         auto pkt = &batch->pkts[i];
+        if (pkt->hold) {
+            auto base = (const uint8_t *)duct_at(pkt->hold);
+            stage_pkts[i] = (duct_msg_inter_pkt_t){
+                .offset = pkt->payload.data
+                        ? (uint32_t)((const uint8_t *)pkt->payload.data - base) : 0u,
+                .len = (uint32_t)pkt->payload.size,
+                .stream_id = pkt->stream_id,
+                .flags = pkt->flags,
+            };
+            held[i] = (void *)pkt->hold;
+            continue;
+        }
         stage_pkts[i] = (duct_msg_inter_pkt_t){
             .offset = (uint32_t)cursor,
             .len = (uint32_t)pkt->payload.size,
             .stream_id = pkt->stream_id,
             .flags = pkt->flags,
         };
+        if (held)
+            held[i] = nullptr;
         if (pkt->payload.size)
             memcpy((char *)stage + cursor, pkt->payload.data, pkt->payload.size);
         cursor += pkt->payload.size;

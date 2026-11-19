@@ -114,8 +114,7 @@ typedef struct duct_olb_hdr {
 
     duct_cacheline_struct(
         duct_olb_flags_t _Atomic lifecycle; /**< io_busy/delete_req rendezvous. */
-        size_t buf_size,    /**< @c data[] capacity, bytes. */
-               total_size;  /**< Full VM mapping size for @c duct_vm_del. */
+        size_t buf_size;    /**< @c data[] capacity, bytes. */
     );  /* CL-2 */
 } duct_olb_hdr_t;
 

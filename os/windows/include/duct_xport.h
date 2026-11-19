@@ -906,9 +906,11 @@ duct_xwritev(SOCKET fd, duct_xport_t t, const duct_view_u8 *bufs, unsigned n,
     DWORD sent = 0;
     if (WSASend(fd, wbufs, n, &sent, (DWORD)flags, nullptr, nullptr) == SOCKET_ERROR) {
         int err = WSAGetLastError();
-        switch (err) {
-        case WSAEWOULDBLOCK:
+        if (duct_x_send_retryable(err))
             return rc_again;
+        switch (err) {
+        case WSAEMSGSIZE:
+            return duct_xport_delimited(t) ? rc_drop : rc_fatal;
         default:
             duct_dbg_errf("WSA error %d", err);
             return rc_fatal;

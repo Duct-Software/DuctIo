@@ -211,7 +211,7 @@ static bool s_is_dgram(const noise_engine_t *e)
 
 /** @brief Split @p hs into @p out, whose counter then crosses the wire as wide as
  *  @p e's vtbl sends it. */
-static bool s_split(const noise_engine_t *e, duct_noise_hs_t *hs, duct_noise_transport_t *out)
+duct_zero_regs static bool s_split(const noise_engine_t *e, duct_noise_hs_t *hs, duct_noise_transport_t *out)
 {
     if (!duct_noise_hs_split(hs, out))
         return false;
@@ -232,7 +232,7 @@ static duct_noise_transport_t *s_tx(noise_engine_t *e)
 
 /** @brief Key the handshake's masks derive from.
  *  The config's wire key, or its PSK where the wire key is all-zero. */
-static const uint8_t *s_mask_key(const duct_noise_cfg_t *cfg)
+duct_zero_regs static const uint8_t *s_mask_key(const duct_noise_cfg_t *cfg)
 {
     static const uint8_t zero[duct_noise_key_size];
     return duct_ct_equal(cfg->wire_key, zero, sizeof zero) ? cfg->psk : cfg->wire_key;
@@ -245,7 +245,7 @@ static const uint8_t *s_mask_key(const duct_noise_cfg_t *cfg)
  *  the config's PSK, which a responder with @c peer_psk replaces once its peer
  *  is named, by message 1 under IKpsk2 and by message 3 under XKpsk3.
  *  @return nullptr on allocation failure. */
-static duct_noise_hs_t *s_hs_new(noise_engine_t *e, duct_noise_pattern_t pattern)
+duct_zero_regs static duct_noise_hs_t *s_hs_new(noise_engine_t *e, duct_noise_pattern_t pattern)
 {
     auto hs = duct_noise_hs_create_for(pattern, &e->cfg->local_static,
                                        e->is_initiator ? duct_at(e->peer_id) : nullptr,
@@ -306,7 +306,7 @@ static size_t s_pdu_len(duct_view_u8 hdr)
  *          @c noise_pattern_count, a role naming neither side, or an
  *          allocation failure.
  */
-static duct_seal_engine_t *s_create_framed(const duct_seal_engine_vtbl_t *vt, void *cfg,
+duct_zero_regs static duct_seal_engine_t *s_create_framed(const duct_seal_engine_vtbl_t *vt, void *cfg,
                                            duct_seal_role_t role)
 {
     auto c = (const duct_noise_cfg_t *)cfg;
@@ -344,7 +344,12 @@ static duct_seal_engine_t *s_create_framed(const duct_seal_engine_vtbl_t *vt, vo
         e->hc = s_hc_new(e);
     else
         e->hs = s_hs_new(e, noise_pattern_ikpsk2);
-    duct_do_if(!e->hs && !e->hc, { duct_del(e->peer_id); return nullptr; });
+    if (!e->hs && !e->hc) {
+        duct_del(e->peer_id);
+        duct_del(e->hs_payload);
+        duct_del(e->hs_frame);
+        return nullptr;
+    }
     return &duct_move(e)->base;
 }
 
@@ -361,7 +366,7 @@ static duct_seal_engine_t *s_create_dgram(const duct_seal_engine_vtbl_t *self, v
 /** @brief Release the instance, a handshake state or context still live included.
  *  The block is wiped whole: the transport keys, the exporter and the Diffie-Hellman cache
  *  go with it. */
-static void s_destroy(duct_seal_engine_t *eng)
+duct_zero_regs static void s_destroy(duct_seal_engine_t *eng)
 {
     auto e = DUCT_CAST(noise_engine_t, base, eng);
     duct_noise_hs_destroy(e->hs);
@@ -378,7 +383,8 @@ static void s_destroy(duct_seal_engine_t *eng)
  *  PDU to @c tx_append. The body is already written at @p hdr, so no copy
  *  happens here.
  */
-static bool s_emit(duct_unseal_ctx_t *ctx, uint8_t *framed, size_t hdr, size_t len)
+static bool s_emit(duct_unseal_ctx_t *ctx, size_t hdr, size_t len,
+                   uint8_t framed[static hdr + len])
 {
     duct_do_if(len == 0u, return false);
     if (hdr)
@@ -392,7 +398,7 @@ static bool s_emit(duct_unseal_ctx_t *ctx, uint8_t *framed, size_t hdr, size_t l
  *  handshake AEAD makes the ciphertext pseudorandom whatever they are. The run
  *  stays within @p room behind the lead, so the whole stays within the room the
  *  caller sized from its config. */
-static size_t s_hs_pad(uint8_t *out, size_t room, size_t lead)
+static size_t s_hs_pad(size_t room, uint8_t out[static room], size_t lead)
 {
     uint32_t draw = 0u;
     duct_discard duct_random_bytes(&draw, sizeof draw);
@@ -405,10 +411,10 @@ static size_t s_hs_pad(uint8_t *out, size_t room, size_t lead)
  *  @p msg1_body bytes, short enough that message 2 is no larger than that
  *  message 1 and no longer than the padding bound both ends build with.
  *  @return the padding, a payload over @p pad. */
-static duct_view_u8 s_answer_pad(uint8_t *pad, size_t msg1_body)
+static duct_view_u8 s_answer_pad(uint8_t pad[static duct_noise_hs_pad_max], size_t msg1_body)
 {
     size_t cap = msg1_body > duct_noise_msg2_size ? msg1_body - duct_noise_msg2_size : 0u;
-    return (duct_view_u8){ .data = pad, .size = duct_min(s_hs_pad(pad, duct_noise_hs_pad_max, 0u), cap) };
+    return (duct_view_u8){ .data = pad, .size = duct_min(s_hs_pad(duct_noise_hs_pad_max, pad, 0u), cap) };
 }
 
 /** @brief Build message 1's payload in the instance's work room: the config's
@@ -419,31 +425,32 @@ static duct_view_u8 s_msg1_payload(const noise_engine_t *e)
     auto payload = duct_at(e->hs_payload);
     if (lead)
         memcpy(payload, e->cfg->hello, lead);
-    return (duct_view_u8){ .data = payload, .size = s_hs_pad(payload, lead + duct_noise_hs_pad_max, lead) };
+    return (duct_view_u8){ .data = payload, .size = s_hs_pad(lead + duct_noise_hs_pad_max, payload, lead) };
 }
 
 /** @brief Write this initiator's IKpsk2 message 1 and hand it to @p ctx.
  *  The payload is the config's hello then random zero padding, and the PDU leads
  *  with the vtbl's length prefix where it has one.
  *  @return false when the message does not write or @p ctx refuses it. */
-static bool s_offer_msg1(noise_engine_t *e, duct_unseal_ctx_t *ctx)
+duct_zero_regs static bool s_offer_msg1(noise_engine_t *e, duct_unseal_ctx_t *ctx)
 {
     size_t hdr = e->base.vtbl->pdu_hdr_size;
     size_t framed_cap = s_hs_frame_max(e->cfg->hello_len);
     size_t len = 0u;
-    return duct_noise_hs_write_msg1(e->hs, s_msg1_payload(e), duct_at(e->hs_frame) + hdr,
-                                    framed_cap - hdr, &len)
-        && s_emit(ctx, duct_at(e->hs_frame), hdr, len);
+    return duct_noise_hs_write_msg1(e->hs, s_msg1_payload(e), framed_cap - hdr,
+                                    duct_at(e->hs_frame) + hdr, &len)
+        && s_emit(ctx, hdr, len, duct_at(e->hs_frame));
 }
 
 /** @brief Write the IKpsk2 message 2 into a PDU behind @p hdr bytes of length
  *  prefix and hand it to @p ctx. */
-static bool s_answer_msg1(duct_noise_hs_t *hs, duct_unseal_ctx_t *ctx, size_t hdr,
-                          duct_view_u8 payload, uint8_t *framed, size_t framed_cap)
+duct_zero_regs static bool s_answer_msg1(duct_noise_hs_t *hs, duct_unseal_ctx_t *ctx, size_t hdr,
+                          duct_view_u8 payload, size_t framed_cap,
+                          uint8_t framed[static framed_cap])
 {
     size_t len = 0u;
-    return duct_noise_hs_write_msg2(hs, payload, framed + hdr, framed_cap - hdr, &len)
-        && s_emit(ctx, framed, hdr, len);
+    return duct_noise_hs_write_msg2(hs, payload, framed_cap - hdr, framed + hdr, &len)
+        && s_emit(ctx, hdr, len, framed);
 }
 
 /** @brief Write the IKpsk2 initiator's key confirmation, an empty PDU sealed under
@@ -451,13 +458,13 @@ static bool s_answer_msg1(duct_noise_hs_t *hs, duct_unseal_ctx_t *ctx, size_t hd
  *  It leaves at the split: the responder names its peer only on a PDU
  *  authenticating under these keys, and a protocol stays free to hold all
  *  application traffic until then. */
-static bool s_confirm(noise_engine_t *e, duct_unseal_ctx_t *ctx)
+duct_zero_regs static bool s_confirm(noise_engine_t *e, duct_unseal_ctx_t *ctx)
 {
     size_t hdr = e->base.vtbl->pdu_hdr_size;
     uint8_t framed[s_len_prefix + s_pdu_overhead];
-    size_t len = duct_noise_transport_seal(&e->tp, nullptr, 0u, framed + hdr,
-                                           sizeof framed - hdr);
-    return s_emit(ctx, framed, hdr, len);
+    size_t len = duct_noise_transport_seal(&e->tp, nullptr, 0u, sizeof framed - hdr,
+                                           framed + hdr);
+    return s_emit(ctx, hdr, len, framed);
 }
 
 /** @brief Hand the message at @p framed, @p len body bytes behind the vtbl's length
@@ -465,10 +472,11 @@ static bool s_confirm(noise_engine_t *e, duct_unseal_ctx_t *ctx)
  *  The datagram vtbl also keeps it in @c last as the message a repeat is answered
  *  with, whether or not @p ctx took it.
  *  @return false when @p ctx refuses it. */
-static bool s_hc_send(noise_engine_t *e, duct_unseal_ctx_t *ctx, uint8_t *framed, size_t len)
+static bool s_hc_send(noise_engine_t *e, duct_unseal_ctx_t *ctx, size_t len,
+                      uint8_t framed[static len])
 {
     size_t hdr = e->base.vtbl->pdu_hdr_size;
-    bool sent = s_emit(ctx, framed, hdr, len);
+    bool sent = s_emit(ctx, hdr, len, framed);
     if (s_is_dgram(e)) {
         memcpy(duct_at(e->hc->last), framed, hdr + len);
         e->hc->last_len = (uint16_t)(hdr + len);
@@ -490,14 +498,14 @@ static void s_hc_arm(const noise_engine_t *e, duct_unseal_ctx_t *ctx)
  *  first resend.
  *  @return false when the message does not write or @p ctx refuses it; the first
  *  resend is armed once it has written, refused or not. */
-static bool s_hc_offer(noise_engine_t *e, duct_unseal_ctx_t *ctx)
+duct_zero_regs static bool s_hc_offer(noise_engine_t *e, duct_unseal_ctx_t *ctx)
 {
     size_t hdr = e->base.vtbl->pdu_hdr_size;
     size_t framed_cap = s_hs_frame_max(e->cfg->hello_len);
     size_t len = 0u;
-    bool written = duct_noise_hs_write_msg1_xk(e->hc->hs, s_msg1_payload(e), duct_at(e->hs_frame) + hdr,
-                                               framed_cap - hdr, &len);
-    bool sent = written && s_hc_send(e, ctx, duct_at(e->hs_frame), len);
+    bool written = duct_noise_hs_write_msg1_xk(e->hc->hs, s_msg1_payload(e),
+                                               framed_cap - hdr, duct_at(e->hs_frame) + hdr, &len);
+    bool sent = written && s_hc_send(e, ctx, len, duct_at(e->hs_frame));
     if (written)
         s_hc_arm(e, ctx);
     return sent;
@@ -536,7 +544,7 @@ static void s_emit_opening(noise_engine_t *e, duct_unseal_ctx_t *ctx)
  *  here sends message 1 again. A refused opening packet ends the opening and
  *  message 1 still follows.
  */
-static void s_start(duct_seal_engine_t *eng, duct_unseal_ctx_t *ctx)
+duct_zero_regs static void s_start(duct_seal_engine_t *eng, duct_unseal_ctx_t *ctx)
 {
     auto e = DUCT_CAST(noise_engine_t, base, eng);
     duct_do_if(!e->is_initiator, return);
@@ -567,7 +575,7 @@ static bool s_peer_admitted(const duct_noise_cfg_t *cfg, const uint8_t peer[duct
 /** @brief Look up the PSK of the peer @p remote: the config PSK where
  *  @c peer_psk is unset, else what it answers for @p payload.
  *  @return false for a peer @c peer_psk refuses, else true with the PSK in @p out. */
-static bool s_psk_lookup(const duct_noise_cfg_t *cfg, const uint8_t remote[duct_noise_key_size],
+duct_zero_regs static bool s_psk_lookup(const duct_noise_cfg_t *cfg, const uint8_t remote[duct_noise_key_size],
                          duct_view_u8 payload, uint8_t out[duct_noise_key_size])
 {
     if (!cfg->peer_psk) {
@@ -585,7 +593,7 @@ static bool s_psk_lookup(const duct_noise_cfg_t *cfg, const uint8_t remote[duct_
  *  @return false for an empty payload under @c peer_psk when the config names a
  *          hello, for a payload shorter than the hello without @c peer_psk, and
  *          for a peer @c peer_psk refuses. */
-static bool s_psk_for(const duct_noise_cfg_t *cfg, duct_noise_hs_t *hs,
+duct_zero_regs static bool s_psk_for(const duct_noise_cfg_t *cfg, duct_noise_hs_t *hs,
                       const uint8_t remote[duct_noise_key_size], duct_view_u8 payload)
 {
     /* A config with no hello admits an empty payload: what carries is padding
@@ -603,7 +611,8 @@ static bool s_psk_for(const duct_noise_cfg_t *cfg, duct_noise_hs_t *hs,
 /** @brief Keep the peer's hello in its naming: the payload's head, zero-filled to
  *  the config's hello length, so a peer whose hello runs short of it still names
  *  whole and no work-room byte past the payload is read. */
-static void s_hello_keep(const noise_engine_t *e, const uint8_t *payload, size_t payload_len)
+static void s_hello_keep(const noise_engine_t *e, size_t payload_len,
+                         const uint8_t payload[static payload_len])
 {
     auto dst = duct_at(e->peer_id) + duct_noise_key_size;
     size_t take = duct_min(payload_len, e->cfg->hello_len);
@@ -618,7 +627,7 @@ static void s_hello_keep(const noise_engine_t *e, const uint8_t *payload, size_t
  *  @c verify_peer and the PSK lookup in that order, answers message 2 through
  *  @c ctx->tx_append and waits in @c key_confirming.
  */
-static duct_result_t s_hs_step(noise_engine_t *e, duct_view_u8 body,
+duct_zero_regs static duct_result_t s_hs_step(noise_engine_t *e, duct_view_u8 body,
                                duct_unseal_ctx_t *ctx)
 {
     if (e->is_initiator) {
@@ -628,8 +637,8 @@ static duct_result_t s_hs_step(noise_engine_t *e, duct_view_u8 body,
         uint8_t remote[duct_noise_key_size];
         size_t payload_len = 0u;
         auto payload = duct_at(e->hs_payload);
-        bool ok = duct_noise_hs_read_msg1(e->hs, body, remote, payload,
-                                          e->cfg->hello_len + duct_noise_hs_pad_max, &payload_len);
+        bool ok = duct_noise_hs_read_msg1(e->hs, body, remote,
+                                          e->cfg->hello_len + duct_noise_hs_pad_max, payload, &payload_len);
         duct_do_if(!ok, return rc_invalid_arg);
         /* Ahead of message 2, not after it: a rejected peer that still draws a
          * reply learns its key is one this responder does not carry. */
@@ -639,12 +648,12 @@ static duct_result_t s_hs_step(noise_engine_t *e, duct_view_u8 body,
         if (!admitted)
             return rc_invalid_arg;
         memcpy(duct_at(e->peer_id), remote, duct_noise_key_size);
-        s_hello_keep(e, payload, payload_len);
+        s_hello_keep(e, payload_len, payload);
         /* The payload has gone into the peer's naming, so the answer's padding
          * reuses its room. */
         ok = s_answer_msg1(e->hs, ctx, e->base.vtbl->pdu_hdr_size,
                            s_answer_pad(duct_at(e->hs_payload), body.size),
-                           duct_at(e->hs_frame), s_hs_frame_max(e->cfg->hello_len));
+                           s_hs_frame_max(e->cfg->hello_len), duct_at(e->hs_frame));
         duct_do_if(!ok, return rc_invalid_arg);
     }
     bool ok = s_split(e, e->hs, &e->tp)
@@ -663,7 +672,7 @@ static duct_result_t s_hs_step(noise_engine_t *e, duct_view_u8 body,
  *  is the sender's claim. The allowed list and @c verify_peer admit it, then
  *  @c peer_psk answers for the hello message 1 left in @c peer_id.
  *  @return false for a peer refused, else true with the PSK in @p out. */
-static bool s_xk_psk_for(void *ctx, const uint8_t remote[duct_noise_key_size],
+duct_zero_regs static bool s_xk_psk_for(void *ctx, const uint8_t remote[duct_noise_key_size],
                          uint8_t out[duct_noise_key_size])
 {
     auto e = (const noise_engine_t *)ctx;
@@ -737,7 +746,7 @@ static void s_retry(duct_seal_engine_t *eng, duct_unseal_ctx_t *ctx)
  *  handshake state and settle the keys.
  *  The datagram vtbl moves the context to its confirm state; a stream frees it.
  *  @return false when the split or the exporter fails. */
-static bool s_hc_settle(noise_engine_t *e)
+duct_zero_regs static bool s_hc_settle(noise_engine_t *e)
 {
     auto hc = e->hc;
     bool ok = s_split(e, hc->hs, &e->tp) && duct_noise_hs_exporter(hc->hs, e->exporter);
@@ -759,7 +768,7 @@ static bool s_hc_settle(noise_engine_t *e)
  *          exchange ready for the genuine one, and for a message 3 that does not
  *          write, send or settle; one that @p ctx refuses leaves the end
  *          settled. Else hc_out_ok. */
-static hc_out_t s_hc_initiator_m2(noise_engine_t *e, duct_view_u8 body, duct_unseal_ctx_t *ctx)
+duct_zero_regs static hc_out_t s_hc_initiator_m2(noise_engine_t *e, duct_view_u8 body, duct_unseal_ctx_t *ctx)
 {
     auto hc = e->hc;
     bool ok = duct_noise_hs_read_msg2_xk(hc->hs, body);
@@ -769,10 +778,10 @@ static hc_out_t s_hc_initiator_m2(noise_engine_t *e, duct_view_u8 body, duct_uns
     size_t hdr = e->base.vtbl->pdu_hdr_size;
     size_t framed_cap = s_hs_frame_max(e->cfg->hello_len);
     size_t len = 0u;
-    ok = duct_noise_hs_write_msg3_xk(hc->hs, (duct_view_u8){ .data = pad, .size = s_hs_pad(pad, duct_noise_hs_pad_max, 0u) },
-                                     duct_at(e->hs_frame) + hdr, framed_cap - hdr, &len);
+    ok = duct_noise_hs_write_msg3_xk(hc->hs, (duct_view_u8){ .data = pad, .size = s_hs_pad(duct_noise_hs_pad_max, pad, 0u) },
+                                     framed_cap - hdr, duct_at(e->hs_frame) + hdr, &len);
     duct_do_if(!ok, return hc_out_refused);
-    bool sent = s_hc_send(e, ctx, duct_at(e->hs_frame), len);
+    bool sent = s_hc_send(e, ctx, len, duct_at(e->hs_frame));
     bool settled = s_hc_settle(e);
     return sent && settled ? hc_out_ok : hc_out_refused;
 }
@@ -784,14 +793,14 @@ static hc_out_t s_hc_initiator_m2(noise_engine_t *e, duct_view_u8 body, duct_uns
  *          length gate refuses, and a hello @c hello_ok refuses, none of which
  *          draws message 2, and for an answer that does not write or send. Else
  *          hc_out_ok. */
-static hc_out_t s_hc_responder_m1(noise_engine_t *e, duct_view_u8 body, duct_unseal_ctx_t *ctx)
+duct_zero_regs static hc_out_t s_hc_responder_m1(noise_engine_t *e, duct_view_u8 body, duct_unseal_ctx_t *ctx)
 {
     auto hc = e->hc;
     auto cfg = e->cfg;
     auto payload = duct_at(e->hs_payload);
     size_t payload_len = 0u;
-    bool ok = duct_noise_hs_read_msg1_xk(hc->hs, body, payload,
-                                         cfg->hello_len + duct_noise_hs_pad_max, &payload_len);
+    bool ok = duct_noise_hs_read_msg1_xk(hc->hs, body,
+                                         cfg->hello_len + duct_noise_hs_pad_max, payload, &payload_len);
     /* Where @c hello_ok stands it names the payload whole — the hello then its
      * zero padding — and an empty one is refused ahead of it unless the config
      * names no hello at all; without the callback the config's hello must be
@@ -803,17 +812,17 @@ static hc_out_t s_hc_responder_m1(noise_engine_t *e, duct_view_u8 body, duct_uns
                  || cfg->hello_ok(cfg->verify_ctx, (duct_view_u8){ .data = payload, .size = payload_len });
     if (!admitted)
         return hc_out_refused;
-    s_hello_keep(e, payload, payload_len);
+    s_hello_keep(e, payload_len, payload);
     s_remember(e, body);
     auto pad = duct_at(e->hs_payload);
     size_t hdr = e->base.vtbl->pdu_hdr_size;
     size_t framed_cap = s_hs_frame_max(cfg->hello_len);
     size_t len = 0u;
-    ok = duct_noise_hs_write_msg2_xk(hc->hs, s_answer_pad(pad, body.size), duct_at(e->hs_frame) + hdr,
-                                     framed_cap - hdr, &len);
+    ok = duct_noise_hs_write_msg2_xk(hc->hs, s_answer_pad(pad, body.size),
+                                     framed_cap - hdr, duct_at(e->hs_frame) + hdr, &len);
     duct_do_if(!ok, return hc_out_refused);
     hc->state = hc_r_m3;
-    return s_hc_send(e, ctx, duct_at(e->hs_frame), len) ? hc_out_ok : hc_out_refused;
+    return s_hc_send(e, ctx, len, duct_at(e->hs_frame)) ? hc_out_ok : hc_out_refused;
 }
 
 /** @brief Answer a repeat of message 1 with message 2 again, else read message 3,
@@ -821,15 +830,15 @@ static hc_out_t s_hc_responder_m1(noise_engine_t *e, duct_view_u8 body, duct_uns
  *  @return hc_out_refused for a message 3 that does not read, a peer the allowed
  *          list, @c verify_peer or @c peer_psk refuses included; the exchange stays
  *          ready for a message 3 they admit. Else hc_out_ok. */
-static hc_out_t s_hc_responder_m3(noise_engine_t *e, duct_view_u8 body, duct_unseal_ctx_t *ctx)
+duct_zero_regs static hc_out_t s_hc_responder_m3(noise_engine_t *e, duct_view_u8 body, duct_unseal_ctx_t *ctx)
 {
     if (s_repeat(e->hc, body))
         return s_resend(e, ctx);
     uint8_t remote[duct_noise_key_size];
     auto payload = duct_at(e->hs_payload);
     size_t payload_len = 0u;
-    bool ok = duct_noise_hs_read_msg3_xk(e->hc->hs, body, s_xk_psk_for, e, remote, payload,
-                                         duct_noise_hs_pad_max, &payload_len);
+    bool ok = duct_noise_hs_read_msg3_xk(e->hc->hs, body, s_xk_psk_for, e, remote,
+                                         duct_noise_hs_pad_max, payload, &payload_len);
     duct_do_if(!ok, return hc_out_refused);
     memcpy(duct_at(e->peer_id), remote, duct_noise_key_size);
     s_remember(e, body);
@@ -840,7 +849,7 @@ static hc_out_t s_hc_responder_m3(noise_engine_t *e, duct_view_u8 body, duct_uns
  *  stands in.
  *  @return hc_out_pass for a PDU past the split that repeats no peer message;
  *          every PDU before it is the context's. */
-static hc_out_t s_hc_step(noise_engine_t *e, duct_view_u8 body, duct_unseal_ctx_t *ctx)
+duct_zero_regs static hc_out_t s_hc_step(noise_engine_t *e, duct_view_u8 body, duct_unseal_ctx_t *ctx)
 {
     switch (e->hc->state) {
     case hc_i_m2:
@@ -862,7 +871,7 @@ static hc_out_t s_hc_step(noise_engine_t *e, duct_view_u8 body, duct_unseal_ctx_
  *  A second offer answered while a set is already pending leaves @c prev
  *  alone: it holds the keys the peer is still sealing under, while the
  *  half-finished set in @c tp is the one nobody reached. */
-static void s_adopt(noise_engine_t *e, duct_noise_transport_t *fresh)
+duct_zero_regs static void s_adopt(noise_engine_t *e, duct_noise_transport_t *fresh)
 {
     if (e->keys != key_pending) {
         duct_noise_transport_destroy(&e->prev);
@@ -877,7 +886,7 @@ static void s_adopt(noise_engine_t *e, duct_noise_transport_t *fresh)
 
 /** @brief Settle on @c tp, a PDU having authenticated under it, and drop
  *  @c prev, which is empty where @c tp holds the first key set. */
-static void s_promote(noise_engine_t *e)
+duct_zero_regs static void s_promote(noise_engine_t *e)
 {
     duct_noise_transport_destroy(&e->prev);
     e->keys = key_settled;
@@ -898,7 +907,7 @@ static void s_promote(noise_engine_t *e)
  *  @return @c rc_invalid_arg for anything that is not this peer's message 1,
  *          which an undecryptable PDU gets either way.
  */
-static duct_result_t s_rekey_msg1(noise_engine_t *e, duct_view_u8 body,
+duct_zero_regs static duct_result_t s_rekey_msg1(noise_engine_t *e, duct_view_u8 body,
                                   duct_unseal_ctx_t *ctx)
 {
     /* A rekey's message 1 carries the hello, so its payload spans the config's
@@ -915,14 +924,14 @@ static duct_result_t s_rekey_msg1(noise_engine_t *e, duct_view_u8 body,
     auto payload = duct_at(e->hs_payload);
     size_t payload_len = 0u;
     duct_secret(duct_noise_transport_t, fresh, {});
-    bool ok = duct_noise_hs_read_msg1(hs, body, remote, payload,
-                                      e->cfg->hello_len + duct_noise_hs_pad_max, &payload_len)
+    bool ok = duct_noise_hs_read_msg1(hs, body, remote,
+                                      e->cfg->hello_len + duct_noise_hs_pad_max, payload, &payload_len)
            && duct_ct_equal(remote, duct_at(e->peer_id), sizeof remote)
            && s_psk_for(e->cfg, hs, remote,
                         (duct_view_u8){ .data = payload, .size = payload_len })
            && s_answer_msg1(hs, ctx, e->base.vtbl->pdu_hdr_size,
                             s_answer_pad(payload, body.size),
-                            duct_at(e->hs_frame), s_hs_frame_max(e->cfg->hello_len))
+                            s_hs_frame_max(e->cfg->hello_len), duct_at(e->hs_frame))
            && s_split(e, hs, &fresh);
     duct_noise_hs_destroy(hs);
     if (!ok) {
@@ -939,7 +948,7 @@ static duct_result_t s_rekey_msg1(noise_engine_t *e, duct_view_u8 body,
  *  non-authenticating body answers @c rc_invalid_arg with the offer left live.
  *  Past @c s_rekey_fail_cap such bodies in one window @c read_msg2 is skipped and
  *  the genuine answer is turned away too, deferring the rekey. */
-static duct_result_t s_rekey_msg2(noise_engine_t *e, duct_view_u8 body)
+duct_zero_regs static duct_result_t s_rekey_msg2(noise_engine_t *e, duct_view_u8 body)
 {
     duct_do_if(!e->hs, return rc_invalid_arg);
     duct_do_if(e->rekey_fails >= s_rekey_fail_cap, return rc_invalid_arg);
@@ -971,7 +980,7 @@ static duct_result_t s_rekey_msg2(noise_engine_t *e, duct_view_u8 body)
  *  out, the last two asked again at the conn's next PDU. Never @c rc_fatal, so
  *  this engine outlasts internal operational failures.
  */
-static duct_result_t s_rekey(duct_seal_engine_t *eng, duct_unseal_ctx_t *ctx)
+duct_zero_regs static duct_result_t s_rekey(duct_seal_engine_t *eng, duct_unseal_ctx_t *ctx)
 {
     auto e = DUCT_CAST(noise_engine_t, base, eng);
     e->rekey_fails = 0u;
@@ -1010,12 +1019,12 @@ static duct_view_u8 s_peer_identity(duct_seal_engine_t *eng)
 
 /** @brief Derive @p len bytes under @p label from the exporter, once the peer
  *  is named. */
-static bool s_derive(duct_seal_engine_t *eng, const char *label, void *out, size_t len)
+duct_zero_regs static bool s_derive(duct_seal_engine_t *eng, const char *label, void *out, size_t len)
 {
     auto e = DUCT_CAST(noise_engine_t, base, eng);
     if (s_peer_identity(eng).size == 0u)
         return false;
-    return duct_noise_derive(e->exporter, label, (uint8_t *)out, len);
+    return duct_noise_derive(e->exporter, label, len, (uint8_t *)out);
 }
 
 /** @brief Size the cleartext @p pdu unseals to: what is left past the length
@@ -1079,11 +1088,11 @@ s_unseal(duct_seal_engine_t *eng, duct_view_u8 pdu, duct_unseal_ctx_t *ctx)
     auto ct = (uint8_t *)ctx->reserve(ctx, &cap);
     size_t out_len = 0u;
     bool pending = e->keys == key_pending;
-    bool got = duct_noise_transport_unseal(&e->tp, body, ct, cap, &out_len);
+    bool got = duct_noise_transport_unseal(&e->tp, body, cap, ct, &out_len);
     if (got && (pending || e->keys == key_confirming))
         s_promote(e);
     else if (!got && pending)
-        got = duct_noise_transport_unseal(&e->prev, body, ct, cap, &out_len);
+        got = duct_noise_transport_unseal(&e->prev, body, cap, ct, &out_len);
     if (got) {
         s_hc_free(e);
         return ctx->commit(ctx, out_len) ? rc_ok : rc_invalid_arg;
@@ -1157,7 +1166,7 @@ static void s_seal(duct_seal_engine_t *eng, const duct_view_u8 *spans,
         size_t body = duct_noise_transport_seal_size_of(s_tx(e), chunk);
         if (hdr)
             duct_store_be16(out, (uint16_t)body);
-        size_t got = duct_noise_transport_seal(s_tx(e), window, pieces, out + hdr, body);
+        size_t got = duct_noise_transport_seal(s_tx(e), window, pieces, body, out + hdr);
         duct_fatal(got != body);
         out += hdr + body;
         remaining -= chunk;

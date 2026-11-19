@@ -196,7 +196,7 @@ struct duct_noise_hs {
 };
 
 /** @brief True when every one of @p n bytes at @p p is zero. */
-static bool s_is_all_zero(const uint8_t *p, size_t n)
+duct_zero_regs static bool s_is_all_zero(size_t n, const uint8_t p[static n])
 {
     uint8_t acc = 0u;
     for (size_t i = 0u; i < n; ++i)
@@ -212,7 +212,7 @@ static bool s_is_all_zero(const uint8_t *p, size_t n)
  *  RFC 7748: a small-order peer public key forces that output, and it must
  *  not pass as a shared secret any observer can predict.
  */
-static bool s_dh(EVP_PKEY_CTX *ctx, uint8_t out[32], const uint8_t pub[32])
+duct_zero_regs static bool s_dh(EVP_PKEY_CTX *ctx, uint8_t out[32], const uint8_t pub[32])
 {
     duct_do_if(!ctx, return false);
     auto pubkey = EVP_PKEY_new_raw_public_key(EVP_PKEY_X25519, nullptr, pub, 32u);
@@ -223,7 +223,11 @@ static bool s_dh(EVP_PKEY_CTX *ctx, uint8_t out[32], const uint8_t pub[32])
            && EVP_PKEY_derive(ctx, out, &outlen) == 1
            && outlen == 32u;
     EVP_PKEY_free(pubkey);
-    return ok && !s_is_all_zero(out, 32u);
+    if (!ok || s_is_all_zero(32u, out)) {
+        duct_secure_zero(out, 32u);
+        return false;
+    }
+    return true;
 }
 
 /** @brief The derive context for @p priv, built on first use and kept at @p slot.
@@ -232,7 +236,7 @@ static bool s_dh(EVP_PKEY_CTX *ctx, uint8_t out[32], const uint8_t pub[32])
  *  the secret scope.
  *  @return nullptr where OpenSSL refused, @p slot left empty for a later try.
  */
-static EVP_PKEY_CTX *s_dh_ctx(EVP_PKEY_CTX **slot, const uint8_t priv[32])
+duct_zero_regs static EVP_PKEY_CTX *s_dh_ctx(EVP_PKEY_CTX **slot, const uint8_t priv[32])
 {
     if (*slot)
         return *slot;
@@ -245,13 +249,13 @@ static EVP_PKEY_CTX *s_dh_ctx(EVP_PKEY_CTX **slot, const uint8_t priv[32])
 }
 
 /** @brief DH against @p pub under this side's static key. */
-static bool s_dh_static(duct_noise_hs_t *hs, uint8_t out[32], const uint8_t pub[32])
+duct_zero_regs static bool s_dh_static(duct_noise_hs_t *hs, uint8_t out[32], const uint8_t pub[32])
 {
     return s_dh(s_dh_ctx(&hs->static_dh, hs->local_static.priv), out, pub);
 }
 
 /** @brief DH against @p pub under this side's ephemeral key. */
-static bool s_dh_ephemeral(duct_noise_hs_t *hs, uint8_t out[32], const uint8_t pub[32])
+duct_zero_regs static bool s_dh_ephemeral(duct_noise_hs_t *hs, uint8_t out[32], const uint8_t pub[32])
 {
     return s_dh(s_dh_ctx(&hs->ephemeral_dh, hs->local_ephemeral.priv), out, pub);
 }
@@ -262,11 +266,11 @@ static bool s_dh_ephemeral(duct_noise_hs_t *hs, uint8_t out[32], const uint8_t p
  *  the sender of a message 1 carrying an unknown static neither reads the
  *  entry nor evicts it.
  */
-static bool s_dh_ss(duct_noise_hs_t *hs, uint8_t out[32])
+duct_zero_regs static bool s_dh_ss(duct_noise_hs_t *hs, uint8_t out[32])
 {
     bool pinned = hs->ss_peer
                && duct_ct_equal(hs->ss_peer, hs->remote_static_pub, 32u);
-    if (pinned && !s_is_all_zero(hs->ss_cache, 32u)) {
+    if (pinned && !s_is_all_zero(32u, hs->ss_cache)) {
         memcpy(out, hs->ss_cache, 32u);
         return true;
     }
@@ -284,7 +288,7 @@ static bool s_dh_ss(duct_noise_hs_t *hs, uint8_t out[32])
  *  deriving under the old private key while the transcript carries the new
  *  public one, which no error path reports.
  */
-static bool s_ephemeral_generate(duct_noise_hs_t *hs)
+duct_zero_regs static bool s_ephemeral_generate(duct_noise_hs_t *hs)
 {
     bool made = duct_noise_keypair_generate(&hs->local_ephemeral);
     duct_do_if(!made, return false);
@@ -293,7 +297,7 @@ static bool s_ephemeral_generate(duct_noise_hs_t *hs)
     return true;
 }
 
-static bool s_hash(uint8_t out[32], const void *data, size_t len)
+duct_zero_regs static bool s_hash(uint8_t out[32], const void *data, size_t len)
 {
     unsigned int outlen = 0u;
     return EVP_Digest(data, len, out, &outlen, EVP_blake2s256(), nullptr) == 1
@@ -302,7 +306,7 @@ static bool s_hash(uint8_t out[32], const void *data, size_t len)
 
 /** @brief HMAC of @p len bytes at @p data under @p key with digest @p md, 32 bytes to @p out.
  *  False unless @p md yields 32 bytes, as BLAKE2s-256 and SHA-256 do. */
-static bool s_hmac(const EVP_MD *md, const void *key, size_t key_len,
+duct_zero_regs static bool s_hmac(const EVP_MD *md, const void *key, size_t key_len,
                    const void *data, size_t len, uint8_t out[32])
 {
     unsigned int outlen = 0u;
@@ -310,19 +314,19 @@ static bool s_hmac(const EVP_MD *md, const void *key, size_t key_len,
         && outlen == 32u;
 }
 
-static bool s_hmac_hash(uint8_t out[32], const uint8_t key[32], const void *data, size_t len)
+duct_zero_regs static bool s_hmac_hash(uint8_t out[32], const uint8_t key[32], const void *data, size_t len)
 {
     return s_hmac(EVP_blake2s256(), key, 32u, data, len, out);
 }
 
-bool duct_hmac_sha256(const void *key, size_t key_len, const void *data, size_t data_len,
+duct_zero_regs bool duct_hmac_sha256(const void *key, size_t key_len, const void *data, size_t data_len,
                       uint8_t out[duct_hmac_sha256_size])
 {
     return key_len <= INT_MAX && s_hmac(EVP_sha256(), key, key_len, data, data_len, out);
 }
 
 /** @brief Noise HKDF(chaining_key, ikm, 2 outputs). */
-static bool s_hkdf2(const uint8_t ck[32], const void *ikm, size_t ikm_len,
+duct_zero_regs static bool s_hkdf2(const uint8_t ck[32], const void *ikm, size_t ikm_len,
                     uint8_t out1[32], uint8_t out2[32])
 {
     duct_secret_array(uint8_t, temp_key, 32);
@@ -339,7 +343,7 @@ static bool s_hkdf2(const uint8_t ck[32], const void *ikm, size_t ikm_len,
 /** @brief Noise HKDF(chaining_key, ikm, 3 outputs) — used only for the
  *  `psk` token's MixKeyAndHash.
  */
-static bool s_hkdf3(const uint8_t ck[32], const void *ikm, size_t ikm_len,
+duct_zero_regs static bool s_hkdf3(const uint8_t ck[32], const void *ikm, size_t ikm_len,
                     uint8_t out1[32], uint8_t out2[32], uint8_t out3[32])
 {
     duct_secret_array(uint8_t, temp_key, 32);
@@ -360,7 +364,7 @@ static bool s_hkdf3(const uint8_t ck[32], const void *ikm, size_t ikm_len,
 /** @brief h = HASH(h || data); @p len 0 skips the second update (a nullptr
  *  @p data is only ever passed with @p len 0 — the empty-prologue call).
  */
-static bool s_mix_hash(duct_noise_hs_t *hs, const void *data, size_t len)
+duct_zero_regs static bool s_mix_hash(duct_noise_hs_t *hs, const void *data, size_t len)
 {
     auto mdctx = EVP_MD_CTX_new();
     duct_do_if(!mdctx, return false);
@@ -375,7 +379,7 @@ static bool s_mix_hash(duct_noise_hs_t *hs, const void *data, size_t len)
 }
 
 /** @brief ck, k = HKDF(ck, ikm, 2); arms @c has_key, resets @c n. */
-static bool s_mix_key(duct_noise_hs_t *hs, const uint8_t ikm[32])
+duct_zero_regs static bool s_mix_key(duct_noise_hs_t *hs, const uint8_t ikm[32])
 {
     duct_secret_array(uint8_t, new_ck, 32);
     duct_secret_array(uint8_t, new_k, 32);
@@ -391,7 +395,7 @@ static bool s_mix_key(duct_noise_hs_t *hs, const uint8_t ikm[32])
 /** @brief ck, temp_h, k = HKDF(ck, psk, 3); MixHash(temp_h); arms @c has_key,
  *  resets @c n — the `psk` token.
  */
-static bool s_mix_key_and_hash(duct_noise_hs_t *hs, const uint8_t psk[32])
+duct_zero_regs static bool s_mix_key_and_hash(duct_noise_hs_t *hs, const uint8_t psk[32])
 {
     duct_secret_array(uint8_t, new_ck, 32);
     duct_secret_array(uint8_t, temp_h, 32);
@@ -409,27 +413,27 @@ static bool s_mix_key_and_hash(duct_noise_hs_t *hs, const uint8_t psk[32])
 
 /** @brief Mix the ephemeral public key @p e into the hash and the chaining key, as Noise requires of the `e`
  *  token in a handshake with a psk token. */
-static bool s_mix_ephemeral(duct_noise_hs_t *hs, const uint8_t e[32])
+duct_zero_regs static bool s_mix_ephemeral(duct_noise_hs_t *hs, const uint8_t e[32])
 {
     return s_mix_hash(hs, e, 32u) && s_mix_key(hs, e);
 }
 
 /** @brief MixKey of the DH between this side's static key and @p pub. */
-static bool s_mix_dh_static(duct_noise_hs_t *hs, const uint8_t pub[32])
+duct_zero_regs static bool s_mix_dh_static(duct_noise_hs_t *hs, const uint8_t pub[32])
 {
     duct_secret_array(uint8_t, dh, 32);
     return s_dh_static(hs, dh, pub) && s_mix_key(hs, dh);
 }
 
 /** @brief MixKey of the DH between this side's ephemeral key and @p pub. */
-static bool s_mix_dh_ephemeral(duct_noise_hs_t *hs, const uint8_t pub[32])
+duct_zero_regs static bool s_mix_dh_ephemeral(duct_noise_hs_t *hs, const uint8_t pub[32])
 {
     duct_secret_array(uint8_t, dh, 32);
     return s_dh_ephemeral(hs, dh, pub) && s_mix_key(hs, dh);
 }
 
 /** @brief MixKey of the IKpsk2 `ss` DH. */
-static bool s_mix_dh_ss(duct_noise_hs_t *hs)
+duct_zero_regs static bool s_mix_dh_ss(duct_noise_hs_t *hs)
 {
     duct_secret_array(uint8_t, dh, 32);
     return s_dh_ss(hs, dh) && s_mix_key(hs, dh);
@@ -440,7 +444,7 @@ static bool s_mix_dh_ss(duct_noise_hs_t *hs)
  *  encoding, matched again by the transport-data nonce below for the same
  *  cipher.
  */
-static void s_nonce_from_counter(uint8_t nonce[12], uint64_t n)
+static void s_nonce_from_counter(uint8_t nonce[static 12], uint64_t n)
 {
     memset(nonce, 0, 4u);
     for (unsigned i = 0u; i < 8u; ++i)
@@ -451,9 +455,9 @@ static void s_nonce_from_counter(uint8_t nonce[12], uint64_t n)
  *  advances @c n, then MixHash's the produced ciphertext. Writes @p pt_len
  *  @c + (@c has_key @c ? @ref duct_noise_tag_size @c : 0) bytes to @p out.
  */
-static bool
+duct_zero_regs static bool
 s_encrypt_and_hash(duct_noise_hs_t *hs, const void *pt, size_t pt_len,
-                   uint8_t *out, size_t *out_len)
+                   uint8_t out[static pt_len], size_t *out_len)
 {
     if (!hs->has_key) {
         if (pt_len)
@@ -489,10 +493,12 @@ s_encrypt_and_hash(duct_noise_hs_t *hs, const void *pt, size_t pt_len,
  *
  *  MixHash over @p ct — the whole input, tag included — is deferred until
  *  after a successful decrypt, so a failed auth never mutates @c h. Same
- *  ordering as @ref s_encrypt_and_hash: mix only what was genuinely
- *  produced or consumed.
+*  ordering as @ref s_encrypt_and_hash: mix only what was genuinely
+ *  produced or consumed. @p out writes the plaintext whole where the cipher is
+ *  not yet armed (ct_len bytes) and the plaintext without the tag where it is
+ *  (ct_len - tag): the mode decides the write, so no static bound names it.
  */
-static bool
+duct_zero_regs static bool
 s_decrypt_and_hash(duct_noise_hs_t *hs, const void *ct, size_t ct_len,
                    uint8_t *out, size_t *out_len)
 {
@@ -520,14 +526,17 @@ s_decrypt_and_hash(duct_noise_hs_t *hs, const void *ct, size_t ct_len,
     int fin_len = 0;
     ok = ok && EVP_DecryptFinal_ex(cctx, out + len, &fin_len) == 1;
     EVP_CIPHER_CTX_free(cctx);
-    duct_do_if(!ok, return false);
+    if (!ok) {
+        duct_secure_zero(out, pt_len);
+        duct_do_if(true, return false);
+    }
 
     hs->n++;
     *out_len = pt_len;
     return s_mix_hash(hs, ct, ct_len);
 }
 
-bool duct_noise_keypair_generate(duct_noise_keypair_t *out)
+duct_zero_regs bool duct_noise_keypair_generate(duct_noise_keypair_t *out)
 {
     [[gnu::cleanup(s_scope_leave)]] bool outer = s_scope_enter();
     auto pkey = EVP_PKEY_Q_keygen(nullptr, nullptr, "X25519");
@@ -536,10 +545,12 @@ bool duct_noise_keypair_generate(duct_noise_keypair_t *out)
     bool ok = EVP_PKEY_get_raw_private_key(pkey, out->priv, &priv_len) == 1 && priv_len == sizeof out->priv
            && EVP_PKEY_get_raw_public_key(pkey, out->pub, &pub_len) == 1 && pub_len == sizeof out->pub;
     EVP_PKEY_free(pkey);
+    if (!ok)
+        duct_secure_zero(out, sizeof *out);
     return ok;
 }
 
-bool duct_noise_keypair_from_priv(duct_noise_keypair_t *out, const uint8_t priv[32])
+duct_zero_regs bool duct_noise_keypair_from_priv(duct_noise_keypair_t *out, const uint8_t priv[32])
 {
     [[gnu::cleanup(s_scope_leave)]] bool outer = s_scope_enter();
     auto pkey = EVP_PKEY_new_raw_private_key(EVP_PKEY_X25519, nullptr, priv, 32u);
@@ -548,13 +559,15 @@ bool duct_noise_keypair_from_priv(duct_noise_keypair_t *out, const uint8_t priv[
     size_t pub_len = sizeof out->pub;
     bool ok = EVP_PKEY_get_raw_public_key(pkey, out->pub, &pub_len) == 1 && pub_len == sizeof out->pub;
     EVP_PKEY_free(pkey);
+    if (!ok)
+        duct_secure_zero(out, sizeof *out);
     return ok;
 }
 
 /** @brief Label of the key every handshake mask derives from the mask key. */
 static const char s_mask_label[] = "duct handshake mask";
 
-bool duct_noise_ephemeral_mask(const uint8_t psk[duct_noise_key_size], uint8_t msg,
+duct_zero_regs bool duct_noise_ephemeral_mask(const uint8_t psk[duct_noise_key_size], uint8_t msg,
                                const uint8_t tag[duct_noise_tag_size],
                                uint8_t out[duct_noise_key_size])
 {
@@ -573,8 +586,8 @@ bool duct_noise_ephemeral_mask(const uint8_t psk[duct_noise_key_size], uint8_t m
  *  itself: the tag lies behind the masked bytes. A build without
  *  @c DUCT_HANDSHAKE_MASK leaves @p ephemeral as it is.
  *  @return false on an OpenSSL failure, @p ephemeral then untouched. */
-static bool s_ephemeral_mask(const duct_noise_hs_t *hs, uint8_t which, const uint8_t *msg,
-                             size_t len, uint8_t ephemeral[32])
+duct_zero_regs static bool s_ephemeral_mask(const duct_noise_hs_t *hs, uint8_t which, size_t len,
+                             const uint8_t msg[static len], uint8_t ephemeral[static 32])
 {
     if (!duct_handshake_mask)
         return true;
@@ -587,7 +600,7 @@ static bool s_ephemeral_mask(const duct_noise_hs_t *hs, uint8_t which, const uin
 }
 
 /** @brief Mint this side's ephemeral key, write its public half at @p out and mix it into the transcript. */
-static bool s_emit_ephemeral(duct_noise_hs_t *hs, uint8_t *out)
+duct_zero_regs static bool s_emit_ephemeral(duct_noise_hs_t *hs, uint8_t out[static duct_noise_key_size])
 {
     bool made = s_ephemeral_generate(hs);
     duct_do_if(!made, return false);
@@ -597,14 +610,15 @@ static bool s_emit_ephemeral(duct_noise_hs_t *hs, uint8_t *out)
 
 /** @brief Unmask the ephemeral key leading message @p which, of @p len bytes at @p msg, keep it as the peer's and
  *  mix it into the transcript. */
-static bool s_take_ephemeral(duct_noise_hs_t *hs, uint8_t which, const uint8_t *msg, size_t len)
+duct_zero_regs static bool s_take_ephemeral(duct_noise_hs_t *hs, uint8_t which, size_t len,
+                              const uint8_t msg[static len])
 {
     memcpy(hs->remote_ephemeral_pub, msg, duct_noise_key_size);
-    bool ok = s_ephemeral_mask(hs, which, msg, len, hs->remote_ephemeral_pub);
+    bool ok = s_ephemeral_mask(hs, which, len, msg, hs->remote_ephemeral_pub);
     return ok && s_mix_ephemeral(hs, hs->remote_ephemeral_pub);
 }
 
-duct_noise_hs_t *
+duct_zero_regs duct_noise_hs_t *
 duct_noise_hs_create_for(duct_noise_pattern_t pattern, const duct_noise_keypair_t *local_static,
                          const uint8_t remote_static_pub[32], const uint8_t psk[32], bool is_initiator,
                          duct_view_u8 prologue)
@@ -636,7 +650,7 @@ duct_noise_hs_create_for(duct_noise_pattern_t pattern, const duct_noise_keypair_
     return nullptr;
 }
 
-duct_noise_hs_t *
+duct_zero_regs duct_noise_hs_t *
 duct_noise_hs_create(const duct_noise_keypair_t *local_static,
                     const uint8_t remote_static_pub[32],
                     const uint8_t psk[32],
@@ -653,12 +667,12 @@ void duct_noise_hs_ss_cache(duct_noise_hs_t *hs, uint8_t cache[32],
     hs->ss_peer = peer;
 }
 
-void duct_noise_hs_set_psk(duct_noise_hs_t *hs, const uint8_t psk[duct_noise_key_size])
+duct_zero_regs void duct_noise_hs_set_psk(duct_noise_hs_t *hs, const uint8_t psk[duct_noise_key_size])
 {
     memcpy(hs->psk, psk, sizeof hs->psk);
 }
 
-void duct_noise_hs_destroy(duct_noise_hs_t *hs)
+duct_zero_regs void duct_noise_hs_destroy(duct_noise_hs_t *hs)
 {
     if (!hs)
         return;
@@ -669,9 +683,9 @@ void duct_noise_hs_destroy(duct_noise_hs_t *hs)
     duct_del(hs);
 }
 
-bool
-duct_noise_hs_write_msg1(duct_noise_hs_t *hs, duct_view_u8 payload,
-                         uint8_t *out, size_t out_cap, size_t *out_len)
+duct_zero_regs bool
+duct_noise_hs_write_msg1(duct_noise_hs_t *hs, duct_view_u8 payload, size_t out_cap,
+                         uint8_t out[static out_cap], size_t *out_len)
 {
     duct_do_if(hs->pattern != noise_pattern_ikpsk2 || !hs->is_initiator, return false);
     size_t len = duct_noise_hs_msg1_size(payload.size);
@@ -698,7 +712,7 @@ duct_noise_hs_write_msg1(duct_noise_hs_t *hs, duct_view_u8 payload,
     duct_do_if(!ok, return false);
 
     assert(len == duct_noise_key_size + static_ct_len + payload_ct_len);
-    bool masked = s_ephemeral_mask(hs, duct_noise_mask_msg1, out, len, out);
+    bool masked = s_ephemeral_mask(hs, duct_noise_mask_msg1, len, out, out);
     duct_do_if(!masked, return false);
     *out_len = len;
     hs->step = 1u;
@@ -719,7 +733,7 @@ typedef struct {
 } hs_symm_t;
 
 /** @brief Capture the handshake fields a message read mutates. */
-static void s_hs_symm_save(const duct_noise_hs_t *hs, hs_symm_t *s)
+duct_zero_regs static void s_hs_symm_save(const duct_noise_hs_t *hs, hs_symm_t *s)
 {
     memcpy(s->h, hs->h, sizeof s->h);
     memcpy(s->ck, hs->ck, sizeof s->ck);
@@ -731,7 +745,7 @@ static void s_hs_symm_save(const duct_noise_hs_t *hs, hs_symm_t *s)
 }
 
 /** @brief Restore the handshake's mutated fields after a failed read. */
-static void s_hs_symm_restore(duct_noise_hs_t *hs, const hs_symm_t *s)
+duct_zero_regs static void s_hs_symm_restore(duct_noise_hs_t *hs, const hs_symm_t *s)
 {
     memcpy(hs->h, s->h, sizeof hs->h);
     memcpy(hs->ck, s->ck, sizeof hs->ck);
@@ -742,10 +756,10 @@ static void s_hs_symm_restore(duct_noise_hs_t *hs, const hs_symm_t *s)
     hs->has_key = s->has_key;
 }
 
-bool
+duct_zero_regs bool
 duct_noise_hs_read_msg1(duct_noise_hs_t *hs, duct_view_u8 msg,
-                        uint8_t remote_static_out[32],
-                        uint8_t *payload_out, size_t payload_cap,
+                        uint8_t remote_static_out[static 32], size_t payload_cap,
+                        uint8_t payload_out[static payload_cap],
                         size_t *payload_len_out)
 {
     duct_do_if(hs->pattern != noise_pattern_ikpsk2 || hs->is_initiator, return false);
@@ -760,7 +774,7 @@ duct_noise_hs_read_msg1(duct_noise_hs_t *hs, duct_view_u8 msg,
     s_hs_symm_save(hs, &save);
 
     /* e */
-    bool ok = s_take_ephemeral(hs, duct_noise_mask_msg1, p, msg.size);
+    bool ok = s_take_ephemeral(hs, duct_noise_mask_msg1, msg.size, p);
 
     /* es: our static + their (just-received) ephemeral */
     ok = ok && s_mix_dh_static(hs, hs->remote_ephemeral_pub);
@@ -788,9 +802,9 @@ duct_noise_hs_read_msg1(duct_noise_hs_t *hs, duct_view_u8 msg,
     return true;
 }
 
-bool
-duct_noise_hs_write_msg2(duct_noise_hs_t *hs, duct_view_u8 payload,
-                         uint8_t *out, size_t out_cap, size_t *out_len)
+duct_zero_regs bool
+duct_noise_hs_write_msg2(duct_noise_hs_t *hs, duct_view_u8 payload, size_t out_cap,
+                         uint8_t out[static out_cap], size_t *out_len)
 {
     duct_do_if(hs->pattern != noise_pattern_ikpsk2 || hs->is_initiator || hs->step != 1u, return false);
     duct_do_if(out_cap < duct_noise_msg2_size + payload.size, return false);
@@ -814,14 +828,14 @@ duct_noise_hs_write_msg2(duct_noise_hs_t *hs, duct_view_u8 payload,
     duct_do_if(!ok, return false);
 
     size_t len = duct_noise_key_size + payload_len;
-    bool masked = s_ephemeral_mask(hs, duct_noise_mask_msg2, out, len, out);
+    bool masked = s_ephemeral_mask(hs, duct_noise_mask_msg2, len, out, out);
     duct_do_if(!masked, return false);
     *out_len = len;
     hs->step = 2u;
     return true;
 }
 
-bool duct_noise_hs_read_msg2(duct_noise_hs_t *hs, duct_view_u8 msg)
+duct_zero_regs bool duct_noise_hs_read_msg2(duct_noise_hs_t *hs, duct_view_u8 msg)
 {
     duct_do_if(hs->pattern != noise_pattern_ikpsk2 || !hs->is_initiator, return false);
     duct_do_if(msg.size < duct_noise_msg2_size
@@ -832,7 +846,7 @@ bool duct_noise_hs_read_msg2(duct_noise_hs_t *hs, duct_view_u8 msg)
     s_hs_symm_save(hs, &save);
 
     /* e */
-    bool ok = s_take_ephemeral(hs, duct_noise_mask_msg2, p, msg.size);
+    bool ok = s_take_ephemeral(hs, duct_noise_mask_msg2, msg.size, p);
 
     /* ee */
     ok = ok && s_mix_dh_ephemeral(hs, hs->remote_ephemeral_pub);
@@ -844,7 +858,7 @@ bool duct_noise_hs_read_msg2(duct_noise_hs_t *hs, duct_view_u8 msg)
     ok = ok && s_mix_key_and_hash(hs, hs->psk);
 
     /* payload — the auth check that completes mutual authentication */
-    uint8_t discard[duct_noise_hs_pad_max];
+    duct_secret_array(uint8_t, discard, duct_noise_hs_pad_max);
     size_t got_len = 0u;
     ok = ok && s_decrypt_and_hash(hs, p + duct_noise_key_size,
                                   msg.size - duct_noise_key_size, discard, &got_len);
@@ -854,9 +868,9 @@ bool duct_noise_hs_read_msg2(duct_noise_hs_t *hs, duct_view_u8 msg)
     return true;
 }
 
-bool
-duct_noise_hs_write_msg1_xk(duct_noise_hs_t *hs, duct_view_u8 payload,
-                            uint8_t *out, size_t out_cap, size_t *out_len)
+duct_zero_regs bool
+duct_noise_hs_write_msg1_xk(duct_noise_hs_t *hs, duct_view_u8 payload, size_t out_cap,
+                            uint8_t out[static out_cap], size_t *out_len)
 {
     duct_do_if(hs->pattern != noise_pattern_xkpsk3 || !hs->is_initiator || hs->step != 0u, return false);
     size_t len = duct_noise_xk_msg1_size(payload.size);
@@ -874,16 +888,16 @@ duct_noise_hs_write_msg1_xk(duct_noise_hs_t *hs, duct_view_u8 payload,
     duct_do_if(!ok, return false);
 
     assert(len == duct_noise_key_size + payload_ct_len);
-    bool masked = s_ephemeral_mask(hs, duct_noise_mask_msg1, out, len, out);
+    bool masked = s_ephemeral_mask(hs, duct_noise_mask_msg1, len, out, out);
     duct_do_if(!masked, return false);
     *out_len = len;
     hs->step = 1u;
     return true;
 }
 
-bool
-duct_noise_hs_read_msg1_xk(duct_noise_hs_t *hs, duct_view_u8 msg,
-                           uint8_t *payload_out, size_t payload_cap, size_t *payload_len_out)
+duct_zero_regs bool
+duct_noise_hs_read_msg1_xk(duct_noise_hs_t *hs, duct_view_u8 msg, size_t payload_cap,
+                           uint8_t payload_out[static payload_cap], size_t *payload_len_out)
 {
     duct_do_if(hs->pattern != noise_pattern_xkpsk3 || hs->is_initiator || hs->step != 0u, return false);
     duct_do_if(msg.size < duct_noise_xk_msg1_fixed_size, return false);
@@ -895,7 +909,7 @@ duct_noise_hs_read_msg1_xk(duct_noise_hs_t *hs, duct_view_u8 msg,
     s_hs_symm_save(hs, &save);
 
     /* e */
-    bool ok = s_take_ephemeral(hs, duct_noise_mask_msg1, p, msg.size);
+    bool ok = s_take_ephemeral(hs, duct_noise_mask_msg1, msg.size, p);
 
     /* es: our static + their (just-received) ephemeral */
     ok = ok && s_mix_dh_static(hs, hs->remote_ephemeral_pub);
@@ -910,9 +924,9 @@ duct_noise_hs_read_msg1_xk(duct_noise_hs_t *hs, duct_view_u8 msg,
     return true;
 }
 
-bool
-duct_noise_hs_write_msg2_xk(duct_noise_hs_t *hs, duct_view_u8 payload,
-                            uint8_t *out, size_t out_cap, size_t *out_len)
+duct_zero_regs bool
+duct_noise_hs_write_msg2_xk(duct_noise_hs_t *hs, duct_view_u8 payload, size_t out_cap,
+                            uint8_t out[static out_cap], size_t *out_len)
 {
     duct_do_if(hs->pattern != noise_pattern_xkpsk3 || hs->is_initiator || hs->step != 1u, return false);
     duct_do_if(out_cap < duct_noise_msg2_size + payload.size, return false);
@@ -929,14 +943,14 @@ duct_noise_hs_write_msg2_xk(duct_noise_hs_t *hs, duct_view_u8 payload,
     duct_do_if(!ok, return false);
 
     size_t len = duct_noise_key_size + payload_len;
-    bool masked = s_ephemeral_mask(hs, duct_noise_mask_msg2, out, len, out);
+    bool masked = s_ephemeral_mask(hs, duct_noise_mask_msg2, len, out, out);
     duct_do_if(!masked, return false);
     *out_len = len;
     hs->step = 2u;
     return true;
 }
 
-bool duct_noise_hs_read_msg2_xk(duct_noise_hs_t *hs, duct_view_u8 msg)
+duct_zero_regs bool duct_noise_hs_read_msg2_xk(duct_noise_hs_t *hs, duct_view_u8 msg)
 {
     duct_do_if(hs->pattern != noise_pattern_xkpsk3 || !hs->is_initiator || hs->step != 1u, return false);
     duct_do_if(msg.size < duct_noise_msg2_size
@@ -947,13 +961,13 @@ bool duct_noise_hs_read_msg2_xk(duct_noise_hs_t *hs, duct_view_u8 msg)
     s_hs_symm_save(hs, &save);
 
     /* e */
-    bool ok = s_take_ephemeral(hs, duct_noise_mask_msg2, p, msg.size);
+    bool ok = s_take_ephemeral(hs, duct_noise_mask_msg2, msg.size, p);
 
     /* ee */
     ok = ok && s_mix_dh_ephemeral(hs, hs->remote_ephemeral_pub);
 
     /* payload — the tag proves the responder holds the static key message 1 was sent to */
-    uint8_t discard[duct_noise_hs_pad_max];
+    duct_secret_array(uint8_t, discard, duct_noise_hs_pad_max);
     size_t got_len = 0u;
     ok = ok && s_decrypt_and_hash(hs, p + duct_noise_key_size, msg.size - duct_noise_key_size, discard, &got_len);
     duct_do_if(!ok, s_hs_symm_restore(hs, &save); return false);
@@ -962,9 +976,9 @@ bool duct_noise_hs_read_msg2_xk(duct_noise_hs_t *hs, duct_view_u8 msg)
     return true;
 }
 
-bool
-duct_noise_hs_write_msg3_xk(duct_noise_hs_t *hs, duct_view_u8 payload,
-                            uint8_t *out, size_t out_cap, size_t *out_len)
+duct_zero_regs bool
+duct_noise_hs_write_msg3_xk(duct_noise_hs_t *hs, duct_view_u8 payload, size_t out_cap,
+                            uint8_t out[static out_cap], size_t *out_len)
 {
     duct_do_if(hs->pattern != noise_pattern_xkpsk3 || !hs->is_initiator || hs->step != 2u, return false);
     size_t len = duct_noise_xk_msg3_size(payload.size);
@@ -991,10 +1005,10 @@ duct_noise_hs_write_msg3_xk(duct_noise_hs_t *hs, duct_view_u8 payload,
     return true;
 }
 
-bool
+duct_zero_regs bool
 duct_noise_hs_read_msg3_xk(duct_noise_hs_t *hs, duct_view_u8 msg, duct_noise_psk_for_t psk_for, void *ctx,
-                           uint8_t remote_static_out[duct_noise_key_size],
-                           uint8_t *payload_out, size_t payload_cap, size_t *payload_len_out)
+                           uint8_t remote_static_out[static duct_noise_key_size], size_t payload_cap,
+                           uint8_t payload_out[static payload_cap], size_t *payload_len_out)
 {
     duct_do_if(hs->pattern != noise_pattern_xkpsk3 || hs->is_initiator || hs->step != 2u, return false);
     duct_do_if(msg.size < duct_noise_xk_msg3_fixed_size, return false);
@@ -1034,7 +1048,7 @@ duct_noise_hs_read_msg3_xk(duct_noise_hs_t *hs, duct_view_u8 msg, duct_noise_psk
     return true;
 }
 
-bool duct_noise_hs_split(duct_noise_hs_t *hs, duct_noise_transport_t *out)
+duct_zero_regs bool duct_noise_hs_split(duct_noise_hs_t *hs, duct_noise_transport_t *out)
 {
     duct_do_if(hs->step != s_pattern[hs->pattern].messages, return false);
     duct_secret_array(uint8_t, k1, 32);
@@ -1053,15 +1067,15 @@ bool duct_noise_hs_split(duct_noise_hs_t *hs, duct_noise_transport_t *out)
     return true;
 }
 
-bool duct_noise_hs_exporter(const duct_noise_hs_t *hs, uint8_t out[duct_noise_key_size])
+duct_zero_regs bool duct_noise_hs_exporter(const duct_noise_hs_t *hs, uint8_t out[duct_noise_key_size])
 {
     duct_do_if(hs->step != s_pattern[hs->pattern].messages, return false);
     duct_secret_array(uint8_t, spare, 32);
     return s_hkdf2(hs->ck, hs->h, sizeof hs->h, out, spare);
 }
 
-bool duct_noise_derive(const uint8_t key[duct_noise_key_size], const char *label,
-                       uint8_t *out, size_t len)
+duct_zero_regs bool duct_noise_derive(const uint8_t key[static duct_noise_key_size], const char *label,
+                       size_t len, uint8_t out[static len])
 {
     duct_secret_array(uint8_t, okm, 64);
     duct_do_if(len == 0u || len > sizeof okm, return false);
@@ -1171,19 +1185,19 @@ s_aead_ctx(void **slot, const uint8_t key[32], bool encrypt)
  *  the message leaves, the read after the lead checked and before the counter
  *  is read.
  */
-void duct_noise_counter_cover(const uint8_t key[duct_noise_key_size], uint8_t *counter,
-                              const uint8_t *sample, size_t wide)
+void duct_noise_counter_cover(const uint8_t key[static duct_noise_key_size], size_t wide,
+                              uint8_t counter[static wide], const uint8_t sample[static 12])
 {
     uint8_t in[12], draw[8];
     memcpy(in, sample, sizeof in);
-    duct_sip_put_le64(draw, sizeof draw, duct_siphash24(key, in, sizeof in));
+    duct_sip_put_le64(sizeof draw, draw, duct_siphash24(key, in, sizeof in));
     for (size_t i = 0u; i < wide; ++i)
         counter[i] ^= draw[i];
 }
 
 size_t
 duct_noise_transport_seal(duct_noise_transport_t *t, const duct_view_u8 *spans, size_t n,
-                          uint8_t *out, size_t out_cap)
+                          size_t out_cap, uint8_t out[static out_cap])
 {
     size_t wide = t->counter_size,
            need = duct_noise_transport_seal_size_of(t, 0u);
@@ -1215,7 +1229,7 @@ duct_noise_transport_seal(duct_noise_transport_t *t, const duct_view_u8 *spans, 
                                    (int)duct_noise_tag_size, out + wide + written) == 1;
     duct_do_if(!ok, return 0u);
 
-    duct_noise_counter_cover(t->send_key, out, out + wide, wide);
+    duct_noise_counter_cover(t->send_key, wide, out, out + wide);
     t->send_counter = counter + 1u;
     return wide + (size_t)written + duct_noise_tag_size;
 }
@@ -1243,7 +1257,7 @@ static uint64_t s_expand_counter(const duct_noise_transport_t *t, uint32_t low)
     return t->replay_top - behind;
 }
 
-void duct_noise_transport_destroy(duct_noise_transport_t *t)
+duct_zero_regs void duct_noise_transport_destroy(duct_noise_transport_t *t)
 {
     duct_do_if(!t, return);
     EVP_CIPHER_CTX_free((EVP_CIPHER_CTX *)t->send_ctx);
@@ -1252,8 +1266,8 @@ void duct_noise_transport_destroy(duct_noise_transport_t *t)
 }
 
 bool
-duct_noise_transport_unseal(duct_noise_transport_t *t, duct_view_u8 sealed,
-                           uint8_t *out, size_t out_cap, size_t *out_len)
+duct_noise_transport_unseal(duct_noise_transport_t *t, duct_view_u8 sealed, size_t out_cap,
+                           uint8_t out[static out_cap], size_t *out_len)
 {
     size_t wide = t->counter_size;
     duct_do_if(sealed.size < wide + duct_noise_tag_size, return false);
@@ -1261,7 +1275,7 @@ duct_noise_transport_unseal(duct_noise_transport_t *t, duct_view_u8 sealed,
 
     uint8_t low[duct_noise_counter_size];
     memcpy(low, p, wide);
-    duct_noise_counter_cover(t->recv_key, low, p + wide, wide);
+    duct_noise_counter_cover(t->recv_key, wide, low, p + wide);
     uint64_t counter = 0u;
     for (unsigned i = 0u; i < wide; ++i)
         counter |= (uint64_t)low[i] << (8u * i);
@@ -1285,12 +1299,18 @@ duct_noise_transport_unseal(duct_noise_transport_t *t, duct_view_u8 sealed,
                                   (void *)(p + wide + pt_len)) == 1;
     int fin_len = 0;
     ok = ok && EVP_DecryptFinal_ex(cctx, out + len, &fin_len) == 1;
-    duct_do_if(!ok, return false);
+    if (!ok) {
+        duct_secure_zero(out, pt_len);
+        duct_do_if(true, return false);
+    }
 
     /* Auth already verified above — only now may the counter influence
      * replay state (see @ref s_replay_accept). */
     ok = s_replay_accept(t, counter);
-    duct_do_if(!ok, return false);
+    if (!ok) {
+        duct_secure_zero(out, pt_len);
+        duct_do_if(true, return false);
+    }
     *out_len = pt_len;
     return true;
 }

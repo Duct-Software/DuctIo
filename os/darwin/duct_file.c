@@ -13,7 +13,7 @@ duct_file_t *duct_file_open(const char *path, unsigned flags)
 {
     bool refuse = duct_has_all(flags, duct_or(duct_file_app, duct_file_mapped));
     duct_do_if(refuse, return nullptr);
-    auto f = duct_new(duct_file_t);
+    duct_auto_del auto f = duct_new(duct_file_t);
     duct_do_if(!f, return nullptr);
     if (duct_has(flags, duct_file_mapped)) {
         f->mode = mapped;
@@ -21,14 +21,11 @@ duct_file_t *duct_file_open(const char *path, unsigned flags)
         if (duct_has(flags, duct_file_out))
             prot = O_RDWR;
         f->map.fd = open(path, prot | O_CLOEXEC);
-        if (f->map.fd < 0) {
-            duct_del(f);
+        if (f->map.fd < 0)
             return nullptr;
-        }
         struct stat st;
         if (fstat(f->map.fd, &st) != 0 || st.st_size == 0) {
             close(f->map.fd);
-            duct_del(f);
             return nullptr;
         }
         f->map.size = (size_t)st.st_size;
@@ -36,10 +33,9 @@ duct_file_t *duct_file_open(const char *path, unsigned flags)
                            MAP_SHARED, f->map.fd, 0);
         if (f->map.base == MAP_FAILED) {
             close(f->map.fd);
-            duct_del(f);
             return nullptr;
         }
-        return f;
+        return duct_move(f);
     }
     /* Append wins over truncate, and out without in writes: the four flag shapes map
      * onto the CRT's own modes, read-write included for a file both read and written. */
@@ -47,18 +43,14 @@ duct_file_t *duct_file_open(const char *path, unsigned flags)
                      : duct_has(flags, duct_file_out) ? ((duct_has(flags, duct_file_in)) ? "r+b" : "wb")
                      : duct_has(flags, duct_file_in)  ? "rb"
                                                       : nullptr;
-    if (!mode) {
-        duct_del(f);
+    if (!mode)
         return nullptr;
-    }
     f->file = fopen(path, mode);
-    if (!f->file) {
-        duct_del(f);
+    if (!f->file)
         return nullptr;
-    }
     duct_discard fcntl(fileno(f->file), F_SETFD, FD_CLOEXEC);
     f->mode = buffered;
-    return f;
+    return duct_move(f);
 }
 
 void duct_file_close(duct_file_t *f)

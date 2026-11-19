@@ -90,7 +90,7 @@ typedef struct duct_msg_frame_batch {
     uint32_t           n;           /**< Frame count in @c frames[].
                                       *  Capped by
                                       *  @ref duct_frame_rx_ctx_t::frame_ceiling. */
-    duct_msg_frame_t   frames[];    /**< Payload: sizeof(base) + n ×
+    duct_msg_frame_t   frames[] duct_counted_by(n);    /**< Payload: sizeof(base) + n ×
                                       *  sizeof(duct_msg_frame_t). */
 } duct_msg_frame_batch_t;
 
@@ -189,12 +189,14 @@ static constexpr unsigned dgram_tx_desc_half = 16u;
  *  the span's pin held from staging until the io thread's send drops it.
  */
 typedef struct duct_dgram_tx_entry {
-    duct_peer_t peer;       /**< Destination address. */
+    duct_peer_t peer;    /**< Destination address. */
+    uint64_t    handle;  /**< Origin conn handle word for drain-completion frontier. */
     union {
         struct {
-            uint32_t len;   /**< Staged form: payload length, bytes. */
-            uint32_t slot;  /**< Staged form: reference of the TX slot holding the
-                             *  payload. */
+            uint32_t len;        /**< Staged form: payload length, bytes. */
+            uint32_t slot;       /**< Staged form: reference of the TX slot holding the
+                                  *  payload. */
+            uint32_t done_delta; /**< Staged form: settled fl_send_done count. */
         } staged;
         alignas(8) uint8_t desc[2u * dgram_tx_desc_half]; /**< Descriptor form:
             * flat @c { hdr[16], duct_span_t } in that order, the span's

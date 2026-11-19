@@ -59,7 +59,6 @@ static void duct_conn_pool_dtor(void)
     duct_conn_pool_reclaim();
     duct_block_pool_shutdown(&s_pool->blocks);
     duct_del(s_pool);
-    s_pool = nullptr;
 }
 
 uint32_t duct_conn_idx_get(const duct_conn_t *conn)
@@ -333,17 +332,20 @@ static void s_release_finish(duct_conn_t *conn, uint64_t gen)
         uint64_t want = (old_word & ~gen_req_rel_pend)
                       + (1ull << gen_req_gen_shift);
         if (duct_atomic_cas(weak, slot, &old_word, want, release, relaxed)) {
-            if (s_gen_ceiling_ok(duct_gen_req_gen(old_word), 2u)) {
-                /* The slot's last unit is spent: nobody's commit, completion
-                 * or purge-side walk can hold the ring open now, and the
-                 * records it still carries — a timeout's unsent bytes, a
-                 * lost conn's staged train — complete here, each payload
-                 * reference dropped before the block takes its next
-                 * occupant. */
-                duct_do_if(duct_conn_tx_olb(conn),
-                           duct_olb_tx_purge(duct_conn_tx_olb(conn)));
+            /* The slot's last unit is spent: nobody's commit, completion
+             * or purge-side walk can hold the ring open now, and the
+             * records it still carries — a timeout's unsent bytes, a
+             * lost conn's staged train — complete here, each payload
+             * reference dropped before the block takes its next occupant
+             * or retires at generation saturation. */
+            duct_do_if(duct_conn_tx_olb(conn),
+                       duct_olb_tx_purge(duct_conn_tx_olb(conn)));
+            duct_do_if(duct_conn_lane(conn),
+                       duct_discard duct_vmq_mpsc_drain(duct_conn_lane(conn),
+                                                        duct_conn_inter_slot_release,
+                                                        conn));
+            if (s_gen_ceiling_ok(duct_gen_req_gen(old_word), 2u))
                 s_conn_free_push(conn);
-            }
             return;
         }
     }
@@ -430,18 +432,26 @@ void duct_conn_sealed_codec_detach(duct_conn_t *conn)
     }
 }
 
-void duct_conn_inter_slot_release(duct_vmq_hdr_t *hdr, [[maybe_unused]] void *arg)
+void duct_conn_inter_slot_release(duct_vmq_hdr_t *hdr, void *arg)
 {
     duct_do_if(hdr->type != inter_msg_batch, return);
-    auto b = (const duct_msg_inter_batch_t *)&hdr->payload[0];
-    if (b->rx_pool)
+    auto b = (duct_msg_inter_batch_t *)&hdr->payload[0];
+    if (b->rx_pool) {
         duct_io_rx_slot_drop(b->rx_pool, b->rx_slot, false);
+        return;
+    }
+    auto conn = (const duct_conn_t *)arg;
+    if (b->holds_off && (!conn || !duct_conn_device_ops(conn))) {
+        auto held = duct_msg_inter_holds(b);
+        for (uint32_t i = 0u; i < b->n; ++i)
+            duct_del(held[i]);
+    }
 }
 
 static void s_conn_transport_fini_lane(duct_conn_t *conn)
 {
     auto lane = duct_conn_lane(conn);
-    duct_discard duct_vmq_mpsc_drain(lane, duct_conn_inter_slot_release, nullptr);
+    duct_discard duct_vmq_mpsc_drain(lane, duct_conn_inter_slot_release, conn);
     /* wake_latch stays bound: the latch is its worker's, outliving the conn,
      * and a host thread pinned in §5's word may still notify it after this
      * drain — an empty wake, harmless. Clearing the pointer here would race

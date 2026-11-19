@@ -87,7 +87,9 @@ typedef struct duct_session_defer_maps {
 } duct_session_defer_maps_t;
 
 static constexpr uint32_t session_off_defer_maps =
-    session_off_stats + sizeof(duct_session_stats_t);
+    (session_off_stats + sizeof(duct_session_stats_t) + 7u) & ~(uint32_t)7u;
+static_assert(session_off_defer_maps % 8u == 0u,
+              "session defer maps require 8-byte alignment for uint64 words");
 /** @brief Offset of the defer region itself, the fixed head's last part. */
 static constexpr uint32_t session_off_defer =
     session_off_defer_maps + sizeof(duct_session_defer_maps_t);
@@ -112,7 +114,7 @@ static constexpr size_t session_streams_region =
 
 /** @brief One retry node slot's stride, bytes, pinned to the worker's own
  *  @c retry_node_t by a static_assert there. */
-static constexpr size_t session_retry_node_span = 272u;
+static constexpr size_t session_retry_node_span = 264u;
 /** @brief Bytes of the stream-owned emit nodes' region. */
 static constexpr size_t session_emit_region =
     duct_session_retry_emit_nodes * session_retry_node_span;

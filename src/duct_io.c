@@ -1255,7 +1255,7 @@ typedef struct {
  *  Only a first read of at least @c duct_join_lead_size bytes is asked; a
  *  lead this listener's protocols do not take leaves the read to them. */
 static resolve_result_t
-s_resolve_lead(const duct_listener_t *listener, const uint8_t *peek, size_t n)
+s_resolve_lead(const duct_listener_t *listener, size_t n, const uint8_t peek[static n])
 {
     resolve_result_t r = { .disp = resolve_not_me, .conn_id = duct_conn_id_primary };
     duct_session_handle_t tok;
@@ -1283,7 +1283,7 @@ s_resolve_dgram_lead(const duct_listener_t *listener, const duct_view_u8 *data)
         auto wire = proto->cfg.wire;
         if (!wire || !duct_has(wire->flags, fl_wire_join_lead))
             continue;
-        auto tok = duct_join_dgram_match(data->data, data->size, proto);
+        auto tok = duct_join_dgram_match(data->size, data->data, proto);
         if (tok.word != handle_null)
             return (resolve_result_t){ .disp = resolve_join, .proto = proto,
                                          .tok = tok.word, .conn_id = duct_conn_id_primary };
@@ -1431,7 +1431,7 @@ static bool s_classify_stream(const duct_wfq_route_t *route, duct_listener_t *li
     if (allow_wait && n < listener->peek_min && s_probe_wait_begin(listener, fd, peer, peek))
         return true;
 
-    auto r = s_resolve_lead(listener, (const uint8_t *)peek.data, n);
+    auto r = s_resolve_lead(listener, n, (const uint8_t *)peek.data);
     if (r.disp == resolve_not_me)
         r = s_resolve_sync(listener, peer, &peek);
     if (r.disp == resolve_hold) {
@@ -3106,12 +3106,12 @@ static bool s_vnet_rx_commit(duct_conn_t *conn, size_t n)
     auto state = duct_conn_state(conn);
     bool uso = duct_has(state, fl_conn_vnet_uso) && duct_has(state, fl_conn_vnet_uso_tx);
     size_t out = duct_vnet_cut(duct_at(s_io_this->vnet_hdr),
+                               duct_olb_rx_room(rx),
                                duct_conn_rx_data(conn)
                                  + duct_atomic_load(&h->stage, relaxed),
                                n - conn->vnet_hdr_len,
                                duct_atomic_load(&conn->vnet_gso, relaxed),
-                               uso,
-                               duct_olb_rx_room(rx), &pkts);
+                               uso, &pkts);
     if (!out) {
         duct_rtstat_obj_inc(s_io_this, rtstats.vnet_rx_drop, 1);
         return false;
@@ -3369,7 +3369,8 @@ static bool s_tx_advance(duct_conn_t *conn, size_t offered, size_t n)
 {
     auto tx = duct_conn_tx_olb(conn);
     uint64_t prev = duct_atomic_load(&tx->drained, relaxed);
-    bool zero = duct_olb_tx_advance(tx, n, duct_conn_record_framed(conn));
+    bool done_adv = false;
+    bool zero = duct_olb_tx_advance_done(tx, n, duct_conn_record_framed(conn), &done_adv);
     uint64_t now = duct_atomic_load(&tx->drained, relaxed);
     /* Counted here, where an iocp completion lands as well as a write's return. */
     if (conn->xport_type == x_tcp)
@@ -3380,6 +3381,10 @@ static bool s_tx_advance(duct_conn_t *conn, size_t offered, size_t n)
         /* A zero-wire record freed its slot without moving a byte: an armed
          * word still names a position io has now moved past. */
         s_tx_wake_signalled(conn);
+    if (done_adv && conn->worker_id != conn_worker_none) {
+        duct_worker_done_arm(conn->worker_id, duct_conn_idx_get(conn));
+        duct_worker_wake_id(conn->worker_id);
+    }
     return n == offered; /* short write: socket buffer full, caller stops */
 }
 
@@ -3402,7 +3407,7 @@ static unsigned s_tx_peek_recs(duct_conn_t *conn, duct_tx_rec_t *recs, unsigned 
     if (!duct_conn_record_framed(conn) || duct_atomic_load(&tx->cursor_off, relaxed))
         return 0u;
     duct_view_u8 iov[2u * duct_tx_peek_recs];
-    unsigned n = duct_olb_tx_peek_iov(tx, true, max, iov);
+    unsigned n = duct_olb_tx_peek_iov(tx, false, max, iov);
     n /= 2u;
     for (unsigned i = 0u; i < n; ++i)
         recs[i] = (duct_tx_rec_t){ .hdr = iov[2u * i], .body = iov[2u * i + 1u] };
@@ -3476,10 +3481,12 @@ static bool s_tx_send_batch(duct_conn_t *conn, const duct_io_xfer_t *p,
         if (sent < n)
             *out_rc = rc_again;
         break;
-    case rc_drop:
-        duct_discard s_tx_advance(conn, duct_x_dgram_len_rec(&recs[0]), 0u);
+    case rc_drop: {
+        size_t len = duct_x_dgram_len_rec(&recs[0]);
+        duct_discard s_tx_advance(conn, len, len);
         *out_rc = rc_ok;
         break;
+    }
     default:
         break;
     }
@@ -3534,7 +3541,7 @@ advance:
     case rc_ok:
         return s_tx_advance(conn, offered, nwritten);
     case rc_drop:
-        return s_tx_advance(conn, offered, 0u);
+        return s_tx_advance(conn, offered, offered);
     default:
         return false;
     }
@@ -3662,8 +3669,12 @@ static duct_exec_rc_t s_req_exec(void *self)
     bool rel = (word & gen_req_rel_pend) != 0u;
     if (rel)
         flags &= fl_req_close;
-    if (duct_has(duct_conn_state(conn), fl_conn_closed))
-        flags &= fl_req_fence_retry | fl_req_close;
+    if (duct_has(duct_conn_state(conn), fl_conn_closed)) {
+        if (duct_has(flags, fl_req_close))
+            duct_atomic_fetch(and, duct_conn_gen_req(conn),
+                              ~(uint64_t)fl_req_close, release);
+        flags &= fl_req_fence_retry;
+    }
     /* Rebind first: nothing else in this function touches the wire, but
      * running it first keeps any rx_resume in the same pass reading the
      * already-rebound wire. */
@@ -4209,6 +4220,25 @@ static bool s_dgram_tx_lane_drain_single(duct_vmq_lane_t *ln, duct_listener_t *l
  *  the kernel, the reference has nothing left to hold.
  *  @return true once the snapshot drained whole.
  */
+/** @brief Advance @p handle's drain-completion frontier by @p done_d and arm its worker. */
+static void s_dgram_done_bump(uint64_t h_word, uint32_t done_d)
+{
+    if (!done_d)
+        return;
+    duct_do_if(!h_word, return);
+    duct_conn_handle_t h = { .word = h_word };
+    auto c = duct_conn_by_handle(h);
+    duct_do_if(!c, return);
+    if (duct_conn_pin(c, h.gen) != rc_ok)
+        return;
+    if (c->worker_id != conn_worker_none) {
+        duct_atomic_fetch(add, &duct_conn_tx_done(c)->seq, done_d, release);
+        duct_worker_done_arm(c->worker_id, duct_conn_idx_get(c));
+        duct_worker_wake_id(c->worker_id);
+    }
+    duct_conn_unpin(c);
+}
+
 static bool s_dgram_tx_lane_drain_batch(duct_vmq_lane_t *ln, duct_listener_t *listener,
                                         size_t *out_peeked)
 {
@@ -4221,6 +4251,7 @@ static bool s_dgram_tx_lane_drain_batch(duct_vmq_lane_t *ln, duct_listener_t *li
     for (;;) {
         duct_dgram_out_t outs[duct_x_gso_segs_max];
         duct_span_t spans[duct_x_gso_segs_max];
+        uint64_t handles[duct_x_gso_segs_max];
         size_t heads[duct_x_gso_segs_max];
         unsigned n = 0u;
         duct_vmq_hdr_t *hdr;
@@ -4228,6 +4259,7 @@ static bool s_dgram_tx_lane_drain_batch(duct_vmq_lane_t *ln, duct_listener_t *li
             auto entry = (duct_dgram_tx_entry_t *)&hdr->payload[0];
             duct_view_u8 h;
             s_dgram_tx_desc_parts(entry, &h, &spans[n]);
+            handles[n] = entry->handle;
             outs[n] = (duct_dgram_out_t){
                 .peer = entry->peer,
                 .hdr = h,
@@ -4247,8 +4279,10 @@ static bool s_dgram_tx_lane_drain_batch(duct_vmq_lane_t *ln, duct_listener_t *li
             duct_atomic_store(&listener->dgram_tx_gso_off, 1u, relaxed);
         resolved += sent;
         if (sent) {
-            for (unsigned i = 0u; i < sent; ++i)
+            for (unsigned i = 0u; i < sent; ++i) {
+                s_dgram_done_bump(handles[i], duct_span_done_delta(&spans[i]));
                 duct_span_payload_drop(&spans[i]);
+            }
             head = heads[sent - 1u];
         }
         if (rc != rc_ok || sent < n) {
@@ -4330,6 +4364,8 @@ void duct_io_dgram_send_drain(duct_listener_t *listener, duct_dgram_send_fn send
                 break;
             }
             assert(took <= n);
+            for (unsigned t = 0u; t < took; ++t)
+                s_dgram_done_bump(entries[t]->handle, entries[t]->staged.done_delta);
             commit_head = next_heads[took - 1u];
             pos.head = commit_head;
             any = true;

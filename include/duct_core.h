@@ -54,6 +54,15 @@
     #define duct_nonnull(...)
 #endif
 
+#if DUCT_HAS_ZERO_CALL_USED_REGS
+    /** @brief Clear used caller-saved CPU registers before returning from a function
+     *  that handles secrets (keys, credentials, tokens, plaintexts).
+     */
+    #define duct_zero_regs __attribute__((zero_call_used_regs("used")))
+#else
+    #define duct_zero_regs
+#endif
+
 /** @brief Printf format check for a variadic function.
  *  @p f is the 1-based index of the format argument and @p a that of the first variadic one.
  *  MinGW takes its GNU printf attribute, other GCC and Clang builds @c format(printf), and a
@@ -645,34 +654,22 @@ duct_nonnull(1) static inline void duct_alloc_touched_set(duct_alloc_hdr_t *h, u
  */
 duct_nonnull(1) bool duct_secret_release(void *obj);
 
-/** @brief Byte bound of the array type a @c duct_ptr_t points to.
- *  The smaller of @c PTRDIFF_MAX and 2^61 - 1, the largest array type every compiler of the tree
- *  takes. No real array comes near it.
- */
-static constexpr uint64_t duct_ptr_bound_bytes =
-    (uint64_t)PTRDIFF_MAX < (UINT64_MAX >> 3) ? (uint64_t)PTRDIFF_MAX : UINT64_MAX >> 3;
-
-/** @brief Pointer to the array of @c T that @c duct_new answers when given a count.
- *  The type is @c T (*)[duct_ptr_bound_bytes / sizeof(T)], a bound only these pointers carry:
- *  the compiler refuses one from another element type, from a plain @c T * and from the address
- *  of a fixed-size array. The address of a variable length array converts without a word, and
- *  @ref duct_is_ptr stops it at the accessors. The pointer is never dereferenced as an array:
- *  @ref duct_at yields the elements, and @c p + off steps in whole arrays.
- *  A read-only view is @c duct_ptr_t(const T), which a writable array converts to;
- *  @c duct_ptr_t(T) a, b; declares two pointers.
- */
-#define duct_ptr_t(T) typeof(T (*)[duct_ptr_bound_bytes / sizeof(T)])
-
 /** @brief Zero @p n bytes at @p p in a way the compiler cannot remove.
- *  For key material and any other secret about to leave scope. A @c memset followed by an empty
- *  asm that takes @p p and clobbers memory, on every platform; @p p and @p n are evaluated once.
+ *  For key material and any other secret about to leave scope. Uses C23
+ *  @c memset_explicit inline when the toolchain provides it, and the platform
+ *  @c duct_core.c implementation everywhere else; @p p and @p n are evaluated once.
  */
+#if defined(DUCT_HAS_MEMSET_EXPLICIT) && DUCT_HAS_MEMSET_EXPLICIT
 #define duct_secure_zero(p, n)                                                              \
     ({                                                                                      \
-        auto _zp = (p);                                                                     \
-        memset(_zp, 0, (n));                                                                \
-        __asm__ volatile("" : : "r"(_zp) : "memory");                                       \
+        void *_zp = (p);                                                                    \
+        size_t _zn = (n);                                                                   \
+        if (_zp && _zn)                                                                     \
+            memset_explicit(_zp, 0, _zn);                                                   \
     })
+#else
+void duct_secure_zero(void *p, size_t n);
+#endif
 
 /** @brief Zeroed allocation of one @c T, or of an array of it, behind a header.
  *  With no count answers a @c T *; with a count, a @c duct_ptr_t of @c T, whose elements
@@ -932,7 +929,7 @@ static inline void duct_auto_del_fn(void *pp) { duct_del_fn(*(void **)pp); }
     })
 
 /** @brief Cleanup handler of @c duct_auto_zero, @p r the bytes to wipe. */
-static inline void duct_auto_zero_fn(duct_view_u8 *r) { duct_secure_zero(r->data, r->size); }
+duct_zero_regs static inline void duct_auto_zero_fn(duct_view_u8 *r) { duct_secure_zero(r->data, r->size); }
 
 /** @brief Declaration that wipes the variable or array @p name at the end of its scope.
  *  Written right after @p name; the wipe follows a return expression that reads @p name. Declares
