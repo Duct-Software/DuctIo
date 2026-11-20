@@ -483,9 +483,9 @@ duct_nonnull(1) static inline void duct_conn_touched_update(duct_conn_t *conn)
 {
     auto st = duct_conn_stats(conn);
     size_t bytes = duct_conn_has_olb(conn)
-        ? duct_min(st->rx_total, conn_rx_region_max)
-          + duct_min(st->tx_total, conn_tx_region_max)
-        : duct_min(st->lane_total, duct_inter_lane_cap);
+        ? duct_min(st->rx_total, (uint64_t)conn_rx_region_max)
+          + duct_min(st->tx_total, (uint64_t)conn_tx_region_max)
+        : duct_min(st->lane_total, (uint64_t)duct_inter_lane_cap);
     st->touched = (uint16_t)duct_min(bytes / duct_page_size(), (size_t)UINT16_MAX);
 }
 
