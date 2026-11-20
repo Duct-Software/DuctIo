@@ -941,6 +941,14 @@ duct_xsend_dgram(SOCKET fd, const struct sockaddr *addr,
     return duct_x_send_consumed(n);
 }
 
+/** @brief @ref duct_xsend_dgram ignoring @p local on platforms without @c PKTINFO. */
+duct_nonnull(2) static inline bool
+duct_xsend_dgram_from(SOCKET fd, const struct sockaddr *addr, int addrlen,
+                      [[maybe_unused]] const duct_peer_t *local, duct_view_u8 payload)
+{
+    return duct_xsend_dgram(fd, addr, addrlen, payload);
+}
+
 /** @brief Send @p n already wire-packed datagrams to @p fd, each from its own
  *  descriptor's two spans, unsegmented.
  *
@@ -991,9 +999,10 @@ duct_xsend_peers(SOCKET fd, const duct_dgram_out_t *msgs, unsigned n, unsigned *
  *  nothing was received. A failure past the first read still answers @c rc_ok
  *  for what already arrived, and @p out_n < @p n tells the read loop to stop.
  */
-duct_nonnull(2, 5, 7) static inline duct_result_t
+duct_nonnull(2, 6, 8) static inline duct_result_t
 duct_xrecv_peers(SOCKET fd, const duct_view_u8 *bufs, uint32_t n,
-                 duct_peer_t *out_peers, uint32_t *out_lens, uint32_t *out_segs,
+                 duct_peer_t *out_peers, duct_peer_t *out_locals,
+                 uint32_t *out_lens, uint32_t *out_segs,
                  uint32_t *out_n)
 {
     *out_n = 0u;
@@ -1007,6 +1016,8 @@ duct_xrecv_peers(SOCKET fd, const duct_view_u8 *bufs, uint32_t n,
             return *out_n ? rc_ok : rc;
         if (out_peers)
             out_peers[i] = duct_io_peer_from_sockaddr((struct sockaddr *)&addr);
+        if (out_locals)
+            out_locals[i] = (duct_peer_t){};
         out_lens[i] = (uint32_t)got;
         if (out_segs)
             out_segs[i] = (uint32_t)seg;

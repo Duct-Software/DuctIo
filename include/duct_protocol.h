@@ -875,6 +875,40 @@ duct_nonnull(1, 3) duct_result_t duct_conn_path_mtu(duct_session_t *s,
 duct_nonnull(1) duct_result_t duct_conn_addrs(duct_session_t *s, duct_conn_id_t conn_id,
                                               duct_peer_t *local, duct_peer_t *remote);
 
+/** @brief Migrate a connected @c x_udp_peer leg onto a fresh local ephemeral
+ *  port (and optional new remote IP:port literal @p addr) without disturbing
+ *  the session or its wire keys.
+ *
+ *  Posts a swap onto the leg's I/O thread: there the leg's parked spare
+ *  socket, or a fresh open, connects to @p peer and takes the leg over, the
+ *  previous socket draining delayed packets for ~250 ms before closing. The
+ *  swap itself parks the next hop's spare. A failed open leaves the leg on
+ *  its current tuple, and the next threshold hop retries.
+ *
+ *  @param s          Live session holding @p conn_id.
+ *  @param conn_id    Target @c x_udp_peer leg.
+ *  @param addr       New @c host:port IPv4/IPv6 literal, or @c nullptr / empty
+ *                    to keep the leg's current peer address and rotate the
+ *                    local ephemeral port alone.
+ *  @param egress_if  Interface index to bind the new socket to, 0 for none.
+ *
+ *  @retval rc_ok             Hop scheduled onto I/O thread.
+ *  @retval rc_invalid_arg    Bad arguments or unparsable @p addr literal.
+ *  @retval rc_invalid_order  No live leg there, wrong thread, or leg closing.
+ *  @retval rc_again          Another hop is already in flight on this leg.
+ *  @retval rc_not_supported  Leg is not @c x_udp_peer, or IOCP backend.
+ *  @retval rc_fatal / rc_no_memory  Socket open/connect or message allocation failed.
+ */
+duct_nonnull(1) duct_result_t duct_conn_hop_dgram(duct_session_t *s,
+                                                  duct_conn_id_t conn_id,
+                                                  const char *addr,
+                                                  uint32_t egress_if);
+
+/** @brief True while @ref duct_conn_hop_dgram has a socket swap in flight on
+ *  leg @p conn_id. */
+duct_nonnull(1) bool duct_conn_hopping(const duct_session_t *s,
+                                       duct_conn_id_t conn_id);
+
 /** @brief Read the IP version packets to @p peer travel as.
  *  An IPv4 address, and an IPv6 one in the IPv4-mapped range ::ffff:0:0/96, give
  *  @c fl_ip_v4. Any other IPv6 address gives @c fl_ip_v6, and a peer of neither

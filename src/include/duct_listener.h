@@ -401,6 +401,7 @@ duct_msg_chain_decl(duct_msg_pre_parse,
     duct_listener_t              *listener;
     duct_sock_t                   fd;
     duct_peer_t                   peer;
+    duct_peer_t                   local;
     bool                           fd_registered;
     duct_resolve_disposition_t    decision;    /**< resolve_new / resolve_join / resolve_reject / resolve_not_me. */
     uint16_t                      lead;        /**< Leading bytes of @c payload the preparse consumed. */

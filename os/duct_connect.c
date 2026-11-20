@@ -73,6 +73,15 @@ static bool s_peer_from_literal(const char *host, uint16_t port, duct_peer_t *ou
     return false;
 }
 
+bool duct_connect_parse_peer(const char *addr, duct_peer_t *out)
+{
+    char host[256];
+    uint16_t port = 0u;
+    if (!duct_connect_parse_addr(addr, host, sizeof host, &port))
+        return false;
+    return s_peer_from_literal(host, port, out);
+}
+
 duct_ip_flags_t duct_peer_ip_flags(const duct_peer_t *peer)
 {
     static constexpr uint8_t mapped[12] = { [10] = 0xffu, [11] = 0xffu };

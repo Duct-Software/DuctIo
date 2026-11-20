@@ -590,6 +590,10 @@ typedef struct duct_rt_stats {
                                             round-tripped through trunk.stack for nothing
                                             because an earlier drain already emptied the
                                             lane, all io threads. */
+             dgram_hop_swap_fail,     /**< 5-tuple hop swaps that gave up: the parked
+                                            spare socket and a fresh open both failed to
+                                            connect, the leg staying on its current tuple
+                                            until the next hop, all io threads. */
              dgram_shared_rx_drop,    /**< Classified datagrams for an x_udp_shared conn
                                             dropped: their inter_lane refused the
                                             reservation, or the descriptor size for their
@@ -694,7 +698,8 @@ typedef struct duct_rt_stats {
     apply(fastpath_eagain) apply(dgram_shared_tx_drop) apply(tx_drain_posts)                       \
     apply(tx_drain_deduped) apply(wfq_push_full) apply(fence_push_full) apply(rx_full_latch)       \
     apply(io_loop_pass) apply(io_busy_spin) apply(io_busy_enter) apply(io_busy_exit)               \
-    apply(dgram_tx_real_kick) apply(dgram_tx_real_kick_idle) apply(dgram_shared_rx_drop)           \
+    apply(dgram_tx_real_kick) apply(dgram_tx_real_kick_idle) apply(dgram_hop_swap_fail)            \
+    apply(dgram_shared_rx_drop)           \
     apply(dgram_rx_slot_route) apply(dgram_rx_slot_copy) apply(dgram_tx_batch_calls)              \
     apply(dgram_tx_batch_msgs) apply(dgram_tx_batch_max) apply(dgram_fast_sent)                    \
     apply(dgram_lane_staged) apply(dgram_lane_sent) apply(dgram_tx_gso_writes)                     \

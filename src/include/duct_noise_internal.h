@@ -531,6 +531,13 @@ duct_nonnull(1, 4) bool
 duct_noise_transport_unseal(duct_noise_transport_t *t, duct_view_u8 sealed, size_t out_cap,
                            uint8_t out[static out_cap], size_t *out_len);
 
+/** @brief Extended @ref duct_noise_transport_unseal that also reports in
+ *  @p out_stale (when non-null) whether the accepted packet carried a counter
+ *  strictly behind the highest counter already accepted. */
+duct_nonnull(1, 4) bool
+duct_noise_transport_unseal_ex(duct_noise_transport_t *t, duct_view_u8 sealed, size_t out_cap,
+                              uint8_t out[static out_cap], size_t *out_len, bool *out_stale);
+
 #ifdef __cplusplus
 }
 #endif

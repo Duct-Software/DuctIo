@@ -278,11 +278,12 @@ static duct_pre_conn_t *s_pre_conn_take(duct_io_t *t);
 static uint8_t *s_pre_conn_peek_tail(duct_io_t *t, duct_pre_conn_t *pre_conn);
 static duct_exec_rc_t s_pre_conn_timeout_fire(void *arg);
 static bool s_dgram_peer_find(duct_listener_t *listener, const duct_peer_t *peer,
-                              duct_conn_t **out_conn, bool *out_candidate);
+                              duct_conn_t **out_conn, bool *out_candidate,
+                              uint64_t *out_cand_seq);
 static void s_dgram_peer_candidate_clear(duct_conn_t *conn);
 static void s_dgram_peer_add(duct_listener_t *listener, const duct_peer_t *peer, duct_conn_t *conn);
 static void s_dgram_peer_add_at(duct_listener_t *listener, const duct_peer_t *peer,
-                                duct_conn_t *conn, bool candidate);
+                                duct_conn_t *conn, bool candidate, uint64_t cand_seq);
 static void s_dgram_peer_add_pending(duct_listener_t *listener, const duct_peer_t *peer);
 static void s_dgram_peer_clear_pending(duct_listener_t *listener, const duct_peer_t *peer);
 static duct_exec_rc_t s_preparse_exec_result(void *self);
@@ -621,8 +622,8 @@ static void s_attach_device(const duct_wfq_route_t *route,
  */
 static duct_conn_t *
 s_dgram_shared_conn_new(const duct_wfq_route_t *route, duct_listener_t *listener,
-                        const duct_peer_t *peer, const duct_proto_t *proto,
-                        uint32_t worker_id)
+                        const duct_peer_t *peer, const duct_peer_t *local,
+                        const duct_proto_t *proto, uint32_t worker_id)
 {
     auto conn = duct_conn_acquire();
     duct_do_if(!conn, return nullptr);
@@ -638,6 +639,7 @@ s_dgram_shared_conn_new(const duct_wfq_route_t *route, duct_listener_t *listener
     }
     *duct_conn_dgram_ctx(conn) = (duct_dgram_shared_ctx_t){
         .listener = listener, .peer = *peer,
+        .local = local ? *local : (duct_peer_t){},
     };
     ++listener->pre_conn_refs;
     return conn;
@@ -694,6 +696,7 @@ static unsigned s_dgram_shared_parse(duct_conn_t *conn, uint8_t *scratch, size_t
  *  inline, the slot when @c stage->rx_pool carries them.
  */
 static void s_dgram_shared_publish(duct_conn_t *conn, const duct_peer_t *peer,
+                                   const duct_peer_t *local, uint64_t cand_seq,
                                    duct_msg_inter_batch_t *stage, const duct_vmq_lane_t *ln,
                                    duct_vmq_reserve_pos_t *pos, const dgram_shared_frame_t *frames,
                                    unsigned n_frames, const uint8_t *base)
@@ -702,6 +705,8 @@ static void s_dgram_shared_publish(duct_conn_t *conn, const duct_peer_t *peer,
     stage->conn = ch.word;
     stage->n = n_frames;
     stage->peer = *peer;
+    stage->local = local ? *local : (duct_peer_t){};
+    stage->cand_seq = cand_seq;
     auto pkts = duct_msg_inter_pkts(stage);
     for (unsigned i = 0u; i < n_frames; ++i)
         pkts[i] = (duct_msg_inter_pkt_t){
@@ -785,7 +790,9 @@ static void s_dgram_slot_lend(duct_io_t *t, duct_msg_inter_batch_t *stage, uint3
  *          leaves it entirely to the caller.
  */
 static bool
-s_dgram_shared_route_slot(duct_conn_t *conn, const duct_peer_t *peer, const duct_view_u8 *data)
+s_dgram_shared_route_slot(duct_conn_t *conn, const duct_peer_t *peer,
+                          const duct_peer_t *local, uint64_t cand_seq,
+                          const duct_view_u8 *data)
 {
     auto t = s_io_this;
     uint32_t slot = s_rx_slot_of_payload(t->held_pool, data->data);
@@ -811,7 +818,7 @@ s_dgram_shared_route_slot(duct_conn_t *conn, const duct_peer_t *peer, const duct
     duct_do_if(!stage, return true);
 
     s_dgram_slot_lend(t, stage, slot);
-    s_dgram_shared_publish(conn, peer, stage, &ln, &pos, frames, n_frames, base);
+    s_dgram_shared_publish(conn, peer, local, cand_seq, stage, &ln, &pos, frames, n_frames, base);
     return true;
 }
 
@@ -845,7 +852,9 @@ static bool s_dgram_rx_admits(const duct_conn_t *conn, size_t len)
  *  path that already knows which x_udp_shared conn a datagram belongs
  *  to converges here to route it in.
  */
-static void s_dgram_shared_route(duct_conn_t *conn, const duct_peer_t *peer, const duct_view_u8 *data)
+static void s_dgram_shared_route(duct_conn_t *conn, const duct_peer_t *peer,
+                                 const duct_peer_t *local, uint64_t cand_seq,
+                                 const duct_view_u8 *data)
 {
     duct_do_if(!conn->wire || !conn->wire_parser, return);
     /* Bound before anything is spent on it: past this line a datagram takes a
@@ -854,7 +863,7 @@ static void s_dgram_shared_route(duct_conn_t *conn, const duct_peer_t *peer, con
     if (s_dgram_rx_oversize(conn, data->size))
         return;
 
-    if (s_dgram_shared_route_slot(conn, peer, data))
+    if (s_dgram_shared_route_slot(conn, peer, local, cand_seq, data))
         return;
 
     uint8_t rhdr[duct_dgram_record_hdr_size];
@@ -912,7 +921,7 @@ static void s_dgram_shared_route(duct_conn_t *conn, const duct_peer_t *peer, con
     }
     stage->pkts_off = (uint32_t)desc_off;
     stage->holds_off = 0u;
-    s_dgram_shared_publish(conn, peer, stage, &ln, &pos, frames, n_frames,
+    s_dgram_shared_publish(conn, peer, local, cand_seq, stage, &ln, &pos, frames, n_frames,
                            (const uint8_t *)stage);
 }
 
@@ -937,10 +946,12 @@ static void s_dgram_shared_route(duct_conn_t *conn, const duct_peer_t *peer, con
  */
 static bool
 s_dgram_shared_route_group(duct_listener_t *listener, const duct_peer_t *peer,
-                           duct_view_u8 *data, uint32_t seg)
+                           const duct_peer_t *local, duct_view_u8 *data, uint32_t seg)
 {
     duct_conn_t *conn = nullptr;
-    bool known = s_dgram_peer_find(listener, peer, &conn, nullptr);
+    bool is_cand = false;
+    uint64_t cand_seq = 0u;
+    bool known = s_dgram_peer_find(listener, peer, &conn, &is_cand, &cand_seq);
     if (!known || !conn || conn->xport_type != x_udp_shared)
         return false;
     if (!conn->wire || !conn->wire_parser)
@@ -982,7 +993,8 @@ s_dgram_shared_route_group(duct_listener_t *listener, const duct_peer_t *peer,
         };
     }
     s_dgram_slot_lend(t, stage, slot);
-    s_dgram_shared_publish(conn, peer, stage, &ln, &pos, frames, n_frames,
+    s_dgram_shared_publish(conn, peer, local, is_cand ? cand_seq : 0u, stage, &ln, &pos,
+                           frames, n_frames,
                            (const uint8_t *)duct_x_slot_data(t->held_pool, slot));
     return true;
 }
@@ -995,42 +1007,44 @@ s_dgram_shared_route_group(duct_listener_t *listener, const duct_peer_t *peer,
  */
 static void
 s_dgram_shared_admit_tail(duct_listener_t *listener, const duct_peer_t *peer,
-                          const duct_view_u8 *data, duct_conn_t *conn)
+                          const duct_peer_t *local, const duct_view_u8 *data, duct_conn_t *conn)
 {
-    s_dgram_shared_route(conn, peer, data);
+    s_dgram_shared_route(conn, peer, local, 0u, data);
     s_dgram_peer_add(listener, peer, conn);
 }
 
 /** @brief resolve_join(empty-slot) tail for fl_proto_dgram_shared. */
 static void
 s_dgram_shared_admit_join(const duct_wfq_route_t *route, duct_listener_t *listener,
-                          const duct_peer_t *peer, const duct_view_u8 *data, const duct_proto_t *proto,
+                          const duct_peer_t *peer, const duct_peer_t *local,
+                          const duct_view_u8 *data, const duct_proto_t *proto,
                           uint32_t worker_id, duct_session_handle_t tok, duct_conn_id_t conn_id)
 {
-    auto conn = s_dgram_shared_conn_new(route, listener, peer, proto, worker_id);
+    auto conn = s_dgram_shared_conn_new(route, listener, peer, local, proto, worker_id);
     if (!conn)
         return;
     if (!duct_sessions_post_conn_join(conn, tok, conn_id, peer, (duct_seal_prefix_t){})) {
         duct_io_conn_close(conn, close_internal_error);
         return;
     }
-    s_dgram_shared_admit_tail(listener, peer, data, conn);
+    s_dgram_shared_admit_tail(listener, peer, local, data, conn);
 }
 
 /** @brief resolve_new tail for fl_proto_dgram_shared. */
 static void
 s_dgram_shared_admit_open(const duct_wfq_route_t *route, duct_listener_t *listener,
-                          const duct_peer_t *peer, const duct_view_u8 *data, const duct_proto_t *proto,
+                          const duct_peer_t *peer, const duct_peer_t *local,
+                          const duct_view_u8 *data, const duct_proto_t *proto,
                           uint32_t worker_id, void *user_ctx)
 {
-    auto conn = s_dgram_shared_conn_new(route, listener, peer, proto, worker_id);
+    auto conn = s_dgram_shared_conn_new(route, listener, peer, local, proto, worker_id);
     if (!conn)
         return;
     if (!duct_sessions_post_session_open(conn, proto, user_ctx, (duct_seal_prefix_t){}, false)) {
         duct_io_conn_close(conn, close_internal_error);
         return;
     }
-    s_dgram_shared_admit_tail(listener, peer, data, conn);
+    s_dgram_shared_admit_tail(listener, peer, local, data, conn);
 }
 
 /** @brief Create an @p xport conn atop a caller-owned @p fd and join it
@@ -1183,8 +1197,8 @@ static duct_exec_rc_t s_preparse_exec(void *self)
  *  copied behind the message and the caller keeps its own bytes.
  */
 static bool s_preparse_post(duct_listener_t *listener, duct_sock_t fd,
-                                       const duct_peer_t *peer, duct_view_u8 peek,
-                                       bool fd_registered)
+                                       const duct_peer_t *peer, const duct_peer_t *local,
+                                       duct_view_u8 peek, bool fd_registered)
 {
     auto msg = duct_msg_new_kind(pre_parse, s_preparse_exec, peek.size);
     if (!msg)
@@ -1192,6 +1206,7 @@ static bool s_preparse_post(duct_listener_t *listener, duct_sock_t fd,
     msg->listener = listener;
     msg->fd = fd;
     msg->peer = peer ? *peer : (duct_peer_t){};
+    msg->local = local ? *local : (duct_peer_t){};
     msg->payload_len = (uint32_t)peek.size;
     if (peek.size)
         memcpy(msg->payload, peek.data, peek.size);
@@ -1489,7 +1504,7 @@ static bool s_classify_stream(const duct_wfq_route_t *route, duct_listener_t *li
     if (r.disp == resolve_not_me && r.want_async) {
         if (!allow_wait)
             duct_events_unwatch(s_io_this->trunk.events, fd, nullptr);
-        if (!s_preparse_post(listener, fd, peer, peek, false))
+        if (!s_preparse_post(listener, fd, peer, nullptr, peek, false))
             s_close_fd(fd, false);
         return true;
     }
@@ -1750,7 +1765,8 @@ static bool s_dgram_rx_append_checked(duct_conn_t *conn, const duct_view_u8 *dat
  *  and lose them. */
 static void s_preparse_retry_reply(const duct_listener_t *listener,
                                    const duct_proto_t *proto,
-                                   const duct_peer_t *peer)
+                                   const duct_peer_t *peer,
+                                   const duct_peer_t *local)
 {
     if (!proto)
         return;
@@ -1768,7 +1784,30 @@ static void s_preparse_retry_reply(const duct_listener_t *listener,
 #endif
     struct sockaddr_storage ss;
     socklen_t slen = (socklen_t)duct_io_sockaddr_from_peer(peer, &ss);
-    duct_discard duct_xsend_dgram(listener->listen_fd, (struct sockaddr *)&ss, slen, reply);
+    duct_discard duct_xsend_dgram_from(listener->listen_fd, (struct sockaddr *)&ss,
+                                       slen, local, reply);
+}
+
+/** @brief Register @p peer as a roaming candidate on @p conn (an @c x_udp_shared
+ *  leg) and dispatch @p data with its monotonic @c cand_seq. */
+static void s_dgram_shared_roam_route(duct_listener_t *listener,
+                                      const duct_peer_t *peer, const duct_peer_t *local,
+                                      const duct_view_u8 *data, duct_conn_t *conn)
+{
+    duct_conn_t *dup = nullptr;
+    bool dup_cand = false;
+    uint64_t seq = 0u;
+    if (s_dgram_peer_find(listener, peer, &dup, &dup_cand, &seq) && dup == conn) {
+        s_dgram_shared_route(conn, peer, local, dup_cand ? seq : 0u, data);
+        return;
+    }
+    s_dgram_peer_candidate_clear(conn);
+    seq = ++duct_conn_dgram_ctx(conn)->cand_seq;
+    if (!seq)
+        seq = ++duct_conn_dgram_ctx(conn)->cand_seq;
+    s_dgram_peer_add_at(listener, peer, conn, true, seq);
+    duct_conn_state_set(conn, fl_conn_roaming);
+    s_dgram_shared_route(conn, peer, local, seq, data);
 }
 
 /** @brief Classification and dispatch for one already-received datagram
@@ -1779,15 +1818,17 @@ static void s_preparse_retry_reply(const duct_listener_t *listener,
  *  datagram loop or a proactive one's own completion handler.
  */
 static void s_classify_dgram(const duct_wfq_route_t *route, duct_listener_t *listener,
-                                         const duct_peer_t *peer, const duct_view_u8 *data)
+                             const duct_peer_t *peer, const duct_peer_t *local,
+                             const duct_view_u8 *data)
 {
     duct_conn_t *existing = nullptr;
     bool is_candidate = false;
-    if (s_dgram_peer_find(listener, peer, &existing, &is_candidate)) {
+    uint64_t cand_seq = 0u;
+    if (s_dgram_peer_find(listener, peer, &existing, &is_candidate, &cand_seq)) {
         /* Dispatches datagrams from known peer addresses without re-evaluating
          * new connection classification. */
         if (existing && existing->xport_type == x_udp_shared) {
-            s_dgram_shared_route(existing, peer, data);
+            s_dgram_shared_route(existing, peer, local, is_candidate ? cand_seq : 0u, data);
             return;
         }
         /* A datagram from an address this leg is already reachable at retires
@@ -1817,12 +1858,12 @@ static void s_classify_dgram(const duct_wfq_route_t *route, duct_listener_t *lis
     r = s_resolve_tail(listener, r);
 
     if (r.disp == resolve_not_me && r.want_async) {
-        duct_discard s_preparse_post(listener, duct_sock_bad, peer, *data, false);
+        duct_discard s_preparse_post(listener, duct_sock_bad, peer, local, *data, false);
         return;
     }
 
     if (r.disp == resolve_retry) {
-        s_preparse_retry_reply(listener, r.proto, peer);
+        s_preparse_retry_reply(listener, r.proto, peer, local);
         return;
     }
 
@@ -1836,22 +1877,18 @@ static void s_classify_dgram(const duct_wfq_route_t *route, duct_listener_t *lis
             return;
         if (duct_has(duct_proto_cfg_of(r.proto)->flags, fl_proto_dgram_shared)) {
             /* Occupied slot: this leg's client roamed, its address changing
-             * under preparse's own CID map. Routes to the existing conn and
-             * aliases the new address, a conn-join post here being what
-             * refuses an occupied slot. Empty slot: a genuine new leg,
-             * light-attach and join as usual. The conn's dgram ctx @c peer
-             * is written only by the owning worker, off the inter_lane
-             * message this route carries, to avoid racing a read here. */
+             * under preparse's own CID map. Registers the new peer as a
+             * candidate (retiring older addresses only after worker AEAD
+             * confirmation) and routes inbound traffic onto the existing conn. */
             auto slot = duct_session_conn_at(target, r.conn_id);
             if (slot.word) {
                 auto conn = duct_conn_by_handle(slot);
                 if (!conn || conn->xport_type != x_udp_shared)
                     return;
-                s_dgram_shared_route(conn, peer, data);
-                s_dgram_peer_add(listener, peer, conn);
+                s_dgram_shared_roam_route(listener, peer, local, data, conn);
                 return;
             }
-            s_dgram_shared_admit_join(route, listener, peer, data, r.proto,
+            s_dgram_shared_admit_join(route, listener, peer, local, data, r.proto,
                                       (uint32_t)target->worker_id, tok, r.conn_id);
             return;
         }
@@ -1877,7 +1914,7 @@ static void s_classify_dgram(const duct_wfq_route_t *route, duct_listener_t *lis
                 return;
             auto rx = duct_conn_rx_olb(roamed);
             s_dgram_peer_candidate_clear(roamed);
-            s_dgram_peer_add_at(listener, peer, roamed, true);
+            s_dgram_peer_add_at(listener, peer, roamed, true, 0u);
             duct_atomic_store(&rx->roam_at,
                       duct_olb_rx_total_at(rx, duct_atomic_load(&rx->h.stage, relaxed)),
                       release);
@@ -1902,7 +1939,7 @@ static void s_classify_dgram(const duct_wfq_route_t *route, duct_listener_t *lis
 
     /* resolve_new */
     if (duct_has(duct_proto_cfg_of(r.proto)->flags, fl_proto_dgram_shared)) {
-        s_dgram_shared_admit_open(route, listener, peer, data, r.proto, conn_worker_none, r.user_ctx);
+        s_dgram_shared_admit_open(route, listener, peer, local, data, r.proto, conn_worker_none, r.user_ctx);
         return;
     }
     auto conn = s_conn_prepare(listener, peer, *data, r.proto, x_udp_peer,
@@ -1919,25 +1956,31 @@ static void s_classify_dgram(const duct_wfq_route_t *route, duct_listener_t *lis
 
 /* Reached from a reactive backend's readiness-driven read loop, or from a
  * proactive one's completion handler. */
-void duct_io_on_dgram(duct_listener_t *listener, const duct_peer_t *peer,
-                      duct_view_u8 *data, uint32_t seg)
+void duct_io_on_dgram_from(duct_listener_t *listener, const duct_peer_t *peer,
+                           const duct_peer_t *local, duct_view_u8 *data, uint32_t seg)
 {
     /* A zero-length datagram is a datagram, and the single-unit path carries
      * it: the split loop's condition is false at once for an empty read. */
     if (!seg || seg >= data->size) {
-        s_classify_dgram(&s_io_this->route, listener, peer, data);
+        s_classify_dgram(&s_io_this->route, listener, peer, local, data);
         return;
     }
     s_rtstat_gro(data->size, seg);
-    if (s_dgram_shared_route_group(listener, peer, data, seg))
+    if (s_dgram_shared_route_group(listener, peer, local, data, seg))
         return;
     /* Walked apart one datagram at a time, so nothing past here learns they
      * arrived together. */
     for (size_t off = 0u; off < data->size; off += seg) {
         size_t take = duct_min(data->size - off, (size_t)seg);
-        s_classify_dgram(&s_io_this->route, listener, peer,
+        s_classify_dgram(&s_io_this->route, listener, peer, local,
                          &(duct_view_u8){ .data = data->data + off, .size = take });
     }
+}
+
+void duct_io_on_dgram(duct_listener_t *listener, const duct_peer_t *peer,
+                      duct_view_u8 *data, uint32_t seg)
+{
+    duct_io_on_dgram_from(listener, peer, nullptr, data, seg);
 }
 
 bool duct_io_on_dgram_slot(duct_listener_t *listener, const duct_peer_t *peer, uint32_t slot,
@@ -2142,7 +2185,7 @@ static duct_exec_rc_t s_preparse_exec_result(void *self)
         s_dgram_peer_clear_pending(result->listener, &result->peer);
 
     if (result->decision == resolve_retry && is_dgram)
-        s_preparse_retry_reply(result->listener, result->proto, &result->peer);
+        s_preparse_retry_reply(result->listener, result->proto, &result->peer, &result->local);
 
     if (result->decision == resolve_reject || result->decision == resolve_not_me
         || result->decision == resolve_retry || !result->proto) {
@@ -2169,21 +2212,20 @@ static duct_exec_rc_t s_preparse_exec_result(void *self)
      * flag. */
     if (is_dgram && duct_has(duct_proto_cfg_of(result->proto)->flags, fl_proto_dgram_shared)) {
         if (!target) {
-            s_dgram_shared_admit_open(route, result->listener, &result->peer, &payload,
-                                      result->proto, conn_worker_none, result->user_ctx);
+            s_dgram_shared_admit_open(route, result->listener, &result->peer, &result->local,
+                                      &payload, result->proto, conn_worker_none, result->user_ctx);
             return exec_done;
         }
         auto slot = duct_session_conn_at(target, result->join_conn_id);
         if (slot.word) {
             auto held = duct_conn_by_handle(slot);
-            if (held && held->xport_type == x_udp_shared) {
-                s_dgram_shared_route(held, &result->peer, &payload);
-                s_dgram_peer_add(result->listener, &result->peer, held);
-            }
+            if (held && held->xport_type == x_udp_shared)
+                s_dgram_shared_roam_route(result->listener, &result->peer, &result->local,
+                                          &payload, held);
             return exec_done;
         }
-        s_dgram_shared_admit_join(route, result->listener, &result->peer, &payload,
-                                  result->proto, (uint32_t)target->worker_id,
+        s_dgram_shared_admit_join(route, result->listener, &result->peer, &result->local,
+                                  &payload, result->proto, (uint32_t)target->worker_id,
                                   join_tok, result->join_conn_id);
         return exec_done;
     }
@@ -2228,6 +2270,7 @@ typedef struct s_dgram_peer_node {
     duct_hash_handle_t  hh;
     duct_peer_t         peer;
     duct_conn_handle_t  conn;
+    uint64_t            cand_seq;
     bool                candidate;
 } dgram_peer_node_t;
 
@@ -2270,11 +2313,13 @@ uint64_t duct_peer_hash(const duct_peer_t *peer)
  */
 static bool
 s_dgram_peer_find(duct_listener_t *listener, const duct_peer_t *peer,
-                  duct_conn_t **out_conn, bool *out_candidate)
+                  duct_conn_t **out_conn, bool *out_candidate, uint64_t *out_cand_seq)
 {
     *out_conn = nullptr;
     if (out_candidate)
         *out_candidate = false;
+    if (out_cand_seq)
+        *out_cand_seq = 0u;
     auto buckets = (duct_hash_handle_t **)listener->dgram_peers;
     if (!buckets)
         return false;
@@ -2294,6 +2339,8 @@ s_dgram_peer_find(duct_listener_t *listener, const duct_peer_t *peer,
         *out_conn = conn;
         if (out_candidate)
             *out_candidate = node->candidate;
+        if (out_cand_seq)
+            *out_cand_seq = node->cand_seq;
         return true;
     }
     return false;
@@ -2350,7 +2397,7 @@ static duct_hash_handle_t **s_dgram_peer_prepare(duct_listener_t *listener)
  *  @p candidate marks roaming candidate addresses awaiting protocol verification.
  */
 static void s_dgram_peer_add_at(duct_listener_t *listener, const duct_peer_t *peer,
-                                duct_conn_t *conn, bool candidate)
+                                duct_conn_t *conn, bool candidate, uint64_t cand_seq)
 {
     auto buckets = s_dgram_peer_prepare(listener);
     if (!buckets)
@@ -2359,14 +2406,14 @@ static void s_dgram_peer_add_at(duct_listener_t *listener, const duct_peer_t *pe
     if (!node)
         return;
     *node = (dgram_peer_node_t){ .peer = *peer, .conn = duct_conn_handle_get(conn),
-                                   .candidate = candidate };
+                                   .cand_seq = cand_seq, .candidate = candidate };
     duct_hash_insert(&buckets[duct_hash_idx(duct_peer_hash(peer), s_dgram_peer_mask)], &node->hh);
 }
 
 /** @brief @p conn recorded as freshly spun off for @p peer. */
 static void s_dgram_peer_add(duct_listener_t *listener, const duct_peer_t *peer, duct_conn_t *conn)
 {
-    s_dgram_peer_add_at(listener, peer, conn, false);
+    s_dgram_peer_add_at(listener, peer, conn, false, 0u);
 }
 
 /** @brief @p conn's candidate node, and in @p out_listener the listener holding
@@ -2447,6 +2494,15 @@ static void s_req_do_peer_roam(duct_conn_t *conn)
     duct_listener_t *listener = nullptr;
     auto node = s_dgram_peer_candidate_find(conn, &listener);
     if (!node) {
+        duct_conn_state_clear(conn, fl_conn_roaming);
+        return;
+    }
+    if (conn->xport_type == x_udp_shared) {
+        auto dctx = duct_conn_dgram_ctx(conn);
+        if (duct_atomic_load(&dctx->accepted_seq, acquire) < node->cand_seq)
+            return;
+        s_dgram_peer_drop_others(listener, node);
+        node->candidate = false;
         duct_conn_state_clear(conn, fl_conn_roaming);
         return;
     }
@@ -2836,10 +2892,71 @@ void duct_io_on_pre_conn_readable(duct_pre_conn_t *pre_conn)
  *  this file's own reserve, commit, and done steps. This function only
  *  decides whether a drive should start at all.
  */
+/** @brief Non-blockingly drain any delayed datagrams queued on @p conn->hop_fd.
+ *  Ignores socket errors on the retired descriptor so old-tuple ICMP never
+ *  disturbs the active leg. */
+static void s_hop_fd_drain(duct_conn_t *conn)
+{
+    if (conn->hop_fd == duct_sock_bad || duct_has(duct_conn_state(conn), fl_conn_closed))
+        return;
+    auto rx = duct_conn_rx_olb(conn);
+    if (!rx || duct_atomic_load(&rx->suspended, relaxed) || duct_olb_rx_stalled(rx))
+        return;
+    auto tag = (void *)(uintptr_t)s_conn_tag_word(conn);
+    for (unsigned pass = 0u; pass < 64u; ++pass) {
+        duct_io_xfer_t xfer;
+        if (!duct_io_rx_reserve(tag, &xfer))
+            break;
+        if (xfer.units > 1u) {
+            xfer.fd = conn->hop_fd;
+            auto rc = duct_io_dgram_rx_units(tag, &xfer);
+            if (rc != rc_ok)
+                break;
+        } else {
+            size_t got = 0u,
+                   seg = 0u;
+            auto rc = duct_xread(conn->hop_fd, x_udp,
+                                 (duct_view_u8){ .data = xfer.buf, .size = xfer.size },
+                                 &got, nullptr, 0u, &seg);
+            if (rc != rc_ok)
+                break;
+            duct_io_rx_commit(tag, got, seg);
+        }
+    }
+}
+
+/** @brief Cancel @p conn->hop_timer, drain @p conn->hop_fd once if still live,
+ *  and close it. I/O-thread-only. */
+static void s_hop_fd_retire(duct_io_t *t, duct_conn_t *conn)
+{
+    if (conn->hop_timer != timer_handle_null) {
+        duct_timer_cancel(&t->timers, conn->hop_timer);
+        conn->hop_timer = timer_handle_null;
+    }
+    if (conn->hop_fd != duct_sock_bad) {
+        s_hop_fd_drain(conn);
+        duct_sock_close(conn->hop_fd);
+        conn->hop_fd = duct_sock_bad;
+    }
+}
+
+static duct_exec_rc_t s_hop_timer_fire(void *arg)
+{
+    auto t = s_io_this;
+    auto h = (duct_conn_handle_t){ .word = (uint64_t)(uintptr_t)arg };
+    auto conn = duct_conn_by_handle(h);
+    if (!conn || conn->io_id != t->route.thread_id)
+        return exec_done;
+    conn->hop_timer = timer_handle_null;
+    s_hop_fd_retire(t, conn);
+    return exec_done;
+}
+
 static void s_rx_start(duct_conn_t *conn)
 {
     if (!conn || !duct_conn_rx_olb(conn))
         return;
+    s_hop_fd_drain(conn);
     auto st = duct_conn_state(conn);
     if (st & fl_conn_closed)
         /* The close decision already unwatched this fd: no reactive
@@ -3218,6 +3335,11 @@ void duct_io_rx_done(void *tag, duct_result_t rc)
      * already no-ops when nothing new arrived, so there is no cheaper
      * gate to duplicate here. */
     duct_frame_rx_post(&t->route, &t->frame_rx, conn);
+    /* The parked hop socket carries no watch of its own: its straggler band
+     * rides the live leg's drive cadence, the hop timer's final drain only
+     * covering a conn gone quiet. */
+    if (conn->hop_fd != duct_sock_bad)
+        s_hop_fd_drain(conn);
     /* The receive follow steps only on a drive that read the socket dry. A
      * drive the full ring latched ends on the backend's initial rc_again too,
      * its kernel queue still full, and a buffer shrunk under that queue has the
@@ -3817,6 +3939,83 @@ static inline void s_msg_push(unsigned io_id, duct_msg_t *msg)
  *  x_local, a socket path; any other value is a DNS failure delivered
  *  straight to whichever on_error channel seed.kind selects.
  */
+static duct_sock_t s_hop_fd_spare(int family, uint32_t egress_if);
+
+duct_msg_chain_decl(duct_msg_dgram_hop,
+    duct_conn_handle_t  conn;
+    duct_peer_t         peer;
+    uint32_t            egress_if;
+);
+
+static duct_exec_rc_t s_msg_exec_dgram_hop(void *self)
+{
+    auto m = (duct_msg_dgram_hop *)self;
+    auto t = s_io_this;
+    auto conn = duct_conn_by_handle(m->conn);
+    if (!conn || duct_has(duct_conn_state(conn), fl_conn_closed)
+        || conn->xport_type != x_udp_peer) {
+        if (conn)
+            duct_conn_state_clear(conn, fl_conn_hopping);
+        return duct_msg_done(m);
+    }
+    s_hop_fd_retire(t, conn);
+    /* The parked spare or a fresh open connects here: a failure leaves the
+     * leg on its current tuple, the next threshold hop retries. */
+    duct_sock_t new_fd = conn->hop_arm_fd;
+    conn->hop_arm_fd = duct_sock_bad;
+    struct sockaddr_storage ss;
+    socklen_t slen = (socklen_t)duct_io_sockaddr_from_peer(&m->peer, &ss);
+    if (new_fd != duct_sock_bad
+        && duct_xconnect(x_udp_peer, new_fd, (struct sockaddr *)&ss, slen) != rc_ok) {
+        duct_sock_close(new_fd);
+        new_fd = duct_sock_bad;
+    }
+    if (new_fd == duct_sock_bad) {
+        new_fd = s_hop_fd_spare(m->peer.family, m->egress_if);
+        if (new_fd != duct_sock_bad
+            && duct_xconnect(x_udp_peer, new_fd, (struct sockaddr *)&ss, slen) != rc_ok) {
+            duct_sock_close(new_fd);
+            new_fd = duct_sock_bad;
+        }
+    }
+    if (new_fd == duct_sock_bad) {
+        duct_conn_state_clear(conn, fl_conn_hopping);
+        duct_rtstat_obj_inc(s_io_this, rtstats.dgram_hop_swap_fail, 1);
+        return duct_msg_done(m);
+    }
+    auto rx = duct_conn_rx_olb(conn);
+    auto tx = duct_conn_tx_olb(conn);
+    duct_sock_t old_fd = conn->fd;
+    duct_events_unwatch(t->trunk.events, old_fd, rx ? rx->h.ext_ptr : nullptr);
+    if (tx)
+        duct_olb_tx_write_armed_set(tx, false);
+    conn->hop_fd = old_fd;
+    conn->fd = new_fd;
+    if (rx)
+        rx->peer = m->peer;
+    if (!duct_events_watch(t->trunk.events, conn->fd, io_tag_conn,
+                           (void *)(uintptr_t)s_conn_tag_word(conn), x_udp)) {
+        duct_conn_state_clear(conn, fl_conn_hopping);
+        duct_io_conn_close(conn, close_io_error);
+        return duct_msg_done(m);
+    }
+    static constexpr uint64_t hop_drain_us = 250000u;
+    conn->hop_timer = duct_timer_add(&t->timers, (uint8_t)t->route.thread_id, 0u,
+                                     hop_drain_us, 0u, 1u, s_hop_timer_fire,
+                                     (void *)(uintptr_t)m->conn.word, nullptr);
+    duct_conn_state_clear(conn, fl_conn_hopping | fl_conn_gso_off);
+    if (conn->hop_timer == timer_handle_null)
+        s_hop_fd_retire(t, conn);
+    else
+        s_hop_fd_drain(conn);
+    s_tx_start(conn);
+    s_rx_start(conn);
+    /* Park the next hop's spare against this swap's peer; a failed open
+     * parks nothing and the next swap opens fresh. */
+    conn->hop_arm_fd = s_hop_fd_spare(m->peer.family, m->egress_if);
+    return duct_msg_done(m);
+}
+
 duct_msg_chain_decl(duct_msg_io_connect,
     duct_dial_target_t   target;
     uint32_t             connect_timeout_ms;
@@ -3869,8 +4068,16 @@ duct_result_t duct_io_addrs(const duct_conn_t *conn, duct_peer_t *local, duct_pe
     len = sizeof theirs;
     if (remote && !shared && getpeername(conn->fd, (struct sockaddr *)&theirs, &len) != 0)
         return rc_invalid_order;
-    if (local)
-        *local = duct_io_peer_from_sockaddr((struct sockaddr *)&mine);
+    if (local) {
+        auto mine_peer = duct_io_peer_from_sockaddr((struct sockaddr *)&mine);
+        if (shared && shared->local.family) {
+            *local = shared->local;
+            if (!local->port)
+                local->port = mine_peer.port;
+        } else {
+            *local = mine_peer;
+        }
+    }
     if (remote)
         *remote = shared ? shared->peer : duct_io_peer_from_sockaddr((struct sockaddr *)&theirs);
     return rc_ok;
@@ -4096,7 +4303,8 @@ duct_result_t duct_io_udp_peer_send_staged(duct_conn_t *conn, size_t *out_sent,
 {
     *out_sent = 0u;
     auto tx = duct_conn_tx_olb(conn);
-    if (duct_olb_tx_write_armed(tx)) {
+    if (duct_has(duct_conn_state(conn), fl_conn_hopping)
+        || duct_olb_tx_write_armed(tx)) {
 #if DUCT_RUNTIME_STATS
         duct_worker_rtstat_fast_miss(true);
 #endif
@@ -4262,6 +4470,7 @@ static bool s_dgram_tx_lane_drain_batch(duct_vmq_lane_t *ln, duct_listener_t *li
             handles[n] = entry->handle;
             outs[n] = (duct_dgram_out_t){
                 .peer = entry->peer,
+                .local = entry->local,
                 .hdr = h,
                 .body = duct_span_body(&spans[n]),
             };
@@ -4437,6 +4646,34 @@ void duct_io_post_dgram_tx(duct_listener_t *listener)
  */
 static duct_socket_prepare_fn s_socket_prepare;
 static void *s_socket_ctx;
+
+static duct_sock_t s_hop_fd_spare(int family, uint32_t egress_if)
+{
+    duct_sock_t fd = duct_xsocket(family, x_udp_peer, egress_if, nullptr);
+    if (fd != duct_sock_bad && s_socket_prepare
+        && !s_socket_prepare(s_socket_ctx, fd, family)) {
+        duct_sock_close(fd);
+        fd = duct_sock_bad;
+    }
+    return fd;
+}
+
+duct_result_t
+duct_io_dgram_hop_start(duct_conn_t *conn, duct_conn_handle_t handle,
+                        const duct_peer_t *peer, uint32_t egress_if)
+{
+    duct_conn_state_set(conn, fl_conn_hopping);
+    auto m = duct_msg_new_kind(dgram_hop, s_msg_exec_dgram_hop);
+    if (!m) {
+        duct_conn_state_clear(conn, fl_conn_hopping);
+        return rc_no_memory;
+    }
+    m->conn = handle;
+    m->peer = *peer;
+    m->egress_if = egress_if;
+    s_msg_post(conn->io_id, m);
+    return rc_ok;
+}
 
 static bool s_msg_post_connect(unsigned io_id, const duct_dial_target_t *target,
                                   duct_conn_intent_t seed, uint32_t connect_timeout_ms,
@@ -5298,6 +5535,7 @@ static void s_conn_detach(duct_io_t *t, duct_conn_t *conn)
 {
     duct_frame_rx_retry_discard(&t->frame_rx, conn);
     duct_conn_state_set(conn, fl_conn_closed);
+    s_hop_fd_retire(t, conn);
     s_conn_deregister(t, conn);
     duct_conn_io_list_unlink(conn, t->route.thread_id);
 }
@@ -5641,6 +5879,11 @@ static void s_io_abandon_io_connect(duct_msg_io_connect *m)
     if (m->fd != duct_sock_bad)
         duct_sock_close(m->fd);
     s_dial_abandon(&m->seed, m->dns_err != rc_ok ? m->dns_err : rc_closed);
+}
+
+static void s_io_abandon_dgram_hop([[maybe_unused]] duct_msg_dgram_hop *m)
+{
+    /* No resource rides the message: the swap opens its socket on the io side. */
 }
 
 /** @brief Drop what an unrun pre-parse job holds: a stream's probe fd and the listener reference.

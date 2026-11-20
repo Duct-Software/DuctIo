@@ -1088,12 +1088,17 @@ s_unseal(duct_seal_engine_t *eng, duct_view_u8 pdu, duct_unseal_ctx_t *ctx)
     auto ct = (uint8_t *)ctx->reserve(ctx, &cap);
     size_t out_len = 0u;
     bool pending = e->keys == key_pending;
-    bool got = duct_noise_transport_unseal(&e->tp, body, cap, ct, &out_len);
+    bool stale = false;
+    bool got = duct_noise_transport_unseal_ex(&e->tp, body, cap, ct, &out_len, &stale);
     if (got && (pending || e->keys == key_confirming))
         s_promote(e);
-    else if (!got && pending)
-        got = duct_noise_transport_unseal(&e->prev, body, cap, ct, &out_len);
+    else if (!got && pending) {
+        got = duct_noise_transport_unseal_ex(&e->prev, body, cap, ct, &out_len, &stale);
+        if (got && e->tp.replay_started)
+            stale = true;
+    }
     if (got) {
+        ctx->rx_stale = stale;
         s_hc_free(e);
         return ctx->commit(ctx, out_len) ? rc_ok : rc_invalid_arg;
     }

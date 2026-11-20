@@ -141,6 +141,27 @@ s_bind_socket_open(const char *host, uint16_t *port, duct_bind_kind_t kind)
                       (const char *)&(int){ (int)duct_dgram_sock_rcvbuf }, sizeof(int));
             setsockopt(fd, SOL_SOCKET, SO_SNDBUF,
                       (const char *)&(int){ (int)duct_dgram_sock_sndbuf }, sizeof(int));
+#if defined(__linux__)
+            if (kind == bind_udp_shared) {
+                bool is_wildcard =
+                    (it->ai_family == AF_INET
+                     && ((const struct sockaddr_in *)it->ai_addr)->sin_addr.s_addr
+                            == htonl(INADDR_ANY))
+                 || (it->ai_family == AF_INET6
+                     && IN6_IS_ADDR_UNSPECIFIED(
+                            &((const struct sockaddr_in6 *)it->ai_addr)->sin6_addr));
+                if (is_wildcard) {
+#ifdef IPV6_RECVPKTINFO
+                    if (it->ai_family == AF_INET6)
+                        setsockopt(fd, IPPROTO_IPV6, IPV6_RECVPKTINFO,
+                                   &(int){ 1 }, sizeof(int));
+#endif
+#ifdef IP_PKTINFO
+                    setsockopt(fd, IPPROTO_IP, IP_PKTINFO, &(int){ 1 }, sizeof(int));
+#endif
+                }
+            }
+#endif
         }
         if (socktype == SOCK_DGRAM && !*port)
             s_udp_port_draw(it);

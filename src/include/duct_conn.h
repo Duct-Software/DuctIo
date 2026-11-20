@@ -14,6 +14,7 @@
 #include "duct_types.h"
 #include "duct_core.h"
 #include "duct_msg.h"
+#include "duct_timer.h"
 #include "duct_vmq.h"
 
 #include <assert.h>
@@ -130,6 +131,10 @@ typedef enum duct_conn_flags : uint16_t {
     fl_conn_dgram_gro   = 1u << 5,
     fl_conn_gso_off     = 1u << 6,
     fl_conn_vnet_uso_tx = 1u << 7,
+    fl_conn_hopping     = 1u << 8,  /**< An @c x_udp_peer leg mid-5-tuple hop:
+                                      *  worker direct writes yield to @c tx_olb
+                                      *  until the I/O thread installs the new fd
+                                      *  and drains queued datagrams onto it. */
 } duct_conn_flags_t;
 
 static_assert(sizeof(duct_conn_flags_t) == sizeof(uint16_t),
@@ -341,6 +346,15 @@ typedef struct duct_conn {
                           *  through @ref duct_conn_block.h; the xport alone
                           *  decides which of them is live. */
 
+        duct_sock_t hop_fd; /**< Previous @c x_udp_peer socket parked during a
+                              *  make-before-break 5-tuple hop to drain delayed
+                              *  inbound datagrams before close; I/O-thread-owned. */
+
+        duct_sock_t hop_arm_fd; /**< Spare @c x_udp_peer socket parked by the
+                                  *  I/O swap ahead of the next 5-tuple hop;
+                                  *  the next swap consumes it or teardown
+                                  *  closes it. I/O-thread-owned. */
+
         const duct_wire_t  *wire; /**< Bound wire for RX parse + TX pack.
                                     *  Set by @ref duct_conn_bind_wire at
                                     *  accept/attach, rebound on a
@@ -360,6 +374,9 @@ typedef struct duct_conn {
          *  which has no other synchronization with the worker's write.
          */
         const duct_proto_t * _Atomic wire_rebind_next;
+
+        duct_timer_handle_t hop_timer; /**< Close timer for @c hop_fd;
+                                         *  I/O-thread-owned. */
 
         /** @brief Transport kind of @c fd.
          *  Drives per-conn I/O dispatch across the OS backends;
@@ -439,9 +456,14 @@ duct_nonnull(1) void duct_local_listener_drop(duct_conn_t *conn);
 
 /** @brief x_udp_shared conn's @c ctx layout. */
 typedef struct duct_dgram_shared_ctx {
-    duct_listener_t *listener; /**< Listener back-reference. */
-    duct_peer_t      peer;     /**< This leg's current peer address,
-                                 *  updated on every migration. */
+    duct_listener_t  *listener;     /**< Listener back-reference. */
+    duct_peer_t       peer;         /**< This leg's current peer address,
+                                      *  updated on every verified migration. */
+    duct_peer_t       local;        /**< Local destination address from @c PKTINFO
+                                      *  on this leg's inbound traffic. */
+    uint64_t          cand_seq;     /**< Monotonic candidate seq (I/O-owned). */
+    uint64_t _Atomic  accepted_seq; /**< Highest candidate seq accepted by worker;
+                                      *  checked by I/O before candidate promotion. */
 } duct_dgram_shared_ctx_t;
 
 /** @brief True when @p conn's live union arm is @c rx_buf / @c tx_buf.

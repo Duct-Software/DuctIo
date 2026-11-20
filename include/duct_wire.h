@@ -283,6 +283,11 @@ typedef struct duct_unseal_ctx {
      *  @retval rc_no_memory  No timer is to be had.
      */
     duct_result_t (*arm)(struct duct_unseal_ctx *self, uint32_t delay_ms);
+
+    /** @brief Set by @c unseal when an authenticated datagram arrived out of
+     *  order (behind the engine's highest accepted sequence number). Cleared at
+     *  the start of every @c unseal call. */
+    bool rx_stale;
 } duct_unseal_ctx_t;
 
 /** @brief What a wire carries beyond payload bytes, fixed at construction. */

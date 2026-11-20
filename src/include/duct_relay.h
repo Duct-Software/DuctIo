@@ -48,7 +48,7 @@ typedef struct duct_span          duct_span_t;
 /** @brief Kinds the io sweep gives back, each also the kind @c msg_kind_NAME. */
 #define duct_msg_sweep_io(X)                                              \
     X(attach_device) X(attach_fd) X(open_packet_fd) X(io_connect)         \
-    X(pre_parse) X(listener_register) X(listener_close)
+    X(dgram_hop) X(pre_parse) X(listener_register) X(listener_close)
 
 /** @brief Kinds the worker sweep gives back, each also the kind @c msg_kind_NAME. */
 #define duct_msg_sweep_ctrl(X) X(session_open) X(session_invoke) X(proto_post)
@@ -953,6 +953,18 @@ duct_io_post_attach_fd(unsigned io_id, const duct_session_handle_t *h,
  */
 duct_nonnull(3) bool
 duct_io_post_open_packet_fd(unsigned io_id, duct_sock_t fd, duct_proto_t *proto, void *user_ctx);
+
+/** @brief Parse a @c host:port IPv4/IPv6 literal string into @p out. */
+duct_nonnull(1, 2) bool
+duct_connect_parse_peer(const char *addr, duct_peer_t *out);
+
+/** @brief Post @c dgram_hop to @p conn's I/O thread: the swap consumes the
+ *  leg's parked spare socket or opens one, connects to @p peer and swaps.
+ *  Sets @c fl_conn_hopping ahead of the post; the I/O side clears it when the
+ *  swap gave up, the leg then staying on its current tuple. */
+duct_nonnull(1, 3) duct_result_t
+duct_io_dgram_hop_start(duct_conn_t *conn, duct_conn_handle_t handle,
+                        const duct_peer_t *peer, uint32_t egress_if);
 
 /** @brief Attach device callbacks on @p io_id's I/O thread.
  *  @c ops is copied into the message; device context lifetime moves to the I/O

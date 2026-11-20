@@ -137,6 +137,10 @@ typedef struct duct_io_rt {
                                         *  round-tripped through trunk.stack for nothing,
                                         *  because a real EPOLLOUT reconcile already emptied
                                         *  the lane first. */
+             dgram_hop_swap_fail,     /**< s_msg_exec_dgram_hop swaps that gave up: the
+                                        *  parked spare and a fresh open both failed to
+                                        *  connect, the leg staying on its current tuple
+                                        *  until the next threshold hop. */
              dgram_tx_batch_calls,    /**< s_dgram_tx_lane_drain_batch calls that offered
                                         *  the socket at least one entry. */
              dgram_tx_batch_msgs,     /**< Entries those calls offered: submissions, so an

@@ -127,6 +127,12 @@ typedef struct duct_msg_inter_batch {
      *  single-thread-owned.
      */
     duct_peer_t            peer;
+    /** @brief Classified destination local address (@c PKTINFO).
+     *  @c x_udp_shared only; zero-family when unknown. */
+    duct_peer_t            local;
+    /** @brief Candidate migration sequence assigned by I/O when this batch
+     *  originated from a candidate node; 0 otherwise. */
+    uint64_t               cand_seq;
     /** @brief Where the payload bytes live.
      *  An RX slot when set, inline in this batch's own lane slot when null;
      *  each packet's @c offset counts from whichever of the two it selects.
@@ -190,6 +196,7 @@ static constexpr unsigned dgram_tx_desc_half = 16u;
  */
 typedef struct duct_dgram_tx_entry {
     duct_peer_t peer;    /**< Destination address. */
+    duct_peer_t local;   /**< Source address (@c PKTINFO) when @c family != 0. */
     uint64_t    handle;  /**< Origin conn handle word for drain-completion frontier. */
     union {
         struct {

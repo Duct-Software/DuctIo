@@ -466,6 +466,7 @@ s_tls_unseal(const duct_wire_t *self, duct_wire_codec_t *codec,
     if (!ctl.size) {
         bool carries = duct_wire_codec_rx_strip(codec, &pv);
         duct_do_if(!carries, return rc_invalid_arg);
+        ctx->rx_stale = false;
         if (!tw->dgram_env)
             return codec->engine->vtbl->unseal(codec->engine, pv, ctx);
         s_env_unseal_ctx_t shim = {
@@ -481,7 +482,9 @@ s_tls_unseal(const duct_wire_t *self, duct_wire_codec_t *codec,
             shim.base.tx_append_bare = s_env_tx_append_bare;
         if (ctx->arm)
             shim.base.arm = s_env_arm;
-        return codec->engine->vtbl->unseal(codec->engine, pv, &shim.base);
+        auto urc = codec->engine->vtbl->unseal(codec->engine, pv, &shim.base);
+        ctx->rx_stale = shim.base.rx_stale;
+        return urc;
     }
     assert((const uint8_t *)ctl.data >= (const uint8_t *)pv.data
            && (const uint8_t *)ctl.data + ctl.size <= (const uint8_t *)pv.data + pv.size);

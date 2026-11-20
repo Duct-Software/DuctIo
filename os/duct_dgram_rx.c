@@ -24,6 +24,7 @@ void duct_io_dgram_rx_drain(duct_listener_t *listener)
     uint8_t     sink = 0u;
     duct_view_u8  bufs[duct_dgram_rx_batch];
     duct_peer_t peers[duct_dgram_rx_batch];
+    duct_peer_t locals[duct_dgram_rx_batch];
     uint32_t    lens[duct_dgram_rx_batch];
     uint32_t    segs[duct_dgram_rx_batch];
 
@@ -50,15 +51,15 @@ void duct_io_dgram_rx_drain(duct_listener_t *listener)
 
         uint32_t got = 0u;
         auto rc = duct_xrecv_peers(listener->listen_fd, bufs, want,
-                                   peers, lens, segs, &got);
+                                   peers, locals, lens, segs, &got);
         for (uint32_t i = 0u; i < got; ++i) {
             /* A truncated read holds no whole datagram: a coalesced one loses
              * every segment in the group, and a lone one loses its tail with
              * nothing on the wire saying so. */
             duct_do_if(lens[i] == duct_dgram_len_truncated, continue);
-            duct_io_on_dgram(listener, &peers[i],
-                             &(duct_view_u8){ .data = bufs[i].data, .size = lens[i] },
-                             segs[i]);
+            duct_io_on_dgram_from(listener, &peers[i], &locals[i],
+                                  &(duct_view_u8){ .data = bufs[i].data, .size = lens[i] },
+                                  segs[i]);
         }
         duct_io_rx_slots_release();
         if (rc != rc_ok || got < want)
@@ -77,7 +78,7 @@ duct_result_t duct_io_dgram_rx_units(void *tag, const duct_io_xfer_t *r)
     size_t stride = r->size + duct_dgram_record_hdr_size;
     for (uint32_t i = 0u; i < r->units; ++i)
         bufs[i] = (duct_view_u8){ .data = r->buf + (size_t)i * stride, .size = r->size };
-    auto rc = duct_xrecv_peers(r->fd, bufs, r->units, nullptr, lens, segs, &got);
+    auto rc = duct_xrecv_peers(r->fd, bufs, r->units, nullptr, nullptr, lens, segs, &got);
     if (rc != rc_ok)
         return rc;
     for (uint32_t i = 0u; i < got; ++i)

@@ -33,12 +33,14 @@ extern "C" {
  *  the send.
  */
 typedef struct duct_dgram_out {
-    duct_peer_t peer; /**< Destination address. */
-    duct_view_u8  hdr;  /**< Wire header packed apart from the payload.
-                        *  Zero-sized when the header sits at the head of
-                        *  @c body. */
-    duct_view_u8  body; /**< Payload bytes, or header-plus-payload when @c hdr
-                        *  is empty. */
+    duct_peer_t  peer;  /**< Destination address. */
+    duct_peer_t  local; /**< Source address when set (@c family != 0),
+                          *  written as @c PKTINFO on shared UDP sends. */
+    duct_view_u8 hdr;   /**< Wire header packed apart from the payload.
+                          *  Zero-sized when the header sits at the head of
+                          *  @c body. */
+    duct_view_u8 body;  /**< Payload bytes, or header-plus-payload when @c hdr
+                          *  is empty. */
 } duct_dgram_out_t;
 
 /** @brief One record of a connected socket's TX descriptor ring: its inline
@@ -92,6 +94,14 @@ duct_x_same_peer(const duct_peer_t *a, const duct_peer_t *b)
     return memcmp(a, b, sizeof *a) == 0;
 }
 
+/** @brief Report whether @p a and @p b share both destination peer and local source. */
+duct_nonnull(1, 2) static inline bool
+duct_x_same_out(const duct_dgram_out_t *a, const duct_dgram_out_t *b)
+{
+    return duct_x_same_peer(&a->peer, &b->peer)
+        && duct_x_same_peer(&a->local, &b->local);
+}
+
 /** @name Per-entry datagram length a group scanner reads
  *  The whole datagram, header span included.
  *  @{ */
@@ -131,8 +141,7 @@ duct_nonnull(1) static inline size_t duct_x_dgram_len_rec(const duct_tx_rec_t *r
                                         duct_x_gso_segs_max));                \
         unsigned i = 1u;                                                      \
         for (bool open = true; open && i < n;) {                              \
-            bool same = true __VA_OPT__(&&                                    \
-                duct_x_same_peer(&m[i].__VA_ARGS__, &m[0].__VA_ARGS__));      \
+            bool same = true __VA_OPT__(&& __VA_ARGS__(&m[i], &m[0]));       \
             auto fit = same ? duct_x_gso_fit(len_fn(&m[i]), seg)              \
                             : x_gso_fit_none;                                 \
             switch (fit) {                                                    \
@@ -147,7 +156,7 @@ duct_nonnull(1) static inline size_t duct_x_dgram_len_rec(const duct_tx_rec_t *r
 
 DUCT_X_GSO_GROUP_DECLARE(duct_x_gso_group_bufs, duct_view_u8, duct_x_dgram_len_buf)
 DUCT_X_GSO_GROUP_DECLARE(duct_x_gso_group_peers, duct_dgram_out_t,
-                         duct_x_dgram_len_out, peer)
+                         duct_x_dgram_len_out, duct_x_same_out)
 DUCT_X_GSO_GROUP_DECLARE(duct_x_gso_group_recs, duct_tx_rec_t, duct_x_dgram_len_rec)
 
 /** @brief Count the entries from @p m one segmented write carries.

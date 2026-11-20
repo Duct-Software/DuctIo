@@ -382,6 +382,13 @@ duct_nonnull(1, 2, 3) void
 duct_io_on_dgram(duct_listener_t *listener,
                  const duct_peer_t *peer, duct_view_u8 *data, uint32_t seg);
 
+/** @brief Variant of @ref duct_io_on_dgram carrying the datagram's destination
+ *  interface address @p local (or @c nullptr / zero-family when unknown). */
+duct_nonnull(1, 2, 4) void
+duct_io_on_dgram_from(duct_listener_t *listener,
+                      const duct_peer_t *peer, const duct_peer_t *local,
+                      duct_view_u8 *data, uint32_t seg);
+
 /** @brief Classify and dispatch one received datagram that sits in RX slot @p slot of @p listener's pool.
  *  The completion-driven counterpart of @ref duct_io_on_dgram for a read posted into a pooled slot:
  *  @p bytes is the datagram's length and @p seg is as there. @p lend says the caller holds a replacement

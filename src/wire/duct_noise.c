@@ -1117,12 +1117,14 @@ static void s_replay_bit_clear(duct_noise_transport_t *t, uint64_t counter)
  *  must never influence this state, since a forged packet then poisons the
  *  window against a later legitimate one.
  */
-static bool s_replay_accept(duct_noise_transport_t *t, uint64_t counter)
+static bool s_replay_accept(duct_noise_transport_t *t, uint64_t counter, bool *out_stale)
 {
     if (!t->replay_started) {
         t->replay_started = true;
         t->replay_top = counter;
         s_replay_bit_set(t, counter);
+        if (out_stale)
+            *out_stale = false;
         return true;
     }
     if (counter <= t->replay_top) {
@@ -1131,6 +1133,8 @@ static bool s_replay_accept(duct_noise_transport_t *t, uint64_t counter)
         bool seen = s_replay_bit_test(t, counter);
         duct_do_if(seen, return false);
         s_replay_bit_set(t, counter);
+        if (out_stale)
+            *out_stale = counter < t->replay_top;
         return true;
     }
     /* Advancing: clear every bit newly entering the window before setting
@@ -1144,6 +1148,8 @@ static bool s_replay_accept(duct_noise_transport_t *t, uint64_t counter)
         s_replay_bit_clear(t, c);
     t->replay_top = counter;
     s_replay_bit_set(t, counter);
+    if (out_stale)
+        *out_stale = false;
     return true;
 }
 
@@ -1266,8 +1272,8 @@ duct_zero_regs void duct_noise_transport_destroy(duct_noise_transport_t *t)
 }
 
 bool
-duct_noise_transport_unseal(duct_noise_transport_t *t, duct_view_u8 sealed, size_t out_cap,
-                           uint8_t out[static out_cap], size_t *out_len)
+duct_noise_transport_unseal_ex(duct_noise_transport_t *t, duct_view_u8 sealed, size_t out_cap,
+                               uint8_t out[static out_cap], size_t *out_len, bool *out_stale)
 {
     size_t wide = t->counter_size;
     duct_do_if(sealed.size < wide + duct_noise_tag_size, return false);
@@ -1306,11 +1312,18 @@ duct_noise_transport_unseal(duct_noise_transport_t *t, duct_view_u8 sealed, size
 
     /* Auth already verified above — only now may the counter influence
      * replay state (see @ref s_replay_accept). */
-    ok = s_replay_accept(t, counter);
+    ok = s_replay_accept(t, counter, out_stale);
     if (!ok) {
         duct_secure_zero(out, pt_len);
         duct_do_if(true, return false);
     }
     *out_len = pt_len;
     return true;
+}
+
+bool
+duct_noise_transport_unseal(duct_noise_transport_t *t, duct_view_u8 sealed, size_t out_cap,
+                           uint8_t out[static out_cap], size_t *out_len)
+{
+    return duct_noise_transport_unseal_ex(t, sealed, out_cap, out, out_len, nullptr);
 }

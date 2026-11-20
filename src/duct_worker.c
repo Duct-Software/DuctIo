@@ -262,6 +262,7 @@ static constexpr uint32_t duct_tx_span_threshold = 128u;
 typedef struct {
     duct_conn_handle_t handle;
     duct_peer_t        peer;
+    duct_peer_t        local;
     duct_span_t        span;
     uint8_t            hdr[wire_tx_hdr_max];
     uint8_t            hdr_len;
@@ -785,7 +786,8 @@ typedef struct {
  *          @c vmq_push_too_large for a size past the large class, @c vmq_push_full for a dry class,
  *          or the lane's own refusal.
  */
-static bool s_dgram_out_open(duct_listener_t *listener, const duct_peer_t *peer, size_t need,
+static bool s_dgram_out_open(duct_listener_t *listener, const duct_peer_t *peer,
+                             const duct_peer_t *local, size_t need,
                              dgram_out_t *o, duct_vmq_push_rc_t *rc)
 {
     o->ln = duct_mpsc_lane(duct_io_dgram_shared_outbox(listener), s_this_worker->worker_id);
@@ -816,6 +818,7 @@ static bool s_dgram_out_open(duct_listener_t *listener, const duct_peer_t *peer,
         return false;
     }
     o->entry->peer = *peer;
+    o->entry->local = local ? *local : (duct_peer_t){};
     o->entry->handle = 0u;
     if (o->pools) {
         o->entry->staged.len = 0u;
@@ -2694,7 +2697,7 @@ static bool s_unseal_tx_append_dgram(duct_unseal_ctx_t *self, duct_view_u8 bytes
     duct_io_post_dgram_tx(listener);
     dgram_out_t dout;
     duct_vmq_push_rc_t push_rc;
-    if (!s_dgram_out_open(listener, &dctx->peer, pre + bytes.size, &dout, &push_rc))
+    if (!s_dgram_out_open(listener, &dctx->peer, &dctx->local, pre + bytes.size, &dout, &push_rc))
         return false;
     if (dout.pools) {
         auto at = (uint8_t *)dout.span.data;
@@ -3676,6 +3679,43 @@ static void s_redirect_release(redirect_t *r)
  *  sized to the datagram and the inner header; @ref s_redirect_release closes
  *  either on every return.
  */
+/** @brief Compare peer IP networks ignoring port and low IPv6 host bits so
+ *  proactive 5-tuple rotation does not discard the OWD baseline. */
+static inline bool s_same_ip_net(const duct_peer_t *a, const duct_peer_t *b)
+{
+    if (a->family != b->family)
+        return false;
+    if (a->family == AF_INET)
+        return memcmp(a->addr.v4, b->addr.v4, sizeof a->addr.v4) == 0;
+    if (a->family == AF_INET6)
+        return memcmp(a->addr.v6, b->addr.v6, 8u) == 0;
+    return true;
+}
+
+/** @brief Adopt @p b's peer/local endpoint on a shared UDP leg and advance
+ *  candidate promotion when @p b carries a candidate sequence. */
+static void s_shared_peer_update(duct_conn_t *conn, const duct_msg_inter_batch_t *b,
+                                 bool sealed)
+{
+    auto ctx = duct_conn_dgram_ctx(conn);
+    if (sealed && !s_same_ip_net(&ctx->peer, &b->peer)) {
+        auto sc = duct_conn_sealed_ctx(conn);
+        if (sc && sc->codec)
+            duct_wire_codec_owd_reset(sc->codec);
+    }
+    ctx->peer = b->peer;
+    ctx->local = b->local;
+    if (b->cand_seq) {
+        uint64_t prev = duct_atomic_load(&ctx->accepted_seq, relaxed);
+        if (b->cand_seq > prev)
+            duct_atomic_store(&ctx->accepted_seq, b->cand_seq, release);
+        if (duct_has(duct_conn_state(conn), fl_conn_roaming)) {
+            auto h = (duct_conn_handle_t){ .word = b->conn };
+            duct_io_post_peer_roam(&h);
+        }
+    }
+}
+
 static void s_inter_pkt(duct_conn_handle_t handle,
                                   const duct_msg_inter_batch_t *b, const duct_msg_inter_pkt_t *pkt)
 {
@@ -3776,15 +3816,8 @@ static void s_inter_pkt(duct_conn_handle_t handle,
      * engine carries the replay window @c fl_wire_dgram_ok stands for: without
      * one, a captured datagram replayed from a foreign address moves the
      * endpoint. */
-    if (sealed && shared) {
-        auto ctx = duct_conn_dgram_ctx(conn);
-        if (memcmp(&ctx->peer, &b->peer, sizeof ctx->peer) != 0) {
-            ctx->peer = b->peer;
-            auto sc = duct_conn_sealed_ctx(conn);
-            if (sc && sc->codec)
-                duct_wire_codec_owd_reset(sc->codec);
-        }
-    }
+    if (sealed && shared && !redirect.base.rx_stale)
+        s_shared_peer_update(conn, b, true);
     if (duct_has(cfg->flags, fl_proto_multiplexed) && frame.stream_id != 0u
         && cfg->handler_kind != handler_none) {
         /* Claim-eligible: the VMQ batch this frame lives in commits — frees
@@ -3886,7 +3919,7 @@ static void s_inter_pkt(duct_conn_handle_t handle,
      * creation this worker both writes and reads the field, so the plain write
      * races nothing. */
     if (!sealed && shared)
-        duct_conn_dgram_ctx(conn)->peer = b->peer;
+        s_shared_peer_update(conn, b, false);
     duct_discard s_response_take(s, &out, cid, frame.stream_id, frame.flags, &redirect, nullptr);
 }
 
@@ -4534,7 +4567,7 @@ typedef struct retry_node {
          * parked one; dgram_parked gates flush and commits while any is
          * parked. */
         struct { duct_conn_handle_t handle; duct_listener_t *listener;
-                 duct_peer_t peer; duct_span_t span;
+                 duct_peer_t peer; duct_peer_t local; duct_span_t span;
                  uint8_t hdr[wire_tx_hdr_max]; uint8_t hdr_len;
                  bool send_done; } dgram_tx;
         /* The conn whose codec's engine park holds bytes, and the wire
@@ -4992,6 +5025,7 @@ static bool s_retry_dgram_tx_save(duct_worker_t *w, const duct_worker_dgram_batc
     node->dgram_tx.handle = e->handle;
     node->dgram_tx.listener = listener;
     node->dgram_tx.peer = e->peer;
+    node->dgram_tx.local = e->local;
     node->dgram_tx.send_done = e->send_done;
     node->dgram_tx.span = e->span;
     node->dgram_tx.hdr_len = e->hdr_len;
@@ -5696,7 +5730,7 @@ static duct_nonnull(1) bool s_retry_drain(duct_worker_t *w)
             duct_vmq_push_rc_t drc;
             dgram_out_t dout;
             bool staged = s_dgram_out_open(node->dgram_tx.listener, &node->dgram_tx.peer,
-                                           parked, &dout, &drc);
+                                           &node->dgram_tx.local, parked, &dout, &drc);
             if (!staged && drc == vmq_push_too_large) {
                 /* Terminal: this entry can never fit the lane at all --
                  * unreachable for any datagram a commit already staged
@@ -6052,7 +6086,8 @@ s_worker_dgram_flush(void)
             for (uint32_t i = 0u; i + 2u < n; ++i) {
                 uint32_t put = i + 1u;
                 for (uint32_t j = put; j < n; ++j) {
-                    if (!duct_x_same_peer(&pass->entries[j].peer, &pass->entries[i].peer))
+                    if (!duct_x_same_peer(&pass->entries[j].peer, &pass->entries[i].peer)
+                        || !duct_x_same_peer(&pass->entries[j].local, &pass->entries[i].local))
                         continue;
                     if (j != put) {
                         auto tmp = pass->entries[j];
@@ -6069,10 +6104,11 @@ s_worker_dgram_flush(void)
         duct_dgram_out_t msgs[n];
         for (uint32_t i = 0u; i < n; ++i)
             msgs[i] = (duct_dgram_out_t){
-                .peer = pass->entries[i].peer,
-                .hdr  = { .data = pass->entries[i].hdr,
-                          .size = pass->entries[i].hdr_len },
-                .body = s_dgram_entry_body(&pass->entries[i]),
+                .peer  = pass->entries[i].peer,
+                .local = pass->entries[i].local,
+                .hdr   = { .data = pass->entries[i].hdr,
+                           .size = pass->entries[i].hdr_len },
+                .body  = s_dgram_entry_body(&pass->entries[i]),
             };
         duct_x_gso_tally_t tally = {};
         resolved = duct_io_dgram_shared_send_batch(listener, msgs, n, &tally);
@@ -6100,7 +6136,7 @@ s_worker_dgram_flush(void)
             dgram_out_t o;
             size_t bytes = (size_t)e->hdr_len + duct_span_len(&e->span);
             bool staged = !w->dgram_parked
-                       && s_dgram_out_open(listener, &e->peer, bytes, &o, &push_rc);
+                       && s_dgram_out_open(listener, &e->peer, &e->local, bytes, &o, &push_rc);
             if (staged) {
                 auto c = duct_conn_by_handle(e->handle);
                 uint32_t dd = e->send_done && c ? s_tx_done_take_delta(c) : 0u;
@@ -6400,6 +6436,7 @@ s_commit_dgram_shared(const commit_ctx_t *ctx)
         assert(entry == &pass->entries[pass->n]);
         entry->handle = ctx->handle;
         entry->peer = dctx->peer;
+        entry->local = dctx->local;
         entry->send_done = duct_has(out->flags, fl_send_done);
         if (!pass->n)
             pass->first_ns = now;
@@ -6419,7 +6456,7 @@ s_commit_dgram_shared(const commit_ctx_t *ctx)
     duct_io_post_dgram_tx(listener);
     dgram_out_t dout;
     duct_vmq_push_rc_t push_rc;
-    if (!s_dgram_out_open(listener, &dctx->peer, need, &dout, &push_rc)) {
+    if (!s_dgram_out_open(listener, &dctx->peer, &dctx->local, need, &dout, &push_rc)) {
         duct_rtstat_obj_inc(s_this_worker, rtstats.dgram_shared_tx_drop, 1);
         return push_rc == vmq_push_too_large
              ? s_commit_ctx_fail(ctx, rc_invalid_arg, commit_invalid)
@@ -6511,7 +6548,8 @@ static bool s_tx_train_board(const commit_ctx_t *ctx)
         return true;
     s_tx_train_flush(w);
     auto conn = ctx->conn;
-    if (duct_olb_tx_published(duct_conn_tx_olb(conn))
+    if (duct_has(duct_conn_state(conn), fl_conn_hopping)
+        || duct_olb_tx_published(duct_conn_tx_olb(conn))
         || duct_olb_tx_write_armed(duct_conn_tx_olb(conn)))
         return false;
     t->conn = ctx->handle;
@@ -7330,7 +7368,7 @@ s_ctl_fin_stage_dgram(duct_conn_t *conn, duct_session_t *s, const duct_frame_t *
     s_worker_dgram_flush();
     dgram_out_t dout;
     duct_vmq_push_rc_t push_rc;
-    if (!s_dgram_out_open(listener, &dctx->peer, need, &dout, &push_rc)) {
+    if (!s_dgram_out_open(listener, &dctx->peer, &dctx->local, need, &dout, &push_rc)) {
         duct_rtstat_obj_inc(w, rtstats.dgram_shared_tx_drop, 1);
         return push_rc == vmq_push_too_large ? olb_tx_too_large : olb_tx_full;
     }
@@ -8445,6 +8483,50 @@ duct_result_t duct_conn_addrs(duct_session_t *s, duct_conn_id_t conn_id,
         && conn->xport_type != x_udp_shared)
         return rc_not_supported;
     return duct_io_addrs(conn, local, remote);
+}
+
+duct_result_t duct_conn_hop_dgram(duct_session_t *s, duct_conn_id_t conn_id,
+                                  const char *addr, uint32_t egress_if)
+{
+    duct_do_if(conn_id >= duct_session_max_legs, return rc_invalid_arg);
+    auto w = s_this_worker;
+    duct_do_if(!w || s->worker_id != w->worker_id, return rc_invalid_order);
+#if DUCT_EVENTS_MODEL_IOCP
+    (void)addr;
+    (void)egress_if;
+    return rc_not_supported;
+#else
+    auto h = duct_session_conn_at(s, conn_id);
+    auto conn = duct_conn_by_handle(h);
+    duct_do_if(!conn || duct_conn_phase(conn) >= conn_quiesced, return rc_invalid_order);
+    if (conn->xport_type != x_udp_peer)
+        return rc_not_supported;
+    if (duct_has(duct_conn_state(conn), fl_conn_hopping))
+        return rc_again;
+    duct_peer_t peer = {};
+    if (addr && *addr) {
+        if (!duct_connect_parse_peer(addr, &peer))
+            return rc_invalid_arg;
+    } else {
+        auto rx = duct_conn_rx_olb(conn);
+        peer = rx ? rx->peer : (duct_peer_t){};
+        if (!peer.family && duct_io_addrs(conn, nullptr, &peer) != rc_ok)
+            return rc_invalid_order;
+    }
+    if (w->tx_train.frames && w->tx_train.conn.word == h.word) {
+        s_tx_train_flush(w);
+        duct_do_if(!s->proto || duct_conn_phase(conn) >= conn_quiesced,
+                   return rc_invalid_order);
+    }
+    return duct_io_dgram_hop_start(conn, h, &peer, egress_if);
+#endif
+}
+
+bool duct_conn_hopping(const duct_session_t *s, duct_conn_id_t conn_id)
+{
+    duct_do_if(conn_id >= duct_session_max_legs, return false);
+    auto conn = duct_conn_by_handle(duct_session_conn_at(s, conn_id));
+    return conn && duct_has(duct_conn_state(conn), fl_conn_hopping);
 }
 
 duct_result_t duct_conn_tcp_congestion(duct_session_t *s, duct_conn_id_t conn_id,

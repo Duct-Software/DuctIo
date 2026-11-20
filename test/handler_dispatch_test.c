@@ -2353,7 +2353,7 @@ static void test_dgram_out_stages_into_a_send_slot(void)
 
     /* Nothing is in circulation until the first take grows the first chunk. */
     assert(duct_atomic_load(&pools[0].live, relaxed) == 0u);
-    assert(s_dgram_out_open(&lst, &peer, 1000u, &o, &rc));
+    assert(s_dgram_out_open(&lst, &peer, nullptr, 1000u, &o, &rc));
     assert(duct_atomic_load(&pools[0].live, relaxed) == 1u);
     assert(o.pools == pools && o.ref != treiber_empty && !(o.ref & duct_x_slot_ref_large));
     assert(o.span.size == duct_x_slot_cap(&pools[0]) && o.entry->staged.slot == o.ref);
@@ -2374,7 +2374,7 @@ static void test_dgram_out_stages_into_a_send_slot(void)
 
     /* A size past the large class is refused for good; one past the small class
      * takes the large pool, which is still ungrown and so not yet dry. */
-    assert(!s_dgram_out_open(&lst, &peer, duct_x_slot_cap(&pools[1]) + 1u, &o, &rc)
+    assert(!s_dgram_out_open(&lst, &peer, nullptr, duct_x_slot_cap(&pools[1]) + 1u, &o, &rc)
            && rc == vmq_push_too_large);
     assert(s_dgram_out_fits(&lst, 9000u));
     assert(duct_atomic_load(&pools[1].live, relaxed) == 0u);
@@ -2389,10 +2389,10 @@ static void test_dgram_out_stages_into_a_send_slot(void)
     }
     assert(duct_atomic_load(&pools[0].live, relaxed) == pools[0].n_chunks);
     assert(!s_dgram_out_fits(&lst, 100u));
-    assert(!s_dgram_out_open(&lst, &peer, 100u, &o, &rc) && rc == vmq_push_full);
+    assert(!s_dgram_out_open(&lst, &peer, nullptr, 100u, &o, &rc) && rc == vmq_push_full);
     assert(duct_vmq_ack_waiter(ln.ctrl));
     duct_x_slot_put(pools, held[0]);
-    assert(s_dgram_out_open(&lst, &peer, 100u, &o, &rc));
+    assert(s_dgram_out_open(&lst, &peer, nullptr, 100u, &o, &rc));
     assert(o.ref == held[0]);
     s_dgram_out_abort(&o);
     assert(duct_x_slot_take(pools, 100u) == held[0]);
@@ -2401,7 +2401,7 @@ static void test_dgram_out_stages_into_a_send_slot(void)
     duct_del(held);
 
     lst.tx_slots = nullptr;
-    assert(s_dgram_out_open(&lst, &peer, 300u, &o, &rc));
+    assert(s_dgram_out_open(&lst, &peer, nullptr, 300u, &o, &rc));
     assert(!o.pools);
     /* The descriptor form: the entry carries { hdr[16], span } flat and the
      * payload stays where its author built it — no bytes copy into the lane. */
