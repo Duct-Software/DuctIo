@@ -95,9 +95,15 @@ is an enqueue, not a peer acknowledgement.
 
 `Engine::attach_inter` opens an application-controlled inter leg. `InterHost`
 collects emitted packets; `InterIngress::packet` or `batch` delivers them to a
-matching leg. `Engine::post_to` selects a connection and reports native
-pack/enqueue completion through `Handler::send_done`. Host transport and
-delivery guarantees remain application concerns.
+matching leg. `Engine::post_to(session, conn_id, payload, track_completion)` selects a
+connection. When tracking is enabled, `Handler::send_done(session, conn_id,
+frontier, result)` reports the native per-connection drain frontier. The
+1-based frontier counts settled tracked responses; callbacks can coalesce.
+Pre-stage refusal keeps the frontier unchanged and carries its error code;
+connection close settles unfinished responses with `rc_closed`. Cancelled
+stream or session teardown can discard parked responses without a callback.
+There are no application send tokens or per-send completion promises. A drain
+is not a remote acknowledgement; host delivery guarantees remain application concerns.
 
 `Engine::attach_stream_fd` and `attach_packet_fd` transfer a Unix descriptor
 to a session; `FdAttachRequest::wait` reports the native attach result.

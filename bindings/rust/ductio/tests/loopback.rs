@@ -813,6 +813,48 @@ fn worker_timers_fire_and_can_be_cancelled() {
 }
 
 #[test]
+fn tracked_posts_report_per_connection_drain_frontiers() {
+    struct TrackedClient {
+        opened: Sender<SessionToken>,
+        done: Sender<(SessionToken, u32, u64, i32)>,
+    }
+    impl Handler for TrackedClient {
+        fn open(&self, session: SessionToken) {
+            self.opened.send(session).unwrap();
+        }
+        fn send_done(&self, session: SessionToken, conn_id: u32, frontier: u64, result: i32) {
+            self.done.send((session, conn_id, frontier, result)).unwrap();
+        }
+    }
+    let _serial = TEST_ENGINE.lock().unwrap();
+    let (stx, _srx) = mpsc::channel();
+    let (opened, rx) = mpsc::channel();
+    let (done, settlements) = mpsc::channel();
+    let mut engine = Engine::start(1, 1).unwrap();
+    let server = engine.add_protocol(Protocol::plain("tracked-server", Arc::new(Echo(stx))).unwrap());
+    let client = engine.add_protocol(Protocol::plain("tracked-client",
+        Arc::new(TrackedClient { opened, done })).unwrap());
+    let mut listener = engine.bind_tcp(server,
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)).unwrap();
+    engine.dial_tcp(client, SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), listener.port())).unwrap();
+    let session = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    engine.post_to(session, 0, b"untracked".to_vec(), false).unwrap();
+    engine.post_to(session, 0, b"tracked-one".to_vec(), true).unwrap();
+    engine.post_to(session, 0, b"tracked-two".to_vec(), true).unwrap();
+    let mut last = 0;
+    while last < 2 {
+        let (reported_session, conn, frontier, result) = settlements.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(reported_session, session);
+        assert_eq!(conn, 0);
+        assert_eq!(result, 0);
+        assert!(frontier > last && frontier <= 2);
+        last = frontier;
+    }
+    engine.close_listener(&mut listener).unwrap();
+    engine.stop().unwrap();
+}
+
+#[test]
 fn custom_wire_frames_tcp_without_ffi_in_application() {
     let _serial = TEST_ENGINE.lock().unwrap();
     let (stx, _srx) = mpsc::channel();
@@ -903,7 +945,8 @@ fn compact_udp_admits_owned_allow_list_peer_psk_and_hello() {
         .with_allowed_peers(vec![client_pub])
         .unwrap()
         .with_peer_psk(move |peer, hello| {
-            if peer == &client_pub && hello == b"alice" {
+            if peer == &client_pub && hello.starts_with(b"alice")
+                && hello[5..].iter().all(|byte| *byte == 0) {
                 Some([97; 32])
             } else {
                 None
@@ -977,7 +1020,8 @@ fn owned_hello_peer_psk_echo(datagram: bool) {
         .unwrap().with_wire_key([105; 32])
         .with_hello(&server_input).unwrap()
         .with_peer_psk(move |peer, hello| {
-            (peer == &client_pub && hello == expected).then_some([107; 32])
+            (peer == &client_pub && hello.starts_with(&expected)
+                && hello[expected.len()..].iter().all(|byte| *byte == 0)).then_some([107; 32])
         });
     server_input.fill(0xa5);
     drop(server_input);

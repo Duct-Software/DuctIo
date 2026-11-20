@@ -50,17 +50,6 @@ struct RustWire {
 unsafe extern "C" fn destroy(self_: *mut ffi::duct_wire_t) {
     drop(Box::from_raw(self_ as *mut RustWire));
 }
-unsafe extern "C" fn create_parser(_self: *const ffi::duct_wire_t) -> *mut ffi::duct_wire_parser_t {
-    Box::into_raw(Box::new(0_u8)).cast()
-}
-unsafe extern "C" fn destroy_parser(
-    _self: *const ffi::duct_wire_t,
-    parser: *mut ffi::duct_wire_parser_t,
-) {
-    if !parser.is_null() {
-        drop(Box::from_raw(parser.cast::<u8>()));
-    }
-}
 unsafe extern "C" fn parse(
     self_: *const ffi::duct_wire_t,
     input: ffi::duct_view_u8,
@@ -179,8 +168,7 @@ pub(crate) fn build(name: &str, codec: Arc<dyn CustomWire>) -> Result<NonNull<ff
     }
     base.on_parse = Some(parse);
     base.on_pack = Some(pack);
-    base.create_parser = Some(create_parser);
-    base.destroy_parser = Some(destroy_parser);
+    // CustomWire::parse is stateless; no per-connection parser slot is needed.
     base.destroy = Some(destroy);
     let mut wire = Box::new(RustWire {
         base,
