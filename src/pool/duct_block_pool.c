@@ -302,7 +302,7 @@ static bool s_dirty_drop(duct_block_pool_t *pool, duct_sweep_cursor_t *cur, uint
 static bool s_dirty_over(duct_block_pool_t *pool)
 {
     return duct_atomic_load(&pool->dirty_bytes, relaxed)
-         > duct_max(duct_atomic_load(&pool->live_bytes, relaxed), pool->floor);
+         > duct_max(duct_atomic_load(&pool->live_bytes, relaxed), (uint64_t)pool->floor);
 }
 
 bool duct_block_pool_sweep_step(duct_block_pool_t *pool, duct_sweep_cursor_t *cur,
