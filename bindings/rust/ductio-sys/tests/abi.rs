@@ -95,9 +95,13 @@ fn public_header_layout_matches_compiled_c() {
             ffi::ductio_rs_offset_wire_on_parse()
         );
         assert_eq!(
-            offset_of!(ffi::duct_wire_t, create_parser),
-            ffi::ductio_rs_offset_wire_create_parser()
+            offset_of!(ffi::duct_wire_t, init_parser),
+            ffi::ductio_rs_offset_wire_init_parser()
         );
+        assert_eq!(size_of::<ffi::duct_send_done_info_t>(), ffi::ductio_rs_sizeof_send_done_info());
+        assert_eq!(offset_of!(ffi::duct_send_done_info_t, conn_id), ffi::ductio_rs_offset_send_done_conn_id());
+        assert_eq!(offset_of!(ffi::duct_send_done_info_t, frontier), ffi::ductio_rs_offset_send_done_frontier());
+        assert_eq!(offset_of!(ffi::duct_send_done_info_t, result), ffi::ductio_rs_offset_send_done_result());
         assert_eq!(
             size_of::<ffi::duct_host_cfg_t>(),
             ffi::ductio_rs_sizeof_host_cfg()

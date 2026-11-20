@@ -55,7 +55,11 @@ size_t ductio_rs_sizeof_inter_batch(void) { return sizeof(duct_inter_batch_t); }
 size_t ductio_rs_sizeof_wire(void) { return sizeof(duct_wire_t); }
 size_t ductio_rs_offset_wire_header_size(void) { return offsetof(duct_wire_t, header_size); }
 size_t ductio_rs_offset_wire_on_parse(void) { return offsetof(duct_wire_t, on_parse); }
-size_t ductio_rs_offset_wire_create_parser(void) { return offsetof(duct_wire_t, create_parser); }
+size_t ductio_rs_offset_wire_init_parser(void) { return offsetof(duct_wire_t, init_parser); }
+size_t ductio_rs_sizeof_send_done_info(void) { return sizeof(duct_send_done_info_t); }
+size_t ductio_rs_offset_send_done_conn_id(void) { return offsetof(duct_send_done_info_t, conn_id); }
+size_t ductio_rs_offset_send_done_frontier(void) { return offsetof(duct_send_done_info_t, frontier); }
+size_t ductio_rs_offset_send_done_result(void) { return offsetof(duct_send_done_info_t, result); }
 size_t ductio_rs_sizeof_host_cfg(void) { return sizeof(duct_host_cfg_t); }
 size_t ductio_rs_sizeof_seal_vtbl(void) { return sizeof(duct_seal_engine_vtbl_t); }
 size_t ductio_rs_alignof_seal_vtbl(void) { return alignof(duct_seal_engine_vtbl_t); }

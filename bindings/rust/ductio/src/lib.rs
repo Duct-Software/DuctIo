@@ -172,8 +172,9 @@ pub trait Handler: Send + Sync + 'static {
     fn authenticated(&self, _session: SessionToken, _key: &[u8]) {}
     fn conn_join(&self, _session: SessionToken, _conn_id: u32) {}
     fn conn_lost(&self, _session: SessionToken, _conn_id: u32, _reason: u8) {}
-    /// Native pack/enqueue outcome, not a remote acknowledgement.
-    fn send_done(&self, _session: SessionToken, _send_token: u64, _result: i32) {}
+    /// Settled tracked-response frontier on one connection, not a remote ACK.
+    /// Completions may coalesce; pre-stage refusal keeps the frontier unchanged.
+    fn send_done(&self, _session: SessionToken, _conn_id: u32, _frontier: u64, _result: i32) {}
     fn timer(&self, _session: SessionToken, _tag: u64) -> Option<Vec<u8>> {
         None
     }
@@ -561,7 +562,7 @@ unsafe extern "C" fn on_send_done(
     if catch_unwind(AssertUnwindSafe(|| {
         state
             .handler
-            .send_done(token(state), info.send_token as u64, info.result)
+            .send_done(token(state), info.conn_id, info.frontier, info.result)
     }))
     .is_err()
     {
@@ -945,6 +946,8 @@ impl NoiseWire {
     }
     /// Select a responder PSK after peer-key authentication. None or a panic
     /// refuses the handshake. This callback may run concurrently on workers.
+    /// The native payload is passed whole, including zero padding after hello;
+    /// parse the protocol's hello length rather than comparing the whole slice.
     pub fn with_peer_psk<F>(mut self, lookup: F) -> Self
     where
         F: Fn(&[u8; 32], &[u8]) -> Option<[u8; 32]> + Send + Sync + 'static,
@@ -1177,7 +1180,7 @@ struct PostState {
     payload: Vec<u8>,
     token: u64,
     conn_id: u32,
-    send_token: Option<u64>,
+    track_completion: bool,
     started: AtomicBool,
     registry: Arc<Mutex<HashMap<usize, Box<PostState>>>>,
 }
@@ -1282,9 +1285,8 @@ unsafe extern "C" fn send_post(
     (*out).payload.data = cmd.payload.as_ptr() as *mut _;
     (*out).payload.size = cmd.payload.len();
     (*out).flags = ffi::duct_send_flags_fl_send_owned;
-    if let Some(send_token) = cmd.send_token {
+    if cmd.track_completion {
         (*out).flags |= ffi::duct_send_flags_fl_send_done;
-        (*out).send_token = send_token as usize;
     }
     (*out).conn_id = cmd.conn_id;
     (*out).stream_id = ffi::duct_stream_id_same;
@@ -1341,7 +1343,7 @@ pub struct ConnectionPoolStats {
 /// the C library was compiled without statistics support.
 pub type RuntimeStats = ffi::duct_rt_stats_t;
 
-/// Host-owned post contexts, separate from application send-token tracking.
+/// Host-owned post contexts, separate from native drain-frontier tracking.
 /// Started contexts may still be held by native TX staging/retry/codec release.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PendingPostStats {
@@ -1844,16 +1846,16 @@ impl Engine {
     /// only that the worker command was posted, never that a peer received it.
     /// Unrun commands are reclaimed after `stop` joins the workers.
     pub fn post(&self, session: SessionToken, payload: Vec<u8>) -> Result<()> {
-        self.post_to(session, ffi::duct_conn_id_same, payload, None)
+        self.post_to(session, ffi::duct_conn_id_same, payload, false)
     }
-    /// Queue payload on a specific leg, optionally asking for the native
-    /// pack/enqueue result through `Handler::send_done`.
+    /// Queue payload on a specific leg, optionally tracking its native drain
+    /// frontier through `Handler::send_done`. Tracking has no per-send token.
     pub fn post_to(
         &self,
         session: SessionToken,
         conn_id: u32,
         payload: Vec<u8>,
-        send_token: Option<u64>,
+        track_completion: bool,
     ) -> Result<()> {
         let native = self.native()?;
         if session.engine_id != self.id || payload.is_empty() || payload.len() > 16 * 1024 {
@@ -1867,7 +1869,7 @@ impl Engine {
             payload,
             token: session.raw,
             conn_id,
-            send_token,
+            track_completion,
             started: AtomicBool::new(false),
             registry: self.pending.clone(),
         });
@@ -1938,6 +1940,46 @@ impl Drop for Engine {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn send_done_preserves_native_connection_frontier_and_refusal() {
+        use super::*;
+        struct Settlements(Mutex<Vec<(SessionToken, u32, u64, i32)>>);
+        impl Handler for Settlements {
+            fn send_done(&self, session: SessionToken, conn_id: u32, frontier: u64, result: i32) {
+                self.0.lock().unwrap().push((session, conn_id, frontier, result));
+            }
+        }
+        let handler = Arc::new(Settlements(Mutex::new(Vec::new())));
+        let state = Box::new(SessionState {
+            handler: handler.clone(),
+            token: 77,
+            engine_id: 1,
+            pending: Arc::new(Mutex::new(HashMap::new())),
+            dials: Arc::new(Mutex::new(HashMap::new())),
+            dial_key: 0,
+            accepted: AtomicBool::new(true),
+            authenticated: Arc::new(Mutex::new(HashSet::new())),
+            fd_attaches: Arc::new(Mutex::new(HashMap::new())),
+            timers: Arc::new(Mutex::new(HashMap::new())),
+        });
+        let expected = [
+            (7, 3, ffi::duct_result_rc_ok),
+            (7, 3, ffi::duct_result_rc_again),
+            (2, u64::MAX - 1, ffi::duct_result_rc_closed),
+        ];
+        for (conn_id, frontier, result) in expected {
+            let info = ffi::duct_send_done_info_t { conn_id, frontier, result };
+            let mut out = ffi::duct_response_t::default();
+            assert_eq!(unsafe { on_send_done(ptr::null_mut(), &info, &mut out,
+                (&*state as *const SessionState).cast_mut().cast()) }, ffi::duct_result_rc_ok);
+        }
+        let events = handler.0.lock().unwrap();
+        assert_eq!(events.len(), expected.len());
+        for (event, (conn_id, frontier, result)) in events.iter().zip(expected) {
+            assert_eq!(*event, (token(&state), conn_id, frontier, result));
+        }
+    }
+
     #[test]
     fn noise_hello_owns_input_through_replacement_and_protocol_moves() {
         use super::*;
@@ -2048,7 +2090,7 @@ mod tests {
                         payload: vec![1],
                         token: 77,
                         conn_id: ffi::duct_conn_id_same,
-                        send_token: None,
+                        track_completion: false,
                         started: AtomicBool::new(key % 2 == 0),
                         registry: pending.clone(),
                     }),
@@ -2207,7 +2249,7 @@ mod tests {
             payload: vec![1, 2, 3],
             token: 42,
             conn_id: ffi::duct_conn_id_same,
-            send_token: None,
+            track_completion: false,
             started: AtomicBool::new(false),
             registry: pending.clone(),
         });
@@ -2242,7 +2284,7 @@ mod tests {
             payload: vec![9; 16 * 1024],
             token: 42,
             conn_id: ffi::duct_conn_id_same,
-            send_token: None,
+            track_completion: false,
             started: AtomicBool::new(true),
             registry: pending.clone(),
         });
