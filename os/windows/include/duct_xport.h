@@ -28,6 +28,17 @@
 #define MSG_DONTWAIT 0
 #endif
 
+/** @brief Read how many bytes the socket still holds undelivered.
+ *  @return false where Winsock refuses the reading, @p out untouched. */
+duct_nonnull(2) static inline bool duct_x_dgram_held(SOCKET fd, size_t *out)
+{
+    u_long held = 0u;
+    if (ioctlsocket(fd, FIONREAD, &held) != 0)
+        return false;
+    *out = held > 0 ? (size_t)held : 0u;
+    return true;
+}
+
 /** @brief Event a @c WSAPoll() @c POLLHUP stands for: a read. A graceful peer
  *  FIN raises it without @c POLLIN, and @c recv's own 0-byte end then
  *  classifies the close. */
@@ -113,6 +124,17 @@ static inline void duct_xset_dgram_bufs(SOCKET fd, [[maybe_unused]] int family)
     if (family == AF_INET6)
         duct_discard setsockopt(fd, IPPROTO_IPV6, IPV6_DONTFRAG,
                                 (const char *)&(DWORD){ TRUE }, sizeof(DWORD));
+#endif
+#ifdef SIO_UDP_CONNRESET
+    /* An inbound ICMP unreachable would arm the socket: every read after it
+     * answers WSAECONNRESET until the error is consumed, which reads on a
+     * connected datagram socket has no way to tell from a real failure. The
+     * hop's retired legs drain through reads like these -- the poison turns a
+     * full band into one error and a closed socket. Winsock's own behaviour
+     * for the condition, a silent drop, is what the wire wants here. */
+    duct_discard WSAIoctl(fd, SIO_UDP_CONNRESET, &(DWORD){ FALSE }, sizeof(DWORD),
+                          &(DWORD){ 0u }, sizeof(DWORD), &(DWORD){ 0u },
+                          nullptr, nullptr);
 #endif
 }
 
