@@ -29,11 +29,23 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/uio.h>
+#include <sys/ioctl.h>
 #include <unistd.h>
 
 /** @brief Event a @c poll() @c POLLHUP stands for: the local end hanging up,
  *  as @c EPOLLHUP does. */
 static constexpr duct_io_ev_flags_t duct_x_poll_hup = io_ev_hup;
+
+/** @brief Read how many bytes the socket still holds undelivered.
+ *  @return false where the kernel refuses the reading, @p out untouched. */
+duct_nonnull(2) static inline bool duct_x_dgram_held(int fd, size_t *out)
+{
+    int held = 0u;
+    if (ioctl(fd, FIONREAD, &held) != 0)
+        return false;
+    *out = held > 0 ? (size_t)held : 0u;
+    return true;
+}
 
 static inline void duct_xset_nonblock(int fd)
 {
@@ -847,6 +859,11 @@ duct_xwritev(int fd, duct_xport_t t, const duct_view_u8 *bufs, unsigned n,
         case EWOULDBLOCK:
 #endif
             return rc_again;
+        case EMSGSIZE:
+            /* The wire refuses the frame's size: the datagram dies whole, the
+             * queue moves, the conn lives -- same as the batched send. */
+            duct_dbg_errf("EMSGSIZE, %zu bytes", bufs[0].size);
+            return rc_drop;
         default:
             duct_dbg_errf("errno %d", errno);
             return rc_fatal;

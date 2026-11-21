@@ -26,6 +26,8 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/filio.h>
+#include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/uio.h>
 #include <unistd.h>
@@ -35,6 +37,17 @@
  *  @c POLLOUT: a send side ended under armed @c POLLOUT shows as @c POLLHUP,
  *  and the send it drives fails and closes the conn. */
 static constexpr duct_io_ev_flags_t duct_x_poll_hup = (duct_io_ev_flags_t)(io_ev_read | io_ev_write);
+
+/** @brief Read how many bytes the socket still holds undelivered.
+ *  @return false where the kernel refuses the reading, @p out untouched. */
+duct_nonnull(2) static inline bool duct_x_dgram_held(int fd, size_t *out)
+{
+    int held = 0u;
+    if (ioctl(fd, FIONREAD, &held) != 0)
+        return false;
+    *out = held > 0 ? (size_t)held : 0u;
+    return true;
+}
 
 /** @brief One message of a batched send or receive, with the bytes the call moved.
  *  Darwin has no @c sendmmsg / @c recvmmsg: @ref duct_xsendmmsg and
@@ -577,6 +590,11 @@ duct_xwritev(int fd, duct_xport_t t, const duct_view_u8 *bufs, unsigned n,
         switch (errno) {
         case EAGAIN:
             return rc_again;
+        case EMSGSIZE:
+            /* The wire refuses the frame's size: the datagram dies whole, the
+             * queue moves, the conn lives -- same as the batched send. */
+            duct_dbg_errf("EMSGSIZE, %zu bytes", bufs[0].size);
+            return rc_drop;
         default:
             duct_dbg_errf("errno %d", errno);
             return rc_fatal;
