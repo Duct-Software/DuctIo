@@ -1347,8 +1347,9 @@ s_tx_stage_frame(duct_conn_t *conn, duct_session_t *s, const duct_frame_t *frame
     size_t need = 0u;
     if (!s_tx_frame_need(conn, frame->payload.size, &need))
         return olb_tx_too_large;
-    if (!duct_olb_tx_room_contig(tx, need))
+    if (!duct_olb_tx_room_contig(tx, need)) {
         return olb_tx_full;
+    }
 
     /* conn->wire->unseal gates the sealed-only s_tls_codec call: guards a
      * client-first protocol reaching TX before session bind or a wire-fence
@@ -2523,8 +2524,9 @@ static duct_exec_rc_t s_dispatch_one_frame(duct_worker_t *w, duct_conn_t *conn,
     auto cfg = duct_proto_cfg_of(s->proto);
     duct_do_if(!cfg->on_frame, return exec_done);
     auto hold = s_conn_tx_hold(conn);
-    if (s_tx_held(s, hold, conn))
+    if (s_tx_held(s, hold, conn)) {
         return exec_defer;
+    }
     w->hold_into = hold;
     w->hold_conn = conn;
     auto rc = s_dispatch_frame_body(w, conn, s, cfg, cid, frame, ack, redirect);
@@ -3363,13 +3365,15 @@ static duct_exec_rc_t s_dispatch_sealed_frame(duct_worker_t *w, duct_conn_t *con
         if (duct_x_slot_obj_cap(duct_at(codec->ct_buf)) - codec->ct_len < vt->pdu_ct_max) {
             s_codec_compact(codec);
             if (duct_x_slot_obj_cap(duct_at(codec->ct_buf)) - codec->ct_len < vt->pdu_ct_max
-                && !s_codec_spill(codec, s_ct_chunks(s_this_worker), vt->pdu_ct_max))
+                && !s_codec_spill(codec, s_ct_chunks(s_this_worker), vt->pdu_ct_max)) {
                 return exec_defer;
+            }
         }
         if (codec->engine_park_len
             && duct_conn_park_cap - codec->engine_park_len < s_hs_need(conn, codec)
-            && !s_engine_park_flush(conn))
+            && !s_engine_park_flush(conn)) {
             return exec_defer;
+        }
         /* task->header_size specifies the frame slice for rebind-replay
          * safety. Zero indicates datagram transports that carry no record
          * header. */
@@ -3396,8 +3400,9 @@ static duct_exec_rc_t s_dispatch_sealed_frame(duct_worker_t *w, duct_conn_t *con
         if (rc == rc_again) {
             s_tx_wait_arm(conn, 0u);
             rc = conn->wire->unseal(conn->wire, codec, pdu, &redirect.base);
-            if (rc == rc_again)
+            if (rc == rc_again) {
                 return exec_defer;
+            }
         }
         /* On datagram transports with independent records, unseal failures are
          * acknowledged and dropped while preserving the session. On stream
@@ -4520,7 +4525,9 @@ static_assert(span_mat == 0u, "the parked substrate kind keeps the none slot");
  *  first remove its emit node from this list, or @c s_retry_drain
  *  dereferences a dangling @c emit.hctx. Exactly two paths do:
  *  @ref duct_stream_cancel through @c s_retry_emit_discard, and this drain's
- *  own terminal branch, which consumes the node in place.
+ *  own terminal branch, which consumes the node in place. The drain's emit
+ *  case also treats a ctx whose @c s reads null as voided, so a release that
+ *  skipped the discard empties the node in place instead of faulting.
  */
 typedef struct retry_node {
     struct retry_node *next;
@@ -4530,8 +4537,14 @@ typedef struct retry_node {
     union {
         /* A copy-mode payload is the node's own copy; a static or owned one
          * keeps pointing where it did. hctx's pin stays live until this node
-         * resolves. See s_retry_emit_save. */
+         * resolves; a voided node (teardown or dead-stream exit) nulls
+         * @c hctx as its marker -- the drain's voided branch, the hold scan
+         * and the switch gate read that, and @c tok resolves the session
+         * safely across teardown for ticket pass and slot drop. The ticket
+         * stays for the drain to resolve at its turn.
+         * See s_retry_emit_save. */
         struct { duct_stream_ctx_t *hctx;
+                 duct_handle_t     tok;
                  duct_response_t out;
                  uint32_t ticket; } emit;
         /* pin: the inbound buffer the payload, uncopied, points into, for an
@@ -4711,9 +4724,13 @@ static retry_node_t *s_retry_sess_node_take(duct_session_t *s, retry_kind_t kind
 static void s_retry_node_drop(retry_node_t *node)
 {
     switch (node->kind) {
-    case retry_emit:
-        s_retry_sess_node_release(node->emit.hctx->s, node);
+    case retry_emit: {
+        auto h = (duct_session_handle_t){ .word = node->emit.tok };
+        auto s = duct_session_by_handle(h);
+        if (s)
+            s_retry_sess_node_release(s, node);
         return;
+    }
     case retry_timer:
         auto h = (duct_session_handle_t){ .word = node->timer.tok };
         if (duct_session_block_live(h.id))
@@ -4830,8 +4847,9 @@ static bool s_hold_adopt(const duct_session_t *s, duct_tx_hold_t *h, const duct_
                 waits = (duct_tx_hold_t){ n->fin.handle.word, n->fin.ticket };
             break;
         case retry_emit:
-            if (n->emit.hctx->s == s
-                && duct_session_conn_at(s, n->emit.hctx->conn_id).word == of.word)
+            if (!n->emit.hctx || n->emit.hctx->s != s)
+                break; /* voided: the answer is gone, the hold moot */
+            if (duct_session_conn_at(s, n->emit.hctx->conn_id).word == of.word)
                 waits = (duct_tx_hold_t){ duct_session_conn_at(s, n->emit.out.conn_id).word,
                                           n->emit.ticket };
             break;
@@ -5195,7 +5213,8 @@ static bool s_retry_emit_save(duct_worker_t *w, duct_stream_ctx_t *hctx, uint32_
         duct_conn_tx_seq(out_conn)->done_posted += 1u;
     *node = (retry_node_t){
         .kind = retry_emit,
-        .emit = { .hctx = hctx, .out = hctx->out, .ticket = ticket },
+        .emit = { .hctx = hctx, .tok = duct_session_handle_from_live(s).word,
+                  .out = hctx->out, .ticket = ticket },
     };
     s_retry_enqueue(w, node);
     auto rx_conn = duct_conn_by_handle(duct_session_conn_at(s, hctx->conn_id));
@@ -5580,47 +5599,62 @@ static duct_nonnull(1) bool s_retry_drain(duct_worker_t *w)
             break;
         case retry_emit: {
             auto hctx = node->emit.hctx;
-            auto s = hctx->s;
-            auto sid = hctx->stream_id;
-            auto emit_ticket = node->emit.ticket;
-            /* node->emit.out.conn_id, not hctx->conn_id: s_commit_response
-             * already route-resolved the real target leg, which a multiplexed
-             * emit's round-robin routing can differ from. */
-            auto emit_conn = duct_conn_by_handle(duct_session_conn_at(s, node->emit.out.conn_id));
-            if (emit_conn)
-                s_tx_wait_arm(emit_conn, 0u);
-            auto c_rc = s_response_retry(s, &node->emit.out, hctx->conn_id, sid,
-                                         fl_frame_none, &emit_ticket);
-            bool alive = hctx->s == s && hctx->stream_id == sid;
-            if (c_rc == commit_internal) {
+            if (hctx && !hctx->s) {
+                /* Released in place without a cancel while popped: void in
+                 * place and settle its ticket on the voided branch below. */
+                s_response_void_payload(&node->emit.out);
+                node->emit.hctx = hctx = nullptr;
+            }
+            if (hctx) {
+                auto s = hctx->s;
+                auto sid = hctx->stream_id;
+                auto emit_ticket = node->emit.ticket;
+                /* node->emit.out.conn_id, not hctx->conn_id: s_commit_response
+                 * already route-resolved the real target leg, which a multiplexed
+                 * emit's round-robin routing can differ from. */
+                auto emit_conn = duct_conn_by_handle(duct_session_conn_at(s, node->emit.out.conn_id));
+                if (emit_conn)
+                    s_tx_wait_arm(emit_conn, 0u);
+                auto c_rc = s_response_retry(s, &node->emit.out, hctx->conn_id, sid,
+                                             fl_frame_none, &emit_ticket);
+                bool alive = hctx->s == s && hctx->stream_id == sid;
+                if (c_rc != commit_internal) {
+                    progress = true;
+                    if (alive) {
+                        if (c_rc == commit_ok)
+                            /* Frame and pin survive: handler parked on async_yield. */
+                            s_hctx_enqueue(&w->coop, hctx, true);
+                        else {
+                            s_hctx_hold_release(hctx);
+                            s_hctx_remove_release(&w->coop, hctx);
+                            s_hctx_stream_fail(s, hctx);
+                            s_hctx_release(hctx);
+                        }
+                    }
+                    s_retry_node_drop(node);
+                    break;
+                }
                 if (alive) {
                     keep = true;
                     break;
                 }
+                /* The stream died while its answer waits for the ring: void in
+                 * place and settle the ticket below in sequence order so an
+                 * abandon never holes tx_seq_serve mid-run. */
                 auto drop_conn = duct_conn_by_handle(duct_session_conn_at(s, node->emit.out.conn_id));
                 if (drop_conn && duct_has(node->emit.out.flags, fl_send_done))
                     s_tx_done_skip(drop_conn);
-                s_commit_ticket_abandon(drop_conn, emit_ticket, &node->emit.out);
-                progress = true;
-                s_retry_node_drop(node);
+                s_response_void_payload(&node->emit.out);
+                node->emit.hctx = nullptr;
+            }
+            auto es = duct_session_attached_by_handle((duct_session_handle_t){ .word = node->emit.tok });
+            auto conn = es ? duct_conn_by_handle(duct_session_conn_at(es, node->emit.out.conn_id))
+                           : nullptr;
+            if (!s_tx_ticket_pass(conn, node->emit.ticket)) {
+                keep = true;
                 break;
             }
             progress = true;
-            if (!alive) {
-                s_retry_node_drop(node);
-                break;
-            }
-            if (c_rc == commit_ok) {
-                /* Frame and pin survive: the handler parked on an async_yield
-                 * and reads duct_stream_frame again on the step this queues.
-                 * Its own async_wait or async_done drops them. */
-                s_hctx_enqueue(&w->coop, hctx, true);
-            } else {
-                s_hctx_hold_release(hctx);
-                s_hctx_remove_release(&w->coop, hctx);
-                s_hctx_stream_fail(s, hctx);
-                s_hctx_release(hctx);
-            }
             s_retry_node_drop(node);
             break;
         }
@@ -5863,19 +5897,26 @@ static void s_retry_emit_discard(duct_worker_t *w, duct_stream_ctx_t *target)
     for (auto node = w->retry_head; node; prev = node, node = node->next) {
         if (node->kind != retry_emit || node->emit.hctx != target)
             continue;
-        if (prev)
-            prev->next = node->next;
-        else
-            w->retry_head = node->next;
-        if (node == w->retry_tail)
-            w->retry_tail = prev;
-        /* node->emit.out.conn_id, not target->conn_id -- see
-         * s_retry_emit_save's own note. */
+        /* node->emit.out.conn_id, not target->conn_id -- see s_retry_emit_save.
+         * If this node's ticket sits at the front (or its leg is gone), drop it
+         * now; if behind earlier tickets, empty in place so s_retry_drain
+         * advances tx_seq_serve in order without taking the leg down. */
         auto conn = duct_conn_by_handle(duct_session_conn_at(target->s, node->emit.out.conn_id));
         if (conn && duct_has(node->emit.out.flags, fl_send_done))
             s_tx_done_skip(conn);
-        s_commit_ticket_abandon(conn, node->emit.ticket, &node->emit.out);
-        s_retry_node_drop(node);
+        s_response_void_payload(&node->emit.out);
+        if (!conn || s_tx_ticket_pass(conn, node->emit.ticket)) {
+            if (prev)
+                prev->next = node->next;
+            else
+                w->retry_head = node->next;
+            if (w->retry_tail == node)
+                w->retry_tail = prev;
+            node->next = nullptr;
+            s_retry_node_drop(node);
+        } else {
+            node->emit.hctx = nullptr;
+        }
         return;
     }
 }
@@ -7228,7 +7269,7 @@ bool duct_worker_session_tx_parked(const duct_session_t *s)
         duct_conn_handle_t leg;
         switch (n->kind) {
         case retry_emit:
-            if (n->emit.hctx->s == s)
+            if (n->emit.hctx && n->emit.hctx->s == s)
                 return true;
             continue;
         case retry_frame:
@@ -7302,8 +7343,18 @@ static duct_commit_rc_t s_response_put(duct_session_t *s, duct_response_t *out,
         s_response_settle(s, out, stream_id, flags);
     else if (rc == commit_internal) {
         if (hctx && !s_hctx_live_stepping(hctx, s, stream_id)) {
+            /* The stream died with its answer mid-commit: drop its payload and
+             * settle its ticket in order (immediately if at front or leg gone,
+             * else parked empty as a retry_frame) so later commits never wedge
+             * behind an abandoned ticket hole. */
+            s_response_void_payload(out);
             auto conn = duct_conn_by_handle(duct_session_conn_at(s, out->conn_id));
-            s_commit_ticket_abandon(conn, ticket, out);
+            if (!conn || s_tx_ticket_pass(conn, ticket)) {
+                s_response_switch(s);
+                return commit_closed;
+            }
+            duct_discard s_retry_frame_save(s_this_worker, s, conn_id, stream_id,
+                                            fl_frame_none, out, ticket);
             return commit_closed;
         }
         if (!(hctx ? s_retry_emit_save(s_this_worker, hctx, ticket)

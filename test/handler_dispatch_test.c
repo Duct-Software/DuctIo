@@ -1941,6 +1941,12 @@ static void test_retry_emit_save_pins_the_handler_slot(void)
 
     duct_stream_cancel(hctx);
     duct_del(hctx);
+    /* The teardown empties the node in place when its ticket sits behind
+     * others (an unlink would hole the run and take the leg down): the
+     * payload's claim releases at the void, and the drain resolves the
+     * ticket and drops the node off the saved session. */
+    assert(f.w.retry_head && f.w.retry_head->emit.out.payload.size == 0u);
+    s_retry_drop_head(&f);
     assert(!f.w.retry_head);
     assert(duct_atomic_load(&pool.claims, relaxed) == 0u);
     assert(s_slots_free(&pool) == n);
@@ -2153,18 +2159,27 @@ static void test_retry_region_copy_slots(void)
     assert(s_retry_copy_is_regional(f.conn, node->frame.out.payload.data));
     assert(memcmp(node->frame.out.payload.data, big, sizeof big) == 0);
 
-    duct_response_t huge = { .payload = { .data = big, .size = sizeof big + 1u } };
+    /* One byte past the whole copy budget refuses whatever the occupancy: no
+     * run of consecutive units can ever carry it. */
+    static uint8_t
+        huge[duct_conn_retry_tx_copies * duct_conn_retry_tx_copy_max + 1u];
+    duct_response_t hout = { .payload = { .data = huge, .size = sizeof huge } };
     assert(!s_retry_frame_save(&f.w, f.s, duct_conn_id_primary, 0u, fl_frame_none,
-                               &huge, 0u));
+                               &hout, 0u));
     assert(f.w.retry_head == node);
 
-    static uint8_t second[16] = "second-copy";
-    duct_response_t out2 = { .payload = { .data = second, .size = sizeof second } };
-    assert(s_retry_frame_save(&f.w, f.s, duct_conn_id_primary, 0u, fl_frame_none,
-                              &out2, 0u));
-    auto second_node = f.w.retry_tail;
-    assert(second_node && second_node != node);
-
+    /* Fill every remaining unit whole: each one-unit copy parks until the
+     * last, and the next in-range copy refuses with no unit free. */
+    auto second_node = node;
+    for (uint32_t i = 1u; i < duct_conn_retry_tx_copies; ++i) {
+        static uint8_t more[duct_conn_retry_tx_copy_max];
+        memset(more, 0xa0 + (int)i, sizeof more);
+        duct_response_t out_more = { .payload = { .data = more, .size = sizeof more } };
+        assert(s_retry_frame_save(&f.w, f.s, duct_conn_id_primary, 0u, fl_frame_none,
+                                  &out_more, 0u));
+        second_node = f.w.retry_tail;
+        assert(second_node && second_node != node);
+    }
     static uint8_t third[8] = "third";
     duct_response_t out3 = { .payload = { .data = third, .size = sizeof third } };
     assert(!s_retry_frame_save(&f.w, f.s, duct_conn_id_primary, 0u, fl_frame_none,
@@ -2200,6 +2215,15 @@ static void test_retry_region_copy_slots(void)
     assert(wide_node && wide_node->kind == retry_frame);
     assert(s_retry_copy_is_regional(f.conn, wide_node->frame.out.payload.data));
     assert(memcmp(wide_node->frame.out.payload.data, wide, sizeof wide) == 0);
+    /* Hold every remaining unit behind one-unit copies: the next copy
+     * refuses for want of a consecutive run wide enough. */
+    static uint8_t filler[duct_conn_retry_tx_copy_max];
+    memset(filler, 0x77, sizeof filler);
+    for (uint32_t i = 2u; i < duct_conn_retry_tx_copies; ++i) {
+        duct_response_t out_f = { .payload = { .data = filler, .size = sizeof filler } };
+        assert(s_retry_frame_save(&f.w, f.s, duct_conn_id_primary, 0u, fl_frame_none,
+                                  &out_f, 0u));
+    }
     static uint8_t fourth[8] = "fourth";
     duct_response_t out4 = { .payload = { .data = fourth, .size = sizeof fourth } };
     assert(!s_retry_frame_save(&f.w, f.s, duct_conn_id_primary, 0u, fl_frame_none,
@@ -2325,6 +2349,10 @@ static void test_retry_emit_save_shares_the_owned_frame(void)
 
     duct_stream_cancel(hctx);
     duct_del(hctx);
+    /* The teardown empties a behind-ticket node in place (the block's share
+     * releases at the void); the drain drops it off the saved session. */
+    assert(f.w.retry_head && f.w.retry_head->emit.out.payload.size == 0u);
+    s_retry_drop_head(&f);
     assert(!f.w.retry_head);
     s_fixture_fini(&f);
     printf("  retry_emit_save_shares_the_owned_frame OK\n");
