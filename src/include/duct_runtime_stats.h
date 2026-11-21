@@ -141,6 +141,21 @@ typedef struct duct_io_rt {
                                         *  parked spare and a fresh open both failed to
                                         *  connect, the leg staying on its current tuple
                                         *  until the next threshold hop. */
+             dgram_hop_wheel_give,    /**< Retired sockets the socket wheel took in. */
+             dgram_hop_wheel_reap,    /**< ...of those, reaped by a hold's end: drained
+                                        *  dry, then closed. */
+             dgram_hop_wheel_extend,  /**< ...of those, a reap pass that could not prove
+                                        *  the band landed yet, the hold extended once more. */
+             dgram_hop_wheel_forced,  /**< ...of those, closed ahead of the hold: the wheel
+                                        *  full, the oldest giving its slot up. */
+             dgram_hop_band_taken,    /**< Retired bands' datagrams the drain committed into
+                                        *  the conn's rx ring. */
+             dgram_hop_band_stall,    /**< Drain passes the ring refused room to: the band
+                                        *  waits behind the live flow. */
+             dgram_hop_band_drop,     /**< Band datagrams dequeued whole and dropped: each
+                                        *  past the wire's bounds. */
+             dgram_hop_band_error,    /**< Drain reads that answered a socket error: counted
+                                        *  and stepped over, the queue carrying on. */
              dgram_tx_batch_calls,    /**< s_dgram_tx_lane_drain_batch calls that offered
                                         *  the socket at least one entry. */
              dgram_tx_batch_msgs,     /**< Entries those calls offered: submissions, so an

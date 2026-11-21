@@ -267,14 +267,17 @@ bool duct_events_watch(duct_events_env_t *env, duct_sock_t fd,
 bool duct_events_promote(duct_events_env_t *env, duct_sock_t fd, void *tag_ptr)
 {
     duct_do_if(fd == duct_sock_bad, return false);
-    /* MOD not ADD: fd is already in this epoll instance's set, a second
-     * ADD fails EEXIST. Full conn set regardless of what the pre_conn
-     * carried — pre_conn_probe arms EPOLLIN alone. */
+    /* MOD when fd is already in this epoll instance's set (the dial's
+     * pre_conn carried it), ADD for a fresh one -- the hop's swapped-in
+     * socket was never watched. Full conn set regardless of what the
+     * pre_conn carried -- pre_conn_probe arms EPOLLIN alone. */
     struct epoll_event ev = {
         .events = EPOLLIN | EPOLLOUT | EPOLLET,
         .data.u64 = s_tag_pack(io_tag_conn, tag_ptr),
     };
-    return epoll_ctl(env->epoll_fd, EPOLL_CTL_MOD, fd, &ev) >= 0;
+    if (epoll_ctl(env->epoll_fd, EPOLL_CTL_MOD, fd, &ev) >= 0)
+        return true;
+    return epoll_ctl(env->epoll_fd, EPOLL_CTL_ADD, fd, &ev) >= 0;
 }
 
 /* EPOLLIN alone, level-triggered. The drive loop is bounded and stops with the

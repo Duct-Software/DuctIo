@@ -336,7 +336,17 @@ void duct_events_unwatch(duct_events_env_t *env, duct_sock_t fd, void *rx_io_pri
 bool duct_events_promote(duct_events_env_t *env, duct_sock_t fd, void *tag_ptr)
 {
     unsigned i = s_find_slot(env, fd);
-    duct_do_if(i == UINT_MAX, return false);
+    if (i == UINT_MAX) {
+        /* A fresh fd -- the hop's swapped-in socket was never watched: take
+         * the full conn set, POLLOUT armed once here and owned by s_drive_tx
+         * from then on, kept in step with duct_io_tx_write_armed_set. */
+        duct_do_if(env->n_entries >= sizeof env->fds / sizeof env->fds[0], return false);
+        i = env->n_entries++;
+        env->fds[i] = (duct_pollfd_t){ .fd = fd, .events = POLLIN | POLLOUT };
+        env->slots[i] = (duct_events_slot_t){ .kind = io_tag_conn, .tag = tag_ptr };
+        duct_io_on_relocate(io_tag_conn, tag_ptr, &env->fds[i]);
+        return true;
+    }
     /* fd is already in env->fds[]; the tag changes, and the read side is
      * widened to the full conn set — a pre_conn_probe registered POLLIN
      * alone. No x_udp_peer narrowing: a promoted conn holds a real,

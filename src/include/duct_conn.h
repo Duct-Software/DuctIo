@@ -346,14 +346,14 @@ typedef struct duct_conn {
                           *  through @ref duct_conn_block.h; the xport alone
                           *  decides which of them is live. */
 
-        duct_sock_t hop_fd; /**< Previous @c x_udp_peer socket parked during a
-                              *  make-before-break 5-tuple hop to drain delayed
-                              *  inbound datagrams before close; I/O-thread-owned. */
-
         duct_sock_t hop_arm_fd; /**< Spare @c x_udp_peer socket parked by the
                                   *  I/O swap ahead of the next 5-tuple hop;
-                                  *  the next swap consumes it or teardown
-                                  *  closes it. I/O-thread-owned. */
+                                  *  the next swap consumes it (when family and
+                                  *  egress_if match) or teardown closes it.
+                                  *  I/O-thread-owned. */
+
+        uint32_t    hop_arm_if; /**< Egress interface index @c hop_arm_fd bound to. */
+        uint8_t     hop_arm_family; /**< Address family @c hop_arm_fd opened with. */
 
         const duct_wire_t  *wire; /**< Bound wire for RX parse + TX pack.
                                     *  Set by @ref duct_conn_bind_wire at
@@ -374,9 +374,6 @@ typedef struct duct_conn {
          *  which has no other synchronization with the worker's write.
          */
         const duct_proto_t * _Atomic wire_rebind_next;
-
-        duct_timer_handle_t hop_timer; /**< Close timer for @c hop_fd;
-                                         *  I/O-thread-owned. */
 
         /** @brief Transport kind of @c fd.
          *  Drives per-conn I/O dispatch across the OS backends;

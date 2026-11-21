@@ -261,11 +261,11 @@ duct_conn_t *duct_conn_acquire(void)
     duct_atomic_store(&conn->state, 0u, relaxed);
     duct_atomic_store(&conn->refs, 1u, relaxed);
     conn->fd = duct_sock_bad;
-    conn->hop_fd = duct_sock_bad;
     conn->hop_arm_fd = duct_sock_bad;
+    conn->hop_arm_if = 0u;
+    conn->hop_arm_family = 0u;
     conn->wire = nullptr;
     conn->wire_parser = nullptr;
-    conn->hop_timer = timer_handle_null;
     conn->vnet_hdr_len = 0u;
     duct_atomic_store(&conn->vnet_gso, 0u, relaxed);
     /* head_unsealed survives teardown — duct_conn_sealed_codec_detach clears
@@ -531,10 +531,6 @@ void duct_conn_teardown_worker(duct_conn_t *conn)
         conn->fd = duct_sock_bad;
         /* The descriptor just freed may be the one a parked listener waits for. */
         duct_io_accept_resume();
-    }
-    if (conn->hop_fd != duct_sock_bad) {
-        duct_sock_close(conn->hop_fd);
-        conn->hop_fd = duct_sock_bad;
     }
     if (conn->hop_arm_fd != duct_sock_bad) {
         duct_sock_close(conn->hop_arm_fd);

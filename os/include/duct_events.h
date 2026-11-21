@@ -125,8 +125,8 @@ duct_events_watch(duct_events_env_t *env, duct_sock_t fd,
                   duct_io_tag_t kind, void *tag,
                   duct_xport_t xport_type);
 
-/** @brief Elevate an already-watched, still-dialing @p fd from
- *  pre_conn to conn tag once the dial resolves.
+/** @brief Elevate an already-watched @p fd from pre_conn to conn tag once the
+ *  dial resolves, or register an unwatched dialed/hopped @p fd as @c io_tag_conn.
  *
  *  @return false on failure.
  */

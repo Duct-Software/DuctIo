@@ -99,6 +99,52 @@ typedef struct duct_pre_conn_slab {
                                 n;          /**< Records the slab was made with. */
 } duct_pre_conn_slab_t;
 
+/** @brief Retired hop sockets one io thread keeps draining at once. Live
+ *  generations at once = swap rate x reap hold; the stand's threshold
+ *  crossing measured ~65 swaps/s, so a 250 ms hold keeps ~16 alive and 64
+ *  slots carry the double plus the extensions a flow-controlled rx ring
+ *  adds, the oldest force-closed on overflow. */
+static constexpr unsigned duct_sock_reap_slots = 64u;
+
+/** @brief How long a retired socket stays open past its swap. The bound is
+ *  the straggler band's own life: the roam candidate's trip (half a round
+ *  trip), the peer's classify-and-promote of it (measured ~50 ms, its
+ *  accepted-seq watermark gate), and the air time of the last datagram the
+ *  peer addressed to the old tuple before it switched (a full round trip).
+ *  The stand measured that sum at ~220 ms; 250 ms carries the margin. The
+ *  close itself stays soft -- the reap pass drains first and extends the
+ *  hold when the band cannot land yet -- so the number bounds the wait, the
+ *  drained-dry proof closes. */
+static constexpr uint64_t duct_sock_reap_hold_ns = 250u * 1000u * 1000u;
+
+/** @brief The tick's wake bound while a wheel entry exists. A swap strands
+ *  the in-flight window on the retired socket, and the strand's datagrams
+ *  land in the conn's ring only when a drain pass reaches that socket -- the
+ *  live leg's drives do not reach it while the peer still feeds the old
+ *  tuple, which on a download-heavy conn is nearly every datagram. The pass
+ *  therefore wakes at this quantum, so a datagram waits one quantum past its
+ *  arrival instead of one reap hold: the delivery keeps the wire's pace and
+ *  its order, and the loaded RTT stops riding the reap hold. The reap's own
+ *  deadline wake rides the same bound. */
+static constexpr uint32_t duct_sock_band_drain_ms = 10u;
+
+/** @brief One wheel entry: a retired socket, the owning conn's tag word its
+ *  drains resolve through, and the earliest close time. */
+typedef struct {
+    duct_sock_t     fd;      /**< The retired socket. */
+    uint64_t        tag;     /**< The owning conn's tag word; its rx drains. */
+    struct timespec reap_at; /**< Earliest close time. */
+} duct_sock_reap_t;
+
+/** @brief The io thread's socket wheel: the retired @c x_udp_peer sockets
+ *  still owed their straggler bands, FIFO by deadline, each closed by the
+ *  tick's single reap pass once its hold has run. */
+typedef struct {
+    duct_sock_reap_t slot[duct_sock_reap_slots];
+    unsigned head,           /**< The oldest entry, the next reap's. */
+             n;              /**< Entries the wheel holds. */
+} duct_sock_wheel_t;
+
 /** @brief Transport executor state. */
 typedef struct duct_io {
     bool _Atomic           shutdown;
@@ -116,6 +162,7 @@ typedef struct duct_io {
     duct_wfq_route_t     route;
     pthread_t              thread;
     duct_timers_t          timers;
+    duct_sock_wheel_t      socks;         /**< The retired hop sockets' wheel. */
     duct_pre_conn_t       *pre_conns;       /**< Pending dial and
                                               *  probe-wait admissions. */
     duct_pre_conn_slab_t  pre_conn_slab;    /**< The records those admissions
@@ -2892,71 +2939,207 @@ void duct_io_on_pre_conn_readable(duct_pre_conn_t *pre_conn)
  *  this file's own reserve, commit, and done steps. This function only
  *  decides whether a drive should start at all.
  */
-/** @brief Non-blockingly drain any delayed datagrams queued on @p conn->hop_fd.
- *  Ignores socket errors on the retired descriptor so old-tuple ICMP never
- *  disturbs the active leg. */
-static void s_hop_fd_drain(duct_conn_t *conn)
+static bool s_rx_reserve_space(duct_io_t *t, duct_conn_t *conn, size_t min_avail,
+                               uint8_t **out_ptr, size_t *out_avail);
+
+/** @brief Reserve ring room for one retired band's datagram, through the
+ *  live path's own space-with-latch dance. The band is a straggler the
+ *  worker parses by its own wire ordering, so the live socket's
+ *  suspended/stalled read-ahead gate does not apply -- but the ring's room
+ *  does, and where it is short the latch's resume post re-drives this conn,
+ *  whose start drains the band. No latch of the band's own is written past
+ *  that dance.
+ *
+ *  @p held, the bytes the socket's queue reports, sizes the ask: a band's
+ *  datagram reserves only what it needs, so a small straggler slips into a
+ *  small ring window the live flow's full-unit ask would wait past. */
+static bool s_hop_band_reserve(duct_conn_t *conn, size_t held, duct_io_xfer_t *out)
 {
-    if (conn->hop_fd == duct_sock_bad || duct_has(duct_conn_state(conn), fl_conn_closed))
-        return;
+    if (duct_conn_state(conn) & (fl_conn_closed | fl_conn_rx_eof))
+        return false;
     auto rx = duct_conn_rx_olb(conn);
-    if (!rx || duct_atomic_load(&rx->suspended, relaxed) || duct_olb_rx_stalled(rx))
-        return;
+    /* An undescribed coalesced group still in the ring leaves the band's read
+     * nowhere to land: wait, the live drive clears it first. */
+    if (rx->group_bytes)
+        return false;
+    size_t rec = duct_conn_record_framed(conn) ? sizeof(duct_dgram_rec_hdr_t) : 0u,
+           scratch = rec ? duct_events_rx_scratch : 0u;
+    size_t unit = held < rx->read_unit ? held : rx->read_unit;
+    size_t min_avail = rec ? unit + rec + scratch : held;
+    if (min_avail > rx->h.buf_size)
+        min_avail = rx->h.buf_size;
+    uint8_t *ptr = nullptr;
+    size_t avail = 0u;
+    if (!s_rx_reserve_space(s_io_this, conn, min_avail, &ptr, &avail))
+        return false;
+    *out = (duct_io_xfer_t){
+        .buf = ptr + rec, .size = avail - rec - scratch, .units = 1u,
+    };
+    return true;
+}
+
+/** @brief Non-blockingly drain any delayed datagrams queued on @p fd, one of
+ *  @p conn's retired hop sockets. @return true when the queue is proven
+ *  drained to would-block; false when the conn is gone or its rx ring cannot
+ *  take the band yet, so data may still wait. A read error on the retired
+ *  descriptor is counted and stepped over -- the queue keeps delivering after
+ *  one (both stacks report the error once, then carry on) -- so old-tuple ICMP
+ *  never disturbs the active leg and never starves the band. */
+static bool s_hop_fd_one_drain(duct_conn_t *conn, duct_sock_t fd)
+{
+    if (!conn || fd == duct_sock_bad || duct_has(duct_conn_state(conn), fl_conn_closed))
+        return true;
+    auto rx = duct_conn_rx_olb(conn);
+    if (!rx)
+        return true;
     auto tag = (void *)(uintptr_t)s_conn_tag_word(conn);
+    bool drained = false;
     for (unsigned pass = 0u; pass < 64u; ++pass) {
-        duct_io_xfer_t xfer;
-        if (!duct_io_rx_reserve(tag, &xfer))
+        size_t held = 0u;
+        if (!duct_x_dgram_held(fd, &held))
+            /* Unreadable/closed descriptor: treat as drained so the reap
+             * closes it instead of extending forever. */
+            return true;
+        if (!held) {
+            /* The socket itself says dry, whatever the rx ring's room: the
+             * band landed through the live leg's drives or never existed. */
+            drained = true;
             break;
-        if (xfer.units > 1u) {
-            xfer.fd = conn->hop_fd;
-            auto rc = duct_io_dgram_rx_units(tag, &xfer);
-            if (rc != rc_ok)
-                break;
+        }
+        duct_io_xfer_t xfer;
+        if (!s_hop_band_reserve(conn, held, &xfer)) {
+            /* The band waits for the ring the live flow keeps full. */
+            duct_rtstat_obj_inc(s_io_this, rtstats.dgram_hop_band_stall, 1);
+            break;
+        }
+        size_t got = 0u,
+               seg = 0u;
+        auto rc = duct_xread(fd, x_udp_peer,
+                             (duct_view_u8){ .data = xfer.buf, .size = xfer.size },
+                             &got, nullptr, 0u, &seg);
+        if (rc == rc_again) {
+            drained = true;
+            break;
+        }
+        if (rc == rc_drop)
+            /* A datagram past the wire's bounds was dequeued whole and
+             * dropped: the queue moved, the next read may still find more. */
+            duct_rtstat_obj_inc(s_io_this, rtstats.dgram_hop_band_drop, 1);
+        else if (rc != rc_ok) {
+            /* The error was the descriptor's, not the band's: the queue
+             * carries on behind it, and a later pass takes what it holds. */
+            duct_rtstat_obj_inc(s_io_this, rtstats.dgram_hop_band_error, 1);
         } else {
-            size_t got = 0u,
-                   seg = 0u;
-            auto rc = duct_xread(conn->hop_fd, x_udp,
-                                 (duct_view_u8){ .data = xfer.buf, .size = xfer.size },
-                                 &got, nullptr, 0u, &seg);
-            if (rc != rc_ok)
-                break;
+            duct_rtstat_obj_inc(s_io_this, rtstats.dgram_hop_band_taken, 1);
             duct_io_rx_commit(tag, got, seg);
         }
     }
+    return drained;
 }
 
-/** @brief Cancel @p conn->hop_timer, drain @p conn->hop_fd once if still live,
- *  and close it. I/O-thread-only. */
-static void s_hop_fd_retire(duct_io_t *t, duct_conn_t *conn)
+/** @brief Give one unwatched retired hop socket to the io thread's wheel: its
+ *  reap hold runs from now, past the peer's roam lag plus a return trip, so
+ *  the straggler band lands before the close. A full wheel reaps its oldest
+ *  ahead of time. I/O-thread-only. */
+static void s_sock_wheel_give(duct_io_t *t, duct_sock_t fd, uint64_t tag)
 {
-    if (conn->hop_timer != timer_handle_null) {
-        duct_timer_cancel(&t->timers, conn->hop_timer);
-        conn->hop_timer = timer_handle_null;
+    if (fd == duct_sock_bad)
+        return;
+    auto w = &t->socks;
+    duct_rtstat_obj_inc(t, rtstats.dgram_hop_wheel_give, 1);
+    if (w->n == duct_sock_reap_slots) {
+        auto old = &w->slot[w->head];
+        s_hop_fd_one_drain(s_conn_from_tag((void *)(uintptr_t)old->tag), old->fd);
+        duct_sock_close(old->fd);
+        w->head = (w->head + 1u) % duct_sock_reap_slots;
+        w->n--;
+        duct_rtstat_obj_inc(t, rtstats.dgram_hop_wheel_forced, 1);
     }
-    if (conn->hop_fd != duct_sock_bad) {
-        s_hop_fd_drain(conn);
-        duct_sock_close(conn->hop_fd);
-        conn->hop_fd = duct_sock_bad;
+    w->slot[(w->head + w->n) % duct_sock_reap_slots] = (duct_sock_reap_t){
+        .fd = fd, .tag = tag,
+        .reap_at = duct_time_add(duct_time_now(), duct_time_from_ns(duct_sock_reap_hold_ns)) };
+    w->n++;
+}
+
+/** @brief Drain every retired socket of @p conn's still on the wheel. Each
+ *  entry also drains on the tick and at its reap pass; this walk carries a
+ *  band further when the rx ring freed room between arrivals. I/O-thread-only. */
+static void s_hop_fd_drain(duct_io_t *t, duct_conn_t *conn)
+{
+    auto w = &t->socks;
+    if (!w->n)
+        return;
+    auto tag = s_conn_tag_word(conn);
+    for (unsigned i = 0u; i < w->n; ++i) {
+        auto slot = &w->slot[(w->head + i) % duct_sock_reap_slots];
+        if (slot->tag == tag)
+            s_hop_fd_one_drain(conn, slot->fd);
     }
 }
 
-static duct_exec_rc_t s_hop_timer_fire(void *arg)
+/** @brief Reap every wheel entry whose hold has run: drain its straggler band
+ *  into the owning conn's rx ring, then close. A band the rx ring cannot take
+ *  yet extends its hold and moves to the wheel's tail so later entries with
+ *  earlier deadlines still reap on time without breaking FIFO order.
+ *  I/O-thread-only. */
+static void s_sock_wheel_reap(duct_io_t *t, struct timespec now)
 {
-    auto t = s_io_this;
-    auto h = (duct_conn_handle_t){ .word = (uint64_t)(uintptr_t)arg };
-    auto conn = duct_conn_by_handle(h);
-    if (!conn || conn->io_id != t->route.thread_id)
-        return exec_done;
-    conn->hop_timer = timer_handle_null;
-    s_hop_fd_retire(t, conn);
-    return exec_done;
+    auto w = &t->socks;
+    for (unsigned rem = w->n; rem && w->n && duct_time_le(w->slot[w->head].reap_at, now); --rem) {
+        auto slot = w->slot[w->head];
+        w->head = (w->head + 1u) % duct_sock_reap_slots;
+        w->n--;
+        if (!s_hop_fd_one_drain(s_conn_from_tag((void *)(uintptr_t)slot.tag), slot.fd)) {
+            slot.reap_at = duct_time_add(now, duct_time_from_ns(duct_sock_reap_hold_ns));
+            w->slot[(w->head + w->n) % duct_sock_reap_slots] = slot;
+            w->n++;
+            duct_rtstat_obj_inc(t, rtstats.dgram_hop_wheel_extend, 1);
+            continue;
+        }
+        duct_sock_close(slot.fd);
+        duct_rtstat_obj_inc(t, rtstats.dgram_hop_wheel_reap, 1);
+    }
+}
+
+/** @brief Drain every wheel entry's straggler band once, expired or not.
+ *  The reap pass only reaches an entry at its hold's deadline, and the
+ *  owning conn's rx drives only run on live arrivals; a band whose peer still
+ *  feeds the old tuple waits for whichever pass comes first. This pass is
+ *  that first on the tick's cadence. I/O-thread-only. */
+static void s_sock_wheel_drain(duct_io_t *t)
+{
+    auto w = &t->socks;
+    for (unsigned i = 0u; i < w->n; ++i) {
+        auto slot = &w->slot[(w->head + i) % duct_sock_reap_slots];
+        s_hop_fd_one_drain(s_conn_from_tag((void *)(uintptr_t)slot->tag), slot->fd);
+    }
+}
+
+/** @brief Drop every wheel entry of @p conn's now: the conn is detaching, its
+ *  retired sockets have no rx ring left to drain into. Keeps the survivors'
+ *  order. I/O-thread-only. */
+static void s_sock_wheel_drop_conn(duct_io_t *t, uint64_t tag)
+{
+    auto w = &t->socks;
+    unsigned kept = 0u;
+    for (unsigned i = 0u; i < w->n; ++i) {
+        auto slot = &w->slot[(w->head + i) % duct_sock_reap_slots];
+        if (slot->tag == tag) {
+            duct_sock_close(slot->fd);
+            continue;
+        }
+        if (kept != i)
+            w->slot[(w->head + kept) % duct_sock_reap_slots] = *slot;
+        kept++;
+    }
+    w->n = kept;
 }
 
 static void s_rx_start(duct_conn_t *conn)
 {
     if (!conn || !duct_conn_rx_olb(conn))
         return;
-    s_hop_fd_drain(conn);
+    s_hop_fd_drain(s_io_this, conn);
     auto st = duct_conn_state(conn);
     if (st & fl_conn_closed)
         /* The close decision already unwatched this fd: no reactive
@@ -3108,8 +3291,9 @@ bool duct_io_rx_reserve(void *tag, duct_io_xfer_t *out)
      * touching duct_conn_t, so only this check stops its next read after an
      * rx_op_pause or the end of the conn's input. */
     if ((duct_conn_state(conn) & (fl_conn_closed | fl_conn_rx_eof))
-        || duct_atomic_load(&rx->suspended, relaxed))
+        || duct_atomic_load(&rx->suspended, relaxed)) {
         return s_rx_reserve_stall(conn, out);
+    }
     auto t = s_io_this;
     uint8_t *ptr = nullptr;
     size_t avail = 0u;
@@ -3146,8 +3330,9 @@ bool duct_io_rx_reserve(void *tag, duct_io_xfer_t *out)
         if (conn->vnet_hdr_len)
             min_avail = duct_vnet_cut_max;
     }
-    if (!s_rx_reserve_space(t, conn, min_avail, &ptr, &avail))
+    if (!s_rx_reserve_space(t, conn, min_avail, &ptr, &avail)) {
         return s_rx_reserve_stall(conn, out);
+    }
     uint8_t *buf = ptr + rec;
     size_t size = avail - rec - scratch,
            unit = rx->read_unit;
@@ -3335,11 +3520,10 @@ void duct_io_rx_done(void *tag, duct_result_t rc)
      * already no-ops when nothing new arrived, so there is no cheaper
      * gate to duplicate here. */
     duct_frame_rx_post(&t->route, &t->frame_rx, conn);
-    /* The parked hop socket carries no watch of its own: its straggler band
-     * rides the live leg's drive cadence, the hop timer's final drain only
-     * covering a conn gone quiet. */
-    if (conn->hop_fd != duct_sock_bad)
-        s_hop_fd_drain(conn);
+    /* Retired wheel sockets drain on the live leg's drives and on the tick's
+     * cadence; carry bands further when the ring freed room. */
+    if (t->socks.n)
+        s_hop_fd_drain(t, conn);
     /* The receive follow steps only on a drive that read the socket dry. A
      * drive the full ring latched ends on the backend's initial rc_again too,
      * its kernel queue still full, and a buffer shrunk under that queue has the
@@ -3451,6 +3635,12 @@ bool duct_io_tx_peek(void *tag, duct_io_xfer_t *out)
 {
     auto conn = s_conn_from_tag(tag);
     duct_do_if(!conn, return false);
+    if (duct_has(duct_conn_state(conn), fl_conn_hopping)) {
+        /* The hop pacer holds the leg: the composed quanta wait in the ring
+         * until the deferred swap lands, the path takes one quantum per
+         * interval. The swap's own s_tx_start resumes the drive. */
+        return s_tx_peek_idle(conn, true, out);
+    }
     auto tx = duct_conn_tx_olb(conn);
     out->iov_n = duct_olb_tx_peek_iov(tx, duct_conn_record_framed(conn),
                                       duct_tx_peek_recs, out->iov);
@@ -3947,6 +4137,13 @@ duct_msg_chain_decl(duct_msg_dgram_hop,
     uint32_t            egress_if;
 );
 
+/** @brief The swap the threshold crossing asked: the peer reads off the conn's
+ *  own view, the spare the previous swap parked feeds the new socket. The
+ *  threshold crossing itself quantizes the swaps -- one pending swap per conn,
+ *  the next crossing waits on @c fl_conn_hopping -- and the wheel holds every
+ *  retired generation past the peer's roam lag, so no timer gates the rate. */
+static duct_exec_rc_t s_msg_exec_dgram_hop(void *self);
+
 static duct_exec_rc_t s_msg_exec_dgram_hop(void *self)
 {
     auto m = (duct_msg_dgram_hop *)self;
@@ -3958,11 +4155,18 @@ static duct_exec_rc_t s_msg_exec_dgram_hop(void *self)
             duct_conn_state_clear(conn, fl_conn_hopping);
         return duct_msg_done(m);
     }
-    s_hop_fd_retire(t, conn);
     /* The parked spare or a fresh open connects here: a failure leaves the
-     * leg on its current tuple, the next threshold hop retries. */
-    duct_sock_t new_fd = conn->hop_arm_fd;
-    conn->hop_arm_fd = duct_sock_bad;
+     * leg on its current tuple, the next threshold hop retries. Discard a
+     * parked spare whose family or egress interface no longer matches. */
+    duct_sock_t new_fd = duct_sock_bad;
+    if (conn->hop_arm_fd != duct_sock_bad) {
+        if (conn->hop_arm_family == (uint8_t)m->peer.family
+            && conn->hop_arm_if == m->egress_if)
+            new_fd = conn->hop_arm_fd;
+        else
+            duct_sock_close(conn->hop_arm_fd);
+        conn->hop_arm_fd = duct_sock_bad;
+    }
     struct sockaddr_storage ss;
     socklen_t slen = (socklen_t)duct_io_sockaddr_from_peer(&m->peer, &ss);
     if (new_fd != duct_sock_bad
@@ -3989,30 +4193,33 @@ static duct_exec_rc_t s_msg_exec_dgram_hop(void *self)
     duct_events_unwatch(t->trunk.events, old_fd, rx ? rx->h.ext_ptr : nullptr);
     if (tx)
         duct_olb_tx_write_armed_set(tx, false);
-    conn->hop_fd = old_fd;
     conn->fd = new_fd;
     if (rx)
         rx->peer = m->peer;
-    if (!duct_events_watch(t->trunk.events, conn->fd, io_tag_conn,
-                           (void *)(uintptr_t)s_conn_tag_word(conn), x_udp)) {
+    /* The swapped-in socket takes the dialed-conn watch: full read interest
+     * on every backend, no x_udp_peer narrowing -- the shared-listener
+     * demux exists for accepted legs, this conn is the client's own dial. */
+    if (!duct_events_promote(t->trunk.events, conn->fd,
+                             (void *)(uintptr_t)s_conn_tag_word(conn))) {
+        s_hop_fd_one_drain(conn, old_fd);
+        duct_sock_close(old_fd);
         duct_conn_state_clear(conn, fl_conn_hopping);
         duct_io_conn_close(conn, close_io_error);
         return duct_msg_done(m);
     }
-    static constexpr uint64_t hop_drain_us = 250000u;
-    conn->hop_timer = duct_timer_add(&t->timers, (uint8_t)t->route.thread_id, 0u,
-                                     hop_drain_us, 0u, 1u, s_hop_timer_fire,
-                                     (void *)(uintptr_t)m->conn.word, nullptr);
+    /* The retired socket carries no reactor watch: its band drains on the
+     * live leg's drives and on the tick's reap pass, staying off the backend's
+     * handle budget. Give it to the wheel before s_rx_start so any first-pass
+     * ring room reaches it right away. */
+    s_sock_wheel_give(t, old_fd, s_conn_tag_word(conn));
     duct_conn_state_clear(conn, fl_conn_hopping | fl_conn_gso_off);
-    if (conn->hop_timer == timer_handle_null)
-        s_hop_fd_retire(t, conn);
-    else
-        s_hop_fd_drain(conn);
     s_tx_start(conn);
     s_rx_start(conn);
-    /* Park the next hop's spare against this swap's peer; a failed open
-     * parks nothing and the next swap opens fresh. */
+    /* Park the next hop's spare against this swap's family and egress_if; a
+     * failed open parks nothing and the next swap opens fresh. */
     conn->hop_arm_fd = s_hop_fd_spare(m->peer.family, m->egress_if);
+    conn->hop_arm_family = conn->hop_arm_fd != duct_sock_bad ? (uint8_t)m->peer.family : 0u;
+    conn->hop_arm_if = conn->hop_arm_fd != duct_sock_bad ? m->egress_if : 0u;
     return duct_msg_done(m);
 }
 
@@ -5392,8 +5599,12 @@ void duct_io_on_event(duct_io_event_t *ev)
         s_device_drive(conn);
         return;
     }
-    if (duct_has(ev->flags, io_ev_read))
+    if (duct_has(ev->flags, io_ev_read)) {
+        /* The peer's first delivery on the new socket says it has switched
+         * its replies over: any parked generations' stragglers drain on
+         * s_rx_start and the wheel's tick cadence until reaped. */
         s_rx_start(conn);
+    }
     if (duct_has(duct_conn_state(conn), fl_conn_closed))
         return;
     if (duct_has(ev->flags, io_ev_write))
@@ -5478,7 +5689,22 @@ uint32_t duct_io_on_tick(void)
         t->sweep_at = duct_time_add(now, duct_time_from_ns(s_slot_sweep_ns));
         s_pools_sweep(t);
     }
-    return duct_deadline_to_ms_at(duct_timers_nearest(&t->timers), now);
+    /* The socket wheel reaps on the same pass: retired hop sockets close one
+     * reap hold past their swap, and while any entry exists the pass also
+     * drains every band it holds and wakes at the band's quantum -- a strand
+     * waits one quantum past its arrival, not one reap hold. */
+    s_sock_wheel_reap(t, now);
+    if (t->socks.n)
+        s_sock_wheel_drain(t);
+    auto to = duct_deadline_to_ms_at(duct_timers_nearest(&t->timers), now);
+    if (t->socks.n) {
+        auto wheel_to = duct_deadline_to_ms_at(t->socks.slot[t->socks.head].reap_at, now);
+        if (wheel_to < to)
+            to = wheel_to;
+        if (to > duct_sock_band_drain_ms)
+            to = duct_sock_band_drain_ms;
+    }
+    return to;
 }
 
 bool duct_io_work_pending(void)
@@ -5535,7 +5761,7 @@ static void s_conn_detach(duct_io_t *t, duct_conn_t *conn)
 {
     duct_frame_rx_retry_discard(&t->frame_rx, conn);
     duct_conn_state_set(conn, fl_conn_closed);
-    s_hop_fd_retire(t, conn);
+    s_sock_wheel_drop_conn(t, s_conn_tag_word(conn));
     s_conn_deregister(t, conn);
     duct_conn_io_list_unlink(conn, t->route.thread_id);
 }

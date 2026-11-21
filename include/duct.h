@@ -594,6 +594,28 @@ typedef struct duct_rt_stats {
                                             spare socket and a fresh open both failed to
                                             connect, the leg staying on its current tuple
                                             until the next hop, all io threads. */
+             dgram_hop_wheel_give,    /**< Retired hop sockets the io thread's socket
+                                            wheel took in, all io threads. */
+             dgram_hop_wheel_reap,    /**< ...of those, reaped at a hold's end: the band
+                                            proven drained, the socket closed, all io
+                                            threads. */
+             dgram_hop_wheel_extend,  /**< ...of those, a reap pass that could not yet
+                                            prove the band landed, the hold extended,
+                                            all io threads. */
+             dgram_hop_wheel_forced,  /**< ...of those, closed ahead of the hold: the
+                                            wheel full and the oldest slot given up,
+                                            all io threads. */
+             dgram_hop_band_taken,    /**< Retired bands' datagrams the drain committed
+                                            into the conn's rx ring, all io threads. */
+             dgram_hop_band_stall,    /**< Drain passes the ring refused room to: the
+                                            band waits behind the live flow, all io
+                                            threads. */
+             dgram_hop_band_drop,     /**< Band datagrams dequeued whole and dropped:
+                                            each past the wire's bounds, all io
+                                            threads. */
+             dgram_hop_band_error,    /**< Drain reads that answered a socket error:
+                                            counted and stepped over, the queue
+                                            carrying on, all io threads. */
              dgram_shared_rx_drop,    /**< Classified datagrams for an x_udp_shared conn
                                             dropped: their inter_lane refused the
                                             reservation, or the descriptor size for their
@@ -699,6 +721,9 @@ typedef struct duct_rt_stats {
     apply(tx_drain_deduped) apply(wfq_push_full) apply(fence_push_full) apply(rx_full_latch)       \
     apply(io_loop_pass) apply(io_busy_spin) apply(io_busy_enter) apply(io_busy_exit)               \
     apply(dgram_tx_real_kick) apply(dgram_tx_real_kick_idle) apply(dgram_hop_swap_fail)            \
+    apply(dgram_hop_wheel_give) apply(dgram_hop_wheel_reap) apply(dgram_hop_wheel_extend)          \
+    apply(dgram_hop_wheel_forced) apply(dgram_hop_band_taken) apply(dgram_hop_band_stall)          \
+    apply(dgram_hop_band_drop) apply(dgram_hop_band_error)                                         \
     apply(dgram_shared_rx_drop)           \
     apply(dgram_rx_slot_route) apply(dgram_rx_slot_copy) apply(dgram_tx_batch_calls)              \
     apply(dgram_tx_batch_msgs) apply(dgram_tx_batch_max) apply(dgram_fast_sent)                    \

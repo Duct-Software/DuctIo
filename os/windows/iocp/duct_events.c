@@ -975,12 +975,13 @@ bool duct_events_watch(duct_events_env_t *env, duct_sock_t fd,
     return false;
 }
 
-bool duct_events_promote([[maybe_unused]] duct_events_env_t *env,
-                         [[maybe_unused]] duct_sock_t fd, void *tag_ptr)
+bool duct_events_promote(duct_events_env_t *env, duct_sock_t fd, void *tag_ptr)
 {
-    /* fd is already associated by duct_events_watch's io_tag_pre_conn
-     * case, dial or probe alike — just post the first WSARecv, same as a
-     * fresh io_tag_conn. */
+    duct_do_if(fd == duct_sock_bad, return false);
+    /* Already associated by duct_events_watch on the dial/probe path; a
+     * hopped-in socket was never watched and associates here first (s_iocp_assoc
+     * treats an existing association as success). */
+    duct_do_if(!s_iocp_assoc(env, fd), return false);
     duct_events_drive_rx(tag_ptr);
     return true;
 }

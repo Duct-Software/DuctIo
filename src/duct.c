@@ -770,6 +770,15 @@ bool duct_engine_stats(duct_engine_t *e, duct_rt_stats_t *out)
         out->io_busy_exit     += duct_atomic_load(&st->busy_exit, relaxed);
         out->dgram_tx_real_kick      += duct_atomic_load(&st->dgram_tx_real_kick, relaxed);
         out->dgram_tx_real_kick_idle += duct_atomic_load(&st->dgram_tx_real_kick_idle, relaxed);
+        out->dgram_hop_swap_fail     += duct_atomic_load(&st->dgram_hop_swap_fail, relaxed);
+        out->dgram_hop_wheel_give    += duct_atomic_load(&st->dgram_hop_wheel_give, relaxed);
+        out->dgram_hop_wheel_reap    += duct_atomic_load(&st->dgram_hop_wheel_reap, relaxed);
+        out->dgram_hop_wheel_extend  += duct_atomic_load(&st->dgram_hop_wheel_extend, relaxed);
+        out->dgram_hop_wheel_forced  += duct_atomic_load(&st->dgram_hop_wheel_forced, relaxed);
+        out->dgram_hop_band_taken    += duct_atomic_load(&st->dgram_hop_band_taken, relaxed);
+        out->dgram_hop_band_stall    += duct_atomic_load(&st->dgram_hop_band_stall, relaxed);
+        out->dgram_hop_band_drop     += duct_atomic_load(&st->dgram_hop_band_drop, relaxed);
+        out->dgram_hop_band_error    += duct_atomic_load(&st->dgram_hop_band_error, relaxed);
         out->dgram_shared_rx_drop    += duct_atomic_load(&st->dgram_shared_rx_drop, relaxed);
         out->dgram_rx_slot_route     += duct_atomic_load(&st->dgram_rx_slot_route, relaxed);
         out->dgram_rx_slot_copy      += duct_atomic_load(&st->dgram_rx_slot_copy, relaxed);
@@ -820,6 +829,14 @@ void duct_engine_stats_print(duct_engine_t *e, FILE *out, const char *tag)
                       / (double)st.dgram_tx_batch_calls
                 : 0.0,
             st.dgram_tx_batch_max);
+    /* Raw datagram totals of both lanes: what the workers handed over and what
+     * the sockets actually took, against the protocol's own volume. */
+    duct_log(out,
+            "%s: dgram sent fast=%" PRIu64 " staged=%" PRIu64 " lane=%" PRIu64
+            " batch_msgs=%" PRIu64 " gso=%" PRIu64 " rx=%" PRIu64 " gro=%" PRIu64,
+            tag,
+            st.dgram_fast_sent, st.dgram_lane_staged, st.dgram_lane_sent,
+            st.dgram_tx_batch_msgs, st.dgram_tx_gso_dgrams, taken, st.dgram_rx_gro_dgrams);
     duct_log(out,
             "%s: offload gso_writes=%" PRIu64 " gso_avg=%.2f"
             " gro_reads=%" PRIu64 " gro_avg=%.2f"
@@ -858,6 +875,15 @@ void duct_engine_stats_print(duct_engine_t *e, FILE *out, const char *tag)
             " vnet_rx=%" PRIu64 " vnet_tx=%" PRIu64,
             tag, st.dgram_shared_tx_drop, st.dgram_shared_rx_drop,
             st.defer_oom_drop, st.vnet_rx_drop, st.vnet_tx_drop);
+    duct_log(out,
+            "%s: hop swaps fail=%" PRIu64 " wheel give=%" PRIu64
+            " reap=%" PRIu64 " extend=%" PRIu64 " forced=%" PRIu64
+            " band taken=%" PRIu64 " stall=%" PRIu64 " drop=%" PRIu64 " error=%" PRIu64,
+            tag, st.dgram_hop_swap_fail, st.dgram_hop_wheel_give,
+            st.dgram_hop_wheel_reap, st.dgram_hop_wheel_extend,
+            st.dgram_hop_wheel_forced, st.dgram_hop_band_taken,
+            st.dgram_hop_band_stall, st.dgram_hop_band_drop,
+            st.dgram_hop_band_error);
     duct_log(out,
             "%s: backpressure commit_internal=%" PRIu64 " retry_saved=%" PRIu64
             " wfq_full=%" PRIu64 " inter_held=%" PRIu64
