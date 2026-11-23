@@ -293,9 +293,9 @@ void duct_events_drive_rx(void *tag)
             continue;
         }
         if (rc == rc_drop) {
-            /* Truncated datagram, already discarded by Winsock itself
-             * (WSAEMSGSIZE) — nothing to commit, keep draining. Reset rc
-             * so a stale rc_drop never reaches duct_io_rx_done below. */
+            /* A datagram longer than the buffer, already discarded by Winsock
+             * itself (WSAEMSGSIZE) — nothing to commit, keep draining. Reset
+             * rc so a stale rc_drop never reaches duct_io_rx_done below. */
             rc = rc_again;
             continue;
         }

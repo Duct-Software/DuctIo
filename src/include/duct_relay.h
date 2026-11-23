@@ -59,11 +59,11 @@ typedef struct duct_span          duct_span_t;
 #define duct_msg_post_io(X) duct_msg_sweep_io(X) X(attach_inter) X(dgram_tx_kick) X(rx_resume)
 
 /** @brief Types a worker ctrl stack accepts: its sweep kinds, @c pre_parse, which the worker returns
- *  to the trunk, and the plain @c conn_join, @c connect_error, @c connect_leg_error and @c timer_start.
+ *  to the trunk, and the plain @c conn_join, @c connect_error, @c leg_error and @c timer_start.
  */
 #define duct_msg_post_ctrl(X)                                             \
     duct_msg_sweep_ctrl(X) X(pre_parse) X(conn_join) X(connect_error)     \
-    X(connect_leg_error) X(timer_start) X(worker_post)
+    X(leg_error) X(timer_start) X(worker_post)
 /** @} */
 
 /** @brief Kind of a message on an io trunk or worker ctrl stack, stored in @c duct_msg_t::arg.
@@ -166,16 +166,17 @@ duct_nonnull(2) duct_result_t
 duct_worker_post_timer_start(unsigned worker_id, const duct_proto_t *proto, void *user_ctx,
                              uint64_t delay_us, uintptr_t arg);
 
-/** @brief Post a leg-dial failure on an already-live session —
- *  @c control.open_leg == @c leg_kind_connect.
+/** @brief Post a leg's error on an already-live session: a dial's failure
+ *  (@c control.open_leg == @c leg_kind_connect) or a live leg's wire refusing a
+ *  frame for its size (@c rc_frame_too_large).
  *
  *  Resolves @p h on @p worker_id and fires @c cfg->on_error(s, err, ...).
  *  No-op if @p h no longer resolves, e.g. session is closing/closed.
  */
 duct_nonnull(2) void
-duct_worker_post_connect_leg_error(unsigned worker_id,
-                                   const duct_session_handle_t *h,
-                                   duct_result_t err);
+duct_worker_post_leg_error(unsigned worker_id,
+                           const duct_session_handle_t *h,
+                           duct_result_t err);
 
 /** @brief Subscribe I/O thread @p io_id to a wake after its push to
  *  @p worker_id's normal WFQ lane hit lane-full.
@@ -689,13 +690,16 @@ duct_io_dgram_shared_send_batch(duct_listener_t *listener,
  *  TX ring, from the calling worker thread.
  *  The span runs from the published tail to the staging cursor. A run of
  *  equal-length records leaves as one segmented write where the stack cuts
- *  datagrams, a lone record through a plain send. Callable only while io has
+ *  datagrams, a lone record through a plain send. A record the path refuses
+ *  for its size counts as taken and the run sends on behind it, the refusal
+ *  reported to the conn's protocol once per call, through the same leg error
+ *  channel io's own drain reports it. Callable only while io has
  *  no published byte of that ring left to drain. The TX header's
  *  @c write_armed is io's, read relaxed, and @c conn->fd stays open until
  *  @ref duct_conn_teardown_worker, which for a bound conn runs at its
  *  worker's conn_lost consume.
- *  @param out_sent bytes of whole records taken, or refused as too large for
- *         the path, the prefix the caller settles with
+ *  @param out_sent bytes of whole records taken, sent or refused as too large
+ *         for the path, the prefix the caller settles with
  *         @ref duct_olb_tx_advance_worker.
  *  @param tally gains each segmented write and the datagrams it carried.
  *  Counts send declines and refusals in internal statistics.

@@ -596,6 +596,13 @@ duct_nonnull(1, 2) void duct_io_rx_commit_units(void *tag, const uint32_t *lens,
  */
 duct_nonnull(1) void duct_io_rx_done(void *tag, duct_result_t rc);
 
+/** @brief The wire refused a frame of @p tag's conn for its size: the verdict
+ *  a send or a queued error named. Tells the conn's protocol as
+ *  @c rc_frame_too_large, once per io drive, error event or read, never per
+ *  frame.
+ */
+duct_nonnull(1) void duct_io_frame_refused(void *tag);
+
 /** @brief Peek TX buffer content for @p tag's conn. */
 [[nodiscard]] duct_nonnull(1, 2) bool
 duct_io_tx_peek(void *tag, duct_io_xfer_t *out);
@@ -607,7 +614,10 @@ duct_io_tx_peek(void *tag, duct_io_xfer_t *out);
  *  call can consume more of the ring than @p p describes; peek again for
  *  remaining bytes.
  *
- *  @param out_rc what @ref duct_io_tx_done is to be given once the drive ends.
+ *  @param out_rc the drive's verdict, in and out: what @ref duct_io_tx_done
+ *          is to be given once the drive ends. It carries the last send's
+ *          answer, except that @c rc_drop, a frame the wire refused for its
+ *          size, stays over every later send of the drive.
  *  @return true to keep draining. False stops the drive, and @p out_rc
  *          separates the reasons: @c rc_ok is a stream short write, @c rc_again
  *          a socket out of room, @c rc_closed a stale @p tag, @c rc_fatal a
@@ -642,7 +652,8 @@ duct_io_tx_peek_recs(void *tag, duct_tx_rec_t *recs, unsigned max);
 duct_nonnull(1) void
 duct_io_tx_advance_records(void *tag, unsigned n);
 
-/** @brief End one TX-drive step for @p tag. */
+/** @brief End one TX-drive step for @p tag. @c rc_fatal closes the conn; @c rc_drop, a frame
+ *  of the drive the wire refused for its size, reports it once through @ref duct_io_frame_refused. */
 duct_nonnull(1) void duct_io_tx_done(void *tag, duct_result_t rc);
 
 /** @brief Record @p tag's conn write-interest state, @c fl_conn_write_armed

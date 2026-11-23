@@ -178,38 +178,37 @@ void duct_events_rx_stall([[maybe_unused]] duct_sock_t fd,
 void duct_events_drive_rx(void *tag)
 {
     duct_result_t rc = rc_again;
+    bool refused = false;
     duct_io_xfer_t r;
     while (duct_io_rx_reserve(tag, &r)) {
-        if (r.units > 1u) {
-            rc = duct_io_dgram_rx_units(tag, &r);
-            if (rc == rc_drop) {
-                /* A queued pmtu verdict the batch's call consumed: the
-                 * datagrams behind it are still queued, keep draining. */
-                rc = rc_again;
-                continue;
-            }
-            if (rc != rc_ok)
-                break;
-            continue;
-        }
         size_t nread = 0u,
                seg = 0u;
-        rc = duct_xread(r.fd, r.xport_type, (duct_view_u8){ .data = r.buf, .size = r.size },
-                             &nread, r.ctx, 0, &seg);
-        if (rc == rc_ok) {
+        rc = r.units > 1u
+           ? duct_io_dgram_rx_units(tag, &r)
+           : duct_xread(r.fd, r.xport_type, (duct_view_u8){ .data = r.buf, .size = r.size },
+                        &nread, r.ctx, 0, &seg);
+        if (r.units == 1u && rc == rc_ok) {
             duct_io_rx_commit(tag, nread, seg);
             continue;
         }
-        if (rc == rc_drop) {
-            /* Truncated datagram, already dequeued by recv() itself —
-             * nothing to commit, keep draining. Reset rc so a stale
-             * rc_drop never reaches duct_io_rx_done below. */
+        switch (rc) {
+        case rc_ok:
+            continue;
+        case rc_frame_too_large:
+            refused = true;
+            [[fallthrough]];
+        case rc_drop:
+            /* Queued EMSGSIZE or truncated datagram consumed; keep draining. */
             rc = rc_again;
             continue;
+        default:
+            break;
         }
         break;
     }
     duct_io_rx_done(tag, rc);
+    if (refused)
+        duct_io_frame_refused(tag);
 }
 
 void duct_events_drive_tx(void *tag)
@@ -222,7 +221,7 @@ void duct_events_drive_tx(void *tag)
             break;
     }
     duct_io_tx_write_armed_set(tag, filled);
-    duct_io_tx_done(tag, rc); /* no-op unless rc is rc_fatal */
+    duct_io_tx_done(tag, rc); /* reports a refused frame once; closes on rc_fatal */
 }
 
 bool duct_events_watch(duct_events_env_t *env, duct_sock_t fd,

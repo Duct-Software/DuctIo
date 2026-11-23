@@ -623,6 +623,15 @@ bool duct_sessions_post_conn_join(duct_conn_t *conn,
                                   const duct_peer_t *peer,
                                   duct_seal_prefix_t tx_prefix);
 
+/** @brief Dialed-leg variant of @ref duct_sessions_post_conn_join: a pre-join
+ *  exit before @c on_conn_join reports its verdict to the session's @c on_error.
+ */
+bool duct_sessions_post_dial_join(duct_conn_t *conn,
+                                  duct_session_handle_t tok,
+                                  duct_conn_id_t conn_id,
+                                  const duct_peer_t *peer,
+                                  duct_seal_prefix_t tx_prefix);
+
 /* Direct control — internal backing for the declarative control.* fields
  * the worker's ctl-apply step executes. */
 
@@ -822,14 +831,16 @@ duct_msg_chain_decl(duct_msg_session_open,
 /** @brief Conn-join node.
  *  Attaches a new leg to an existing session. A dialed leg's node carries the
  *  prefix its dial declared in @c tx_prefix, which the joined conn's codec takes
- *  as it is built; every other join carries none.
+ *  as it is built, and @c on_fail to report pre-join failures; every other join
+ *  carries neither.
  */
 duct_msg_chain_decl(duct_msg_conn_join,
     duct_conn_handle_t    conn;
     duct_conn_id_t        conn_id;
     duct_session_handle_t tok;
     duct_peer_t           peer;
-    duct_seal_prefix_t      tx_prefix);
+    duct_seal_prefix_t    tx_prefix;
+    void                (*on_fail)(duct_session_t *, duct_result_t));
 
 /** @brief Conn-lost fence node.
  *

@@ -634,14 +634,17 @@ static int s_tx_post_records(void *tag, const duct_io_xfer_t *p, iocp_op_t *op)
  * synchronous success still completes through the port, so the chain continues
  * from s_on_tx_completion, or s_on_tx_records_completion for an x_udp_peer
  * send, and that is also where an in-flight send's duct_olb_io_done lands. A
- * send that failed outright pairs it here. */
-void duct_events_drive_tx(void *tag)
+ * send that failed outright pairs it here.
+ * @return true once the turn stepped over a record the wire refused for its
+ *         size, which the drive reports once. */
+static bool s_tx_turn(void *tag)
 {
     duct_io_xfer_t p;
+    bool refused = false;
     /* nothing to send, if respond-then-close is already handled, or stale tag */
     while (duct_io_tx_peek(tag, &p)) {
         if (duct_olb_io_begin(p.olb_hdr))
-            return; /* a send is already in flight */
+            break; /* a send is already in flight */
         auto conn = duct_conn_of_olb_tx(p.olb_hdr);
         duct_conn_ref_take(conn);
         auto op = (iocp_op_t *)p.olb_hdr->ext;
@@ -649,7 +652,7 @@ void duct_events_drive_tx(void *tag)
                                              : s_tx_post_stream(tag, &p, op);
         switch (err) {
         case NO_ERROR:
-            return;
+            return refused;
         case WSAEMSGSIZE: {
             size_t drop_len = 0u;
             for (unsigned i = 0u; i < p.iov_n; ++i)
@@ -658,8 +661,9 @@ void duct_events_drive_tx(void *tag)
             duct_olb_io_done(p.olb_hdr, conn);
             if (!duct_xport_delimited(p.xport_type)) {
                 duct_io_tx_done(tag, rc_fatal);
-                return;
+                return false;
             }
+            refused = true;
             duct_discard duct_io_tx_advance(tag, drop_len, drop_len);
             continue;
         }
@@ -667,9 +671,16 @@ void duct_events_drive_tx(void *tag)
             duct_dbg_errf("WSA error %d", err);
             duct_olb_io_done(p.olb_hdr, conn);
             duct_io_tx_done(tag, rc_fatal);
-            return;
+            return false;
         }
     }
+    return refused;
+}
+
+void duct_events_drive_tx(void *tag)
+{
+    if (s_tx_turn(tag))
+        duct_io_frame_refused(tag);
 }
 
 /** @brief Post @c AcceptEx for @p ctx's listener.

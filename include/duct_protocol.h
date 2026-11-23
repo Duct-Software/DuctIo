@@ -456,6 +456,9 @@ typedef void (*duct_session_close_fn)(duct_session_t *s,
  *  @c leg_kind_connect dial failure is the ordinary form by contrast: @p s is
  *  the live session the leg was meant to join, @p proto_state its real
  *  state, and @p out's control effects apply.
+ *
+ *  A datagram leg whose socket refused a frame for size reports
+ *  @c rc_frame_too_large while the conn stands.
  */
 typedef duct_result_t (*duct_error_fn)(duct_session_t *s,
                                        duct_result_t error,

@@ -524,11 +524,27 @@ static void s_connect_error(const duct_wfq_route_t *route,
         if (!target)
             return;
         auto worker_id = (unsigned)target->worker_id;
-        duct_worker_post_connect_leg_error(worker_id, DUCT_CAST(duct_session_handle_t, word, &seed.leg.hsession), err);
+        duct_worker_post_leg_error(worker_id, DUCT_CAST(duct_session_handle_t, word, &seed.leg.hsession), err);
         return;
     }
     duct_worker_post_connect_error(route->thread_id % route->n_workers,
                                    seed.proto, seed.user_ctx, err);
+}
+
+/** @brief Report @c rc_frame_too_large once per drive or error event to @p conn's protocol. */
+static void s_frame_refused(duct_conn_t *conn)
+{
+    auto tok = duct_atomic_load(&conn->session_token, acquire);
+    duct_do_if(!duct_xport_delimited(conn->xport_type) || tok == handle_null, return);
+    auto h = (duct_session_handle_t){ .word = tok };
+    duct_worker_post_leg_error(conn->worker_id, &h, rc_frame_too_large);
+}
+
+void duct_io_frame_refused(void *tag)
+{
+    auto conn = s_conn_from_tag(tag);
+    duct_do_if(!conn, return);
+    s_frame_refused(conn);
 }
 
 /** @brief Bind @p conn's wire and join it to @p seed's target — a leg's
@@ -550,7 +566,7 @@ static bool s_connect_ok(duct_conn_t *conn, duct_conn_intent_t seed)
             return false;
         }
         conn->worker_id = (uint32_t)target->worker_id;
-        if (duct_sessions_post_conn_join(conn, leg_tok, seed.leg.conn_id, &(duct_peer_t){},
+        if (duct_sessions_post_dial_join(conn, leg_tok, seed.leg.conn_id, &(duct_peer_t){},
                                          seed.tx_prefix))
             return true;
         duct_io_conn_close(conn, close_internal_error);
@@ -3751,6 +3767,31 @@ void duct_io_tx_advance_records(void *tag, unsigned n)
 DUCT_XSEND_GROUPED_DECLARE(s_peer_send_grouped, duct_dgram_out_t)
 DUCT_XSEND_GROUPED_DECLARE(s_rec_send_grouped, duct_tx_rec_t)
 
+/** @brief Fold one send's @p rc into @p out_rc, the verdict of the drive it belongs to.
+ *  A frame the wire refused for its size is stepped over and the drive goes on;
+ *  the refusal stays in @p out_rc until the drive ends, where @ref duct_io_tx_done
+ *  reports it once, and only a failure that ends the drive speaks over it.
+ *  @return true while the drive goes on. */
+static bool s_tx_answer(duct_result_t *out_rc, duct_result_t rc)
+{
+    switch (rc) {
+    case rc_ok:
+        if (*out_rc != rc_drop)
+            *out_rc = rc_ok;
+        return true;
+    case rc_drop:
+        *out_rc = rc_drop;
+        return true;
+    case rc_again:
+        if (*out_rc != rc_drop)
+            *out_rc = rc_again;
+        return false;
+    default:
+        *out_rc = rc;
+        return false;
+    }
+}
+
 /** @brief Ship the records queued behind @p conn's head in one pass.
  *
  *  Only a connected per-peer socket qualifies: the batch carries no
@@ -3758,14 +3799,14 @@ DUCT_XSEND_GROUPED_DECLARE(s_rec_send_grouped, duct_tx_rec_t)
  *  record boundaries to send on. A single record declines too, leaving the
  *  caller's one-record path to handle it without a second ring walk.
  *
- *  @param out_rc untouched unless this call took the batch. @c rc_drop from the
- *         send names the head record as one the path never carries: it is
- *         stepped over here and reported as @c rc_ok, matching what the
- *         one-record path does with the same verdict.
+ *  @param rc the send's answer, once this call took the batch. @c rc_drop names
+ *         the head record as one the path never carries: it is stepped over
+ *         here, as the one-record path steps over its own, and it stays for
+ *         the caller to keep.
  *  @return true once this call took the batch, whatever the send answered.
  */
 static bool s_tx_send_batch(duct_conn_t *conn, const duct_io_xfer_t *p,
-                            duct_result_t *out_rc)
+                            duct_result_t *rc)
 {
     switch (p->xport_type) {
     case x_udp_peer:
@@ -3781,22 +3822,21 @@ static bool s_tx_send_batch(duct_conn_t *conn, const duct_io_xfer_t *p,
     bool gso = !duct_has(duct_conn_state(conn), fl_conn_gso_off);
     unsigned sent = 0u;
     duct_x_gso_tally_t tally = {};
-    *out_rc = s_rec_send_grouped(p->fd, recs, n, &sent, &tally, &gso);
+    *rc = s_rec_send_grouped(p->fd, recs, n, &sent, &tally, &gso);
     if (!gso)
         duct_conn_state_set(conn, fl_conn_gso_off);
     s_rtstat_gso(tally);
     for (unsigned i = 0u; i < sent; ++i)
         duct_discard s_tx_advance(conn, duct_x_dgram_len_rec(&recs[i]),
                                   duct_x_dgram_len_rec(&recs[i]));
-    switch (*out_rc) {
+    switch (*rc) {
     case rc_ok:
         if (sent < n)
-            *out_rc = rc_again;
+            *rc = rc_again;
         break;
     case rc_drop: {
-        size_t len = duct_x_dgram_len_rec(&recs[0]);
+        size_t len = duct_x_dgram_len_rec(&recs[sent]);
         duct_discard s_tx_advance(conn, len, len);
-        *out_rc = rc_ok;
         break;
     }
     default:
@@ -3813,8 +3853,9 @@ bool duct_io_tx_send(void *tag, const duct_io_xfer_t *p, duct_result_t *out_rc)
         *out_rc = rc_closed;
         return false
     );
-    if (s_tx_send_batch(conn, p, out_rc))
-        return *out_rc == rc_ok;
+    duct_result_t rc;
+    if (s_tx_send_batch(conn, p, &rc))
+        return s_tx_answer(out_rc, rc);
     size_t nwritten = 0u,
            offered = 0u;
     for (unsigned i = 0u; i < p->iov_n; ++i)
@@ -3843,29 +3884,47 @@ bool duct_io_tx_send(void *tag, const duct_io_xfer_t *p, duct_result_t *out_rc)
              * edge needs a readiness transition an idle socket never gives),
              * and the lowat follow would never step again. */
             offered = cap;
-            *out_rc = duct_xwritev(p->fd, p->xport_type, cut, m, &nwritten, flags);
+            rc = duct_xwritev(p->fd, p->xport_type, cut, m, &nwritten, flags);
             goto advance;
         }
     }
-    *out_rc = duct_xwritev(p->fd, p->xport_type, p->iov, p->iov_n, &nwritten, flags);
+    rc = duct_xwritev(p->fd, p->xport_type, p->iov, p->iov_n, &nwritten, flags);
 advance:
-    switch (*out_rc) {
-    case rc_ok:
-        return s_tx_advance(conn, offered, nwritten);
+    switch (rc) {
+    case rc_ok: {
+        /* Whole or short, the send went: the cursor steps, and a refusal the
+         * drive met stays for the drive's end. */
+        bool go_on = s_tx_advance(conn, offered, nwritten);
+        duct_discard s_tx_answer(out_rc, rc);
+        return go_on;
+    }
     case rc_drop:
-        return s_tx_advance(conn, offered, offered);
+        duct_discard s_tx_advance(conn, offered, offered);
+        return s_tx_answer(out_rc, rc);
     default:
-        return false;
+        return s_tx_answer(out_rc, rc);
     }
 }
 
 void duct_io_tx_done(void *tag, duct_result_t rc)
 {
-    if (rc != rc_fatal)
-        return;
-    auto conn = s_conn_from_tag(tag);
-    duct_do_if(!conn, return);
-    s_conn_close(s_io_this, conn, close_io_error);
+    switch (rc) {
+    case rc_drop: {
+        auto conn = s_conn_from_tag(tag);
+        duct_do_if(!conn, return);
+        /* A drive that refused a frame for its size tells of it here, once. */
+        s_frame_refused(conn);
+        break;
+    }
+    case rc_fatal: {
+        auto conn = s_conn_from_tag(tag);
+        duct_do_if(!conn, return);
+        s_conn_close(s_io_this, conn, close_io_error);
+        break;
+    }
+    default:
+        break;
+    }
 }
 
 void duct_io_tx_write_armed_set(void *tag, bool armed)
@@ -4522,25 +4581,36 @@ duct_result_t duct_io_udp_peer_send_staged(duct_conn_t *conn, size_t *out_sent,
     unsigned n = duct_olb_tx_peek_staged_recs(tx, recs, duct_dgram_tx_batch);
     if (!n)
         return rc_again;
-    unsigned sent = 0u;
-    duct_result_t rc;
-    /* A lone record takes the plain send io's own one-record drain makes. */
-    if (n == 1u) {
-        sent = 0u;
-        rc = duct_xsend_plain(conn->fd, recs, 1u, &sent);
-    } else {
-        bool gso = !duct_has(duct_conn_state(conn), fl_conn_gso_off);
-        rc = s_rec_send_grouped(conn->fd, recs, n, &sent, tally, &gso);
-        if (!gso)
-            duct_conn_state_set(conn, fl_conn_gso_off);
+    unsigned taken = 0u;
+    bool refused = false;
+    duct_result_t rc = rc_ok;
+    while (taken < n) {
+        unsigned sent = 0u;
+        /* A lone record takes the plain send io's own one-record drain makes. */
+        if (n - taken == 1u) {
+            rc = duct_xsend_plain(conn->fd, &recs[taken], 1u, &sent);
+        } else {
+            bool gso = !duct_has(duct_conn_state(conn), fl_conn_gso_off);
+            rc = s_rec_send_grouped(conn->fd, &recs[taken], n - taken, &sent, tally, &gso);
+            if (!gso)
+                duct_conn_state_set(conn, fl_conn_gso_off);
+        }
+        for (unsigned i = taken; i < taken + sent; ++i)
+            *out_sent += duct_x_dgram_len_rec(&recs[i]);
+        taken += sent;
+        if (rc != rc_drop)
+            break;
+        /* The head record is one the path will never carry: it counts as
+         * taken, the rest of the run sends on behind it, and the train's
+         * refusal is reported once below. */
+        *out_sent += duct_x_dgram_len_rec(&recs[taken]);
+        ++taken;
+        refused = true;
     }
-    /* rc_drop names the first record, too large for the path: step over it. */
-    if (rc == rc_drop)
-        sent = 1u;
-    for (unsigned i = 0u; i < sent; ++i)
-        *out_sent += duct_x_dgram_len_rec(&recs[i]);
-    if (rc == rc_drop || (rc == rc_ok && sent == n))
-        return rc == rc_drop ? rc_ok : rc;
+    if (refused)
+        s_frame_refused(conn);
+    if (taken == n)
+        return rc_ok;
 #if DUCT_RUNTIME_STATS
     duct_worker_rtstat_fast_miss(false);
 #endif
@@ -5592,15 +5662,8 @@ void duct_io_on_event(duct_io_event_t *ev)
     auto conn = s_conn_from_tag(ev->ptr);
     duct_do_if(!conn, return);
     if (duct_has(ev->flags, duct_or(io_ev_error, io_ev_hup))) {
-        /* A datagram conn's socket error is one frame's refusal: the pmtu
-         * verdict on a frame sent with DONTFRAG, or the kernel out of buffer
-         * space this instant. Neither kills the conn — the send path already
-         * drops the frame and moves on. SO_ERROR is read here, which clears
-         * it; a read that raced us took it, and it reads 0. A hup beside the
-         * error means nothing else for a datagram conn. Any other error ends
-         * the conn. A conn that stands goes on to drain: kqueue's conn
-         * filters are edge-triggered, and a swallow that skipped the reads
-         * would leave the queue unread. */
+        /* Consume queued EMSGSIZE / transient send errors on datagram sockets
+         * without closing, and continue draining edge-triggered queues. */
         int err = 0;
         socklen_t err_len = sizeof err;
         bool stands =
@@ -5615,6 +5678,8 @@ void duct_io_on_event(duct_io_event_t *ev)
             s_conn_close(t, conn, close_io_error);
             return;
         }
+        if (err == EMSGSIZE)
+            s_frame_refused(conn);
     }
     if (conn->xport_type == x_inter && duct_conn_device_ops(conn)) {
         s_device_drive(conn);

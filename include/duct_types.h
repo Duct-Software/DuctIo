@@ -109,6 +109,8 @@ typedef enum duct_result : int {
     rc_conn_refused,      /**< Outbound connect: peer rejected the connection. */
     rc_conn_timeout,      /**< Outbound connect: no completion before @c connect_timeout_ms. */
     rc_timeout,           /**< Caller's bounded wait expired; the posted op still runs. */
+    rc_frame_too_large,   /**< Datagram wire refused a frame for its size. Reported through
+                               @c on_error; the conn stands. */
 
     /** @note Additional result codes must be placed here. */
     rc_count

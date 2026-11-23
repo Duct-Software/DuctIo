@@ -463,11 +463,9 @@ duct_xread(int fd, duct_xport_t t, duct_view_u8 dst, size_t *out_read, void *ctx
         case EAGAIN:
             return rc_again;
         case EMSGSIZE:
-            /* A queued pmtu verdict, consumed by the read itself: the frame
-             * it names is long gone — a drop, the send path's answer to the
-             * same code. Datagram reads alone; no stream carries it. */
+            /* Queued EMSGSIZE consumed by recv; report size refusal on datagrams. */
             if (t == x_udp || t == x_udp_peer)
-                return rc_drop;
+                return rc_frame_too_large;
             [[fallthrough]];
         default:
             duct_dbg_errf("errno %d", errno);
@@ -847,7 +845,8 @@ duct_xsend_recs(int fd, const duct_tx_rec_t *recs, unsigned n, unsigned *out_sen
  *  its entry.
  *
  *  @return @c rc_ok with @p out_n >= 1; @c rc_again when the socket is empty;
- *  @c rc_fatal otherwise. @p out_n < @p n means the socket ran dry mid-batch.
+ *  @c rc_frame_too_large on queued @c EMSGSIZE; @c rc_fatal otherwise.
+ *  @p out_n < @p n means the socket ran dry mid-batch.
  */
 duct_nonnull(2, 6, 8) static inline duct_result_t
 duct_xrecv_peers(int fd, const duct_view_u8 *bufs, uint32_t n,
@@ -877,9 +876,8 @@ duct_xrecv_peers(int fd, const duct_view_u8 *bufs, uint32_t n,
         case EAGAIN:
             return rc_again;
         case EMSGSIZE:
-            /* A queued pmtu verdict, consumed by the batch's own call —
-             * a drop; the next event drains the datagrams behind it. */
-            return rc_drop;
+            /* Queued EMSGSIZE consumed by recv; datagrams behind it wait for next read. */
+            return rc_frame_too_large;
         default:
             duct_dbg_errf("errno %d", errno);
             return rc_fatal;

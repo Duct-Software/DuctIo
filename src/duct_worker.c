@@ -7138,7 +7138,7 @@ static void s_ctl_apply_now(duct_session_t *s, const duct_response_t *out)
      * nothing to the author: a declaration the session cannot honour is logged
      * by s_leg_refused and absorbed, the author having no move to make on it.
      * A dial already in flight is the exception, reaching on_error through
-     * s_msg_exec_connect_leg_error — that failure is the peer's, and retry or
+     * s_msg_exec_leg_error — that failure is the peer's, and retry or
      * fallback is the author's. */
     auto leg = &out->control.open_leg;
     duct_result_t rc = rc_ok;
@@ -8146,19 +8146,20 @@ void duct_worker_post_connect_error(unsigned worker_id, const duct_proto_t *prot
         duct_msg_done(m);
 }
 
-/** @brief Live-session leg-dial failure payload.
+/** @brief Live-session leg error payload: a leg dial's failure, or a standing
+ *  leg's wire refusing a frame for its size.
  *  The session already exists and is resolved by token, same as any other
  *  cross-thread session ctrl message; @see duct_msg_connect_error for the
  *  shape carrying a dial that never reached one.
  */
-duct_msg_chain_decl(duct_msg_connect_leg_error,
+duct_msg_chain_decl(duct_msg_leg_error,
     duct_handle_t tok;
     duct_result_t err;
 );
 
-static duct_exec_rc_t s_msg_exec_connect_leg_error(void *self)
+static duct_exec_rc_t s_msg_exec_leg_error(void *self)
 {
-    auto m = (duct_msg_connect_leg_error *)self;
+    auto m = (duct_msg_leg_error *)self;
     auto stok = (duct_session_handle_t){ .word = m->tok };
     auto s = duct_session_attached_by_handle(stok);
     if (s && s->proto)
@@ -8166,13 +8167,13 @@ static duct_exec_rc_t s_msg_exec_connect_leg_error(void *self)
     return duct_msg_done(m);
 }
 
-void duct_worker_post_connect_leg_error(unsigned worker_id, 
-                                        const duct_session_handle_t *h,
-                                        duct_result_t err)
+void duct_worker_post_leg_error(unsigned worker_id,
+                                const duct_session_handle_t *h,
+                                duct_result_t err)
 {
-    auto m = duct_msg_new(duct_msg_connect_leg_error,
-                                                        s_msg_exec_connect_leg_error,
-                                                        nullptr);
+    auto m = duct_msg_new(duct_msg_leg_error,
+                          s_msg_exec_leg_error,
+                          nullptr);
     duct_do_if(!m, return);
     m->tok = h->word;
     m->err = err;

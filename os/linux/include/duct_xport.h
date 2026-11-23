@@ -631,6 +631,7 @@ duct_xsend_bufs(int fd, const duct_view_u8 *bufs, unsigned n, unsigned *out_sent
  *  @return @c rc_ok with @p out_read set, 0 for an empty datagram or packet;
  *          @c rc_again on would-block; @c rc_closed for a zero-length read on
  *          any transport but a datagram or packet one; @c rc_drop as above;
+ *          @c rc_frame_too_large on queued @c EMSGSIZE on datagram reads;
  *          @c rc_fatal on any other failure; @c rc_invalid_arg for @c x_udp
  *          without @p ctx and for a transport with no descriptor of its own.
  *          @p out_read is 0 on every outcome but @c rc_ok.
@@ -723,11 +724,9 @@ duct_xread(int fd, duct_xport_t t, duct_view_u8 dst, size_t *out_read, void *ctx
 #endif
             return rc_again;
         case EMSGSIZE:
-            /* A queued pmtu verdict, consumed by the read itself: the frame
-             * it names is long gone — a drop, the send path's answer to the
-             * same code. Datagram reads alone; no stream carries it. */
+            /* Queued EMSGSIZE consumed by recv; report size refusal on datagrams. */
             if (t == x_udp || t == x_udp_peer)
-                return rc_drop;
+                return rc_frame_too_large;
             [[fallthrough]];
         default:
             duct_dbg_errf("errno %d", errno);
@@ -1310,7 +1309,8 @@ duct_xsend_peers(int fd, const duct_dgram_out_t *msgs_in, unsigned n, unsigned *
  *  kernel handed back.
  *
  *  @return @c rc_ok with @p out_n >= 1; @c rc_again when the socket is empty;
- *  @c rc_fatal otherwise. @p out_n < @p n means the socket ran dry mid-batch.
+ *  @c rc_frame_too_large on queued @c EMSGSIZE; @c rc_fatal otherwise.
+ *  @p out_n < @p n means the socket ran dry mid-batch.
  */
 duct_nonnull(2, 6, 8) static inline duct_result_t
 duct_xrecv_peers(int fd, const duct_view_u8 *bufs, uint32_t n,
@@ -1352,9 +1352,8 @@ duct_xrecv_peers(int fd, const duct_view_u8 *bufs, uint32_t n,
 #endif
             return rc_again;
         case EMSGSIZE:
-            /* A queued pmtu verdict, consumed by the batch's own call —
-             * a drop; the next event drains the datagrams behind it. */
-            return rc_drop;
+            /* Queued EMSGSIZE consumed by recv; datagrams behind it wait for next read. */
+            return rc_frame_too_large;
         default:
             duct_dbg_errf("errno %d", errno);
             return rc_fatal;

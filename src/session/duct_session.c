@@ -86,6 +86,22 @@ void duct_session_dial_lost(const duct_proto_cfg_t *cfg, void *user_ctx, duct_re
     duct_discard cfg->on_error(nullptr, rc, &out, user_ctx);
 }
 
+/** @brief Report a dialed leg that exited before @c on_conn_join to @p s's @c on_error. */
+static void s_dial_leg_error(duct_session_t *s, duct_result_t rc)
+{
+    auto cfg = s->proto ? duct_proto_cfg_of(s->proto) : nullptr;
+    if (!cfg || !cfg->on_error)
+        return;
+    duct_response_t out;
+    duct_response_reset(&out);
+    auto erc = cfg->on_error(s, rc, &out, s->proto_state);
+    duct_response_release_owned(&out);
+    if (erc == rc_ok) {
+        duct_response_t ctl = { .control = out.control };
+        duct_response_commit(s, 0u, duct_stream_id_default, &ctl);
+    }
+}
+
 /** @brief Bring a leg just bound to @p s into service: its lane armed, its codec
  *  started with the dial's @p prefix, its handshake bounded.
  *  @return false when no codec of the conn takes @p prefix; the bound is then
@@ -213,12 +229,20 @@ duct_exec_rc_t duct_session_exec_conn_join(void *self)
 {
     auto msg = (duct_msg_conn_join *)self;
     auto conn = s_unbound_conn(msg->conn);
-    if (!conn)
+    if (!conn) {
+        if (msg->on_fail) {
+            auto s = duct_session_attached_by_handle(msg->tok);
+            if (s)
+                msg->on_fail(s, rc_closed);
+        }
         return duct_msg_done(msg);
+    }
     auto s = duct_session_attached_by_handle(msg->tok);
     if (!s || msg->conn_id >= duct_session_max_legs || duct_session_conn_at(s, msg->conn_id).word) {
         /* Stale/closing token or occupied slot: no leg was ever prepared for
          * this conn. */
+        if (s && msg->on_fail)
+            msg->on_fail(s, rc_invalid_order);
         s_worker_retire_pre_open(conn);
         duct_conn_release(conn);
         return duct_msg_done(msg);
@@ -239,6 +263,8 @@ duct_exec_rc_t duct_session_exec_conn_join(void *self)
             return exec_defer;
     }
     if (duct_session_attach_conn(s, msg->conn_id, msg->conn) != rc_ok) {
+        if (msg->on_fail)
+            msg->on_fail(s, rc_invalid_order);
         s_worker_retire_pre_open(conn);
         duct_conn_release(conn);
         return duct_msg_done(msg);
@@ -246,12 +272,16 @@ duct_exec_rc_t duct_session_exec_conn_join(void *self)
     auto tok = duct_session_handle_from_live(s);
     if (!duct_conn_session_bind(conn, tok.word)) {
         duct_discard duct_session_detach_leg(s, msg->conn_id, close_internal_error);
+        if (msg->on_fail)
+            msg->on_fail(s, rc_closed);
         s_worker_retire_pre_open(conn);
         duct_conn_release(conn);
         return duct_msg_done(msg);
     }
     if (!s_conn_start(s, conn, &msg->tx_prefix)) {
         s_refuse_leg(s, msg->conn_id, &msg->conn);
+        if (msg->on_fail)
+            msg->on_fail(s, rc_invalid_arg);
         return duct_msg_done(msg);
     }
 
@@ -378,11 +408,12 @@ bool duct_sessions_post_session_open(duct_conn_t *conn,
     return s_post_ctrl(conn, duct_msg_ctrl_root(msg));
 }
 
-bool duct_sessions_post_conn_join(duct_conn_t *conn,
-                                  duct_session_handle_t tok,
-                                  duct_conn_id_t conn_id,
-                                  const duct_peer_t *peer,
-                                  duct_seal_prefix_t tx_prefix)
+static bool s_post_conn_join(duct_conn_t *conn,
+                             duct_session_handle_t tok,
+                             duct_conn_id_t conn_id,
+                             const duct_peer_t *peer,
+                             duct_seal_prefix_t tx_prefix,
+                             void (*on_fail)(duct_session_t *, duct_result_t))
 {
     auto msg = duct_msg_new(duct_msg_conn_join, duct_session_exec_conn_join, nullptr);
     if (!msg)
@@ -392,7 +423,26 @@ bool duct_sessions_post_conn_join(duct_conn_t *conn,
     msg->tok = tok;
     msg->peer = peer ? *peer : (duct_peer_t){};
     msg->tx_prefix = tx_prefix;
+    msg->on_fail = on_fail;
     return s_post_ctrl(conn, duct_msg_ctrl_root(msg));
+}
+
+bool duct_sessions_post_conn_join(duct_conn_t *conn,
+                                  duct_session_handle_t tok,
+                                  duct_conn_id_t conn_id,
+                                  const duct_peer_t *peer,
+                                  duct_seal_prefix_t tx_prefix)
+{
+    return s_post_conn_join(conn, tok, conn_id, peer, tx_prefix, nullptr);
+}
+
+bool duct_sessions_post_dial_join(duct_conn_t *conn,
+                                  duct_session_handle_t tok,
+                                  duct_conn_id_t conn_id,
+                                  const duct_peer_t *peer,
+                                  duct_seal_prefix_t tx_prefix)
+{
+    return s_post_conn_join(conn, tok, conn_id, peer, tx_prefix, s_dial_leg_error);
 }
 
 /** @brief Stream-slot find/insert by id within the carved table's matching
