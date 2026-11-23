@@ -722,6 +722,13 @@ duct_xread(int fd, duct_xport_t t, duct_view_u8 dst, size_t *out_read, void *ctx
         case EWOULDBLOCK:
 #endif
             return rc_again;
+        case EMSGSIZE:
+            /* A queued pmtu verdict, consumed by the read itself: the frame
+             * it names is long gone — a drop, the send path's answer to the
+             * same code. Datagram reads alone; no stream carries it. */
+            if (t == x_udp || t == x_udp_peer)
+                return rc_drop;
+            [[fallthrough]];
         default:
             duct_dbg_errf("errno %d", errno);
             return rc_fatal;
@@ -1344,6 +1351,10 @@ duct_xrecv_peers(int fd, const duct_view_u8 *bufs, uint32_t n,
         case EWOULDBLOCK:
 #endif
             return rc_again;
+        case EMSGSIZE:
+            /* A queued pmtu verdict, consumed by the batch's own call —
+             * a drop; the next event drains the datagrams behind it. */
+            return rc_drop;
         default:
             duct_dbg_errf("errno %d", errno);
             return rc_fatal;

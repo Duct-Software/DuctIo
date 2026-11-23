@@ -182,6 +182,12 @@ void duct_events_drive_rx(void *tag)
     while (duct_io_rx_reserve(tag, &r)) {
         if (r.units > 1u) {
             rc = duct_io_dgram_rx_units(tag, &r);
+            if (rc == rc_drop) {
+                /* A queued pmtu verdict the batch's call consumed: the
+                 * datagrams behind it are still queued, keep draining. */
+                rc = rc_again;
+                continue;
+            }
             if (rc != rc_ok)
                 break;
             continue;

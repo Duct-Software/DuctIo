@@ -5592,27 +5592,29 @@ void duct_io_on_event(duct_io_event_t *ev)
     auto conn = s_conn_from_tag(ev->ptr);
     duct_do_if(!conn, return);
     if (duct_has(ev->flags, duct_or(io_ev_error, io_ev_hup))) {
-        /* A datagram conn's socket error is one send's errno — the pmtu
-         * verdict on a frame sent with DONTFRAG, or the kernel out of
-         * buffer space this instant. The send path survives both, and so
-         * does this side: the error is read off the socket (the reading
-         * clears it) and the conn stands, the frame's drop being what the
-         * wire wants. A hup beside the error is the same verdict seen
-         * from a kqueue's write filter; a datagram conn has no peer
-         * close for it to mean. Every other error — a refused port, a
-         * dead route — ends the conn, its errno named in one line. */
+        /* A datagram conn's socket error is one frame's refusal: the pmtu
+         * verdict on a frame sent with DONTFRAG, or the kernel out of buffer
+         * space this instant. Neither kills the conn — the send path already
+         * drops the frame and moves on. SO_ERROR is read here, which clears
+         * it; a read that raced us took it, and it reads 0. A hup beside the
+         * error means nothing else for a datagram conn. Any other error ends
+         * the conn. A conn that stands goes on to drain: kqueue's conn
+         * filters are edge-triggered, and a swallow that skipped the reads
+         * would leave the queue unread. */
         int err = 0;
         socklen_t err_len = sizeof err;
-        if (duct_xport_delimited(conn->xport_type)
+        bool stands =
+            duct_xport_delimited(conn->xport_type)
             && duct_has(ev->flags, io_ev_error)
             && getsockopt(conn->fd, SOL_SOCKET, SO_ERROR,
-                          (char *)&err, &err_len) == 0) {
-            if (err == EMSGSIZE || duct_x_send_retryable(err))
-                return;
-            duct_log_err(stderr, err, "duct: datagram conn ends on its socket error");
+                          (char *)&err, &err_len) == 0
+            && (err == 0 || err == EMSGSIZE || duct_x_send_retryable(err));
+        if (!stands) {
+            if (err)
+                duct_log_err(stderr, err, "duct: datagram conn ends on its socket error");
+            s_conn_close(t, conn, close_io_error);
+            return;
         }
-        s_conn_close(t, conn, close_io_error);
-        return;
     }
     if (conn->xport_type == x_inter && duct_conn_device_ops(conn)) {
         s_device_drive(conn);
