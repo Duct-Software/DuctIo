@@ -5592,6 +5592,21 @@ void duct_io_on_event(duct_io_event_t *ev)
     auto conn = s_conn_from_tag(ev->ptr);
     duct_do_if(!conn, return);
     if (duct_has(ev->flags, duct_or(io_ev_error, io_ev_hup))) {
+        /* A datagram socket that asks the wire not to fragment meets the path's
+         * refusal as a queued EMSGSIZE — the ICMP verdict on one frame it
+         * already sent, a fact the pmtu ladder wants and not a lost transport.
+         * Reading SO_ERROR takes it off the socket so the wheel stops seeing
+         * it, and the frame's drop is what the wire wants, the same silence
+         * Winsock is told to keep for the condition. Every other error — a
+         * refused port, a dead route — still ends the conn, and so does a
+         * hangup the error does not explain. */
+        int err = 0;
+        socklen_t err_len = sizeof err;
+        if (duct_xport_delimited(conn->xport_type)
+            && duct_has(ev->flags, io_ev_error) && !duct_has(ev->flags, io_ev_hup)
+            && getsockopt(conn->fd, SOL_SOCKET, SO_ERROR, &err, &err_len) == 0
+            && err == EMSGSIZE)
+            return;
         s_conn_close(t, conn, close_io_error);
         return;
     }
