@@ -5592,26 +5592,22 @@ void duct_io_on_event(duct_io_event_t *ev)
     auto conn = s_conn_from_tag(ev->ptr);
     duct_do_if(!conn, return);
     if (duct_has(ev->flags, duct_or(io_ev_error, io_ev_hup))) {
-        /* A datagram socket's error flag carries the pending errno of one
-         * moment's send — the kernel out of buffer space this instant, or the
-         * pmtu verdict on a frame that asked the wire not to fragment. The
-         * send path already classes those retryable or a drop, and the event
-         * side now agrees: the error is read off the socket — the reading
-         * clears it — and the conn stands, the frame's drop being what the
-         * wire wants, the same silence Winsock is told to keep for the
-         * condition. A hangup flag beside the error is the same verdict a
-         * kqueue's write filter reports of it — a datagram conn has no peer
-         * close for a hangup to mean — so the errno decides whichever half
-         * of the pair delivered it. Any other error — a refused port, a dead
-         * route — still ends the conn, its errno named in one line, and so
-         * does a hangup no error explains. */
+        /* A datagram conn's socket error is one send's errno — the pmtu
+         * verdict on a frame sent with DONTFRAG, or the kernel out of
+         * buffer space this instant. The send path survives both, and so
+         * does this side: the error is read off the socket (the reading
+         * clears it) and the conn stands, the frame's drop being what the
+         * wire wants. A hup beside the error is the same verdict seen
+         * from a kqueue's write filter; a datagram conn has no peer
+         * close for it to mean. Every other error — a refused port, a
+         * dead route — ends the conn, its errno named in one line. */
         int err = 0;
         socklen_t err_len = sizeof err;
         if (duct_xport_delimited(conn->xport_type)
             && duct_has(ev->flags, io_ev_error)
             && getsockopt(conn->fd, SOL_SOCKET, SO_ERROR,
                           (char *)&err, &err_len) == 0) {
-            if (duct_x_sock_err_dropped(err) || duct_x_send_retryable(err))
+            if (err == EMSGSIZE || duct_x_send_retryable(err))
                 return;
             duct_log_err(stderr, err, "duct: datagram conn ends on its socket error");
         }

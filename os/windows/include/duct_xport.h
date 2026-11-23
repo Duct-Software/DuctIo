@@ -363,18 +363,6 @@ static inline bool duct_x_send_retryable(int err)
     }
 }
 
-/** @brief True when @p err — a socket's pending error, read off it — says a
- *  frame's drop is what the wire wants: the pmtu verdict on a datagram that
- *  asked the path not to fragment. The send path consumes the same verdict
- *  off its own return; this names it where an event model queued it on the
- *  socket instead. Winsock's socket errors are WSA codes, so the verdict
- *  bears the WSA spelling here.
- */
-static inline bool duct_x_sock_err_dropped(int err)
-{
-    return err == WSAEMSGSIZE;
-}
-
 /** @brief Verdict on one datagram send whose result is @p n: true once the
  *  caller may move past those bytes, false to leave them queued.
  *  A send that failed for good answers true — the bytes go nowhere, and a
