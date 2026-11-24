@@ -202,6 +202,13 @@ static inline void duct_xset_dgram_bufs(int fd, [[maybe_unused]] int family)
 #endif
 }
 
+/** @brief Silence asynchronous ICMP resets on a retired hop socket before it
+ *  enters the drain wheel. No-op here: @c s_hop_fd_one_drain steps over
+ *  single read errors on the unwatched socket. */
+static inline void duct_x_dgram_silence_reset([[maybe_unused]] int fd)
+{
+}
+
 /** @brief Read the send buffer the kernel granted @p fd, bytes.
  *  @return 0 where the kernel answers none. */
 static inline uint32_t duct_xget_sndbuf(int fd)

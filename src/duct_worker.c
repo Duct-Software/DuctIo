@@ -3851,15 +3851,12 @@ static void s_inter_pkt(duct_conn_handle_t handle,
             frame = inner;
         }
     }
-    bool shared = conn->xport_type == x_udp_shared;
     /* A sealed wire authenticates the datagram itself, so its source is adopted
      * here, ahead of every dispatch path below — the handler claim among them,
      * which returns before the plain-wire gate further down. Sound while the
      * engine carries the replay window @c fl_wire_dgram_ok stands for: without
      * one, a captured datagram replayed from a foreign address moves the
      * endpoint. */
-    if (sealed && shared && !redirect.base.rx_stale)
-        s_shared_peer_update(conn, b, true);
     if (sealed && shared) {
         if (!redirect.base.rx_stale)
             s_shared_peer_update(conn, b, true);

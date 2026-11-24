@@ -1058,7 +1058,6 @@ s_dgram_shared_route_group(duct_listener_t *listener, const duct_peer_t *peer,
     }
     s_dgram_slot_lend(t, stage, slot);
     s_dgram_shared_publish(conn, peer, local, is_cand ? cand_seq : 0u, stage, &ln, &pos,
-    s_dgram_shared_publish(conn, peer, local, cand_seq, stage, &ln, &pos,
                            frames, n_frames,
                            (const uint8_t *)duct_x_slot_data(t->held_pool, slot));
     return true;
@@ -1864,7 +1863,6 @@ static void s_dgram_shared_roam_route(duct_listener_t *listener,
     uint64_t seq = 0u;
     if (s_dgram_peer_find(listener, peer, &dup, &dup_cand, &seq) && dup == conn) {
         s_dgram_shared_route(conn, peer, local, dup_cand ? seq : 0u, data);
-        s_dgram_shared_route(conn, peer, local, seq, data);
         return;
     }
     s_dgram_peer_candidate_clear(conn);
@@ -1896,7 +1894,6 @@ static void s_classify_dgram(const duct_wfq_route_t *route, duct_listener_t *lis
          * new connection classification. */
         if (existing && existing->xport_type == x_udp_shared) {
             s_dgram_shared_route(existing, peer, local, is_candidate ? cand_seq : 0u, data);
-            s_dgram_shared_route(existing, peer, local, cand_seq, data);
             return;
         }
         /* A datagram from an address this leg is already reachable at retires
@@ -3127,6 +3124,7 @@ static void s_sock_wheel_give(duct_io_t *t, duct_sock_t fd, uint64_t tag)
 {
     if (fd == duct_sock_bad)
         return;
+    duct_x_dgram_silence_reset(fd);
     auto w = &t->socks;
     duct_rtstat_obj_inc(t, rtstats.dgram_hop_wheel_give, 1);
     if (w->n == duct_sock_reap_slots) {

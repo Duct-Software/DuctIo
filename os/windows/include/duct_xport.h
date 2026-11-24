@@ -125,13 +125,16 @@ static inline void duct_xset_dgram_bufs(SOCKET fd, [[maybe_unused]] int family)
         duct_discard setsockopt(fd, IPPROTO_IPV6, IPV6_DONTFRAG,
                                 (const char *)&(DWORD){ TRUE }, sizeof(DWORD));
 #endif
+}
+
+/** @brief Silence asynchronous ICMP port-unreachable errors on retired
+ *  hop socket @p fd before it enters the drain wheel.
+ *  An active @c x_udp_peer socket leaves @c SIO_UDP_CONNRESET armed so an
+ *  unreachable port surfaces as @c close_io_error; a retired socket drains
+ *  stragglers where old-tuple ICMP must not poison subsequent reads. */
+static inline void duct_x_dgram_silence_reset([[maybe_unused]] SOCKET fd)
+{
 #ifdef SIO_UDP_CONNRESET
-    /* An inbound ICMP unreachable would arm the socket: every read after it
-     * answers WSAECONNRESET until the error is consumed, which reads on a
-     * connected datagram socket has no way to tell from a real failure. The
-     * hop's retired legs drain through reads like these -- the poison turns a
-     * full band into one error and a closed socket. Winsock's own behaviour
-     * for the condition, a silent drop, is what the wire wants here. */
     duct_discard WSAIoctl(fd, SIO_UDP_CONNRESET, &(DWORD){ FALSE }, sizeof(DWORD),
                           &(DWORD){ 0u }, sizeof(DWORD), &(DWORD){ 0u },
                           nullptr, nullptr);

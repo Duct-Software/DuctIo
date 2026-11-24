@@ -708,11 +708,7 @@ static const char *test_send_done_switch_from_cb(void)
 
 /* ── T10 / T11: drain backpressure & close-force ────────────────── */
 
-#ifdef _WIN32
-static constexpr unsigned t10_batch_n = 512u;
-#else
 static constexpr unsigned t10_batch_n = 64u;
-#endif
 static constexpr size_t   t10_chunk_sz = 16384u;
 static uint8_t            t10_big[t10_chunk_sz];
 static uint8_t            t12_big[24576u];
@@ -990,6 +986,11 @@ static test_spec_t s_tests[] = {
 
 int main(void)
 {
+#ifdef _WIN32
+    duct_discard _putenv("DUCT_TCP_SNDBUF=16384");
+#else
+    duct_discard setenv("DUCT_TCP_SNDBUF", "16384", 1);
+#endif
     unsigned n_tests = sizeof(s_tests) / sizeof(s_tests[0]);
     unsigned passed = 0u;
 
