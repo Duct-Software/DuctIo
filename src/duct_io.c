@@ -328,6 +328,7 @@ static bool s_dgram_peer_find(duct_listener_t *listener, const duct_peer_t *peer
                               duct_conn_t **out_conn, bool *out_candidate,
                               uint64_t *out_cand_seq);
 static void s_dgram_peer_candidate_clear(duct_conn_t *conn);
+static void s_dgram_shared_reconcile(duct_listener_t *listener, duct_conn_t *conn, bool drop_to_cap);
 static void s_dgram_peer_add(duct_listener_t *listener, const duct_peer_t *peer, duct_conn_t *conn);
 static void s_dgram_peer_add_at(duct_listener_t *listener, const duct_peer_t *peer,
                                 duct_conn_t *conn, bool candidate, uint64_t cand_seq);
@@ -1057,6 +1058,7 @@ s_dgram_shared_route_group(duct_listener_t *listener, const duct_peer_t *peer,
     }
     s_dgram_slot_lend(t, stage, slot);
     s_dgram_shared_publish(conn, peer, local, is_cand ? cand_seq : 0u, stage, &ln, &pos,
+    s_dgram_shared_publish(conn, peer, local, cand_seq, stage, &ln, &pos,
                            frames, n_frames,
                            (const uint8_t *)duct_x_slot_data(t->held_pool, slot));
     return true;
@@ -1862,9 +1864,11 @@ static void s_dgram_shared_roam_route(duct_listener_t *listener,
     uint64_t seq = 0u;
     if (s_dgram_peer_find(listener, peer, &dup, &dup_cand, &seq) && dup == conn) {
         s_dgram_shared_route(conn, peer, local, dup_cand ? seq : 0u, data);
+        s_dgram_shared_route(conn, peer, local, seq, data);
         return;
     }
     s_dgram_peer_candidate_clear(conn);
+    s_dgram_shared_reconcile(listener, conn, true);
     seq = ++duct_conn_dgram_ctx(conn)->cand_seq;
     if (!seq)
         seq = ++duct_conn_dgram_ctx(conn)->cand_seq;
@@ -1892,6 +1896,7 @@ static void s_classify_dgram(const duct_wfq_route_t *route, duct_listener_t *lis
          * new connection classification. */
         if (existing && existing->xport_type == x_udp_shared) {
             s_dgram_shared_route(existing, peer, local, is_candidate ? cand_seq : 0u, data);
+            s_dgram_shared_route(existing, peer, local, cand_seq, data);
             return;
         }
         /* A datagram from an address this leg is already reachable at retires
@@ -2342,6 +2347,8 @@ typedef struct s_dgram_peer_node {
  */
 static constexpr unsigned s_dgram_peer_buckets = 128u;
 static constexpr unsigned s_dgram_peer_mask = s_dgram_peer_buckets - 1u;
+/** @brief Maximum concurrent unpromoted candidate addresses kept per @c x_udp_shared conn. */
+static constexpr unsigned s_dgram_peer_cand_cap = 4u;
 
 /* Folds the family-and-port word and all 16 bytes of addr.v6 through the splitmix64 finalizer,
  * whatever the family: an IPv4 peer's unused tail is zero, as duct_x_same_peer, which compares the
@@ -2545,6 +2552,61 @@ static void s_dgram_peer_candidate_clear(duct_conn_t *conn)
     duct_conn_state_clear(conn, fl_conn_roaming);
 }
 
+/** @brief Reconcile @p conn's @c dgram_peers entries on an @c x_udp_shared leg
+ *  against the worker's @c settled_seq and @c accepted_seq frontiers.
+ *
+ *  @c settled_seq is loaded (acquire) strictly ahead of @c accepted_seq to pair
+ *  with the worker's release order: seeing a @c settled_seq at or past a node's
+ *  @c cand_seq guarantees its acceptance (if accepted) is already visible in
+ *  @c accepted_seq. Promotes the node matching @c accepted_seq, drops superseded
+ *  entries (@c < accepted_seq) and worker-rejected candidates, and when
+ *  @p drop_to_cap holds, evicts the oldest remaining candidate if @p conn
+ *  already reached @ref s_dgram_peer_cand_cap.
+ */
+static void s_dgram_shared_reconcile(duct_listener_t *listener, duct_conn_t *conn, bool drop_to_cap)
+{
+    if (!listener || !listener->dgram_peers) {
+        duct_conn_state_clear(conn, fl_conn_roaming);
+        return;
+    }
+    auto dctx = duct_conn_dgram_ctx(conn);
+    uint64_t set = duct_atomic_load(&dctx->settled_seq, acquire);
+    uint64_t acc = duct_atomic_load(&dctx->accepted_seq, acquire);
+    uint64_t conn_word = duct_conn_handle_get(conn).word;
+    auto buckets = (duct_hash_handle_t **)listener->dgram_peers;
+
+    unsigned n_cand = 0u;
+    dgram_peer_node_t *oldest = nullptr;
+    for (unsigned i = 0u; i < s_dgram_peer_buckets; ++i) {
+        auto h = buckets[i];
+        while (h) {
+            auto next = h->next;
+            auto node = duct_hash_entry(h, dgram_peer_node_t, hh);
+            if (node->conn.word == conn_word) {
+                if (node->cand_seq < acc
+                    || (node->candidate && node->cand_seq > acc && node->cand_seq <= set)) {
+                    duct_hash_remove(&node->hh);
+                    duct_del(node);
+                } else if (node->cand_seq == acc) {
+                    node->candidate = false;
+                } else if (node->candidate) {
+                    ++n_cand;
+                    if (!oldest || node->cand_seq < oldest->cand_seq)
+                        oldest = node;
+                }
+            }
+            h = next;
+        }
+    }
+    if (drop_to_cap && n_cand >= s_dgram_peer_cand_cap && oldest) {
+        duct_hash_remove(&oldest->hh);
+        duct_del(oldest);
+        --n_cand;
+    }
+    if (!n_cand)
+        duct_conn_state_clear(conn, fl_conn_roaming);
+}
+
 /** @brief Move @p conn's connected socket to its candidate address.
  *
  *  The move runs only while the ring's @c accept_at reaches its @c roam_at: a
@@ -2554,6 +2616,10 @@ static void s_dgram_peer_candidate_clear(duct_conn_t *conn)
  */
 static void s_req_do_peer_roam(duct_conn_t *conn)
 {
+    if (conn->xport_type == x_udp_shared) {
+        s_dgram_shared_reconcile(duct_conn_dgram_ctx(conn)->listener, conn, false);
+        return;
+    }
     duct_listener_t *listener = nullptr;
     auto node = s_dgram_peer_candidate_find(conn, &listener);
     if (!node) {

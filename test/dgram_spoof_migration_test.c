@@ -154,7 +154,8 @@ static const char *sc_spoof_does_not_redirect(void)
     const char *error = nullptr;
     uint8_t msg[msg_size];
     duct_sock_t fd1 = uc_connect(port),
-                fd2 = duct_sock_bad;
+                fd2 = duct_sock_bad,
+                fd3 = duct_sock_bad;
     if (fd1 == duct_sock_bad)
         error = "victim socket connect failed";
 
@@ -208,10 +209,37 @@ static const char *sc_spoof_does_not_redirect(void)
     if (!error && uc_recv_none(fd1, silence_ms) != 0)
         error = "the old address still receives after a real migration";
 
+    /* A rejected third address arriving after fd2 promoted must not evict fd2
+     * or steal subsequent server-initiated traffic. */
+    if (!error) {
+        fd3 = uc_connect(port);
+        if (fd3 == duct_sock_bad)
+            error = "third spoof socket connect failed";
+    }
+    if (!error) {
+        s_msg(msg, 's');
+        if (uc_send(fd3, msg, sizeof msg) != 0)
+            error = "third spoof datagram send failed";
+    }
+    if (!error && !th_wait_int(&g_rejected, 2, wait_ms))
+        error = "the third spoof datagram never reached the session";
+    if (!error) {
+        auto rc = duct_session_invoke(io, duct_atomic_load(&g_tok, acquire),
+                                      s_invoke_fn, nullptr);
+        if (rc != rc_ok)
+            error = "duct_session_invoke refused after the second spoof";
+    }
+    if (!error && uc_recv_eq(fd2, invoke_payload, sizeof invoke_payload - 1u) != 0)
+        error = "a rejected third address displaced the active peer";
+    if (!error && uc_recv_none(fd3, silence_ms) != 0)
+        error = "a rejected third address received server replies";
+
     if (fd1 != duct_sock_bad)
         close(fd1);
     if (fd2 != duct_sock_bad)
         close(fd2);
+    if (fd3 != duct_sock_bad)
+        close(fd3);
     duct_engine_stop(io);
     pthread_join(th, nullptr);
     duct_engine_destroy(io);

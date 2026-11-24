@@ -415,20 +415,26 @@ dl_cli_frame([[maybe_unused]] duct_session_t *s, [[maybe_unused]] duct_conn_id_t
     return rc_ok;
 }
 
-/** @brief A relay between a client and a server, with two sockets towards the
- *  server so the client can be moved to another source address. */
+/** @brief A relay between a client and a server, with three sockets towards the
+ *  server so the client can move across source addresses and a captured
+ *  old-port datagram can be replayed during a later hop. */
 typedef struct {
     duct_sock_t        pfd,         /**< Faces the client. */
-                       up_fd[2];    /**< Face the server, one source address each. */
+                       up_fd[3];    /**< Face the server, one source address each. */
     struct sockaddr_in srv,
                        cli;
     bool               have_cli;
     atomic_int         up;          /**< Index of the socket the client's datagrams
                                      *  leave by. */
     atomic_bool        stop;
-    atomic_int         to_srv[2],   /**< Datagrams sent towards the server, per
+    atomic_bool        replay_stale; /**< Relay trigger to re-inject the captured
+                                      *   datagram from @c up_fd[0]. */
+    atomic_bool        stale_sent;   /**< True once @c replay_stale fired. */
+    atomic_int         to_srv[3],   /**< Datagrams sent towards the server, per
                                      *  socket. */
-                       from_srv[2]; /**< Datagrams the server sent back, per socket. */
+                       from_srv[3]; /**< Datagrams the server sent back, per socket. */
+    uint8_t            stale_pkt[dl_cap];
+    size_t             stale_len;
     uint8_t            leads[dl_log][dl_lead]; /**< First bytes of each client
                                                 *  datagram. */
     size_t             n_leads;
@@ -439,10 +445,18 @@ static void *dl_relay_run(void *arg)
     auto px = (dl_relay_t *)arg;
     uint8_t buf[dl_cap];
     while (!atomic_load_explicit(&px->stop, memory_order_acquire)) {
-        struct pollfd pf[3] = { { .fd = px->pfd, .events = POLLIN },
+        if (atomic_load_explicit(&px->replay_stale, memory_order_acquire)
+            && !atomic_load_explicit(&px->stale_sent, memory_order_relaxed)
+            && px->stale_len > 0u) {
+            sendto(px->up_fd[0], (char *)px->stale_pkt, (int)px->stale_len, 0,
+                   (struct sockaddr *)&px->srv, sizeof px->srv);
+            atomic_store_explicit(&px->stale_sent, true, memory_order_release);
+        }
+        struct pollfd pf[4] = { { .fd = px->pfd, .events = POLLIN },
                                 { .fd = px->up_fd[0], .events = POLLIN },
-                                { .fd = px->up_fd[1], .events = POLLIN } };
-        if (poll(pf, 3, 20) <= 0)
+                                { .fd = px->up_fd[1], .events = POLLIN },
+                                { .fd = px->up_fd[2], .events = POLLIN } };
+        if (poll(pf, 4, 20) <= 0)
             continue;
         if (pf[0].revents & POLLIN) {
             struct sockaddr_in from;
@@ -455,12 +469,16 @@ static void *dl_relay_run(void *arg)
                 int up = atomic_load_explicit(&px->up, memory_order_acquire);
                 if ((size_t)n >= dl_lead && px->n_leads < dl_log)
                     memcpy(px->leads[px->n_leads++], buf, dl_lead);
+                if (up == 0 && px->n_leads >= 3u && px->stale_len == 0u && (size_t)n <= sizeof px->stale_pkt) {
+                    memcpy(px->stale_pkt, buf, (size_t)n);
+                    px->stale_len = (size_t)n;
+                }
                 sendto(px->up_fd[up], (char *)buf, (int)n, 0, (struct sockaddr *)&px->srv,
                        sizeof px->srv);
                 atomic_fetch_add_explicit(&px->to_srv[up], 1, memory_order_relaxed);
             }
         }
-        for (int i = 0; i < 2; ++i) {
+        for (int i = 0; i < 3; ++i) {
             if (!(pf[1 + i].revents & POLLIN))
                 continue;
             ssize_t n = recv(px->up_fd[i], (char *)buf, sizeof buf, 0);
@@ -493,7 +511,8 @@ static duct_proto_t *dl_proto(duct_wire_t *wire, duct_proto_cfg_t pcfg)
 static const char *dl_roam(void)
 {
     static dl_relay_t px;
-    px = (dl_relay_t){ .pfd = duct_sock_bad, .up_fd = { duct_sock_bad, duct_sock_bad } };
+    px = (dl_relay_t){ .pfd = duct_sock_bad,
+                       .up_fd = { duct_sock_bad, duct_sock_bad, duct_sock_bad } };
     uint16_t port = 0u, relay_port = 0u, up_port = 0u;
     const char *err = nullptr;
     duct_proto_t *srv = nullptr, *cli = nullptr;
@@ -501,6 +520,7 @@ static const char *dl_roam(void)
     bool io_running = false, relay_running = false;
     char addr[64];
     int before = 0, tried = 0;
+    int old_from_0 = 0;
 
     atomic_store_explicit(&g_dl_sessions, 0, memory_order_release);
     atomic_store_explicit(&g_dl_echo, 0, memory_order_release);
@@ -529,8 +549,9 @@ static const char *dl_roam(void)
     px.pfd = uc_bind(&relay_port);
     px.up_fd[0] = uc_bind(&up_port);
     px.up_fd[1] = uc_bind(&up_port);
+    px.up_fd[2] = uc_bind(&up_port);
     if (px.pfd == duct_sock_bad || px.up_fd[0] == duct_sock_bad
-        || px.up_fd[1] == duct_sock_bad) {
+        || px.up_fd[1] == duct_sock_bad || px.up_fd[2] == duct_sock_bad) {
         err = "relay sockets failed";
         goto done;
     }
@@ -582,6 +603,30 @@ static const char *dl_roam(void)
     if (atomic_load_explicit(&g_dl_sessions, memory_order_acquire) != 1)
         err = "the datagrams from the new address opened a session of their own";
 
+    /* Move to a third source address while replaying the stale datagram from
+     * up_fd[0]: the stale old-port packet must neither evict the migrating
+     * third address nor revert server replies back to up_fd[0]. */
+    if (!err) {
+        old_from_0 = atomic_load_explicit(&px.from_srv[0], memory_order_acquire);
+        atomic_store_explicit(&px.up, 2, memory_order_release);
+        atomic_store_explicit(&px.replay_stale, true, memory_order_release);
+        before = atomic_load_explicit(&g_dl_echo, memory_order_acquire);
+        for (unsigned waited = 0u; waited < 8000u; waited += 10u) {
+            if (atomic_load_explicit(&px.stale_sent, memory_order_acquire)
+                && atomic_load_explicit(&g_dl_echo, memory_order_acquire) >= before + 3
+                && atomic_load_explicit(&px.from_srv[2], memory_order_acquire) >= 3)
+                break;
+            th_sleep_ms(10u);
+        }
+        if (!atomic_load_explicit(&px.stale_sent, memory_order_acquire)
+            || atomic_load_explicit(&px.from_srv[2], memory_order_acquire) < 3)
+            err = "a stale old-port replay blocked migration to the third address";
+        else if (atomic_load_explicit(&px.from_srv[0], memory_order_acquire) != old_from_0)
+            err = "a stale old-port replay reverted server replies to the retired address";
+        else if (atomic_load_explicit(&g_dl_sessions, memory_order_acquire) != 1)
+            err = "a stale replay or third address opened an extra session";
+    }
+
 done:
     duct_engine_stop(io);
     if (io_running)
@@ -590,7 +635,7 @@ done:
     if (relay_running)
         pthread_join(th_relay, nullptr);
     duct_engine_destroy(io);
-    for (int i = 0; i < 3; ++i) {
+    for (int i = 0; i < 4; ++i) {
         duct_sock_t fd = i ? px.up_fd[i - 1] : px.pfd;
         duct_sock_close(fd);
     }

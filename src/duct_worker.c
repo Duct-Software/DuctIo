@@ -3697,12 +3697,39 @@ static inline bool s_same_ip_net(const duct_peer_t *a, const duct_peer_t *b)
     return true;
 }
 
+/** @brief Record worker acceptance or rejection of @p b's candidate sequence
+ *  and nudge I/O to reconcile @c dgram_peers when roaming is active.
+ *  Stores @c accepted_seq before @c settled_seq (both release) so I/O loading in
+ *  the opposite order never observes a settled candidate without its acceptance. */
+static void s_shared_peer_settle(duct_conn_t *conn, const duct_msg_inter_batch_t *b, bool accept)
+{
+    if (!b->cand_seq)
+        return;
+    auto ctx = duct_conn_dgram_ctx(conn);
+    uint64_t acc = duct_atomic_load(&ctx->accepted_seq, relaxed);
+    if (accept) {
+        if (b->cand_seq > acc)
+            duct_atomic_store(&ctx->accepted_seq, b->cand_seq, release);
+    } else if (b->cand_seq <= acc) {
+        return;
+    }
+    if (b->cand_seq > duct_atomic_load(&ctx->settled_seq, relaxed))
+        duct_atomic_store(&ctx->settled_seq, b->cand_seq, release);
+    if (duct_has(duct_conn_state(conn), fl_conn_roaming)) {
+        auto h = (duct_conn_handle_t){ .word = b->conn };
+        duct_io_post_peer_roam(&h);
+    }
+}
+
 /** @brief Adopt @p b's peer/local endpoint on a shared UDP leg and advance
  *  candidate promotion when @p b carries a candidate sequence. */
 static void s_shared_peer_update(duct_conn_t *conn, const duct_msg_inter_batch_t *b,
                                  bool sealed)
 {
     auto ctx = duct_conn_dgram_ctx(conn);
+    uint64_t prev = duct_atomic_load(&ctx->accepted_seq, relaxed);
+    if (b->cand_seq < prev)
+        return;
     if (sealed && !s_same_ip_net(&ctx->peer, &b->peer)) {
         auto sc = duct_conn_sealed_ctx(conn);
         if (sc && sc->codec)
@@ -3719,6 +3746,7 @@ static void s_shared_peer_update(duct_conn_t *conn, const duct_msg_inter_batch_t
             duct_io_post_peer_roam(&h);
         }
     }
+    s_shared_peer_settle(conn, b, true);
 }
 
 static void s_inter_pkt(duct_conn_handle_t handle,
@@ -3748,6 +3776,7 @@ static void s_inter_pkt(duct_conn_handle_t handle,
     [[gnu::cleanup(s_redirect_release)]] redirect_t redirect;
     redirect.span = nullptr;
     redirect.ct = nullptr;
+    bool shared = conn->xport_type == x_udp_shared;
     bool sealed = conn->wire && conn->wire->unseal;
     if (sealed) {
         auto codec = s_tls_codec(conn);
@@ -3787,11 +3816,17 @@ static void s_inter_pkt(duct_conn_handle_t handle,
         s_rekey_take(conn, codec, &redirect.base);
         auto urc = conn->wire->unseal(conn->wire, codec, frame.payload, &redirect.base);
         if (urc != rc_ok) {
+            if (shared)
+                s_shared_peer_settle(conn, b, false);
             s_fire_error(s, cfg, urc);
             return;
         }
         if (!s_peer_auth_fire(s, cfg, cid, codec))
+        if (!s_peer_auth_fire(s, cfg, cid, codec)) {
+            if (shared)
+                s_shared_peer_settle(conn, b, false);
             return;
+        }
         frame.payload = duct_view(duct_view_u8, (void *)redirect.at, redirect.len);
         if (frame.payload.size == 0u)
             return;
@@ -3808,6 +3843,8 @@ static void s_inter_pkt(duct_conn_handle_t handle,
                                                 &needed) == rc_ok
                       && consumed == frame.payload.size;
             if (!whole) {
+                if (shared)
+                    s_shared_peer_settle(conn, b, false);
                 s_fire_error(s, cfg, rc_invalid_arg);
                 return;
             }
@@ -3823,6 +3860,12 @@ static void s_inter_pkt(duct_conn_handle_t handle,
      * endpoint. */
     if (sealed && shared && !redirect.base.rx_stale)
         s_shared_peer_update(conn, b, true);
+    if (sealed && shared) {
+        if (!redirect.base.rx_stale)
+            s_shared_peer_update(conn, b, true);
+        else
+            s_shared_peer_settle(conn, b, false);
+    }
     if (duct_has(cfg->flags, fl_proto_multiplexed) && frame.stream_id != 0u
         && cfg->handler_kind != handler_none) {
         /* Claim-eligible: the VMQ batch this frame lives in commits — frees
@@ -3910,6 +3953,8 @@ static void s_inter_pkt(duct_conn_handle_t handle,
      * counts it. */
     s_count_rx(s, cid, frame.payload.size);
     if (rc != rc_ok) {
+        if (!sealed && shared)
+            s_shared_peer_settle(conn, b, false);
         if (rc == rc_defer)
             s_fire_error(s, cfg, rc_again);
         s_response_drop(s, &out);

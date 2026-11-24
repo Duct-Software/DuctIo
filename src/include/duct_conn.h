@@ -461,6 +461,9 @@ typedef struct duct_dgram_shared_ctx {
     uint64_t          cand_seq;     /**< Monotonic candidate seq (I/O-owned). */
     uint64_t _Atomic  accepted_seq; /**< Highest candidate seq accepted by worker;
                                       *  checked by I/O before candidate promotion. */
+    uint64_t _Atomic  settled_seq;  /**< Highest candidate seq evaluated by worker
+                                      *  (accepted or rejected), stored after
+                                      *  @c accepted_seq on acceptance. */
 } duct_dgram_shared_ctx_t;
 
 /** @brief True when @p conn's live union arm is @c rx_buf / @c tx_buf.
