@@ -541,13 +541,6 @@ static void s_frame_refused(duct_conn_t *conn)
     duct_worker_post_leg_error(conn->worker_id, &h, rc_frame_too_large);
 }
 
-void duct_io_frame_refused(void *tag)
-{
-    auto conn = s_conn_from_tag(tag);
-    duct_do_if(!conn, return);
-    s_frame_refused(conn);
-}
-
 /** @brief Bind @p conn's wire and join it to @p seed's target — a leg's
  *  session, or open a fresh one.
  *  Both posts carry @p seed's prefix to the worker, whose codec takes it as it
@@ -3591,6 +3584,30 @@ void duct_io_rx_commit_units(void *tag, const uint32_t *lens, uint32_t n)
     duct_frame_rx_post(&t->route, &t->frame_rx, conn);
 }
 
+/** @brief Step TCP receive-window tuning after a dry RX drive. A drive the full
+ *  ring latched ends on the backend's initial rc_again too, its kernel queue
+ *  still full, and a buffer shrunk under that queue has the kernel prune it. */
+static void s_rx_follow([[maybe_unused]] duct_io_t *t, duct_conn_t *conn)
+{
+    if (conn->xport_type != x_tcp)
+        return;
+    auto rx = duct_conn_rx_olb(conn);
+    if (duct_has(duct_conn_state(conn), fl_conn_closed)
+        || duct_atomic_load(&rx->suspended, relaxed) || duct_olb_rx_stalled(rx))
+        return;
+    switch (duct_x_sock_rx_follow(duct_x_sock_rx_of(rx), conn->fd,
+                                  duct_atomic_load(&rx->acked, relaxed))) {
+    case x_follow_set:
+        duct_rtstat_obj_inc(t, rtstats.tcp_rcvbuf_sets, 1);
+        [[fallthrough]];
+    case x_follow_read:
+        duct_rtstat_obj_inc(t, rtstats.tcp_rcvbuf_reads, 1);
+        break;
+    case x_follow_none:
+        break;
+    }
+}
+
 void duct_io_rx_done(void *tag, duct_result_t rc)
 {
     auto conn = s_conn_from_tag(tag);
@@ -3604,37 +3621,29 @@ void duct_io_rx_done(void *tag, duct_result_t rc)
      * cadence; carry bands further when the ring freed room. */
     if (t->socks.n)
         s_hop_fd_drain(t, conn);
-    /* The receive follow steps only on a drive that read the socket dry. A
-     * drive the full ring latched ends on the backend's initial rc_again too,
-     * its kernel queue still full, and a buffer shrunk under that queue has the
-     * kernel prune it. */
-    if (rc == rc_again && conn->xport_type == x_tcp) {
-        auto rx = duct_conn_rx_olb(conn);
-        if (!(duct_has(duct_conn_state(conn), fl_conn_closed))
-            && !duct_atomic_load(&rx->suspended, relaxed) && !duct_olb_rx_stalled(rx))
-            switch (duct_x_sock_rx_follow(duct_x_sock_rx_of(rx), conn->fd,
-                                          duct_atomic_load(&rx->acked, relaxed))) {
-            case x_follow_set:
-                duct_rtstat_obj_inc(t, rtstats.tcp_rcvbuf_sets, 1);
-                [[fallthrough]];
-            case x_follow_read:
-                duct_rtstat_obj_inc(t, rtstats.tcp_rcvbuf_reads, 1);
-                break;
-            case x_follow_none:
-                break;
-            }
-    }
-    if (rc == rc_closed && duct_conn_reads_eof(conn)) {
+    switch (rc) {
+    case rc_again:
+        s_rx_follow(t, conn);
+        break;
+    case rc_closed:
         /* The input ends once: a parse error in this same drive ends it first. */
-        if (!duct_has(duct_conn_state(conn), fl_conn_rx_eof)) {
+        if (duct_conn_reads_eof(conn) && !duct_has(duct_conn_state(conn), fl_conn_rx_eof)) {
             duct_conn_state_set(conn, fl_conn_rx_eof);
             duct_frame_rx_end(&t->route, &t->frame_rx, conn);
         }
-    } else if (rc == rc_fatal || rc == rc_invalid_arg) {
+        break;
+    case rc_fatal:
+    case rc_invalid_arg:
         /* rc_invalid_arg is duct_xread refusing this conn's transport on this
          * build, a permanent condition: the close carries it to the protocol
          * as on_conn_lost with close_io_error. */
         s_conn_close(t, conn, close_io_error);
+        break;
+    case rc_frame_too_large:
+        s_frame_refused(conn);
+        break;
+    default:
+        break;
     }
 }
 
@@ -3834,9 +3843,10 @@ DUCT_XSEND_GROUPED_DECLARE(s_rec_send_grouped, duct_tx_rec_t)
 /** @brief Fold one send's @p rc into @p out_rc, the verdict of the drive it belongs to.
  *  A frame the wire refused for its size is stepped over and the drive goes on;
  *  the refusal stays in @p out_rc until the drive ends, where @ref duct_io_tx_done
- *  reports it once, and only a failure that ends the drive speaks over it.
+ *  reports it once, and only a failure that ends the drive speaks over it
+ *  (flushing any prior @c rc_drop ahead of a @c rc_defer self-post).
  *  @return true while the drive goes on. */
-static bool s_tx_answer(duct_result_t *out_rc, duct_result_t rc)
+static bool s_tx_answer(duct_conn_t *conn, duct_result_t *out_rc, duct_result_t rc)
 {
     switch (rc) {
     case rc_ok:
@@ -3849,6 +3859,11 @@ static bool s_tx_answer(duct_result_t *out_rc, duct_result_t rc)
     case rc_again:
         if (*out_rc != rc_drop)
             *out_rc = rc_again;
+        return false;
+    case rc_defer:
+        if (*out_rc == rc_drop)
+            s_frame_refused(conn);
+        *out_rc = rc_defer;
         return false;
     default:
         *out_rc = rc;
@@ -3919,7 +3934,7 @@ bool duct_io_tx_send(void *tag, const duct_io_xfer_t *p, duct_result_t *out_rc)
     );
     duct_result_t rc;
     if (s_tx_send_batch(conn, p, &rc))
-        return s_tx_answer(out_rc, rc);
+        return s_tx_answer(conn, out_rc, rc);
     size_t nwritten = 0u,
            offered = 0u;
     for (unsigned i = 0u; i < p->iov_n; ++i)
@@ -3959,33 +3974,35 @@ advance:
         /* Whole or short, the send went: the cursor steps, and a refusal the
          * drive met stays for the drive's end. */
         bool go_on = s_tx_advance(conn, offered, nwritten);
-        duct_discard s_tx_answer(out_rc, rc);
+        duct_discard s_tx_answer(conn, out_rc, rc);
         return go_on;
     }
     case rc_drop:
         duct_discard s_tx_advance(conn, offered, offered);
-        return s_tx_answer(out_rc, rc);
+        return s_tx_answer(conn, out_rc, rc);
     default:
-        return s_tx_answer(out_rc, rc);
+        return s_tx_answer(conn, out_rc, rc);
     }
 }
 
 void duct_io_tx_done(void *tag, duct_result_t rc)
 {
+    if (rc != rc_drop && rc != rc_fatal && rc != rc_defer)
+        return;
+    auto conn = s_conn_from_tag(tag);
+    duct_do_if(!conn, return);
     switch (rc) {
-    case rc_drop: {
-        auto conn = s_conn_from_tag(tag);
-        duct_do_if(!conn, return);
+    case rc_drop:
         /* A drive that refused a frame for its size tells of it here, once. */
         s_frame_refused(conn);
         break;
-    }
-    case rc_fatal: {
-        auto conn = s_conn_from_tag(tag);
-        duct_do_if(!conn, return);
+    case rc_fatal:
         s_conn_close(s_io_this, conn, close_io_error);
         break;
-    }
+    case rc_defer:
+        auto h = duct_conn_handle_get(conn);
+        duct_io_post_tx_drain(&h);
+        break;
     default:
         break;
     }
@@ -4646,8 +4663,8 @@ duct_result_t duct_io_udp_peer_send_staged(duct_conn_t *conn, size_t *out_sent,
     if (!n)
         return rc_again;
     unsigned taken = 0u;
-    bool refused = false;
-    duct_result_t rc = rc_ok;
+    duct_result_t rc = rc_ok,
+                  verdict = rc_ok;
     while (taken < n) {
         unsigned sent = 0u;
         /* A lone record takes the plain send io's own one-record drain makes. */
@@ -4669,9 +4686,9 @@ duct_result_t duct_io_udp_peer_send_staged(duct_conn_t *conn, size_t *out_sent,
          * refusal is reported once below. */
         *out_sent += duct_x_dgram_len_rec(&recs[taken]);
         ++taken;
-        refused = true;
+        verdict = rc_drop;
     }
-    if (refused)
+    if (verdict == rc_drop)
         s_frame_refused(conn);
     if (taken == n)
         return rc_ok;

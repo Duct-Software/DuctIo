@@ -46,6 +46,9 @@ static constexpr ULONG_PTR events_status_cancelled = 0xC0000120UL;
 /** @brief NTSTATUS of a ConnectEx the peer refused, STATUS_CONNECTION_REFUSED. */
 static constexpr ULONG_PTR events_status_connection_refused = 0xC0000236UL;
 
+/** @brief NTSTATUS of a kernel/Winsock buffer exhaustion, STATUS_INSUFFICIENT_RESOURCES (WSAENOBUFS). */
+static constexpr ULONG_PTR events_status_insufficient_resources = 0xC000009AUL;
+
 /** @brief NTSTATUS of a wait completion packet call that succeeded, STATUS_SUCCESS. */
 static constexpr LONG        events_status_success = 0;
 
@@ -99,6 +102,9 @@ typedef enum : uint64_t {
     iocp_op_rx_failed,  /**< Synthetic completion of a conn read the kernel refused at once,
                           *  queued by @c duct_events_drive_rx on the read's own embedded op, so
                           *  that its close runs in the loop and never inside a registration. */
+    iocp_op_tx_retry,   /**< Synthetic completion of a conn send the stack refused with a
+                          *  retryable error (WSAENOBUFS / WSAEWOULDBLOCK), queued so the
+                          *  loop retries on the next pass instead of killing the conn. */
 } iocp_op_kind_t;
 
 /** @name Tag pack/unpack
@@ -444,6 +450,7 @@ static void s_drain_completions(duct_events_env_t *env, bool armed)
                     break;
                 case iocp_op_tx:
                 case iocp_op_tx_records:
+                case iocp_op_tx_retry:
                     duct_olb_io_done(s_op_hdr(op), duct_conn_of_olb_tx(s_op_hdr(op)));
                     break;
                 case iocp_op_connect:
@@ -634,13 +641,11 @@ static int s_tx_post_records(void *tag, const duct_io_xfer_t *p, iocp_op_t *op)
  * synchronous success still completes through the port, so the chain continues
  * from s_on_tx_completion, or s_on_tx_records_completion for an x_udp_peer
  * send, and that is also where an in-flight send's duct_olb_io_done lands. A
- * send that failed outright pairs it here.
- * @return true once the turn stepped over a record the wire refused for its
- *         size, which the drive reports once. */
-static bool s_tx_turn(void *tag)
+ * send that failed outright pairs it here. */
+void duct_events_drive_tx(void *tag)
 {
     duct_io_xfer_t p;
-    bool refused = false;
+    duct_result_t verdict = rc_again;
     /* nothing to send, if respond-then-close is already handled, or stale tag */
     while (duct_io_tx_peek(tag, &p)) {
         if (duct_olb_io_begin(p.olb_hdr))
@@ -652,7 +657,8 @@ static bool s_tx_turn(void *tag)
                                              : s_tx_post_stream(tag, &p, op);
         switch (err) {
         case NO_ERROR:
-            return refused;
+            duct_io_tx_done(tag, verdict);
+            return;
         case WSAEMSGSIZE: {
             size_t drop_len = 0u;
             for (unsigned i = 0u; i < p.iov_n; ++i)
@@ -661,26 +667,31 @@ static bool s_tx_turn(void *tag)
             duct_olb_io_done(p.olb_hdr, conn);
             if (!duct_xport_delimited(p.xport_type)) {
                 duct_io_tx_done(tag, rc_fatal);
-                return false;
+                return;
             }
-            refused = true;
+            verdict = rc_drop;
             duct_discard duct_io_tx_advance(tag, drop_len, drop_len);
             continue;
         }
         default:
+            if (duct_x_send_retryable(err)) {
+                op->ov = (OVERLAPPED){};
+                op->packed = s_tag_pack(iocp_op_tx_retry, tag);
+                if (!PostQueuedCompletionStatus(s_port, 0u, 0u, &op->ov)) {
+                    duct_olb_io_done(p.olb_hdr, conn);
+                    duct_io_tx_done(tag, rc_fatal);
+                    return;
+                }
+                duct_io_tx_done(tag, verdict);
+                return;
+            }
             duct_dbg_errf("WSA error %d", err);
             duct_olb_io_done(p.olb_hdr, conn);
             duct_io_tx_done(tag, rc_fatal);
-            return false;
+            return;
         }
     }
-    return refused;
-}
-
-void duct_events_drive_tx(void *tag)
-{
-    if (s_tx_turn(tag))
-        duct_io_frame_refused(tag);
+    duct_io_tx_done(tag, verdict);
 }
 
 /** @brief Post @c AcceptEx for @p ctx's listener.
@@ -1271,21 +1282,47 @@ static inline void s_on_rx_completion(void *tag, DWORD bytes, ULONG_PTR status, 
 }
 
 /** @brief @c WSASend completion handler. */
-static inline void s_on_tx_completion(void *tag, DWORD bytes, size_t offered)
+static inline void s_on_tx_completion(void *tag, DWORD bytes, size_t offered, ULONG_PTR status)
 {
-    duct_io_tx_advance(tag, offered, (size_t)bytes);
-    duct_io_tx_done(tag, rc_again); /* no-op unless rc_fatal, kept for contract parity */
-    duct_events_drive_tx(tag); /* peek returns false once genuinely drained, ending the chain */
+    switch (status) {
+    case 0u:
+        duct_io_tx_advance(tag, offered, (size_t)bytes);
+        [[fallthrough]];
+    case events_status_cancelled:
+    case events_status_insufficient_resources:
+        duct_io_tx_done(tag, rc_again);
+        duct_events_drive_tx(tag);
+        break;
+    default:
+        duct_io_tx_done(tag, rc_fatal);
+        break;
+    }
 }
 
 /** @brief @c WSASendMsg completion handler for an @c x_udp_peer send.
- *  Advances past every record the send carried, delivered or not, then chains
- *  the next send. */
-static inline void s_on_tx_records_completion(void *tag, unsigned records)
+ *  Advances past every record the send carried on success or path-size refusal,
+ *  then chains the next send; retries transient resource exhaustion and closes on
+ *  any other failure. */
+static inline void s_on_tx_records_completion(void *tag, unsigned records, ULONG_PTR status)
 {
-    duct_io_tx_advance_records(tag, records);
-    duct_io_tx_done(tag, rc_again);
-    duct_events_drive_tx(tag);
+    switch (status) {
+    case events_status_buffer_overflow:
+        duct_io_tx_advance_records(tag, records);
+        duct_io_tx_done(tag, rc_drop);
+        duct_events_drive_tx(tag);
+        break;
+    case 0u:
+        duct_io_tx_advance_records(tag, records);
+        [[fallthrough]];
+    case events_status_cancelled:
+    case events_status_insufficient_resources:
+        duct_io_tx_done(tag, rc_again);
+        duct_events_drive_tx(tag);
+        break;
+    default:
+        duct_io_tx_done(tag, rc_fatal);
+        break;
+    }
 }
 
 /** @brief @c AcceptEx completion handler.
@@ -1377,16 +1414,20 @@ static inline void s_on_completion(duct_events_env_t *env, OVERLAPPED_ENTRY *ent
         size_t offered = (size_t)op->buf.len;
         auto hdr = s_op_hdr(op);
         duct_olb_io_done(hdr, duct_conn_of_olb_tx(hdr));
-        s_on_tx_completion(tag, entries[i].dwNumberOfBytesTransferred, offered);
+        s_on_tx_completion(tag, entries[i].dwNumberOfBytesTransferred, offered, entries[i].Internal);
         break;
     }
     case iocp_op_tx_records: {
         unsigned records = op->records;
         auto hdr = s_op_hdr(op);
         duct_olb_io_done(hdr, duct_conn_of_olb_tx(hdr));
-        s_on_tx_records_completion(tag, records);
+        s_on_tx_records_completion(tag, records, entries[i].Internal);
         break;
     }
+    case iocp_op_tx_retry:
+        duct_olb_io_done(s_op_hdr(op), duct_conn_of_olb_tx(s_op_hdr(op)));
+        duct_events_drive_tx(tag);
+        break;
     case iocp_op_connect:
         duct_del(op);
         auto pre_conn = (duct_pre_conn_t *)tag;

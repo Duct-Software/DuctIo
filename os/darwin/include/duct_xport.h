@@ -342,20 +342,43 @@ duct_x_sock_rx_follow([[maybe_unused]] void *x,
     return x_follow_none;
 }
 
-/** @brief True when @p err says to send these same bytes again later.
- *  @c ENOBUFS joins the two would-block codes: the kernel is out of buffer
- *  space this instant, which the next drive finds cleared. Other codes
- *  indicate a permanent message error; repeating the send repeats
- *  the failure.
+/** @brief Classify a send @p err as @c rc_again (socket buffer full — write
+ *  readiness wakes the next drive), @c rc_defer (interface queue @c ENOBUFS —
+ *  no kernel edge on BSD UDP, so the I/O thread self-re-drives), or @c rc_fatal.
  */
-static inline bool duct_x_send_retryable(int err)
+static inline duct_result_t duct_x_send_retry_rc(int err)
 {
     switch (err) {
     case EAGAIN:
+        return rc_again;
     case ENOBUFS:
-        return true;
+        return rc_defer;
     default:
-        return false;
+        return rc_fatal;
+    }
+}
+
+/** @brief True when @p err says to send these same bytes again later. */
+static inline bool duct_x_send_retryable(int err)
+{
+    return duct_x_send_retry_rc(err) != rc_fatal;
+}
+
+/** @brief Map a failed send's @p err into @c duct_result_t for transport @p t. */
+static inline duct_result_t
+duct_x_send_err(int err, duct_xport_t t, [[maybe_unused]] size_t bytes)
+{
+    switch (err) {
+    case EAGAIN:
+        return rc_again;
+    case ENOBUFS:
+        return rc_defer;
+    case EMSGSIZE:
+        duct_dbg_errf("EMSGSIZE, %zu bytes", bytes);
+        return duct_xport_delimited(t) ? rc_drop : rc_fatal;
+    default:
+        duct_dbg_errf("errno %d", err);
+        return rc_fatal;
     }
 }
 
@@ -408,16 +431,7 @@ duct_xsend_bufs(int fd, const duct_view_u8 *bufs, unsigned n, unsigned *out_sent
         *out_sent = (unsigned)r;
         return rc_ok;
     }
-    if (duct_x_send_retryable(errno))
-        return rc_again;
-    switch (errno) {
-    case EMSGSIZE:
-        duct_dbg_errf("EMSGSIZE, %zu bytes", bufs[0].size);
-        return rc_drop;
-    default:
-        duct_dbg_errf("errno %d", errno);
-        return rc_fatal;
-    }
+    return duct_x_send_err(errno, x_udp_peer, bufs[0].size);
 }
 
 duct_nonnull(4) static inline duct_result_t
@@ -531,19 +545,11 @@ duct_xwrite(int fd, duct_xport_t t, duct_view_u8 src, size_t *out_written, void 
     }
     switch (n) {
     case -1:
-        if (duct_x_send_retryable(errno))
-            return rc_again;
-        switch (errno) {
-        case EMSGSIZE:
-            duct_dbg_errf("EMSGSIZE, %zu bytes", src.size);
-            return duct_xport_delimited(t) ? rc_drop : rc_fatal;
-        default:
-            duct_dbg_errf("errno %d", errno);
-            return rc_fatal;
-        }
+        return duct_x_send_err(errno, t, src.size);
     case 0:
         if (t != x_udp && t != x_udp_peer && t != x_inter)
             return rc_again;
+        [[fallthrough]];
     default:
         break;
     }
@@ -599,21 +605,11 @@ duct_xwritev(int fd, duct_xport_t t, const duct_view_u8 *bufs, unsigned n,
     }
     switch (r) {
     case -1:
-        switch (errno) {
-        case EAGAIN:
-            return rc_again;
-        case EMSGSIZE:
-            /* The wire refuses the frame's size: the datagram dies whole, the
-             * queue moves, the conn lives -- same as the batched send. */
-            duct_dbg_errf("EMSGSIZE, %zu bytes", bufs[0].size);
-            return rc_drop;
-        default:
-            duct_dbg_errf("errno %d", errno);
-            return rc_fatal;
-        }
+        return duct_x_send_err(errno, t, bufs[0].size);
     case 0:
         if (t != x_udp_peer)
             return rc_again;
+        [[fallthrough]];
     default:
         break;
     }
@@ -821,8 +817,8 @@ duct_xsend_recs(int fd, const duct_tx_rec_t *recs, unsigned n, unsigned *out_sen
     }
 
     if (n > 1u) {
-        duct_discard duct_xwrite_batch(fd, x_udp, msgs, n, out_sent);
-        return rc_ok;
+        auto brc = duct_xwrite_batch(fd, x_udp, msgs, n, out_sent);
+        return brc == rc_again && duct_x_send_retry_rc(errno) == rc_defer ? rc_defer : rc_ok;
     }
     ssize_t sent;
     do
@@ -832,15 +828,7 @@ duct_xsend_recs(int fd, const duct_tx_rec_t *recs, unsigned n, unsigned *out_sen
         *out_sent = 1u;
         return rc_ok;
     }
-    if (!duct_x_send_retryable(errno)) {
-        if (errno == EMSGSIZE) {
-            duct_dbg_errf("EMSGSIZE, %zu bytes", duct_x_dgram_len_rec(&recs[0]));
-            return rc_drop;
-        }
-        duct_dbg_errf("errno %d", errno);
-        return rc_fatal;
-    }
-    return rc_again;
+    return duct_x_send_err(errno, x_udp_peer, duct_x_dgram_len_rec(&recs[0]));
 }
 
 /** @brief Fill up to @p n of @p bufs from @p fd, reporting each datagram's

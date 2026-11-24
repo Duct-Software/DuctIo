@@ -286,20 +286,13 @@ void duct_events_drive_rx(void *tag)
     while (duct_io_rx_reserve(tag, &r)) {
         size_t nread = 0u,
                seg = 0u;
-        rc = duct_xread(r.fd, r.xport_type, (duct_view_u8){ .data = r.buf, .size = r.size },
-                             &nread, r.ctx, 0, &seg);
-        if (rc == rc_ok) {
+        auto step = duct_xread(r.fd, r.xport_type,
+                               (duct_view_u8){ .data = r.buf, .size = r.size },
+                               &nread, r.ctx, 0, &seg);
+        if (step == rc_ok)
             duct_io_rx_commit(tag, nread, seg);
-            continue;
-        }
-        if (rc == rc_drop) {
-            /* A datagram longer than the buffer, already discarded by Winsock
-             * itself (WSAEMSGSIZE) — nothing to commit, keep draining. Reset
-             * rc so a stale rc_drop never reaches duct_io_rx_done below. */
-            rc = rc_again;
-            continue;
-        }
-        break;
+        if (!duct_events_rx_step(&rc, step))
+            break;
     }
     /* Re-arm FD_READ unconditionally — reaching this function proves whatever
      * earlier cleared it via duct_events_rx_stall no longer applies,

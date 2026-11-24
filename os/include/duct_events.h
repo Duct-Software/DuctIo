@@ -587,21 +587,47 @@ duct_nonnull(1, 2) void duct_io_rx_commit_units(void *tag, const uint32_t *lens,
 
 /** @brief End one RX-drive step for @p tag's conn.
  *
- *  Post arrived data for parsing, and close the conn on @c rc_fatal or
- *  @c rc_invalid_arg. @c rc_closed on a transport whose zero-length read carries
- *  the peer's FIN ends the conn's input: reads stop for good, and the end
- *  follows every frame posted ahead of it to the worker, which closes the leg
- *  with @c close_peer behind the answers ahead of it. A transport delivering
- *  whole packets has no such signal and reads on.
+ *  Post arrived data for parsing, report @c rc_frame_too_large once per drive,
+ *  and close the conn on @c rc_fatal or @c rc_invalid_arg. @c rc_closed on a
+ *  transport whose zero-length read carries the peer's FIN ends the conn's
+ *  input: reads stop for good, and the end follows every frame posted ahead of
+ *  it to the worker, which closes the leg with @c close_peer behind the answers
+ *  ahead of it. A transport delivering whole packets has no such signal and
+ *  reads on.
  */
 duct_nonnull(1) void duct_io_rx_done(void *tag, duct_result_t rc);
 
-/** @brief The wire refused a frame of @p tag's conn for its size: the verdict
- *  a send or a queued error named. Tells the conn's protocol as
- *  @c rc_frame_too_large, once per io drive, error event or read, never per
- *  frame.
+/** @brief Fold one readiness-drive read result @p step into @p verdict.
+ *  @c rc_frame_too_large latches onto @p verdict so @ref duct_io_rx_done
+ *  reports it once per drive while draining continues; @c rc_ok keeps a
+ *  full-ring exit distinct from @c rc_again until a later @c rc_again clears
+ *  it; fatal outcomes override both and stop the loop.
+ *  @return true while the drive loop should keep draining.
  */
-duct_nonnull(1) void duct_io_frame_refused(void *tag);
+duct_nonnull(1) static inline bool
+duct_events_rx_step(duct_result_t *verdict, duct_result_t step)
+{
+    switch (step) {
+    case rc_ok:
+        if (*verdict != rc_frame_too_large)
+            *verdict = rc_ok;
+        return true;
+    case rc_frame_too_large:
+        *verdict = rc_frame_too_large;
+        return true;
+    case rc_drop:
+        if (*verdict != rc_frame_too_large)
+            *verdict = rc_again;
+        return true;
+    case rc_again:
+        if (*verdict != rc_frame_too_large)
+            *verdict = rc_again;
+        return false;
+    default:
+        *verdict = step;
+        return false;
+    }
+}
 
 /** @brief Peek TX buffer content for @p tag's conn. */
 [[nodiscard]] duct_nonnull(1, 2) bool
@@ -653,7 +679,7 @@ duct_nonnull(1) void
 duct_io_tx_advance_records(void *tag, unsigned n);
 
 /** @brief End one TX-drive step for @p tag. @c rc_fatal closes the conn; @c rc_drop, a frame
- *  of the drive the wire refused for its size, reports it once through @ref duct_io_frame_refused. */
+ *  of the drive the wire refused for its size, reports it once to the conn's protocol. */
 duct_nonnull(1) void duct_io_tx_done(void *tag, duct_result_t rc);
 
 /** @brief Record @p tag's conn write-interest state, @c fl_conn_write_armed

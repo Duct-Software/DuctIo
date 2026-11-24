@@ -125,33 +125,18 @@ void duct_events_rx_stall(duct_sock_t fd, void *rx_io_priv)
 void duct_events_drive_rx(void *tag)
 {
     duct_result_t rc = rc_again;
-    bool refused = false;
     duct_io_xfer_t r = { .fd = duct_sock_bad };
     while (duct_io_rx_reserve(tag, &r)) {
         size_t nread = 0u,
                seg = 0u;
-        rc = r.units > 1u
-           ? duct_io_dgram_rx_units(tag, &r)
-           : duct_xread(r.fd, r.xport_type, (duct_view_u8){ .data = r.buf, .size = r.size },
-                        &nread, r.ctx, 0, &seg);
-        if (r.units == 1u && rc == rc_ok) {
+        auto step = r.units > 1u
+            ? duct_io_dgram_rx_units(tag, &r)
+            : duct_xread(r.fd, r.xport_type, (duct_view_u8){ .data = r.buf, .size = r.size },
+                         &nread, r.ctx, 0, &seg);
+        if (r.units == 1u && step == rc_ok)
             duct_io_rx_commit(tag, nread, seg);
-            continue;
-        }
-        switch (rc) {
-        case rc_ok:
-            continue;
-        case rc_frame_too_large:
-            refused = true;
-            [[fallthrough]];
-        case rc_drop:
-            /* Queued EMSGSIZE or truncated datagram consumed; keep draining. */
-            rc = rc_again;
-            continue;
-        default:
+        if (!duct_events_rx_step(&rc, step))
             break;
-        }
-        break;
     }
     /* Re-arm POLLIN unconditionally: reaching this function proves whatever
      * earlier cleared it via duct_events_rx_stall no longer applies,
@@ -163,8 +148,6 @@ void duct_events_drive_rx(void *tag)
         p->events |= POLLIN;
     }
     duct_io_rx_done(tag, rc);
-    if (refused)
-        duct_io_frame_refused(tag);
 }
 
 void duct_events_drive_tx(void *tag)

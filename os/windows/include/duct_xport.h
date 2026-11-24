@@ -350,19 +350,43 @@ duct_x_sock_rx_follow([[maybe_unused]] void *x, [[maybe_unused]] SOCKET fd,
     return x_follow_none;
 }
 
-/** @brief True when @p err says to send these same bytes again later.
- *  @c WSAENOBUFS joins would-block: Winsock is out of buffer space this
- *  instant, which the next drive finds cleared. Other codes
- *  indicate a permanent message error; repeating the send repeats the failure.
+/** @brief Classify a send @p err as @c rc_again (@c WSAEWOULDBLOCK — write
+ *  readiness wakes the next drive), @c rc_defer (@c WSAENOBUFS — edge backends
+ *  get no wakeup edge, so the I/O thread self-re-drives), or @c rc_fatal.
  */
-static inline bool duct_x_send_retryable(int err)
+static inline duct_result_t duct_x_send_retry_rc(int err)
 {
     switch (err) {
     case WSAEWOULDBLOCK:
+        return rc_again;
     case WSAENOBUFS:
-        return true;
+        return rc_defer;
     default:
-        return false;
+        return rc_fatal;
+    }
+}
+
+/** @brief True when @p err says to send these same bytes again later. */
+static inline bool duct_x_send_retryable(int err)
+{
+    return duct_x_send_retry_rc(err) != rc_fatal;
+}
+
+/** @brief Map a failed send's @p err into @c duct_result_t for transport @p t. */
+static inline duct_result_t
+duct_x_send_err(int err, duct_xport_t t, [[maybe_unused]] size_t bytes)
+{
+    switch (err) {
+    case WSAEWOULDBLOCK:
+        return rc_again;
+    case WSAENOBUFS:
+        return rc_defer;
+    case WSAEMSGSIZE:
+        duct_dbg_errf("WSAEMSGSIZE, %zu bytes", bytes);
+        return duct_xport_delimited(t) ? rc_drop : rc_fatal;
+    default:
+        duct_dbg_errf("WSA error %d", err);
+        return rc_fatal;
     }
 }
 
@@ -477,15 +501,13 @@ static inline duct_result_t duct_x_gso_result(int r)
 {
     if (r != SOCKET_ERROR)
         return rc_ok;
-    int err = WSAGetLastError();
-    switch (err) {
-    case WSAEWOULDBLOCK:
-    case WSAENOBUFS:
+    switch (duct_x_send_retry_rc(WSAGetLastError())) {
+    case rc_again:
         return rc_again;
-    case WSAEMSGSIZE:
-    case WSAEINVAL:
+    case rc_defer:
+        return rc_defer;
     default:
-        duct_dbg_errf("WSA error %d", err);
+        duct_dbg_errf("WSA error %d", WSAGetLastError());
         return rc_not_supported;
     }
 }
@@ -582,15 +604,15 @@ duct_xsend_recs(SOCKET fd, const duct_tx_rec_t *recs, unsigned n, unsigned *out_
             ++*out_sent;
             continue;
         }
-        int send_err = WSAGetLastError();
-        if (duct_x_send_retryable(send_err))
+        switch (duct_x_send_err(WSAGetLastError(), x_udp_peer,
+                                duct_x_dgram_len_rec(&recs[i]))) {
+        case rc_again:
             return rc_ok;
-        switch (send_err) {
-        case WSAEMSGSIZE:
-            duct_dbg_errf("WSAEMSGSIZE, %zu bytes", duct_x_dgram_len_rec(&recs[i]));
+        case rc_defer:
+            return rc_defer;
+        case rc_drop:
             return i ? rc_ok : rc_drop;
         default:
-            duct_dbg_errf("WSA error %d", send_err);
             return rc_fatal;
         }
     }
@@ -619,15 +641,14 @@ duct_xsend_bufs(SOCKET fd, const duct_view_u8 *bufs, unsigned n, unsigned *out_s
             ++*out_sent;
             continue;
         }
-        int send_err = WSAGetLastError();
-        if (duct_x_send_retryable(send_err))
+        switch (duct_x_send_err(WSAGetLastError(), x_udp_peer, bufs[i].size)) {
+        case rc_again:
             return rc_ok;
-        switch (send_err) {
-        case WSAEMSGSIZE:
-            duct_dbg_errf("WSAEMSGSIZE, %zu bytes", bufs[i].size);
+        case rc_defer:
+            return rc_defer;
+        case rc_drop:
             return i ? rc_ok : rc_drop;
         default:
-            duct_dbg_errf("WSA error %d", send_err);
             return rc_fatal;
         }
     }
@@ -871,19 +892,11 @@ duct_xwrite(SOCKET fd, duct_xport_t t, duct_view_u8 src,
 
     switch (n) {
     case SOCKET_ERROR:
-        int send_err = WSAGetLastError();
-        if (duct_x_send_retryable(send_err))
-            return rc_again;
-        switch (send_err) {
-        case WSAEMSGSIZE:
-            duct_dbg_errf("WSAEMSGSIZE, %zu bytes", src.size);
-            return duct_xport_delimited(t) ? rc_drop : rc_fatal;
-        default:
-            duct_dbg_errf("WSA error %d", send_err);
-            return rc_fatal;
-        }
+        return duct_x_send_err(WSAGetLastError(), t, src.size);
     case 0:
-        if (t != x_udp && t != x_udp_peer && t != x_inter) return rc_again;
+        if (t != x_udp && t != x_udp_peer && t != x_inter)
+            return rc_again;
+        [[fallthrough]];
     default:
         break;
     }
@@ -929,18 +942,8 @@ duct_xwritev(SOCKET fd, duct_xport_t t, const duct_view_u8 *bufs, unsigned n,
     for (unsigned i = 0u; i < n; ++i)
         wbufs[i] = (WSABUF){ .len = (ULONG)bufs[i].size, .buf = (CHAR *)bufs[i].data };
     DWORD sent = 0;
-    if (WSASend(fd, wbufs, n, &sent, (DWORD)flags, nullptr, nullptr) == SOCKET_ERROR) {
-        int err = WSAGetLastError();
-        if (duct_x_send_retryable(err))
-            return rc_again;
-        switch (err) {
-        case WSAEMSGSIZE:
-            return duct_xport_delimited(t) ? rc_drop : rc_fatal;
-        default:
-            duct_dbg_errf("WSA error %d", err);
-            return rc_fatal;
-        }
-    }
+    if (WSASend(fd, wbufs, n, &sent, (DWORD)flags, nullptr, nullptr) == SOCKET_ERROR)
+        return duct_x_send_err(WSAGetLastError(), t, bufs[0].size);
     if (!sent && t != x_udp_peer)
         return rc_again;
     *out_written = sent;
