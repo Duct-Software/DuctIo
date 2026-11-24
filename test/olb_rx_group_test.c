@@ -11,6 +11,9 @@
  * buffer rewinds to its base.
  */
 
+#define _GNU_SOURCE
+
+#include "duct_conn_block.h"
 #include "duct_olb_rx.h"
 
 #include "duct_core.h"
@@ -20,6 +23,22 @@
 
 #define CHECK(expr, msg) \
     do { if (!(expr)) { fprintf(stderr, "FAIL: %s\n", msg); return 1; } } while (0)
+
+/* AI-generated test code. */
+static duct_olb_rx_t *s_rx_new(size_t cap)
+{
+    auto conn = duct_conn_acquire();
+    if (!conn)
+        return nullptr;
+    conn->xport_type = x_tcp;
+    duct_conn_carve_olb(conn, cap, 256u);
+    return duct_conn_rx_olb(conn);
+}
+
+static void s_rx_del(duct_olb_rx_t *rx)
+{
+    duct_conn_release((duct_conn_t *)((uintptr_t)rx - conn_off_rx));
+}
 
 static constexpr size_t group_test_cap = 4096u;
 static constexpr size_t lead_len = 100u;
@@ -66,11 +85,11 @@ static void s_post(duct_olb_rx_t *rx, size_t upto)
  */
 static duct_olb_rx_t *s_rx_with_group(void)
 {
-    auto rx = duct_olb_rx_new(group_test_cap);
+    auto rx = s_rx_new(group_test_cap);
     if (!rx)
         return nullptr;
     if (!s_stage(rx, 'L', lead_len) || !s_stage(rx, 'G', group_len)) {
-        duct_olb_del(&rx->h);
+        s_rx_del(rx);
         return nullptr;
     }
     s_post(rx, lead_len);
@@ -99,9 +118,9 @@ int main(void)
         CHECK(rx->h.stage == group_len, "only the group survives the boundary");
         CHECK(duct_atomic_load(&rx->h.tail, relaxed) == group_len, "tail follows stage");
         CHECK(free_after == rx->h.buf_size - group_len, "free span is what is left");
-        CHECK(rx->data[0] == 'G' && rx->data[group_len - 1u] == 'G',
+        CHECK(duct_olb_rx_data(rx)[0] == 'G' && duct_olb_rx_data(rx)[group_len - 1u] == 'G',
               "group bytes must land at the buffer base");
-        duct_olb_del(&rx->h);
+        s_rx_del(rx);
     }
 
     /* Boundary 0 discards nothing, so the group keeps the offset it had. This
@@ -116,15 +135,15 @@ int main(void)
         CHECK(rx->group_off == lead_len, "a zero boundary must leave group_off alone");
         CHECK(rx->group_bytes == group_len, "a zero boundary must leave the group whole");
         CHECK(rx->h.stage == lead_len + group_len, "nothing is discarded at boundary 0");
-        CHECK(rx->data[0] == 'L' && rx->data[lead_len] == 'G',
+        CHECK(duct_olb_rx_data(rx)[0] == 'L' && duct_olb_rx_data(rx)[lead_len] == 'G',
               "a zero boundary must not shift the bytes");
-        duct_olb_del(&rx->h);
+        s_rx_del(rx);
     }
 
     /* With no group pending, the offset is nobody's to maintain: whatever a
      * previous group left there stays, and no reader is gated on it. */
     {
-        auto rx = duct_olb_rx_new(group_test_cap);
+        auto rx = s_rx_new(group_test_cap);
         CHECK(rx, "alloc (dead group)");
         CHECK(s_stage(rx, 'L', lead_len), "stage the lead");
         s_post(rx, lead_len);
@@ -133,7 +152,7 @@ int main(void)
         duct_discard duct_olb_rx_compact(rx, lead_len, &ptr);
         CHECK(rx->group_off == 12345u, "a dead group's offset is not maintained");
         CHECK(rx->h.stage == 0u, "everything before the boundary is discarded");
-        duct_olb_del(&rx->h);
+        s_rx_del(rx);
     }
 
     /* A discard throws away the bytes the group describes, so the group goes
@@ -146,7 +165,7 @@ int main(void)
         duct_olb_rx_discard(rx, tail);
         CHECK(rx->posted_off == tail, "discard moves the parse frontier to the tail");
         CHECK(rx->group_bytes == 0u, "discard abandons the group with the bytes");
-        duct_olb_del(&rx->h);
+        s_rx_del(rx);
     }
 
     /* Dropping the unposted tail leaves its bytes in place and counts them
@@ -168,13 +187,13 @@ int main(void)
         duct_olb_rx_rewind(rx);
         CHECK(rx->h.stage == 0u && rx->pass_base == lead_len && rx->skip == 0u,
               "a consumed buffer rewinds past the discard");
-        duct_olb_del(&rx->h);
+        s_rx_del(rx);
     }
 
     /* One argument fixes the read span and the threshold that has to clear it,
      * including the fallback both take when it is zero. */
     {
-        auto rx = duct_olb_rx_new(group_test_cap);
+        auto rx = s_rx_new(group_test_cap);
         CHECK(rx, "alloc (threshold and read unit)");
         duct_olb_rx_threshold_set(rx, 1000u);
         CHECK(rx->read_unit == 1000u, "read_unit takes the argument whole");
@@ -186,7 +205,7 @@ int main(void)
         CHECK(rx->read_unit == 0u, "a zero argument leaves no read span");
         CHECK(duct_olb_rx_threshold_get(rx) == rx->h.buf_size / olb_rx_compact_div,
               "a zero argument falls back to the buffer share");
-        duct_olb_del(&rx->h);
+        s_rx_del(rx);
     }
 
     /* The free span is parked inside the relaxed branch's window — above half
@@ -196,14 +215,14 @@ int main(void)
      * must be refused. Fractions of the buffer, not byte counts: the sizing
      * holds whatever duct_olb_rx_new rounds to. */
     {
-        auto rx = duct_olb_rx_new(group_test_cap);
+        auto rx = s_rx_new(group_test_cap);
         CHECK(rx, "alloc (min_avail floor)");
         size_t buf = rx->h.buf_size,
                unit = buf / 3u,
                avail_want = buf * 3u / 10u;
         duct_olb_rx_threshold_set(rx, unit);
         CHECK(s_stage(rx, 'L', buf - avail_want), "stage up to the relaxed window");
-        duct_atomic_store(&rx->held_frames, 1u, relaxed);
+        duct_atomic_store(&rx->pins, 1u, relaxed);
 
         uint8_t *ptr = nullptr;
         size_t avail = 0u;
@@ -213,11 +232,11 @@ int main(void)
               "the free span must sit inside the relaxed window");
         CHECK(duct_olb_rx_try_space(rx, unit, false, &ptr, &avail) == olb_rx_full,
               "no branch may answer success below min_avail");
-        duct_olb_del(&rx->h);
+        s_rx_del(rx);
     }
 
     {
-        auto rx = duct_olb_rx_new(group_test_cap);
+        auto rx = s_rx_new(group_test_cap);
         CHECK(rx, "alloc (compaction short of min_avail)");
         size_t buf = rx->h.buf_size,
                posted = buf / 2u,
@@ -235,14 +254,14 @@ int main(void)
               "the compaction ran: the unparsed tail slid down");
         CHECK(avail == buf - (staged - posted) && avail < unit,
               "what it freed is real, and still short");
-        duct_olb_del(&rx->h);
+        s_rx_del(rx);
     }
 
     /* The rewind waits for every staged byte to be posted and for the worker to
      * be done with all of them; each condition alone holds the bytes where
      * they are. */
     {
-        auto rx = duct_olb_rx_new(group_test_cap);
+        auto rx = s_rx_new(group_test_cap);
         CHECK(rx, "alloc (rewind)");
         CHECK(s_stage(rx, 'L', lead_len), "stage the lead");
         duct_olb_rx_rewind(rx);
@@ -251,10 +270,10 @@ int main(void)
         duct_olb_rx_rewind(rx);
         CHECK(rx->h.stage == lead_len, "an unacked frame holds the rewind");
         s_post(rx, lead_len);
-        duct_atomic_store(&rx->held_frames, 1u, relaxed);
+        duct_atomic_store(&rx->pins, 1u, relaxed);
         duct_olb_rx_rewind(rx);
-        CHECK(rx->h.stage == lead_len, "a held frame holds the rewind");
-        duct_atomic_store(&rx->held_frames, 0u, relaxed);
+        CHECK(rx->h.stage == lead_len, "a held frame pin holds the rewind");
+        duct_atomic_store(&rx->pins, 0u, relaxed);
         duct_atomic_store(&rx->dispatch_frontier, 0u, relaxed);
         duct_olb_rx_rewind(rx);
         CHECK(rx->h.stage == lead_len, "an undispatched frame holds the rewind");
@@ -266,7 +285,7 @@ int main(void)
         CHECK(duct_atomic_load(&rx->acked, relaxed) == lead_len
                   && rx->pass_base == lead_len,
               "the worker's ack count stands; the pass starts where it is");
-        duct_olb_del(&rx->h);
+        s_rx_del(rx);
     }
 
     /* An undescribed group sits past the parse frontier, so it holds the rewind
@@ -277,14 +296,14 @@ int main(void)
         duct_olb_rx_rewind(rx);
         CHECK(rx->h.stage == lead_len + group_len && rx->group_bytes == group_len,
               "an undescribed group holds the rewind");
-        duct_olb_del(&rx->h);
+        s_rx_del(rx);
     }
 
     /* A record-framed read out of tail room opens a second pass at offset 0
      * over what the worker released, grows it as the release point moves,
      * and retires the first pass once the worker is past its end. */
     {
-        auto rx = duct_olb_rx_new(group_test_cap);
+        auto rx = s_rx_new(group_test_cap);
         CHECK(rx, "alloc (second pass)");
         size_t buf = rx->h.buf_size,
                p = buf / 8u,
@@ -300,17 +319,17 @@ int main(void)
               "without a second pass the tail is all there is");
         CHECK(duct_olb_rx_try_space(rx, p, true, &ptr, &avail) == olb_rx_compacted,
               "a released head of the buffer takes the next read");
-        CHECK(ptr == rx->data && avail == 3u * p && rx->h.stage == 0u,
+        CHECK(ptr == duct_olb_rx_data(rx) && avail == 3u * p && rx->h.stage == 0u,
               "the second pass starts at the base, up to what the worker released");
         CHECK(rx->pass_end == staged && rx->posted_off == 0u
                   && duct_olb_rx_posted_total(rx) == staged,
               "the first pass ends where it was staged, its bytes still posted");
-        CHECK(rx->data[staged - 1u] == 'A', "the first pass's bytes stay in place");
+        CHECK(duct_olb_rx_data(rx)[staged - 1u] == 'A', "the first pass's bytes stay in place");
 
         CHECK(s_stage(rx, 'B', 2u * p), "stage into the second pass");
         rx->posted_off = (uint32_t)(2u * p);
         CHECK(duct_olb_rx_try_space(rx, p, true, &ptr, &avail) == olb_rx_ok
-                  && avail == p && ptr == rx->data + 2u * p,
+                  && avail == p && ptr == duct_olb_rx_data(rx) + 2u * p,
               "the second pass grows up to the first pass's release point");
         CHECK(duct_olb_rx_try_space(rx, 2u * p, true, &ptr, &avail) == olb_rx_full,
               "and no further");
@@ -333,14 +352,14 @@ int main(void)
         duct_olb_rx_rewind(rx);
         CHECK(rx->h.stage == 0u && rx->pass_base == staged + 2u * p,
               "a consumed second pass rewinds like any other");
-        duct_olb_del(&rx->h);
+        s_rx_del(rx);
     }
 
     /* Unposted bytes and a held frame keep the second pass closed, and leave
      * the full drain as the only resume target; a conn without records has
      * no other one either. */
     {
-        auto rx = duct_olb_rx_new(group_test_cap);
+        auto rx = s_rx_new(group_test_cap);
         CHECK(rx, "alloc (second pass held off)");
         size_t buf = rx->h.buf_size,
                p = buf / 8u,
@@ -357,38 +376,38 @@ int main(void)
         CHECK(duct_olb_rx_resume_total(rx, p, true) == staged - p,
               "unposted bytes leave only the full drain to resume the read");
         rx->posted_off = (uint32_t)staged;
-        duct_atomic_store(&rx->held_frames, 1u, relaxed);
+        duct_atomic_store(&rx->pins, 1u, relaxed);
         CHECK(duct_olb_rx_try_space(rx, p, true, &ptr, &avail) == olb_rx_full
                   && rx->pass_end == 0u,
               "a held frame holds the second pass");
         CHECK(duct_olb_rx_resume_total(rx, p, true) == staged,
               "with a frame held only a full drain resumes the read");
-        duct_atomic_store(&rx->held_frames, 0u, relaxed);
+        duct_atomic_store(&rx->pins, 0u, relaxed);
         CHECK(duct_olb_rx_resume_total(rx, p, true) == staged - p,
               "otherwise the read resumes once the worker is down to one read of backlog");
         CHECK(duct_olb_rx_resume_total(rx, p, false) == staged,
               "a conn without records waits for the full drain");
-        duct_olb_del(&rx->h);
+        s_rx_del(rx);
     }
 
     /* A pass holding less than one read resumes at the full drain: the point
      * one read of backlog short of it lies before the pass even starts. */
     {
-        auto rx = duct_olb_rx_new(group_test_cap);
+        auto rx = s_rx_new(group_test_cap);
         CHECK(rx, "alloc (short pass)");
         size_t p = rx->h.buf_size / 8u;
         CHECK(s_stage(rx, 'A', p / 2u), "stage less than one read");
         rx->posted_off = (uint32_t)(p / 2u);
         CHECK(duct_olb_rx_resume_total(rx, p, true) == p / 2u,
               "a pass shorter than one read resumes at the full drain");
-        duct_olb_del(&rx->h);
+        s_rx_del(rx);
     }
 
     /* Skipped bytes at the end of the first pass are no ack the worker owes,
      * yet that pass retires only once acks from the second cover them too:
      * the count of acked bytes runs short of the buffer offset by the skip. */
     {
-        auto rx = duct_olb_rx_new(group_test_cap);
+        auto rx = s_rx_new(group_test_cap);
         CHECK(rx, "alloc (skip across passes)");
         size_t buf = rx->h.buf_size,
                p = buf / 8u,
@@ -421,14 +440,14 @@ int main(void)
               "every posted byte is acked");
         duct_atomic_store(&rx->dispatch_frontier, (uint32_t)p, relaxed);
         CHECK(duct_olb_rx_consumed(rx), "and the buffer counts as consumed");
-        duct_olb_del(&rx->h);
+        s_rx_del(rx);
     }
 
     /* The ack total at a staged byte names that byte through a rewind, a
      * second pass opening and the first one retiring; a discard ahead of it
      * lowers it by the bytes skipped. */
     {
-        auto rx = duct_olb_rx_new(group_test_cap);
+        auto rx = s_rx_new(group_test_cap);
         CHECK(rx, "alloc (totals across layouts)");
         size_t buf = rx->h.buf_size,
                p = buf / 8u,
@@ -470,7 +489,7 @@ int main(void)
         duct_olb_rx_rewind(rx);
         CHECK(rx->h.stage == 0u && duct_olb_rx_total_at(rx, 0u) == past_hole,
               "a rewind past the hole keeps the total at the cursor");
-        duct_olb_del(&rx->h);
+        s_rx_del(rx);
     }
 
     printf("olb_rx_group_test OK\n");

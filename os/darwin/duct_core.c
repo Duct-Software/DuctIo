@@ -1,6 +1,8 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 /* Copyright (c) 2026 Duct Software, authors: Constantin Papizh, Dmitriy Puzyrkov, Olzhas Zharasbayev */
 
+#define __STDC_WANT_LIB_EXT1__ 1
+
 #include "duct_core.h"
 #include "duct_xport.h"
 
@@ -74,6 +76,11 @@ duct_vm_handle_t duct_vm_reserve(size_t size)
     return s_vm_map(size, PROT_NONE);
 }
 
+duct_vm_handle_t duct_vm_reserve_lazy(size_t size)
+{
+    return s_vm_map(size, PROT_READ | PROT_WRITE);
+}
+
 /* mprotect read-write and mlock, then MADV_ZERO_WIRED_PAGES, whose answer is not read. A failure of
  * the first two unlocks the range and makes it inaccessible again. */
 duct_result_t duct_vm_lock(void *base, size_t size)
@@ -101,6 +108,17 @@ void duct_vm_discard(void *base, size_t size)
 {
     if (size)
         duct_discard madvise(base, size, MADV_FREE_REUSABLE);
+}
+
+duct_result_t duct_vm_commit([[maybe_unused]] void *base, [[maybe_unused]] size_t size)
+{
+    return rc_ok;
+}
+
+void duct_vm_reuse(void *base, size_t size)
+{
+    if (size)
+        duct_discard madvise(base, size, MADV_FREE_REUSE);
 }
 
 int duct_thread_bind_cpu([[maybe_unused]] unsigned cpu_index)
@@ -196,3 +214,20 @@ duct_cpu_time_t duct_process_cpu(void)
     duct_discard getrusage(RUSAGE_SELF, &ru);
     return (duct_cpu_time_t){ .user_ns = s_timeval_ns(ru.ru_utime), .kernel_ns = s_timeval_ns(ru.ru_stime) };
 }
+
+#if !DUCT_HAS_MEMSET_EXPLICIT
+void duct_secure_zero(void *p, size_t n)
+{
+    if (!p || !n)
+        return;
+#ifdef __STDC_LIB_EXT1__
+    duct_discard memset_s(p, n, 0, n);
+#elif DUCT_HAS_EXPLICIT_BZERO
+    explicit_bzero(p, n);
+#else
+    volatile uint8_t *vp = (volatile uint8_t *)p;
+    for (size_t i = 0u; i < n; ++i)
+        vp[i] = 0u;
+#endif
+}
+#endif

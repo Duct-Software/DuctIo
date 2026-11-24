@@ -131,9 +131,9 @@ static ssize_t bench_send2(duct_sock_t fd, const void *hdr, size_t h_len, const 
 
 /* ── Server callbacks ───────────────────────────────────────────── */
 
-/* Server-side frame counters for integrity verification. */
-static _Atomic(uint64_t) g_srv_frames_rx;
-static _Atomic(uint64_t) g_srv_frames_tx;
+/* Frame counts for the server line of the report live in bench_stats.h's
+ * packed words (bench_inc_frame_rx/_tx); anything else added per frame here
+ * is coherence traffic on the bench's own hot line. */
 
 static duct_result_t
 on_frame_echo([[maybe_unused]] duct_session_t *s,
@@ -141,11 +141,9 @@ on_frame_echo([[maybe_unused]] duct_session_t *s,
               const duct_frame_t *f, duct_response_t *out,
               [[maybe_unused]] void *ps)
 {
-    duct_atomic_fetch(add, &g_srv_frames_rx, 1u, relaxed);
     bench_inc_frame_rx(f->payload.size);
     duct_response_echo(out, f);
     bench_inc_frame_tx(f->payload.size);
-    duct_atomic_fetch(add, &g_srv_frames_tx, 1u, relaxed);
     return rc_ok;
 }
 
@@ -156,14 +154,12 @@ on_frame_echo_zerocopy([[maybe_unused]] duct_session_t *s,
                        const duct_frame_t *f, duct_response_t *out,
                        [[maybe_unused]] void *ps)
 {
-    duct_atomic_fetch(add, &g_srv_frames_rx, 1u, relaxed);
     bench_inc_frame_rx(f->payload.size);
     out->payload = f->payload;
     out->flags = fl_send_static;
     out->conn_id = duct_conn_id_same;
     out->stream_id = duct_stream_id_same;
     bench_inc_frame_tx(f->payload.size);
-    duct_atomic_fetch(add, &g_srv_frames_tx, 1u, relaxed);
     return rc_ok;
 }
 
@@ -240,8 +236,6 @@ typedef struct {
 static int srv_start(server_t *s, echo_mode_t mode, unsigned n_workers)
 {
     bench_reset();
-    duct_atomic_store(&g_srv_frames_rx, 0u, relaxed);
-    duct_atomic_store(&g_srv_frames_tx, 0u, relaxed);
     s->io = duct_engine_launch(&(duct_engine_cfg_t){ .io_threads = 1, .workers = n_workers });
     if (!s->io) return -1;
     s->wire = duct_wire_create_length_prefix(0u);

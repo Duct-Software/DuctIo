@@ -18,10 +18,33 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
+#if defined(__has_include)
+#if __has_include("duct_build_config.h")
+#include "duct_build_config.h"
+#endif
+#endif
 
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+/** @brief Byte bound of the array type a @c duct_ptr_t points to.
+ *  The smaller of @c PTRDIFF_MAX and 2^61 - 1, the largest array type every compiler of the tree
+ *  takes. No real array comes near it.
+ */
+static constexpr uint64_t duct_ptr_bound_bytes =
+    (uint64_t)PTRDIFF_MAX < (UINT64_MAX >> 3) ? (uint64_t)PTRDIFF_MAX : UINT64_MAX >> 3;
+
+/** @brief Pointer to the array of @c T that @c duct_new answers when given a count.
+ *  The type is @c T (*)[duct_ptr_bound_bytes / sizeof(T)], a bound only these pointers carry:
+ *  the compiler refuses one from another element type, from a plain @c T * and from the address
+ *  of a fixed-size array. The address of a variable length array converts without a word, and
+ *  @ref duct_is_ptr stops it at the accessors. The pointer is never dereferenced as an array:
+ *  @ref duct_at yields the elements, and @c p + off steps in whole arrays.
+ *  A read-only view is @c duct_ptr_t(const T), which a writable array converts to;
+ *  @c duct_ptr_t(T) a, b; declares two pointers.
+ */
+#define duct_ptr_t(T) typeof(T (*)[duct_ptr_bound_bytes / sizeof(T)])
 
 /** @brief Runtime engine; owns I/O threads, workers and session table. */
 typedef struct duct_engine duct_engine_t;
@@ -86,6 +109,8 @@ typedef enum duct_result : int {
     rc_conn_refused,      /**< Outbound connect: peer rejected the connection. */
     rc_conn_timeout,      /**< Outbound connect: no completion before @c connect_timeout_ms. */
     rc_timeout,           /**< Caller's bounded wait expired; the posted op still runs. */
+    rc_frame_too_large,   /**< Datagram wire refused a frame for its size. Reported through
+                               @c on_error; the conn stands. */
 
     /** @note Additional result codes must be placed here. */
     rc_count
@@ -176,7 +201,38 @@ typedef struct duct_tcp_stats {
  *  What @ref duct_conn_tx_unsent answers where it has none to give. */
 static constexpr uint64_t duct_tx_unsent_unread = UINT64_MAX;
 
-/** @brief Named views of the duct_view macros; the constructors live in duct_core.h. */
+/** @name Runtime-counted bounds
+ *  The count member names the array's element count, and
+ *  @c __builtin_dynamic_object_size reads it back wherever the toolchain
+ *  honors the attribute, making every fortify-bounded access through the
+ *  member a checked one.
+ *
+ *  Every branch spells the GNU form: the @c [[gnu::counted_by]] C23 spelling
+ *  is unknown to the compilers this tree builds on even where the feature
+ *  exists (clang 22 answers "unknown attribute ignored" for it). The two
+ *  macros split by what the toolchain accepts: @c counted_by on a trailing
+ *  flexible array member follows @c __has_attribute(counted_by), while
+ *  pointer-member @c counted_by shares that same attribute name in older
+ *  frontends that reject pointers, so CMake probes pointer support directly
+ *  with @c check_c_source_compiles into @c DUCT_HAS_PTR_COUNTED_BY.
+ *  @{
+ */
+#if defined(__has_attribute) && __has_attribute(counted_by)
+#define duct_counted_by(member) __attribute__((counted_by(member)))
+#else
+#define duct_counted_by(member)
+#endif
+#if defined(DUCT_HAS_PTR_COUNTED_BY) && DUCT_HAS_PTR_COUNTED_BY
+#define duct_ptr_counted_by(member) __attribute__((counted_by(member)))
+#else
+#define duct_ptr_counted_by(member)
+#endif
+/** @} */
+
+/** @brief Named views of the duct_view macros; the constructors live in
+ *  duct_core.h. The members lay out as @c struct iovec, the order the kernel
+ *  spans ride — the pointer-form counted_by wants the count first, so the
+ *  views carry none. */
 typedef struct { uint8_t *data; size_t size; } duct_view_u8;
 typedef struct { const uint8_t *data; size_t size; } duct_view_cu8;
 typedef struct { const char *data; size_t size; } duct_view_cc;
@@ -238,6 +294,10 @@ typedef enum duct_frame_flags : uint8_t {
                                 *  writes it, a wire with @c fl_wire_frame_flags
                                 *  carries it, and every other leg refuses it
                                 *  with @c rc_not_supported. */
+    fl_frame_env  = 1u << 3,  /**< An 8-byte @c duct_dgram_env_t trailer rides
+                                *  the frame's tail; the codec strips it and
+                                *  clears the bit before @c on_frame sees the
+                                *  frame. */
 } duct_frame_flags_t;
 
 static_assert(sizeof(duct_frame_flags_t) == sizeof(uint8_t),
@@ -361,7 +421,8 @@ typedef enum duct_handler_kind : uint8_t {
  *  @c fl_frame_none respectively for opaque / single-stream case.
  */
 typedef struct duct_inter_pkt {
-    duct_view_u8         payload;   /**< Non-owning view into caller storage. */
+    duct_view_u8        payload;   /**< View into caller or held storage. */
+    duct_ptr_t(uint8_t) hold;      /**< Optional owning block moved on rc_ok. */
     duct_stream_id_t    stream_id; /**< Target stream; duct_stream_id_default for opaque. */
     duct_frame_flags_t  flags;     /**< @c fl_frame_fin and @c fl_frame_rst close stream
                                      * after this packet. */
@@ -375,7 +436,7 @@ typedef struct duct_inter_pkt {
  */
 typedef struct duct_inter_batch {
     unsigned n;                         /**< Number of packets in @c pkts. */
-    alignas(8) duct_inter_pkt_t pkts[]; /**< Packets; non-owning views into caller storage. */
+    alignas(8) duct_inter_pkt_t pkts[] duct_counted_by(n); /**< Packets; non-owning views into caller storage. */
 } duct_inter_batch_t;
 
 /** @brief Full size of an inter batch holding @p n packets. */
@@ -387,6 +448,157 @@ static inline duct_inter_pkt_t *duct_inter_batch_pkt(duct_inter_batch_t *b, unsi
 {
     return &b->pkts[i];
 }
+
+/** @brief Egress for an inter conn — the runtime hands an outbound packet to the host.
+ *
+ *  Invoked on the host executor through @c duct_host_cfg_t::run, never on the
+ *  worker, when the worker emits TX on a conn attached with @c duct_conn_attach_inter.
+ *
+ *  @param app_ctx  @c duct_host_cfg_t::ctx.
+ *  @param tok      Session that produced the packet.
+ *  @param conn_id  Inter conn the packet targets.
+ *  @param pkt      Non-owning; valid only for the call. Copy it if the host sink
+ *                 consumes it asynchronously.
+ *
+ *  Must not call @c duct_session_invoke_sync or otherwise block on the worker.
+ */
+typedef void (*duct_packet_out_fn)(void *app_ctx,
+                                    duct_handle_t tok,
+                                    duct_conn_id_t conn_id,
+                                    duct_view_u8 pkt);
+
+/** @brief Host executor dispatch hook.
+ *
+ *  Schedules @c fn(ctx) onto the host egress queue for @c on_packet_out
+ *  execution. Required when inter connections exist; otherwise @c nullptr.
+ *
+ *  @param fn         Work item to run on the host queue.
+ *  @param ctx        Argument forwarded to @p fn.
+ *  @param queue_ctx  @c duct_host_cfg_t::queue_ctx.
+ */
+typedef void (*duct_host_run_fn)(void (*fn)(void *ctx), void *ctx, void *queue_ctx);
+
+/** @brief Backpressure release for inter-conn ingress.
+ *
+ *  Called once the conn's RX staging has room again after a pushed batch drains;
+ *  the host issues its next read from here. @c nullptr when no inter conn is used.
+ *
+ *  @param app_ctx  @c duct_host_cfg_t::ctx.
+ */
+typedef void (*duct_inter_resume_fn)(void *app_ctx);
+
+/** @brief Host-bridge configuration for inter conns.
+ *
+ *  "Host" is the embedding application: code running on any thread the engine
+ *  does not own — not an io thread, not a worker. Leave every field
+ *  @c nullptr (zero-initialized) when no inter conn is used.
+ */
+typedef struct duct_host_cfg {
+    duct_host_run_fn     run;             /**< Dispatch onto the host queue; required with inter conns. */
+    void                 *queue_ctx;       /**< Forwarded to @c run. */
+    duct_packet_out_fn    on_packet_out;   /**< Inter-conn TX sink; required when any inter conn exists. */
+    duct_inter_resume_fn  on_inter_resume; /**< Fires after a worker drains an inter conn's lane — a
+                                             *  hint to retry a push that returned rc_defer, not a
+                                             *  per-push wait requirement. @c nullptr when unused. */
+    void                 *ctx;             /**< Forwarded to @c on_packet_out and @c on_inter_resume. */
+} duct_host_cfg_t;
+
+/** @brief Listener transport kind. */
+typedef enum duct_listener_kind : uint8_t {
+    listener_stream, /**< TCP-like: one listen socket, accept() per new session (default). */
+    listener_dgram,  /**< UDP-like: one shared classification socket, per-peer conns spun off
+                       *  via connect() on first datagram. @see duct_listener_bind */
+} duct_listener_kind_t;
+
+/** @brief One bound listener with its protocol array.
+ *        Passed to @ref duct_listener_bind.
+ *
+ *  @c protos is borrowed for the @ref duct_listener_bind call only; the runtime
+ *  copies the array. Array order is dispatch priority: on accept/receipt the
+ *  runtime tries protocols in order (sync pre-parse, then async, then
+ *  @c preparse==NULL fallbacks) and the first non-@c resolve_not_me wins.
+ *  @c addr is the bind host only (e.g. @c "127.0.0.1", @c "::1"); the port is
+ *  passed separately to @ref duct_listener_bind as an in/out parameter.
+ *  A path listener sets @c local_path in place of @c addr, and the three
+ *  fields after it are its alone.
+ */
+typedef struct duct_listener_cfg {
+    const char                *addr;     /**< Bind host: bare name/IP, no port, no brackets. */
+    unsigned                   n_protos; /**< Entries in @c protos; at least 1. */
+    const duct_proto_t *const *protos;   /**< Borrowed for the call; order = dispatch priority. */
+    duct_listener_kind_t       kind;     /**< @c listener_stream (default) or @c listener_dgram. */
+    size_t                     peek_cap; /**< Stream: max bytes to read for pre-parse
+                                              probe — consumed for good, then re-injected
+                                              into the conn's own RX once it exists. Datagram: max
+                                              accepted payload for classification (whole datagram
+                                              either way). Either way, 0 = default. */
+    uint32_t                   probe_wait_ms; /**< Stream only: if every sync pre-parse returns
+                                              @c resolve_not_me on a literally empty first read, wait
+                                              up to this long for the peer's first bytes before falling
+                                              back to the has_async/fallback/reject dispatch — at
+                                              most one wait per accepted fd. @c peek_min extends the
+                                              wait to a first read that is short. 0 = disabled (default). */
+    uint16_t                   peek_min; /**< Stream only: bytes a first read has to reach before the
+                                              runtime asks anything of it, a pre-parse and the engine's
+                                              join lead included. A shorter read is held and the wait
+                                              goes on until the bytes are in, the peer closes or
+                                              @c probe_wait_ms runs out, and what was read is then
+                                              classified as it stands; arrivals leave that deadline
+                                              where it was. Needs @c probe_wait_ms and is at most the
+                                              stream read span: @c peek_cap, or the runtime's default
+                                              clamped to its largest size. 0 = off (default). */
+    const char                *local_path; /**< Socket file of an AF_UNIX stream listener, shorter
+                                              than @c sockaddr_un's @c sun_path; @c nullptr = an
+                                              address listener. Needs @c addr unset and
+                                              @c listener_stream. */
+    const char                *local_group; /**< Group of the socket file: a name or a decimal gid;
+                                              @c nullptr = left as created. Path listener only,
+                                              refused on Windows. */
+    uint16_t                   local_mode; /**< Permission bits of the socket file, the low nine of
+                                              the value, applied before the listener accepts; 0 =
+                                              left as created. Path listener only, refused on
+                                              Windows. */
+    uint16_t                   max_sessions; /**< Most accepted conns alive at once on a path
+                                              listener; a client past it is closed before a conn
+                                              is taken. 0 = no cap. Path listener only. */
+    uint16_t                   max_conns_per_s; /**< Most conns a path listener takes in a second, one every
+                                              1/N s: it stops accepting for that long after each accept,
+                                              and the clients that come meanwhile wait in the socket's
+                                              queue, one place on Linux and five on Windows, a
+                                              non-blocking connect that finds it full failing at once.
+                                              0 = no pace. Path listener only. */
+} duct_listener_cfg_t;
+
+/** @brief Statistics section: a protocol's table of named counters, kept in one shard for each I/O thread and each worker.
+ *  Made by @ref duct_stats_create and owned by its engine, which frees it in
+ *  @ref duct_engine_destroy.
+ */
+typedef struct duct_stats duct_stats_t;
+
+/** @brief Row of a section's table: one counter by name and place in the shard. */
+typedef struct {
+    const char *name;   /**< Counter name, copied into the section. */
+    uint16_t    offset; /**< Byte offset of the counter in a shard: a multiple of 8, the start of a @c uint64_t @c _Atomic. */
+} duct_stat_field_t;
+
+/** @brief Initializer of one @c duct_stat_field_t row, named as @p member and placed at its offset in the struct @p T. */
+#define duct_stat_field(T, member) { #member, offsetof(T, member) }
+
+/** @brief Table of a statistics section. */
+typedef struct {
+    const char              *name;       /**< Section name, non-empty. */
+    const duct_stat_field_t *fields;     /**< Counters of the section, read in this order. */
+    uint16_t                 n_fields;   /**< Rows in @c fields, at least 1. */
+    uint16_t                 shard_size; /**< Bytes of the struct one shard holds. */
+} duct_stats_cfg_t;
+
+/** @brief Receiver of one counter of a reading.
+ *  @p section and @p field name the counter and stay valid for the call; @p value is
+ *  the counter summed over the shards, stopped at @c UINT64_MAX. It runs on the thread
+ *  that calls @ref duct_stats_read.
+ */
+typedef void (*duct_stats_visit_fn)(void *ctx, const char *section, const char *field,
+                                    uint64_t value);
 
 #ifdef __cplusplus
 }

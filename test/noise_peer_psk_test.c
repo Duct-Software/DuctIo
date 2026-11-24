@@ -128,7 +128,7 @@ typedef struct {
                               *  config names, its own fill of @c hello_len bytes. */
 } world_t;
 
-static void s_fill(uint8_t *p, size_t n, unsigned seed)
+static void s_fill(size_t n, uint8_t p[static n], unsigned seed)
 {
     for (size_t i = 0u; i < n; ++i)
         p[i] = (uint8_t)(seed + i);
@@ -138,7 +138,7 @@ static bool s_world(world_t *w, size_t hello_len, duct_noise_pattern_t pattern)
 {
     *w = (world_t){};
     uint8_t wire_key[duct_noise_key_size];
-    s_fill(wire_key, sizeof wire_key, 0x70u);
+    s_fill(sizeof wire_key, wire_key, 0x70u);
     auto server = &w->server;
     if (!duct_noise_keypair_generate(&server->local_static))
         return false;
@@ -154,13 +154,13 @@ static bool s_world(world_t *w, size_t hello_len, duct_noise_pattern_t pattern)
             return false;
         client->suite.pattern = pattern;
         memcpy(peer->pub, client->local_static.pub, duct_noise_key_size);
-        s_fill(peer->psk, sizeof peer->psk, 0x10u * (i + 1u));
+        s_fill(sizeof peer->psk, peer->psk, 0x10u * (i + 1u));
         client->hello_len = hello_len;
         client->hello = w->client_hello[i];
         memcpy(client->remote_static_pub, server->local_static.pub, duct_noise_key_size);
         memcpy(client->psk, peer->psk, sizeof client->psk);
         memcpy(client->wire_key, wire_key, sizeof wire_key);
-        s_fill(w->client_hello[i], hello_len, 0xa0u + 0x10u * i);
+        s_fill(hello_len, w->client_hello[i], 0xa0u + 0x10u * i);
     }
     return true;
 }
@@ -407,8 +407,8 @@ static const char *s_short_hello(const duct_seal_engine_vtbl_t *vt, world_t *w)
         uint8_t framed[port_cap];
         size_t  hdr = vt->pdu_hdr_size, n = 0u;
         duct_view_u8 payload = { .data = zeros, .size = len };
-        bool    wrote = s_xk(w) ? duct_noise_hs_write_msg1_xk(hs, payload, framed + hdr, sizeof framed - hdr, &n)
-                                : duct_noise_hs_write_msg1(hs, payload, framed + hdr, sizeof framed - hdr, &n);
+        bool    wrote = s_xk(w) ? duct_noise_hs_write_msg1_xk(hs, payload, sizeof framed - hdr, framed + hdr, &n)
+                                : duct_noise_hs_write_msg1(hs, payload, sizeof framed - hdr, framed + hdr, &n);
         duct_noise_hs_destroy(hs);
         if (!wrote)
             return "crafting message 1 failed";
@@ -440,7 +440,7 @@ static const char *s_older_peer(const duct_seal_engine_vtbl_t *vt, world_t *w)
            cl = sl < 24u ? sl : 24u;
     w->server.hello_ok = s_hello_seen;
     w->client[0].hello_len = cl;
-    s_fill(w->client_hello[0], cl, 0xa0u);
+    s_fill(cl, w->client_hello[0], 0xa0u);
     uint8_t want[hello_stage_max] = {};
     memcpy(want, w->client_hello[0], cl < sl ? cl : sl);
     pair_t p;

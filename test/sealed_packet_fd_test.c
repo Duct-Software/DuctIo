@@ -58,13 +58,13 @@ static void s_reset(void)
     g_raw_peer_fd = duct_sock_bad;
 }
 
-static void s_fill(uint8_t *p, unsigned len)
+static void s_fill(unsigned len, uint8_t p[static len])
 {
     for (unsigned i = 0u; i < len; ++i)
         p[i] = (uint8_t)(i * 7u + 1u);
 }
 
-static bool s_check(const uint8_t *p, unsigned len)
+static bool s_check(unsigned len, const uint8_t p[static len])
 {
     for (unsigned i = 0u; i < len; ++i)
         if (p[i] != (uint8_t)(i * 7u + 1u))
@@ -131,7 +131,7 @@ on_frame([[maybe_unused]] duct_session_t *s, duct_conn_id_t conn_id,
     if (conn_id != 1u)
         return rc_ok;
     bool ok = frame->payload.size == payload_len
-           && s_check((const uint8_t *)frame->payload.data, payload_len);
+           && s_check(payload_len, (const uint8_t *)frame->payload.data);
     if (!ok)
         duct_discard duct_atomic_fetch(add, &g_bad_body, 1, release);
     duct_discard duct_atomic_fetch(add, &g_frames, 1, release);
@@ -183,7 +183,7 @@ static const char *sc_sealed_dgram_leg(void)
     if (driver == duct_sock_bad)
         error = "udp connect failed";
     if (!error) {
-        s_fill(clear, payload_len);
+        s_fill(payload_len, clear);
         size_t n = tls_null_record(rec, 1u, clear, 4u);
         if (send(driver, rec, n, 0) != (ssize_t)n)
             error = "handshake datagram send failed";
@@ -312,8 +312,8 @@ on_frame_leg_wire([[maybe_unused]] duct_session_t *s, duct_conn_id_t conn_id,
     auto at = (unsigned)duct_atomic_fetch(add, &g_leg_slot, 1, acq_rel);
     if (at < leg_packets)
         g_leg_seen[at] = (unsigned)frame->payload.size;
-    if (!s_check((const uint8_t *)frame->payload.data,
-                 (unsigned)frame->payload.size))
+    if (!s_check((unsigned)frame->payload.size,
+                 (const uint8_t *)frame->payload.data))
         duct_discard duct_atomic_fetch(add, &g_bad_body, 1, relaxed);
     duct_discard duct_atomic_fetch(add, &g_leg_frames, 1, release);
     return rc_ok;
@@ -374,7 +374,7 @@ static const char *sc_leg_wire_on_stream_proto(void)
     if (!error) {
         uint8_t packet[2048];
         for (unsigned i = 0u; i < leg_packets && !error; ++i) {
-            s_fill(packet, leg_sizes[i]);
+            s_fill(leg_sizes[i], packet);
             if (write(g_peer_fd, packet, leg_sizes[i]) != (ssize_t)leg_sizes[i])
                 error = "write to the packet fd failed";
         }

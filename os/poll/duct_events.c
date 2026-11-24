@@ -92,16 +92,16 @@ static duct_sock_t s_make_wake_sock(void)
 
 duct_events_env_t *duct_events_init(void)
 {
-    auto env = duct_new(duct_events_env_t);
+    duct_auto_del auto env = duct_new(duct_events_env_t);
     duct_do_if(!env, return nullptr);
     env->cancel_io = nullptr;
     duct_sock_t wake_sock = s_make_wake_sock();
-    duct_do_if(wake_sock == duct_sock_bad, duct_del(env); return nullptr);
+    duct_do_if(wake_sock == duct_sock_bad, return nullptr);
     env->wake_sock = wake_sock;
     env->fds[0] = (duct_pollfd_t){ .fd = wake_sock, .events = POLLIN };
     env->slots[0] = (duct_events_slot_t){ .kind = io_tag_wake, .tag = nullptr };
     env->n_entries = env->n_polled = 1u;
-    return env;
+    return duct_move(env);
 }
 
 void (*duct_events_cancel_io_of(duct_events_env_t *env))(duct_sock_t fd)
@@ -125,28 +125,31 @@ void duct_events_rx_stall(duct_sock_t fd, void *rx_io_priv)
 void duct_events_drive_rx(void *tag)
 {
     duct_result_t rc = rc_again;
+    bool refused = false;
     duct_io_xfer_t r = { .fd = duct_sock_bad };
     while (duct_io_rx_reserve(tag, &r)) {
-        if (r.units > 1u) {
-            rc = duct_io_dgram_rx_units(tag, &r);
-            if (rc != rc_ok)
-                break;
-            continue;
-        }
         size_t nread = 0u,
                seg = 0u;
-        rc = duct_xread(r.fd, r.xport_type, (duct_view_u8){ .data = r.buf, .size = r.size },
-                             &nread, r.ctx, 0, &seg);
-        if (rc == rc_ok) {
+        rc = r.units > 1u
+           ? duct_io_dgram_rx_units(tag, &r)
+           : duct_xread(r.fd, r.xport_type, (duct_view_u8){ .data = r.buf, .size = r.size },
+                        &nread, r.ctx, 0, &seg);
+        if (r.units == 1u && rc == rc_ok) {
             duct_io_rx_commit(tag, nread, seg);
             continue;
         }
-        if (rc == rc_drop) {
-            /* Truncated datagram, already dequeued by recv() itself —
-             * nothing to commit, keep draining. Reset rc so a stale
-             * rc_drop never reaches duct_io_rx_done below. */
+        switch (rc) {
+        case rc_ok:
+            continue;
+        case rc_frame_too_large:
+            refused = true;
+            [[fallthrough]];
+        case rc_drop:
+            /* Queued EMSGSIZE or truncated datagram consumed; keep draining. */
             rc = rc_again;
             continue;
+        default:
+            break;
         }
         break;
     }
@@ -160,6 +163,8 @@ void duct_events_drive_rx(void *tag)
         p->events |= POLLIN;
     }
     duct_io_rx_done(tag, rc);
+    if (refused)
+        duct_io_frame_refused(tag);
 }
 
 void duct_events_drive_tx(void *tag)
@@ -182,7 +187,7 @@ void duct_events_drive_tx(void *tag)
                              : (short)(pf->events & ~(short)POLLOUT);
         duct_io_tx_write_armed_set(tag, filled);
     }
-    duct_io_tx_done(tag, rc); /* no-op unless rc is rc_fatal */
+    duct_io_tx_done(tag, rc); /* reports a refused frame once; closes on rc_fatal */
 }
 
 /** @brief Find @p fd's live slot in @p env.
@@ -336,7 +341,17 @@ void duct_events_unwatch(duct_events_env_t *env, duct_sock_t fd, void *rx_io_pri
 bool duct_events_promote(duct_events_env_t *env, duct_sock_t fd, void *tag_ptr)
 {
     unsigned i = s_find_slot(env, fd);
-    duct_do_if(i == UINT_MAX, return false);
+    if (i == UINT_MAX) {
+        /* A fresh fd -- the hop's swapped-in socket was never watched: take
+         * the full conn set, POLLOUT armed once here and owned by s_drive_tx
+         * from then on, kept in step with duct_io_tx_write_armed_set. */
+        duct_do_if(env->n_entries >= sizeof env->fds / sizeof env->fds[0], return false);
+        i = env->n_entries++;
+        env->fds[i] = (duct_pollfd_t){ .fd = fd, .events = POLLIN | POLLOUT };
+        env->slots[i] = (duct_events_slot_t){ .kind = io_tag_conn, .tag = tag_ptr };
+        duct_io_on_relocate(io_tag_conn, tag_ptr, &env->fds[i]);
+        return true;
+    }
     /* fd is already in env->fds[]; the tag changes, and the read side is
      * widened to the full conn set — a pre_conn_probe registered POLLIN
      * alone. No x_udp_peer narrowing: a promoted conn holds a real,

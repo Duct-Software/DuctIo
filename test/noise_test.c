@@ -82,7 +82,7 @@ s_do_handshake(duct_noise_hs_t *hs_i, duct_noise_hs_t *hs_r,
     uint8_t msg1[256];
     size_t msg1_len = 0u;
     if (!duct_noise_hs_write_msg1(hs_i, (duct_view_u8){ (void *)hello, hello_len },
-                                  msg1, sizeof msg1, &msg1_len))
+                                  sizeof msg1, msg1, &msg1_len))
         return "write_msg1 failed";
     const char *err = s_send(sock_i, msg1, msg1_len);
     if (err) return err;
@@ -95,7 +95,7 @@ s_do_handshake(duct_noise_hs_t *hs_i, duct_noise_hs_t *hs_r,
     uint8_t payload_out[64];
     size_t payload_out_len = 0u;
     if (!duct_noise_hs_read_msg1(hs_r, (duct_view_u8){ rbuf, rlen },
-                                 learned_static, payload_out, sizeof payload_out, &payload_out_len))
+                                 learned_static, sizeof payload_out, payload_out, &payload_out_len))
         return "read_msg1 failed";
     if (memcmp(learned_static, kp_i->pub, 32u) != 0)
         return "learned static key mismatch";
@@ -104,7 +104,7 @@ s_do_handshake(duct_noise_hs_t *hs_i, duct_noise_hs_t *hs_r,
 
     uint8_t msg2[128];
     size_t msg2_len = 0u;
-    if (!duct_noise_hs_write_msg2(hs_r, (duct_view_u8){}, msg2, sizeof msg2, &msg2_len))
+    if (!duct_noise_hs_write_msg2(hs_r, (duct_view_u8){}, sizeof msg2, msg2, &msg2_len))
         return "write_msg2 failed";
     if ((err = s_send(sock_r, msg2, msg2_len))) return err;
 
@@ -124,7 +124,7 @@ s_do_transport_round(duct_noise_transport_t *send_side, duct_noise_transport_t *
 {
     uint8_t sealed[64];
     size_t sealed_len = duct_noise_transport_seal(send_side, &(duct_view_u8){ (void *)plain, plain_len },
-                                                  1u, sealed, sizeof sealed);
+                                                  1u, sizeof sealed, sealed);
     if (!sealed_len) return "seal failed";
     const char *err = s_send(sock_from, sealed, sealed_len);
     if (err) return err;
@@ -135,13 +135,27 @@ s_do_transport_round(duct_noise_transport_t *send_side, duct_noise_transport_t *
 
     uint8_t opened[32];
     size_t opened_len = 0u;
-    if (!duct_noise_transport_unseal(recv_side, (duct_view_u8){ rbuf, rlen }, opened, sizeof opened, &opened_len))
+    if (!duct_noise_transport_unseal(recv_side, (duct_view_u8){ rbuf, rlen }, sizeof opened, opened, &opened_len))
         return "unseal failed";
     if (opened_len != plain_len || memcmp(opened, plain, opened_len) != 0)
         return "transport payload mismatch";
 
-    if (duct_noise_transport_unseal(recv_side, (duct_view_u8){ rbuf, rlen }, opened, sizeof opened, &opened_len))
+    if (duct_noise_transport_unseal(recv_side, (duct_view_u8){ rbuf, rlen }, sizeof opened, opened, &opened_len))
         return "replayed message was accepted";
+
+    /* Tampered tag must fail and zero-wipe any partially decrypted plaintext in out. */
+    rlen = duct_noise_transport_seal(send_side, &(duct_view_u8){ (void *)plain, plain_len },
+                                     1u, sizeof rbuf, rbuf);
+    if (!rlen) return "tamper-test seal failed";
+    rbuf[rlen - 1u] ^= 0xffu;
+    memset(opened, 0xa5, sizeof opened);
+    if (duct_noise_transport_unseal(recv_side, (duct_view_u8){ rbuf, rlen }, sizeof opened, opened, &opened_len))
+        return "tampered message was accepted";
+    for (size_t i = 0u; i < plain_len; ++i)
+    {
+        if (opened[i] != 0u)
+            return "tampered unseal left non-zero bytes in output";
+    }
     return nullptr;
 }
 

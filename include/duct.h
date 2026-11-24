@@ -28,67 +28,10 @@
 #include "duct_wire.h"
 #include "duct_protocol.h"
 #include "duct_stream.h"
-#include "duct_tx_pool.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
-
-/* Host-side event callbacks */
-
-/** @brief Egress for an inter conn — the runtime hands an outbound packet to the host.
- *
- *  Invoked on the host executor through @c duct_host_cfg_t::run, never on the
- *  worker, when the worker emits TX on a conn attached with @c duct_conn_attach_inter.
- *
- *  @param app_ctx  @c duct_host_cfg_t::ctx.
- *  @param tok      Session that produced the packet.
- *  @param conn_id  Inter conn the packet targets.
- *  @param pkt      Non-owning; valid only for the call. Copy it if the host sink
- *                 consumes it asynchronously.
- *
- *  Must not call @c duct_session_invoke_sync or otherwise block on the worker.
- */
-typedef void (*duct_packet_out_fn)(void *app_ctx,
-                                    duct_handle_t tok,
-                                    duct_conn_id_t conn_id,
-                                    duct_view_u8 pkt);
-
-/** @brief Host executor dispatch hook.
- *
- *  Schedules @c fn(ctx) onto the host egress queue for @c on_packet_out
- *  execution. Required when inter connections exist; otherwise @c nullptr.
- *
- *  @param fn         Work item to run on the host queue.
- *  @param ctx        Argument forwarded to @c fn.
- *  @param queue_ctx  @c duct_host_cfg_t::queue_ctx.
- */
-typedef void (*duct_host_run_fn)(void (*fn)(void *ctx), void *ctx, void *queue_ctx);
-
-/** @brief Backpressure release for inter-conn ingress.
- *
- *  Called once the conn's RX staging has room again after a pushed batch drains;
- *  the host issues its next read from here. @c nullptr when no inter conn is used.
- *
- *  @param app_ctx  @c duct_host_cfg_t::ctx.
- */
-typedef void (*duct_inter_resume_fn)(void *app_ctx);
-
-/** @brief Host-bridge configuration for inter conns.
- *
- *  "Host" is the embedding application: code running on any thread the engine
- *  does not own — not an io thread, not a worker. Leave every field
- *  @c nullptr (zero-initialized) when no inter conn is used.
- */
-typedef struct duct_host_cfg {
-    duct_host_run_fn     run;             /**< Dispatch onto the host queue; required with inter conns. */
-    void                 *queue_ctx;       /**< Forwarded to @c run. */
-    duct_packet_out_fn    on_packet_out;   /**< Inter-conn TX sink; required when any inter conn exists. */
-    duct_inter_resume_fn  on_inter_resume; /**< Fires after a worker drains an inter conn's lane — a
-                                             *  hint to retry a push that returned rc_defer, not a
-                                             *  per-push wait requirement. @c nullptr when unused. */
-    void                 *ctx;             /**< Forwarded to @c on_packet_out and @c on_inter_resume. */
-} duct_host_cfg_t;
 
 /* Runtime configuration */
 
@@ -211,6 +154,9 @@ typedef enum duct_thread_role : uint8_t {
  */
 int duct_engine_thread_cpu(const duct_engine_t *e, duct_thread_role_t role, unsigned index);
 
+/** @brief The engine's actual worker count; 0 for a null @p e. */
+unsigned duct_engine_workers(const duct_engine_t *e);
+
 /* Network binding */
 
 /** @brief Listen for inbound stream connections; one session per accepted conn.
@@ -230,72 +176,6 @@ int duct_engine_thread_cpu(const duct_engine_t *e, duct_thread_role_t role, unsi
  */
 duct_result_t duct_io_listen(duct_engine_t *e, const char *host, uint16_t *port,
                               duct_proto_t *proto);
-
-/** @brief Listener transport kind. */
-typedef enum duct_listener_kind : uint8_t {
-    listener_stream, /**< TCP-like: one listen socket, accept() per new session (default). */
-    listener_dgram,  /**< UDP-like: one shared classification socket, per-peer conns spun off
-                       *  via connect() on first datagram. @see duct_listener_bind */
-} duct_listener_kind_t;
-
-/** @brief One bound listener with its protocol array.
- *        Passed to @ref duct_listener_bind.
- *
- *  @c protos is borrowed for the @ref duct_listener_bind call only; the runtime
- *  copies the array. Array order is dispatch priority: on accept/receipt the
- *  runtime tries protocols in order (sync pre-parse, then async, then
- *  @c preparse==NULL fallbacks) and the first non-@c resolve_not_me wins.
- *  @c addr is the bind host only (e.g. @c "127.0.0.1", @c "::1"); the port is
- *  passed separately to @ref duct_listener_bind as an in/out parameter.
- *  A path listener sets @c local_path in place of @c addr, and the three
- *  fields after it are its alone.
- */
-typedef struct duct_listener_cfg {
-    const char                *addr;     /**< Bind host: bare name/IP, no port, no brackets. */
-    unsigned                   n_protos; /**< Entries in @c protos; at least 1. */
-    const duct_proto_t *const *protos;   /**< Borrowed for the call; order = dispatch priority. */
-    duct_listener_kind_t       kind;     /**< @c listener_stream (default) or @c listener_dgram. */
-    size_t                     peek_cap; /**< Stream: max bytes to read for pre-parse
-                                              probe — consumed for good, then re-injected
-                                              into the conn's own RX once it exists. Datagram: max
-                                              accepted payload for classification (whole datagram
-                                              either way). Either way, 0 = default. */
-    uint32_t                   probe_wait_ms; /**< Stream only: if every sync pre-parse returns
-                                              @c resolve_not_me on a literally empty first read, wait
-                                              up to this long for the peer's first bytes before falling
-                                              back to the has_async/fallback/reject dispatch — at
-                                              most one wait per accepted fd. @c peek_min extends the
-                                              wait to a first read that is short. 0 = disabled (default). */
-    uint16_t                   peek_min; /**< Stream only: bytes a first read has to reach before the
-                                              runtime asks anything of it, a pre-parse and the engine's
-                                              join lead included. A shorter read is held and the wait
-                                              goes on until the bytes are in, the peer closes or
-                                              @c probe_wait_ms runs out, and what was read is then
-                                              classified as it stands; arrivals leave that deadline
-                                              where it was. Needs @c probe_wait_ms and is at most the
-                                              stream read span: @c peek_cap, or the runtime's default
-                                              clamped to its largest size. 0 = off (default). */
-    const char                *local_path; /**< Socket file of an AF_UNIX stream listener, shorter
-                                              than @c sockaddr_un's @c sun_path; @c nullptr = an
-                                              address listener. Needs @c addr unset and
-                                              @c listener_stream. */
-    const char                *local_group; /**< Group of the socket file: a name or a decimal gid;
-                                              @c nullptr = left as created. Path listener only,
-                                              refused on Windows. */
-    uint16_t                   local_mode; /**< Permission bits of the socket file, the low nine of
-                                              the value, applied before the listener accepts; 0 =
-                                              left as created. Path listener only, refused on
-                                              Windows. */
-    uint16_t                   max_sessions; /**< Most accepted conns alive at once on a path
-                                              listener; a client past it is closed before a conn
-                                              is taken. 0 = no cap. Path listener only. */
-    uint16_t                   max_conns_per_s; /**< Most conns a path listener takes in a second, one every
-                                              1/N s: it stops accepting for that long after each accept,
-                                              and the clients that come meanwhile wait in the socket's
-                                              queue, one place on Linux and five on Windows, a
-                                              non-blocking connect that finds it full failing at once.
-                                              0 = no pace. Path listener only. */
-} duct_listener_cfg_t;
 
 /** @brief Bind a listener with an explicit protocol array and pre-parse
  *        configuration; stream or datagram, selected by @c cfg->kind.
@@ -370,6 +250,12 @@ duct_result_t duct_io_connect_via(duct_engine_t *e, const char *addr,
                                    void *user_ctx, duct_xport_t xport,
                                    uint32_t egress_if, duct_view_u8 tx_prefix);
 
+duct_result_t duct_io_connect_worker(duct_engine_t *e, const char *addr,
+                                     duct_proto_t *proto,
+                                     void *user_ctx, duct_xport_t xport,
+                                     uint32_t egress_if, duct_view_u8 tx_prefix,
+                                     unsigned worker);
+
 /** @brief Open a session whose leg 0 is the caller's packet-delimited fd.
  *
  *  The session-opening sibling of @ref duct_conn_attach_packet_fd, callable from
@@ -412,6 +298,74 @@ duct_result_t duct_io_attach_packet_fd(duct_engine_t *e, duct_sock_t fd, duct_pr
 duct_result_t duct_timer_start(duct_engine_t *e, duct_proto_t *proto, void *user_ctx,
                                uint64_t delay_ms, uintptr_t arg);
 
+/** @brief Worker index wildcards. @c duct_worker_any picks a worker round-robin;
+ *  @c duct_worker_none is what @ref duct_worker_self answers off a worker thread.
+ */
+static constexpr unsigned duct_worker_any  = UINT32_MAX;
+static constexpr unsigned duct_worker_none = UINT32_MAX;
+
+/** @brief The calling thread's worker id, or @c duct_worker_none off a worker. */
+unsigned duct_worker_self(void);
+
+/** @brief Out-of-session work: runs on the addressed worker, outside any session. */
+typedef void (*duct_worker_fn)(duct_engine_t *e, unsigned worker, void *ctx);
+
+duct_nonnull(2, 3) duct_result_t
+duct_worker_post_work(unsigned worker_id, duct_engine_t *e, duct_worker_fn fn, void *ctx);
+
+duct_nonnull(2, 3) duct_result_t
+duct_worker_post_proto(unsigned worker_id, duct_engine_t *e, duct_proto_t *proto,
+                       void *user_ctx, uintptr_t arg);
+
+/** @brief Post @p fn onto one worker's ctrl stack and return immediately.
+ *
+ *  The worker runs @c fn(e, its id, ctx) during its next drain. @p ctx stays
+ *  the caller's: a node still queued at engine stop is freed without execution
+ *  and the runtime runs no callback for it. @p fn must not block — a blocking
+ *  @p fn stalls every machine parked on that worker; work that waits unbounded
+ *  or on events unrelated to @p fn runs on its own context and posts its
+ *  completion back with @ref duct_worker_post. A host machine keeps one home
+ *  worker for its whole life and re-posts when it finds itself elsewhere.
+ *
+ *  @param e       Runtime instance.
+ *  @param worker  Worker index, or @c duct_worker_any for round-robin.
+ *  @param fn      Work to run on the worker.
+ *  @param ctx     Argument forwarded to @p fn.
+ *  @retval rc_ok             Posted.
+ *  @retval rc_invalid_arg    Null @p e or @p fn, or an index past the worker
+ *                            count other than @c duct_worker_any.
+ *  @retval rc_invalid_order  The engine is not running.
+ */
+duct_result_t duct_worker_post(duct_engine_t *e, unsigned worker,
+                               duct_worker_fn fn, void *ctx);
+
+/** @brief Post one @c on_work tour of @p proto onto a worker's ctrl stack.
+ *
+ *  The worker runs @c cfg.on_work with @c user_ctx falling back to
+ *  @c cfg.user_ctx when null; the message carries a root hold on @p proto from
+ *  post to execution or cleanup, so a tour cannot outlive its protocol. A tour
+ *  may call the OS boundary synchronously — adapter close, netlink, a guard
+ *  transaction — when the result gates the tour's own next state and the call
+ *  is bounded; it suspends instead, a coroutine wait or a machine state, when
+ *  the wait is unbounded, when other cargo on that worker would actually
+ *  progress meanwhile, or when it waits on work unrelated to the tour's next
+ *  state.
+ *
+ *  @param e         Runtime instance.
+ *  @param worker    Worker index, or @c duct_worker_any for round-robin.
+ *  @param proto     Protocol whose @c on_work runs; must stay alive until the
+ *                   engine is destroyed.
+ *  @param user_ctx  Argument for the tour; null falls back to @c cfg.user_ctx.
+ *  @param arg       Tag forwarded to @c on_work.
+ *  @retval rc_ok             Posted.
+ *  @retval rc_invalid_arg    Null @p e or @p proto, a protocol without
+ *                            @c on_work, or an index past the worker count.
+ *  @retval rc_invalid_order  The engine is not running, or the hold count on
+ *                            @p proto is exhausted.
+ */
+duct_result_t duct_proto_post(duct_engine_t *e, unsigned worker,
+                              duct_proto_t *proto, void *user_ctx, uintptr_t arg);
+
 /** @brief Revoke one listener by its socket, from any thread.
  *
  *  Deregisters exactly the node whose listening socket equals @p fd — one of
@@ -452,6 +406,39 @@ duct_result_t duct_session_invoke(duct_engine_t *e,
                                    duct_handle_t tok,
                                    duct_session_fn fn,
                                    void *ctx);
+
+/** @brief Invoke completion; runs exactly once per accepted call — see
+ *  @ref duct_session_invoke_done.
+ */
+typedef void (*duct_session_invoke_done_fn)(duct_result_t rc, void *done_ctx);
+
+/** @brief Post @p fn to the session's worker and report its outcome to
+ *  @p on_done exactly once.
+ *
+ *  @p on_done runs with @p fn's return code on the worker after a normal
+ *  commit, with @c rc_closed on the worker when @p tok no longer resolves by
+ *  the time the message executes, with @c rc_no_memory synchronously on this
+ *  thread when the message allocation fails, and with @c rc_closed
+ *  synchronously when the engine is not running or @p tok is already stale.
+ *  Releasing @p done_ctx is @p on_done's job — the runtime never frees it.
+ *
+ *  @param e         Runtime instance.
+ *  @param tok       Session token.
+ *  @param fn        Work to run on the worker.
+ *  @param ctx       Argument forwarded to @p fn.
+ *  @param on_done   Completion callback; runs exactly once.
+ *  @param done_ctx  Argument forwarded to @p on_done.
+ *  @retval rc_ok           Posted; @p on_done still runs exactly once.
+ *  @retval rc_invalid_arg  Null @p e or @p fn; @p on_done does not run.
+ *  @retval rc_closed       The engine is not running or @p tok is stale;
+ *                          @p on_done has run with @c rc_closed.
+ */
+duct_result_t duct_session_invoke_done(duct_engine_t *e,
+                                        duct_handle_t tok,
+                                        duct_session_fn fn,
+                                        void *ctx,
+                                        duct_session_invoke_done_fn on_done,
+                                        void *done_ctx);
 
 /** @brief Post @p fn and block the caller until @c fn and its flush complete,
  *  or a 5-second timeout elapses first.
@@ -603,6 +590,32 @@ typedef struct duct_rt_stats {
                                             round-tripped through trunk.stack for nothing
                                             because an earlier drain already emptied the
                                             lane, all io threads. */
+             dgram_hop_swap_fail,     /**< 5-tuple hop swaps that gave up: the parked
+                                            spare socket and a fresh open both failed to
+                                            connect, the leg staying on its current tuple
+                                            until the next hop, all io threads. */
+             dgram_hop_wheel_give,    /**< Retired hop sockets the io thread's socket
+                                            wheel took in, all io threads. */
+             dgram_hop_wheel_reap,    /**< ...of those, reaped at a hold's end: the band
+                                            proven drained, the socket closed, all io
+                                            threads. */
+             dgram_hop_wheel_extend,  /**< ...of those, a reap pass that could not yet
+                                            prove the band landed, the hold extended,
+                                            all io threads. */
+             dgram_hop_wheel_forced,  /**< ...of those, closed ahead of the hold: the
+                                            wheel full and the oldest slot given up,
+                                            all io threads. */
+             dgram_hop_band_taken,    /**< Retired bands' datagrams the drain committed
+                                            into the conn's rx ring, all io threads. */
+             dgram_hop_band_stall,    /**< Drain passes the ring refused room to: the
+                                            band waits behind the live flow, all io
+                                            threads. */
+             dgram_hop_band_drop,     /**< Band datagrams dequeued whole and dropped:
+                                            each past the wire's bounds, all io
+                                            threads. */
+             dgram_hop_band_error,    /**< Drain reads that answered a socket error:
+                                            counted and stepped over, the queue
+                                            carrying on, all io threads. */
              dgram_shared_rx_drop,    /**< Classified datagrams for an x_udp_shared conn
                                             dropped: their inter_lane refused the
                                             reservation, or the descriptor size for their
@@ -677,10 +690,6 @@ typedef struct duct_rt_stats {
                                             toward its producer, and what a
                                             shared datagram listener discards
                                             is reported as dgram_shared_rx_drop. */
-             tx_pool_acquire_fail,    /**< duct_tx_pool_acquire calls that returned NULL,
-                                            all workers: genuine TX staging saturation --
-                                            regions are being held or referenced faster
-                                            than sends resolve them. */
              tcp_writes,              /**< x_tcp writes: worker direct sends and
                                             io drain writes, all workers and io
                                             threads. */
@@ -711,7 +720,11 @@ typedef struct duct_rt_stats {
     apply(fastpath_eagain) apply(dgram_shared_tx_drop) apply(tx_drain_posts)                       \
     apply(tx_drain_deduped) apply(wfq_push_full) apply(fence_push_full) apply(rx_full_latch)       \
     apply(io_loop_pass) apply(io_busy_spin) apply(io_busy_enter) apply(io_busy_exit)               \
-    apply(dgram_tx_real_kick) apply(dgram_tx_real_kick_idle) apply(dgram_shared_rx_drop)           \
+    apply(dgram_tx_real_kick) apply(dgram_tx_real_kick_idle) apply(dgram_hop_swap_fail)            \
+    apply(dgram_hop_wheel_give) apply(dgram_hop_wheel_reap) apply(dgram_hop_wheel_extend)          \
+    apply(dgram_hop_wheel_forced) apply(dgram_hop_band_taken) apply(dgram_hop_band_stall)          \
+    apply(dgram_hop_band_drop) apply(dgram_hop_band_error)                                         \
+    apply(dgram_shared_rx_drop)           \
     apply(dgram_rx_slot_route) apply(dgram_rx_slot_copy) apply(dgram_tx_batch_calls)              \
     apply(dgram_tx_batch_msgs) apply(dgram_tx_batch_max) apply(dgram_fast_sent)                    \
     apply(dgram_lane_staged) apply(dgram_lane_sent) apply(dgram_tx_gso_writes)                     \
@@ -719,7 +732,7 @@ typedef struct duct_rt_stats {
     apply(vnet_rx_tso_reads) apply(vnet_rx_tso_pkts) apply(vnet_rx_drop) apply(vnet_tx_gro_writes) \
     apply(vnet_tx_gro_pkts) apply(vnet_tx_drop) apply(vnet_tx_gro_single)                          \
     apply(tx_train_flush_full) apply(tx_train_flush_end) apply(tx_train_flush_wait)                \
-    apply(inter_held) apply(tx_pool_acquire_fail) apply(tcp_writes) apply(tcp_eor_writes)          \
+    apply(inter_held) apply(tcp_writes) apply(tcp_eor_writes)          \
     apply(tcp_cut_writes) apply(tcp_lowat_reads) apply(tcp_lowat_sets) apply(tcp_rcvbuf_reads)     \
     apply(tcp_rcvbuf_sets)
 
@@ -742,37 +755,6 @@ bool duct_engine_stats(duct_engine_t *e, duct_rt_stats_t *out);
  *  nothing. The totals are final once @ref duct_engine_stop has returned.
  */
 void duct_engine_stats_print(duct_engine_t *e, FILE *out, const char *tag);
-
-/** @brief Statistics section: a protocol's table of named counters, kept in one shard for each I/O thread and each worker.
- *  Made by @ref duct_stats_create and owned by its engine, which frees it in
- *  @ref duct_engine_destroy.
- */
-typedef struct duct_stats duct_stats_t;
-
-/** @brief Row of a section's table: one counter by name and place in the shard. */
-typedef struct {
-    const char *name;   /**< Counter name, copied into the section. */
-    uint16_t    offset; /**< Byte offset of the counter in a shard: a multiple of 8, the start of a @c uint64_t @c _Atomic. */
-} duct_stat_field_t;
-
-/** @brief Initializer of one @c duct_stat_field_t row, named as @p member and placed at its offset in the struct @p T. */
-#define duct_stat_field(T, member) { #member, offsetof(T, member) }
-
-/** @brief Table of a statistics section. */
-typedef struct {
-    const char              *name;       /**< Section name, non-empty. */
-    const duct_stat_field_t *fields;     /**< Counters of the section, read in this order. */
-    uint16_t                 n_fields;   /**< Rows in @c fields, at least 1. */
-    uint16_t                 shard_size; /**< Bytes of the struct one shard holds. */
-} duct_stats_cfg_t;
-
-/** @brief Receiver of one counter of a reading.
- *  @p section and @p field name the counter and stay valid for the call; @p value is
- *  the counter summed over the shards, stopped at @c UINT64_MAX. It runs on the thread
- *  that calls @ref duct_stats_read.
- */
-typedef void (*duct_stats_visit_fn)(void *ctx, const char *section, const char *field,
-                                    uint64_t value);
 
 /** @brief Declare a statistics section on a running engine.
  *  The table and its names are copied, and the engine keeps a shard of @c shard_size

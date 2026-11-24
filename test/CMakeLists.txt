@@ -133,6 +133,44 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     set_tests_properties(secret_arena_nolock PROPERTIES TIMEOUT 60)
 endif()
 
+add_executable(ductio_block_pool_test block_pool_test.c)
+target_link_libraries(ductio_block_pool_test PRIVATE DuctIo::ductio)
+target_include_directories(ductio_block_pool_test PRIVATE
+    ${DUCT_INTERNAL_INCLUDE_DIRS})
+target_compile_features(ductio_block_pool_test PRIVATE c_std_23)
+add_test(NAME block_pool COMMAND ductio_block_pool_test)
+set_tests_properties(block_pool PROPERTIES TIMEOUT 60)
+
+add_executable(ductio_conn_block_test conn_block_test.c)
+target_link_libraries(ductio_conn_block_test PRIVATE DuctIo::ductio)
+target_include_directories(ductio_conn_block_test PRIVATE
+    ${DUCT_INTERNAL_INCLUDE_DIRS})
+target_compile_features(ductio_conn_block_test PRIVATE c_std_23)
+add_test(NAME conn_block COMMAND ductio_conn_block_test)
+set_tests_properties(conn_block PROPERTIES TIMEOUT 60)
+
+add_executable(ductio_session_block_test session_block_test.c)
+target_link_libraries(ductio_session_block_test PRIVATE DuctIo::ductio)
+target_include_directories(ductio_session_block_test PRIVATE
+    ${DUCT_INTERNAL_INCLUDE_DIRS})
+target_compile_features(ductio_session_block_test PRIVATE c_std_23)
+add_test(NAME session_block COMMAND ductio_session_block_test)
+set_tests_properties(session_block PROPERTIES TIMEOUT 60)
+
+add_executable(ductio_session_timer_test session_timer_test.c)
+target_link_libraries(ductio_session_timer_test PRIVATE DuctIo::ductio)
+target_include_directories(ductio_session_timer_test PRIVATE
+    ${DUCT_INTERNAL_INCLUDE_DIRS})
+target_compile_features(ductio_session_timer_test PRIVATE c_std_23)
+add_test(NAME session_timer COMMAND ductio_session_timer_test)
+set_tests_properties(session_timer PROPERTIES TIMEOUT 60)
+
+add_test(NAME conn_block_audit
+    COMMAND ${CMAKE_COMMAND}
+        -DSRCDIR=${PROJECT_SOURCE_DIR}/src
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/CheckConnBlockAudit.cmake)
+set_tests_properties(conn_block_audit PROPERTIES TIMEOUT 30)
+
 add_executable(ductio_crypto_test crypto_test.c)
 target_link_libraries(ductio_crypto_test PRIVATE DuctIo::ductio)
 target_compile_features(ductio_crypto_test PRIVATE c_std_23)
@@ -269,6 +307,14 @@ target_include_directories(ductio_wire_frame_flags_test PRIVATE
 target_compile_features(ductio_wire_frame_flags_test PRIVATE c_std_23)
 add_test(NAME wire_frame_flags COMMAND ductio_wire_frame_flags_test)
 set_tests_properties(wire_frame_flags PROPERTIES TIMEOUT 30)
+
+add_executable(ductio_dgram_env_test dgram_env_test.c tls_engine_null.c)
+target_link_libraries(ductio_dgram_env_test PRIVATE DuctIo::ductio)
+target_include_directories(ductio_dgram_env_test PRIVATE
+    ${DUCT_INTERNAL_INCLUDE_DIRS})
+target_compile_features(ductio_dgram_env_test PRIVATE c_std_23)
+add_test(NAME dgram_env COMMAND ductio_dgram_env_test)
+set_tests_properties(dgram_env PROPERTIES TIMEOUT 30)
 
 add_executable(ductio_mux_wire_test mux_wire_test.c)
 target_link_libraries(ductio_mux_wire_test PRIVATE DuctIo::ductio)
@@ -438,6 +484,8 @@ add_test(NAME dgram_join COMMAND ductio_dgram_join_test)
 
 add_executable(ductio_dgram_shared_test dgram_shared_test.c)
 target_link_libraries(ductio_dgram_shared_test PRIVATE DuctIo::ductio)
+target_include_directories(ductio_dgram_shared_test PRIVATE
+    ${DUCT_INTERNAL_INCLUDE_DIRS})
 target_compile_features(ductio_dgram_shared_test PRIVATE c_std_23)
 add_test(NAME dgram_shared COMMAND ductio_dgram_shared_test)
 
@@ -897,6 +945,14 @@ target_compile_features(ductio_stats_sections_test PRIVATE c_std_23)
 add_test(NAME stats_sections COMMAND ductio_stats_sections_test)
 set_tests_properties(stats_sections PROPERTIES TIMEOUT 60)
 
+add_executable(ductio_worker_post_test worker_post_test.c)
+target_link_libraries(ductio_worker_post_test PRIVATE DuctIo::ductio)
+target_include_directories(ductio_worker_post_test PRIVATE
+    ${DUCT_INTERNAL_INCLUDE_DIRS})
+target_compile_features(ductio_worker_post_test PRIVATE c_std_23)
+add_test(NAME worker_post COMMAND ductio_worker_post_test)
+set_tests_properties(worker_post PROPERTIES TIMEOUT 30)
+
 add_executable(ductio_dgram_spoof_migration_test
     dgram_spoof_migration_test.c tls_engine_null.c)
 target_link_libraries(ductio_dgram_spoof_migration_test PRIVATE DuctIo::ductio)
@@ -1158,6 +1214,7 @@ target_compile_features(ductio_handler_dispatch_test PRIVATE c_std_23)
 target_compile_options(ductio_handler_dispatch_test PRIVATE
     -Wall -Wextra -Wenum-conversion -Wformat=2
 )
+duct_apply_lto(ductio_handler_dispatch_test)
 if(DUCT_ENABLE_RUNTIME_STATS)
     target_compile_definitions(ductio_handler_dispatch_test PRIVATE DUCT_RUNTIME_STATS=1)
 else()
@@ -1185,6 +1242,7 @@ target_compile_features(ductio_retry_drain_quota_test PRIVATE c_std_23)
 target_compile_options(ductio_retry_drain_quota_test PRIVATE
     -Wall -Wextra -Wenum-conversion -Wformat=2
 )
+duct_apply_lto(ductio_retry_drain_quota_test)
 if(DUCT_ENABLE_RUNTIME_STATS)
     target_compile_definitions(ductio_retry_drain_quota_test PRIVATE DUCT_RUNTIME_STATS=1)
 else()
@@ -1212,6 +1270,7 @@ target_compile_features(ductio_retry_frame_ordering_test PRIVATE c_std_23)
 target_compile_options(ductio_retry_frame_ordering_test PRIVATE
     -Wall -Wextra -Wenum-conversion -Wformat=2
 )
+duct_apply_lto(ductio_retry_frame_ordering_test)
 if(DUCT_ENABLE_RUNTIME_STATS)
     target_compile_definitions(ductio_retry_frame_ordering_test PRIVATE DUCT_RUNTIME_STATS=1)
 else()
@@ -1239,6 +1298,7 @@ target_compile_features(ductio_tx_hold_multi_leg_test PRIVATE c_std_23)
 target_compile_options(ductio_tx_hold_multi_leg_test PRIVATE
     -Wall -Wextra -Wenum-conversion -Wformat=2
 )
+duct_apply_lto(ductio_tx_hold_multi_leg_test)
 if(DUCT_ENABLE_RUNTIME_STATS)
     target_compile_definitions(ductio_tx_hold_multi_leg_test PRIVATE DUCT_RUNTIME_STATS=1)
 else()
@@ -1246,6 +1306,36 @@ else()
 endif()
 add_test(NAME tx_hold_multi_leg COMMAND ductio_tx_hold_multi_leg_test)
 set_tests_properties(tx_hold_multi_leg PROPERTIES TIMEOUT 10)
+
+# sealed_vnet_tx_test includes ../src/duct_worker.c directly too (same
+# reason and exclusion as handler_dispatch_test above).
+add_executable(ductio_sealed_vnet_tx_test
+    sealed_vnet_tx_test.c
+    tls_engine_null.c
+    ${DUCTIO_SRC_DISPATCH}
+    ${DUCTIO_SRC_OS}
+)
+duct_platform_configure(ductio_sealed_vnet_tx_test)
+if(DUCT_WITH_OPENSSL OR DUCT_WITH_NOISE)
+    target_link_libraries(ductio_sealed_vnet_tx_test PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+endif()
+target_include_directories(ductio_sealed_vnet_tx_test PRIVATE
+    "${PROJECT_SOURCE_DIR}/include"
+    "${DUCT_GENERATED_INCLUDE_DIR}"
+    ${DUCT_INTERNAL_INCLUDE_DIRS}
+)
+target_compile_features(ductio_sealed_vnet_tx_test PRIVATE c_std_23)
+target_compile_options(ductio_sealed_vnet_tx_test PRIVATE
+    -Wall -Wextra -Wenum-conversion -Wformat=2
+)
+duct_apply_lto(ductio_sealed_vnet_tx_test)
+if(DUCT_ENABLE_RUNTIME_STATS)
+    target_compile_definitions(ductio_sealed_vnet_tx_test PRIVATE DUCT_RUNTIME_STATS=1)
+else()
+    target_compile_definitions(ductio_sealed_vnet_tx_test PRIVATE DUCT_RUNTIME_STATS=0)
+endif()
+add_test(NAME sealed_vnet_tx COMMAND ductio_sealed_vnet_tx_test)
+set_tests_properties(sealed_vnet_tx PROPERTIES TIMEOUT 10)
 
 add_executable(ductio_pmtu_test pmtu_test.c)
 target_link_libraries(ductio_pmtu_test PRIVATE DuctIo::ductio)
@@ -1259,33 +1349,6 @@ target_include_directories(ductio_xopening_test PRIVATE ${DUCT_INTERNAL_INCLUDE_
 target_compile_features(ductio_xopening_test PRIVATE c_std_23)
 add_test(NAME xopening COMMAND ductio_xopening_test)
 set_tests_properties(xopening PROPERTIES TIMEOUT 10)
-
-# tx_pool_test includes ../src/duct_worker.c directly too (same reason and
-# exclusion as handler_dispatch_test above).
-add_executable(ductio_tx_pool_test
-    tx_pool_test.c
-    ${DUCTIO_SRC_DISPATCH}
-    ${DUCTIO_SRC_OS}
-)
-duct_platform_configure(ductio_tx_pool_test)
-if(DUCT_WITH_OPENSSL OR DUCT_WITH_NOISE)
-    target_link_libraries(ductio_tx_pool_test PRIVATE OpenSSL::SSL OpenSSL::Crypto)
-endif()
-target_include_directories(ductio_tx_pool_test PRIVATE
-    "${PROJECT_SOURCE_DIR}/include"
-    "${DUCT_GENERATED_INCLUDE_DIR}"
-    ${DUCT_INTERNAL_INCLUDE_DIRS}
-)
-target_compile_features(ductio_tx_pool_test PRIVATE c_std_23)
-target_compile_options(ductio_tx_pool_test PRIVATE
-    -Wall -Wextra -Wenum-conversion -Wformat=2
-)
-if(DUCT_ENABLE_RUNTIME_STATS)
-    target_compile_definitions(ductio_tx_pool_test PRIVATE DUCT_RUNTIME_STATS=1)
-else()
-    target_compile_definitions(ductio_tx_pool_test PRIVATE DUCT_RUNTIME_STATS=0)
-endif()
-add_test(NAME tx_pool COMMAND ductio_tx_pool_test)
 
 # vnet_train_test includes ../src/duct_worker.c directly too, and drives a seqpacket
 # socketpair in the tun's place, which only Linux has.
@@ -1308,6 +1371,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     target_compile_options(ductio_vnet_train_test PRIVATE
         -Wall -Wextra -Wenum-conversion -Wformat=2 -UNDEBUG
     )
+    duct_apply_lto(ductio_vnet_train_test)
     if(DUCT_ENABLE_RUNTIME_STATS)
         target_compile_definitions(ductio_vnet_train_test PRIVATE DUCT_RUNTIME_STATS=1)
     else()
@@ -1344,6 +1408,7 @@ if(NOT WIN32)
         target_compile_options(ductio_${_io_test}_test PRIVATE
             -Wall -Wextra -Wenum-conversion -Wformat=2 -UNDEBUG
         )
+        duct_apply_lto(ductio_${_io_test}_test)
         if(DUCT_ENABLE_RUNTIME_STATS)
             target_compile_definitions(ductio_${_io_test}_test PRIVATE DUCT_RUNTIME_STATS=1)
         else()
@@ -1374,7 +1439,6 @@ set_tests_properties(peer_disconnect      PROPERTIES TIMEOUT 10)
 set_tests_properties(defer_stream         PROPERTIES TIMEOUT 10)
 set_tests_properties(handler_dispatch     PROPERTIES TIMEOUT 10)
 set_tests_properties(retry_drain_quota    PROPERTIES TIMEOUT 10)
-set_tests_properties(tx_pool              PROPERTIES TIMEOUT 10)
 set_tests_properties(tx_full_batch        PROPERTIES TIMEOUT 30)
 set_tests_properties(tx_full_once         PROPERTIES TIMEOUT 60)
 set_tests_properties(owned_retry          PROPERTIES TIMEOUT 30)
@@ -1407,9 +1471,9 @@ duct_platform_configure(ductio_bench_echo)
 target_compile_features(ductio_bench_echo PRIVATE c_std_23)
 
 if(DUCT_ENABLE_RUNTIME_STATS)
-    target_compile_definitions(ductio_bench_echo PRIVATE DUCT_BENCH=1 DUCT_RUNTIME_STATS=1)
+    target_compile_definitions(ductio_bench_echo PRIVATE DUCT_RUNTIME_STATS=1)
 else()
-    target_compile_definitions(ductio_bench_echo PRIVATE DUCT_BENCH=1 DUCT_RUNTIME_STATS=0)
+    target_compile_definitions(ductio_bench_echo PRIVATE DUCT_RUNTIME_STATS=0)
 endif()
 
 add_executable(ductio_bench_hops bench_hops.c)
@@ -1509,3 +1573,12 @@ if(NOT WIN32)
     target_compile_options(ductio_socket_prepare_test PRIVATE -UNDEBUG)
     add_test(NAME socket_prepare COMMAND ductio_socket_prepare_test)
 endif()
+
+# The include-layer DAG law on the live tree: walks include/, src/, os/,
+# checks every quoted include against the layering map's tier table and
+# proves the resolved graph acyclic. No engine link — the tree is the oracle.
+add_executable(ductio_layer_dag_test layer_dag_test.c)
+target_compile_definitions(ductio_layer_dag_test PRIVATE
+    DUCT_LAYER_ROOT="${PROJECT_SOURCE_DIR}")
+target_compile_features(ductio_layer_dag_test PRIVATE c_std_23)
+add_test(NAME layer_dag COMMAND ductio_layer_dag_test)

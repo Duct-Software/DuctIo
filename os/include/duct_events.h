@@ -11,6 +11,7 @@
 #define DUCT_EVENTS_H
 
 #include "duct_core.h"
+#include "duct_dgram_out.h"
 #include "duct_ticks.h"
 #include "duct_types.h"
 #include "duct_time.h"
@@ -71,6 +72,11 @@ static constexpr size_t duct_events_rx_scratch = 128u;
 static constexpr size_t duct_events_rx_scratch = 0u;
 #endif
 
+/** @brief Records one TX gather addresses, at most — the descriptor ring's
+ *  records, two spans each (§2: the grouped and stream posts are multi-iovec
+ *  arrays the backends take natively). */
+static constexpr unsigned duct_tx_peek_recs = (unsigned)duct_dgram_tx_batch;
+
 /** @brief Ephemeral transfer context for a single RX / TX drive.
  *  Filled by @ref duct_io_rx_reserve and @ref duct_io_tx_peek.
  */
@@ -88,6 +94,11 @@ typedef struct {
                           *  transfer holds nullptr. */
            *io_priv;    /**< Owning conn's backend registration cache. */
     duct_olb_hdr_t *olb_hdr; /**< RX/TX OLB header for duct_olb_io_begin/_done. */
+    duct_view_u8 iov[2u * duct_tx_peek_recs]; /**< TX: the gathered record
+                          *  spans, an empty header or body leaving its slot
+                          *  zero. RX leaves them untouched. */
+    unsigned iov_n;     /**< TX: spans filled, always even — twice the records
+                          *  addressed; 0 while nothing is queued. */
 } duct_io_xfer_t;
 
 typedef struct duct_listener duct_listener_t;
@@ -114,8 +125,8 @@ duct_events_watch(duct_events_env_t *env, duct_sock_t fd,
                   duct_io_tag_t kind, void *tag,
                   duct_xport_t xport_type);
 
-/** @brief Elevate an already-watched, still-dialing @p fd from
- *  pre_conn to conn tag once the dial resolves.
+/** @brief Elevate an already-watched @p fd from pre_conn to conn tag once the
+ *  dial resolves, or register an unwatched dialed/hopped @p fd as @c io_tag_conn.
  *
  *  @return false on failure.
  */
@@ -371,6 +382,13 @@ duct_nonnull(1, 2, 3) void
 duct_io_on_dgram(duct_listener_t *listener,
                  const duct_peer_t *peer, duct_view_u8 *data, uint32_t seg);
 
+/** @brief Variant of @ref duct_io_on_dgram carrying the datagram's destination
+ *  interface address @p local (or @c nullptr / zero-family when unknown). */
+duct_nonnull(1, 2, 4) void
+duct_io_on_dgram_from(duct_listener_t *listener,
+                      const duct_peer_t *peer, const duct_peer_t *local,
+                      duct_view_u8 *data, uint32_t seg);
+
 /** @brief Classify and dispatch one received datagram that sits in RX slot @p slot of @p listener's pool.
  *  The completion-driven counterpart of @ref duct_io_on_dgram for a read posted into a pooled slot:
  *  @p bytes is the datagram's length and @p seg is as there. @p lend says the caller holds a replacement
@@ -385,20 +403,13 @@ duct_io_on_dgram_slot(duct_listener_t *listener, const duct_peer_t *peer, uint32
 
 typedef struct duct_dgram_tx_entry duct_dgram_tx_entry_t;
 
-/** @brief Post one queued send.
- *  The callback of @ref duct_io_dgram_send_drain.
- *  @return false when the backend can take no more now, which leaves @p entry queued; true once
- *          @p entry is spent, posted or not.
- */
-typedef bool (*duct_dgram_send_fn)(void *arg, const duct_dgram_tx_entry_t *entry);
+typedef unsigned (*duct_dgram_send_fn)(void *arg,
+                                       const duct_dgram_tx_entry_t *const *entries,
+                                       unsigned n);
 
-/** @brief Hand the entries queued in @p listener's @c dgram_tx_outbox to @p send, lane by lane.
- *  A lane drains in order and stops at the first entry @p send refuses; the entries it took are
- *  committed, and a producer parked on a full lane is woken. The first lane served moves on at each
- *  call. On the listener's io thread.
- */
 duct_nonnull(1, 2) void
-duct_io_dgram_send_drain(duct_listener_t *listener, duct_dgram_send_fn send, void *arg);
+duct_io_dgram_send_drain(duct_listener_t *listener, duct_dgram_send_fn send, void *arg,
+                         unsigned max_batch);
 
 /** @brief Length standing for a datagram too large for the buffer offered it.
  *
@@ -443,10 +454,10 @@ duct_view_u8 duct_io_dgram_rx_scratch(void);
 
 /** @brief Park @p listener on its dry RX slot pool.
  *  Withdraws its read interest and sets the pool's @c stalled; the slot return
- *  or pin that takes the stall back posts this thread a resume, which puts the
+ *  that takes the stall back posts this thread a resume, which puts the
  *  listener back.
  *  @return true with the listener parked; false where reading goes on: a pool
- *          with no live chunk, one a held lane pins, or one a slot or a pin
+ *          with no live chunk, or one a slot
  *          came back to during the call.
  */
 duct_nonnull(1) bool duct_io_dgram_rx_stall(duct_listener_t *listener);
@@ -585,6 +596,13 @@ duct_nonnull(1, 2) void duct_io_rx_commit_units(void *tag, const uint32_t *lens,
  */
 duct_nonnull(1) void duct_io_rx_done(void *tag, duct_result_t rc);
 
+/** @brief The wire refused a frame of @p tag's conn for its size: the verdict
+ *  a send or a queued error named. Tells the conn's protocol as
+ *  @c rc_frame_too_large, once per io drive, error event or read, never per
+ *  frame.
+ */
+duct_nonnull(1) void duct_io_frame_refused(void *tag);
+
 /** @brief Peek TX buffer content for @p tag's conn. */
 [[nodiscard]] duct_nonnull(1, 2) bool
 duct_io_tx_peek(void *tag, duct_io_xfer_t *out);
@@ -596,7 +614,10 @@ duct_io_tx_peek(void *tag, duct_io_xfer_t *out);
  *  call can consume more of the ring than @p p describes; peek again for
  *  remaining bytes.
  *
- *  @param out_rc what @ref duct_io_tx_done is to be given once the drive ends.
+ *  @param out_rc the drive's verdict, in and out: what @ref duct_io_tx_done
+ *          is to be given once the drive ends. It carries the last send's
+ *          answer, except that @c rc_drop, a frame the wire refused for its
+ *          size, stays over every later send of the drive.
  *  @return true to keep draining. False stops the drive, and @p out_rc
  *          separates the reasons: @c rc_ok is a stream short write, @c rc_again
  *          a socket out of room, @c rc_closed a stale @p tag, @c rc_fatal a
@@ -614,13 +635,14 @@ duct_nonnull(1) bool
 duct_io_tx_advance(void *tag, size_t offered, size_t n);
 
 /** @brief Address up to @p max whole records at the head of @p tag's TX ring.
- *  Payload spans only, each record's length prefix stepped over; the walk stops
- *  at the first record the readable run does not hold entirely.
+ *  Each record is its descriptor's two spans — the inline header and the
+ *  payload — a datagram shipping whole or not at all; a partial head record
+ *  (a stream short write left it) ends the walk.
  *  @return records addressed; 0 for a stale @p tag or a ring without record
  *  boundaries.
  */
 duct_nonnull(1, 2) unsigned
-duct_io_tx_peek_bufs(void *tag, duct_view_u8 *bufs, unsigned max);
+duct_io_tx_peek_recs(void *tag, duct_tx_rec_t *recs, unsigned max);
 
 /** @brief Advance @p tag's TX ring past its first @p n records.
  *  Completes a send that carried @p n records at once. They are the ring's
@@ -630,7 +652,8 @@ duct_io_tx_peek_bufs(void *tag, duct_view_u8 *bufs, unsigned max);
 duct_nonnull(1) void
 duct_io_tx_advance_records(void *tag, unsigned n);
 
-/** @brief End one TX-drive step for @p tag. */
+/** @brief End one TX-drive step for @p tag. @c rc_fatal closes the conn; @c rc_drop, a frame
+ *  of the drive the wire refused for its size, reports it once through @ref duct_io_frame_refused. */
 duct_nonnull(1) void duct_io_tx_done(void *tag, duct_result_t rc);
 
 /** @brief Record @p tag's conn write-interest state, @c fl_conn_write_armed

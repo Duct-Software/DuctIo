@@ -10,10 +10,14 @@
  *
  * Includes duct_worker.c directly to reach s_retry_drain/retry_node_t
  * (static symbols), same pattern as handler_dispatch_test.c. Every node
- * carries an all-zero (gen=0) duct_conn_handle_t, which duct_conn_by_handle
- * rejects before ever touching the conn pool (src/conn/duct_conn.c's own
- * guard) -- s_dispatch_resolve reports res_gone, hitting s_retry_drain's
- * cheapest resolution path with no live engine/session/conn required.
+ * comes out of one real conn block's TX retry region (s_retry_node_take)
+ * and carries an all-zero (gen=0) duct_conn_handle_t, which
+ * duct_conn_by_handle rejects before ever touching the conn pool
+ * (src/conn/duct_conn.c's own guard) -- s_dispatch_resolve reports
+ * res_gone, hitting s_retry_drain's cheapest resolution path with no live
+ * engine/session behind the handles. The chain stays inside the region's
+ * node quota (duct_conn_retry_tx_nodes), two full quotas and a remainder
+ * being every bit as multi-pass as three.
  */
 
 #include "../src/duct_worker.c"
@@ -29,10 +33,10 @@ static unsigned s_list_len(const retry_node_t *head)
     return n;
 }
 
-static void s_build_gone_frame_chain(duct_worker_t *w, unsigned count)
+static void s_build_gone_frame_chain(duct_worker_t *w, duct_conn_t *conn, unsigned count)
 {
     for (unsigned i = 0u; i < count; ++i) {
-        auto node = duct_new(retry_node_t);
+        auto node = s_retry_node_take(conn);
         assert(node);
         *node = (retry_node_t){
             .kind = retry_frame,
@@ -46,9 +50,13 @@ int main(void)
 {
     setvbuf(stdout, nullptr, _IOLBF, 0);
 
-    static constexpr unsigned total = retry_drain_quota * 3u + 5u;
+    static constexpr unsigned total = retry_drain_quota * 2u + 5u;
+    static_assert(total <= duct_conn_retry_tx_nodes,
+                  "the gone chain must fit one conn's TX retry node quota");
+    auto conn = duct_conn_acquire();
+    assert(conn);
     duct_worker_t w = {};
-    s_build_gone_frame_chain(&w, total);
+    s_build_gone_frame_chain(&w, conn, total);
     assert(s_list_len(w.retry_head) == total);
     assert(w.retry_tail && !w.retry_tail->next);
 
@@ -83,5 +91,6 @@ int main(void)
     printf("retry_drain_quota: OK (%u nodes, quota=%u, drained in %u passes, "
           "never more than quota resolved in one pass)\n",
           total, retry_drain_quota, passes);
+    duct_conn_release(conn);
     return 0;
 }

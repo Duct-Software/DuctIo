@@ -54,9 +54,11 @@ duct_bits_set(uint64_t _Atomic *bits, unsigned idx)
 duct_nonnull(1) static inline bool
 duct_bits_set_if_new(uint64_t _Atomic *bits, unsigned idx)
 {
+    auto word = &bits[idx >> bits_word_shift];
     auto mask = bits_word_one << (idx & bits_index_mask);
-    return !(duct_atomic_fetch(or, &bits[idx >> bits_word_shift], mask, release)
-             & mask);
+    if (duct_atomic_load(word, relaxed) & mask)
+        return false;
+    return !(duct_atomic_fetch(or, word, mask, acq_rel) & mask);
 }
 
 /** @brief Clear bit by slot index. */
@@ -72,6 +74,8 @@ duct_bits_clear(uint64_t _Atomic *bits, unsigned idx)
 duct_nonnull(1) static inline uint64_t
 duct_bits_grab(uint64_t _Atomic *bits, unsigned word)
 {
+    if (!duct_atomic_load(&bits[word], relaxed))
+        return 0;
     return duct_atomic_exchange(&bits[word], 0, acquire);
 }
 

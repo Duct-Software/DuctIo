@@ -141,17 +141,12 @@ mux_pack(const duct_wire_t *self, [[maybe_unused]] duct_session_t *s,
         duct_view(duct_view_u8, hdr, mux_hdr_size), frame->payload);
 }
 
-static duct_wire_parser_t *mux_create_parser([[maybe_unused]] const duct_wire_t *self)
-{
-    auto st = duct_new(mux_parser_t);
-    duct_do_if(!st, return nullptr);
-    return (duct_wire_parser_t *)st;
-}
+static_assert(sizeof(mux_parser_t) <= duct_wire_parser_slot,
+              "the test wire's parser exceeds the conn block's parser slot");
 
-static void mux_destroy_parser([[maybe_unused]] const duct_wire_t *self, duct_wire_parser_t *parser)
+static void mux_init_parser([[maybe_unused]] const duct_wire_t *self,
+                            [[maybe_unused]] duct_wire_parser_t *storage)
 {
-    auto st = (mux_parser_t *)parser;
-    duct_del(st);
 }
 
 static void mux_destroy(duct_wire_t *self) { duct_del(self); }
@@ -164,7 +159,7 @@ static duct_wire_t *mux_wire_create(void)
         .name = "tls-openssl-mux", .header_size = mux_hdr_size,
         .destroy = mux_destroy, .on_parse = mux_parse, .on_pack = mux_pack,
         .pack_header = mux_pack_header,
-        .create_parser = mux_create_parser, .destroy_parser = mux_destroy_parser,
+        .parser_max = sizeof(mux_parser_t), .init_parser = mux_init_parser,
     };
     return &w->base;
 }

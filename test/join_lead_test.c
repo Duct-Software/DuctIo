@@ -98,7 +98,7 @@ static const char *s_siphash(void)
 static duct_session_t *s_keyed(const fake_engine_t *engine, const void *proto,
                                uint8_t id_byte)
 {
-    auto s = duct_session_acquire();
+    auto s = duct_session_acquire(0u);
     if (!s)
         return nullptr;
     s->proto = (const duct_proto_t *)proto;
@@ -255,7 +255,7 @@ static const char *s_leads(void)
         err = "a released session still took a lead";
         goto done;
     }
-    auto plain = duct_session_acquire();
+    auto plain = duct_session_acquire(0u);
     if (!plain) {
         err = "session acquire failed";
         goto done;
@@ -349,7 +349,7 @@ static bool s_dgram_resolves_under(const uint8_t *dgram, size_t len, size_t off,
                                    const uint8_t cover[duct_siphash_key_size])
 {
     s_wires_set(off, cover);
-    return duct_join_dgram_match(dgram, len, s->proto).word
+    return duct_join_dgram_match(len, dgram, s->proto).word
         == duct_session_handle_from_live(s).word;
 }
 
@@ -365,7 +365,7 @@ static bool s_dgram_resolves(const uint8_t *dgram, size_t len, size_t off,
 static bool s_dgram_refused(const uint8_t *dgram, size_t len, size_t off, const void *proto)
 {
     s_wires_set(off, s_cover);
-    return duct_join_dgram_match(dgram, len, (const duct_proto_t *)proto).word == handle_null;
+    return duct_join_dgram_match(len, dgram, (const duct_proto_t *)proto).word == handle_null;
 }
 
 /** @brief Build a datagram of @p len bytes led under the key of engine @p e.
@@ -379,7 +379,7 @@ static void s_dgram_make(uint8_t *dgram, size_t off, size_t len, const fake_engi
     memset(dgram, 0x77u, off);
     for (size_t i = off; i < len; ++i)
         dgram[i] = (uint8_t)(seed + i * 31u);
-    duct_dgram_lead_fill(dgram, off, len, key, s_cover, name);
+    duct_dgram_lead_fill(off, len, dgram, key, s_cover, name);
 }
 
 /** @brief Datagram leads of two same-named sessions, behind a prefix of @p off
@@ -475,8 +475,8 @@ static const char *s_dgram_leads(size_t off)
         goto done;
     }
     memset(e, 0xeeu, sizeof e);
-    duct_dgram_lead_fill(e, off, min - 1u, key, s_cover, name);
-    duct_dgram_lead_fill(e, duct_seal_lead_size - 1u, len, key, s_cover, name);
+    duct_dgram_lead_fill(off, min - 1u, e, key, s_cover, name);
+    duct_dgram_lead_fill(duct_seal_lead_size - 1u, len, e, key, s_cover, name);
     for (size_t i = 0u; i < sizeof e; ++i)
         if (e[i] != 0xeeu) {
             err = "a datagram too short to carry a lead, or behind a prefix narrower than it, was written to";

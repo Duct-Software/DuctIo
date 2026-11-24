@@ -14,7 +14,8 @@
 #ifndef DUCT_STATS_H
 #define DUCT_STATS_H
 
-#include "duct.h"
+#include "duct_types.h"
+#include "duct_core.h"
 
 #ifdef __cplusplus
 extern "C" {

@@ -117,17 +117,17 @@ static void run_close(run_t *r)
 
 static bool w1(run_t *r)
 {
-    return duct_noise_hs_write_msg1_xk(r->hi, r->p1, r->m1, sizeof r->m1, &r->n1);
+    return duct_noise_hs_write_msg1_xk(r->hi, r->p1, sizeof r->m1, r->m1, &r->n1);
 }
 
 static bool r1(run_t *r, const uint8_t *msg, size_t n)
 {
-    return duct_noise_hs_read_msg1_xk(r->hr, s_bytes(msg, n), r->got1, sizeof r->got1, &r->gn1);
+    return duct_noise_hs_read_msg1_xk(r->hr, s_bytes(msg, n), sizeof r->got1, r->got1, &r->gn1);
 }
 
 static bool w2(run_t *r)
 {
-    return duct_noise_hs_write_msg2_xk(r->hr, r->p2, r->m2, sizeof r->m2, &r->n2);
+    return duct_noise_hs_write_msg2_xk(r->hr, r->p2, sizeof r->m2, r->m2, &r->n2);
 }
 
 static bool r2(run_t *r, const uint8_t *msg, size_t n)
@@ -137,13 +137,13 @@ static bool r2(run_t *r, const uint8_t *msg, size_t n)
 
 static bool w3(run_t *r)
 {
-    return duct_noise_hs_write_msg3_xk(r->hi, r->p3, r->m3, sizeof r->m3, &r->n3);
+    return duct_noise_hs_write_msg3_xk(r->hi, r->p3, sizeof r->m3, r->m3, &r->n3);
 }
 
 static bool r3(run_t *r, const uint8_t *msg, size_t n)
 {
-    return duct_noise_hs_read_msg3_xk(r->hr, s_bytes(msg, n), resolve, &r->res, r->learned, r->got3,
-                                      sizeof r->got3, &r->gn3);
+    return duct_noise_hs_read_msg3_xk(r->hr, s_bytes(msg, n), resolve, &r->res, r->learned,
+                                      sizeof r->got3, r->got3, &r->gn3);
 }
 
 typedef enum { st_w1, st_r1, st_w2, st_r2, st_w3, st_r3, st_count } step_t;
@@ -207,12 +207,12 @@ static const char *sc_roundtrip(void)
                       || memcmp(ti.recv_key, tr.send_key, sizeof ti.recv_key) != 0))
         err = "the ends did not agree";
     else if (!err) {
-        size_t n = duct_noise_transport_seal(&ti, (duct_view_u8[]){ s_text(k_hello) }, 1u, sealed, sizeof sealed);
-        if (!n || !duct_noise_transport_unseal(&tr, s_bytes(sealed, n), opened, sizeof opened, &opened_len)
+        size_t n = duct_noise_transport_seal(&ti, (duct_view_u8[]){ s_text(k_hello) }, 1u, sizeof sealed, sealed);
+        if (!n || !duct_noise_transport_unseal(&tr, s_bytes(sealed, n), sizeof opened, opened, &opened_len)
             || opened_len != strlen(k_hello) || memcmp(opened, k_hello, opened_len) != 0)
             err = "the transport did not carry a message to the responder";
-        n = duct_noise_transport_seal(&tr, (duct_view_u8[]){ s_text(k_hello) }, 1u, sealed, sizeof sealed);
-        if (!err && (!n || !duct_noise_transport_unseal(&ti, s_bytes(sealed, n), opened, sizeof opened, &opened_len)))
+        n = duct_noise_transport_seal(&tr, (duct_view_u8[]){ s_text(k_hello) }, 1u, sizeof sealed, sealed);
+        if (!err && (!n || !duct_noise_transport_unseal(&ti, s_bytes(sealed, n), sizeof opened, opened, &opened_len)))
             err = "the transport did not carry a message to the initiator";
     }
     duct_noise_transport_destroy(&ti);
@@ -227,7 +227,7 @@ static const char *sc_sizes(void)
     if (!run_open(&r, (duct_view_u8){}))
         return "the exchange did not open";
     const char *err = drive(&r, 1u);
-    if (!err && duct_noise_hs_read_msg1_xk(r.hr, s_bytes(r.m1, r.n1), r.got1, r.p1.size - 1u, &r.gn1))
+    if (!err && duct_noise_hs_read_msg1_xk(r.hr, s_bytes(r.m1, r.n1), r.p1.size - 1u, r.got1, &r.gn1))
         err = "a payload was read into a buffer a byte short";
     if (!err && !r1(&r, r.m1, r.n1))
         err = "message 1 was refused after the short buffer";
@@ -240,7 +240,7 @@ static const char *sc_sizes(void)
     r.p1 = r.p2 = r.p3 = (duct_view_u8){};
     uint8_t out[k_cap];
     size_t n = 0u;
-    if (duct_noise_hs_write_msg1_xk(r.hi, r.p1, out, duct_noise_xk_msg1_size(0u) - 1u, &n))
+    if (duct_noise_hs_write_msg1_xk(r.hi, r.p1, duct_noise_xk_msg1_size(0u) - 1u, out, &n))
         err = "message 1 was written into a buffer a byte short";
     else if (!w1(&r) || r.n1 != 48u)
         err = "an empty message 1 does not cost 48 bytes";
@@ -249,7 +249,7 @@ static const char *sc_sizes(void)
             err = "a message 1 shorter than a key and a tag was read";
     if (!err && !r1(&r, r.m1, r.n1))
         err = "message 1 was refused after the short ones";
-    if (!err && duct_noise_hs_write_msg2_xk(r.hr, r.p2, out, duct_noise_msg2_size - 1u, &n))
+    if (!err && duct_noise_hs_write_msg2_xk(r.hr, r.p2, duct_noise_msg2_size - 1u, out, &n))
         err = "message 2 was written into a buffer a byte short";
     else if (!err && (!w2(&r) || r.n2 != 48u))
         err = "an empty message 2 does not cost 48 bytes";
@@ -262,7 +262,7 @@ static const char *sc_sizes(void)
         err = "a message 2 padded past the most the engine sends was read";
     if (!err && !r2(&r, r.m2, r.n2))
         err = "message 2 was refused after the short ones";
-    if (!err && duct_noise_hs_write_msg3_xk(r.hi, r.p3, out, duct_noise_xk_msg3_size(0u) - 1u, &n))
+    if (!err && duct_noise_hs_write_msg3_xk(r.hi, r.p3, duct_noise_xk_msg3_size(0u) - 1u, out, &n))
         err = "message 3 was written into a buffer a byte short";
     else if (!err && (!w3(&r) || r.n3 != 64u))
         err = "an empty message 3 does not cost 64 bytes";
@@ -436,12 +436,12 @@ static const char *sc_order(void)
     duct_noise_transport_t t = {};
     if (w2(&r) || w3(&r) || r2(&r, junk, 64u) || r3(&r, junk, 80u))
         err = "a call was taken ahead of its turn";
-    else if (duct_noise_hs_write_msg1_xk(r.hr, r.p1, out, sizeof out, &n)
-             || duct_noise_hs_read_msg1_xk(r.hi, s_bytes(junk, 64u), out, sizeof out, &n))
+    else if (duct_noise_hs_write_msg1_xk(r.hr, r.p1, sizeof out, out, &n)
+             || duct_noise_hs_read_msg1_xk(r.hi, s_bytes(junk, 64u), sizeof out, out, &n))
         err = "a message 1 call was taken by the wrong role";
-    else if (duct_noise_hs_write_msg1(r.hi, r.p1, out, sizeof out, &n)
-             || duct_noise_hs_read_msg1(r.hr, s_bytes(junk, 112u), r.learned, out, sizeof out, &n)
-             || duct_noise_hs_write_msg2(r.hr, r.p2, out, sizeof out, &n)
+    else if (duct_noise_hs_write_msg1(r.hi, r.p1, sizeof out, out, &n)
+             || duct_noise_hs_read_msg1(r.hr, s_bytes(junk, 112u), r.learned, sizeof out, out, &n)
+             || duct_noise_hs_write_msg2(r.hr, r.p2, sizeof out, out, &n)
              || duct_noise_hs_read_msg2(r.hi, s_bytes(junk, 64u)))
         err = "a call of the other pattern was taken";
     else if (duct_noise_hs_split(r.hi, &t) || duct_noise_hs_split(r.hr, &t)
@@ -472,7 +472,7 @@ static const char *sc_order(void)
     auto hi = duct_noise_hs_create(&ki, kr.pub, psk, true);
     if (!hi)
         return "the IK state did not open";
-    if (duct_noise_hs_write_msg1_xk(hi, s_text(k_hello), out, sizeof out, &n))
+    if (duct_noise_hs_write_msg1_xk(hi, s_text(k_hello), sizeof out, out, &n))
         err = "a message of XKpsk3 was taken by an IKpsk2 state";
     duct_noise_hs_destroy(hi);
     if (err)

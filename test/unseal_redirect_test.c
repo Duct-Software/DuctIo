@@ -65,7 +65,8 @@ static const char ur_drop[]   = "drop-me";
 static const char ur_static[] = "static-me";
 static const char ur_short[]  = "head-then-tail";
 static constexpr size_t ur_short_keep = 4u;
-static const char ur_reply[]  = "from-a-static-buffer";
+alignas(4) static const char ur_reply[]  = "from-a-static-buffer";
+static const char ur_peer[]   = "peer-redirect";
 
 static _Atomic(const void *) g_frame_at;
 static _Atomic(const void *) g_out_at;
@@ -74,6 +75,12 @@ static atomic_int g_srv_frames = 0;
 static atomic_int g_srv_errors = 0;
 static atomic_int g_out_len = 0;
 static char g_out_data[64];
+
+static _Atomic(const void *) g_cli_frame_at;
+static _Atomic(const void *) g_cli_out_at;
+static atomic_int g_cli_out_count = 0;
+static atomic_int g_cli_out_len = 0;
+static char g_cli_out_data[64];
 
 #ifdef _WIN32
 typedef HANDLE ur_signal_t;
@@ -181,6 +188,15 @@ static void ur_route([[maybe_unused]] duct_conn_id_t in_conn,
     *out_conn = (duct_conn_id_t)duct_atomic_load(&g_route_to, acquire);
 }
 
+static void ur_cli_route([[maybe_unused]] duct_conn_id_t in_conn,
+                         [[maybe_unused]] duct_stream_id_t in_stream,
+                         [[maybe_unused]] void *proto_state,
+                         duct_conn_id_t *out_conn,
+                         [[maybe_unused]] duct_stream_id_t *out_stream)
+{
+    *out_conn = ur_host_leg;
+}
+
 static duct_result_t
 ur_srv_error([[maybe_unused]] duct_session_t *s, duct_result_t err,
              [[maybe_unused]] duct_response_t *out, [[maybe_unused]] void *proto_state)
@@ -210,6 +226,11 @@ ur_srv_frame([[maybe_unused]] duct_session_t *s,
         out->conn_id = ur_host_leg;
         return rc_ok;
     }
+    if (ur_is(frame, ur_peer, sizeof ur_peer - 1u)) {
+        duct_response_echo(out, frame);
+        out->conn_id = conn_id;
+        return rc_ok;
+    }
     if (ur_is(frame, ur_short, sizeof ur_short - 1u)) {
         duct_response_echo(out, frame);
         out->payload.size = ur_short_keep;
@@ -224,10 +245,20 @@ static void ur_run(void (*fn)(void *ctx), void *ctx, [[maybe_unused]] void *queu
     fn(ctx);
 }
 
+static _Atomic(duct_handle_t) g_cli_tok;
+
 static void ur_packet_out([[maybe_unused]] void *app_ctx,
-                          [[maybe_unused]] duct_handle_t tok,
+                          duct_handle_t tok,
                           [[maybe_unused]] duct_conn_id_t conn_id, duct_view_u8 pkt)
 {
+    if (tok == duct_atomic_load(&g_cli_tok, acquire)) {
+        duct_atomic_store(&g_cli_out_at, pkt.data, release);
+        size_t n = pkt.size < sizeof g_cli_out_data ? pkt.size : sizeof g_cli_out_data;
+        memcpy(g_cli_out_data, pkt.data, n);
+        duct_atomic_store(&g_cli_out_len, (int)n, release);
+        duct_atomic_fetch(add, &g_cli_out_count, 1, release);
+        return;
+    }
     duct_atomic_store(&g_out_at, pkt.data, release);
     size_t n = pkt.size < sizeof g_out_data ? pkt.size : sizeof g_out_data;
     memcpy(g_out_data, pkt.data, n);
@@ -235,14 +266,14 @@ static void ur_packet_out([[maybe_unused]] void *app_ctx,
     duct_atomic_fetch(add, &g_out_count, 1, release);
 }
 
-static _Atomic(duct_handle_t) g_cli_tok;
-
 static duct_result_t
 ur_cli_open([[maybe_unused]] duct_session_t *s, duct_handle_t tok,
             [[maybe_unused]] void *user_ctx, duct_response_t *out,
             [[maybe_unused]] void *proto_state)
 {
     duct_atomic_store(&g_cli_tok, tok, release);
+    out->control.open_leg.kind = leg_kind_inter;
+    out->control.open_leg.conn_id = ur_host_leg;
     out->payload = (duct_view_u8){ (void *)ur_echo, sizeof ur_echo - 1u };
     out->flags = fl_send_copy;
     return rc_ok;
@@ -258,9 +289,12 @@ ur_send([[maybe_unused]] duct_session_t *s, duct_response_t *out, void *ctx)
 
 static duct_result_t
 ur_cli_frame([[maybe_unused]] duct_session_t *s, [[maybe_unused]] duct_conn_id_t conn_id,
-             [[maybe_unused]] const duct_frame_t *frame,
-             [[maybe_unused]] duct_response_t *out, [[maybe_unused]] void *proto_state)
+             const duct_frame_t *frame,
+             duct_response_t *out, [[maybe_unused]] void *proto_state)
 {
+    duct_atomic_store(&g_cli_frame_at, frame->payload.data, release);
+    duct_response_echo(out, frame);
+    out->conn_id = ur_host_leg;
     return rc_ok;
 }
 
@@ -287,6 +321,21 @@ static const char *ur_round(duct_engine_t *io, const char *lit, size_t len)
 /** @brief The zero-copy claim on the host leg: the plaintext on_frame saw and
  *  the bytes on_packet_out delivers are one buffer at one address.
  */
+static const char *ur_peer_redirect(duct_engine_t *io)
+{
+    int before = duct_atomic_load(&g_cli_out_count, acquire);
+    auto err = ur_push(io, ur_peer, sizeof ur_peer - 1u);
+    if (err) return err;
+    if (!th_wait_int(&g_cli_out_count, before + 1, wait_ms))
+        return "peer on_packet_out never fired";
+    if (duct_atomic_load(&g_cli_out_len, acquire) != (int)(sizeof ur_peer - 1u)
+        || memcmp(g_cli_out_data, ur_peer, sizeof ur_peer - 1u) != 0)
+        return "peer payload did not survive the redirect";
+    if (duct_atomic_load(&g_cli_out_at, acquire) != duct_atomic_load(&g_cli_frame_at, acquire))
+        return "peer plaintext was copied: on_frame and on_packet_out saw two addresses";
+    return nullptr;
+}
+
 static const char *ur_direct(duct_engine_t *io)
 {
     auto err = ur_round(io, ur_echo, sizeof ur_echo - 1u);
@@ -504,6 +553,7 @@ int main(void)
         .name = "unseal-redirect-cli", .wire = cli_wire,
         .on_frame = ur_cli_frame,
         .on_session_open = ur_cli_open,
+        .route = ur_cli_route,
         .max_response = 2048u,
     });
     if (cli_proto) cli_proto->owned_wire = cli_wire; else duct_wire_destroy(cli_wire);
@@ -520,6 +570,7 @@ int main(void)
         goto done;
     }
     err = ur_direct(io);
+    if (!err) err = ur_peer_redirect(io);
     if (!err) err = ur_dropped(io);
     if (!err) err = ur_fallback(io);
     if (!err) err = ur_host_short(io);

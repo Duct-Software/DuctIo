@@ -8,6 +8,7 @@
  * slots while the pool grows and is swept under them.
  */
 
+#include "duct_dgram_rec.h"
 #include "duct_x_slot.h"
 
 #include <pthread.h>
@@ -24,7 +25,7 @@
         }                                                                                     \
     } while (0)
 
-static constexpr uint32_t k_lead = 4u;
+static constexpr uint32_t k_lead = 8u;
 
 static constexpr duct_x_slot_hooks_t k_no_hooks = {};
 
@@ -68,7 +69,7 @@ static duct_x_slot_hooks_t s_hooks_of(hook_log_t *log)
 static void check_empty_pool(void)
 {
     duct_x_slot_pool_t pool;
-    CHECK(duct_x_slot_pool_init(&pool, 0u, 256u, k_lead, 4u, k_no_hooks));
+    CHECK(duct_x_slot_pool_init(&pool, 0u, 256u, k_lead, 0u, 4u, k_no_hooks));
     CHECK(duct_x_slot_acquire(&pool) == treiber_empty);
     duct_x_slot_release(&pool, treiber_empty);
     CHECK(!duct_x_slot_pool_avail(&pool));
@@ -76,17 +77,17 @@ static void check_empty_pool(void)
     CHECK(!duct_x_slot_pool_sweep(&pool));
     duct_x_slot_pool_free(&pool);
 
-    CHECK(duct_x_slot_pool_init(&pool, 8u, 0u, k_lead, 4u, k_no_hooks));
+    CHECK(duct_x_slot_pool_init(&pool, 8u, 0u, k_lead, 0u, 4u, k_no_hooks));
     CHECK(duct_x_slot_acquire(&pool) == treiber_empty);
     duct_x_slot_pool_free(&pool);
-    CHECK(!duct_x_slot_pool_init(&pool, 8u, 4u, 8u, 4u, k_no_hooks));
+    CHECK(!duct_x_slot_pool_init(&pool, 8u, 4u, 8u, 0u, 4u, k_no_hooks));
     printf("  empty_pool OK\n");
 }
 
 static void check_growth_by_chunk(void)
 {
     duct_x_slot_pool_t pool;
-    CHECK(duct_x_slot_pool_init(&pool, 10u, 256u, k_lead, 4u, k_no_hooks));
+    CHECK(duct_x_slot_pool_init(&pool, 10u, 256u, k_lead, 0u, 4u, k_no_hooks));
     CHECK(pool.n_chunks == 3u && pool.chunk_slots == 4u);
     CHECK(duct_atomic_load(&pool.live, relaxed) == 0u);
     CHECK(duct_x_slot_pool_dry(&pool));
@@ -122,13 +123,13 @@ static void check_growth_by_chunk(void)
 static void check_addressing(void)
 {
     duct_x_slot_pool_t pool;
-    CHECK(duct_x_slot_pool_init(&pool, 6u, 200u, k_lead, 3u, k_no_hooks));
+    CHECK(duct_x_slot_pool_init(&pool, 6u, 200u, k_lead, 0u, 3u, k_no_hooks));
     uint32_t a = duct_x_slot_acquire(&pool),
              b = duct_x_slot_acquire(&pool);
     CHECK(a != b);
     CHECK(duct_x_slot_data(&pool, b) == duct_x_slot_data(&pool, a) + ((ptrdiff_t)b - (ptrdiff_t)a) * 200);
-    CHECK(duct_x_slot_payload(&pool, a) == duct_x_slot_data(&pool, a) + k_lead);
-    CHECK(duct_x_slot_cap(&pool) == 200u - k_lead);
+    CHECK(duct_x_slot_payload(&pool, a) == duct_x_slot_data(&pool, a) + k_lead + duct_x_slot_word);
+    CHECK(duct_x_slot_cap(&pool) == 200u - k_lead - duct_x_slot_word);
     CHECK(duct_x_slot_holds(&pool, a, duct_x_slot_data(&pool, a) + 199));
     CHECK(!duct_x_slot_holds(&pool, a, duct_x_slot_data(&pool, a) + 200));
     CHECK(duct_x_slot_pool_owns(&pool, duct_x_slot_data(&pool, 5u) + 199));
@@ -147,7 +148,7 @@ static void check_claims(void)
 {
     duct_x_slot_pool_t pool;
     uint32_t n = duct_dgram_rx_batch + 2u;
-    CHECK(duct_x_slot_pool_init(&pool, n, 64u, k_lead, n, k_no_hooks));
+    CHECK(duct_x_slot_pool_init(&pool, n, 64u, k_lead, 0u, n, k_no_hooks));
     uint32_t idx[2];
     for (unsigned i = 0u; i < 2u; ++i)
         idx[i] = duct_x_slot_acquire(&pool);
@@ -170,8 +171,8 @@ static void check_claims(void)
 static void check_batch(void)
 {
     duct_x_slot_pool_t one, many;
-    CHECK(duct_x_slot_pool_init(&one, 10u, 256u, k_lead, 4u, k_no_hooks));
-    CHECK(duct_x_slot_pool_init(&many, 10u, 256u, k_lead, 4u, k_no_hooks));
+    CHECK(duct_x_slot_pool_init(&one, 10u, 256u, k_lead, 0u, 4u, k_no_hooks));
+    CHECK(duct_x_slot_pool_init(&many, 10u, 256u, k_lead, 0u, 4u, k_no_hooks));
     uint32_t single[6], batch[6];
     for (unsigned i = 0u; i < 6u; ++i)
         single[i] = duct_x_slot_acquire(&one);
@@ -194,7 +195,7 @@ static void check_batch(void)
     CHECK(duct_x_slot_acquire_n(&many, again, 1u) == 0u);
 
     duct_x_slot_pool_t none;
-    CHECK(duct_x_slot_pool_init(&none, 0u, 256u, k_lead, 4u, k_no_hooks));
+    CHECK(duct_x_slot_pool_init(&none, 0u, 256u, k_lead, 0u, 4u, k_no_hooks));
     CHECK(duct_x_slot_acquire_n(&none, again, 3u) == 0u);
     duct_x_slot_pool_free(&none);
     duct_x_slot_pool_free(&many);
@@ -206,7 +207,7 @@ static void check_hooks(void)
 {
     hook_log_t log = { .record = true };
     duct_x_slot_pool_t pool;
-    CHECK(duct_x_slot_pool_init(&pool, 8u, 128u, k_lead, 2u, s_hooks_of(&log)));
+    CHECK(duct_x_slot_pool_init(&pool, 8u, 128u, k_lead, 0u, 2u, s_hooks_of(&log)));
 
     uint32_t got[8];
     for (unsigned i = 0u; i < 8u; ++i) {
@@ -225,7 +226,7 @@ static void check_hooks(void)
 
     /* A refused registration leaves the chunk absent: the take fails, and the next one retries it. */
     hook_log_t flaky = { .fail_at = 3u, .fail_rc = rc_again };
-    CHECK(duct_x_slot_pool_init(&pool, 8u, 128u, k_lead, 2u, s_hooks_of(&flaky)));
+    CHECK(duct_x_slot_pool_init(&pool, 8u, 128u, k_lead, 0u, 2u, s_hooks_of(&flaky)));
     for (unsigned i = 0u; i < 4u; ++i)
         got[i] = duct_x_slot_acquire(&pool);
     CHECK(got[0] != treiber_empty && got[3] != treiber_empty);
@@ -243,7 +244,7 @@ static void check_hooks(void)
 
     /* A refusal that is final ends the growth: the hook is not asked again, and the slots out still serve. */
     hook_log_t spent = { .fail_at = 2u, .fail_rc = rc_no_memory };
-    CHECK(duct_x_slot_pool_init(&pool, 8u, 128u, k_lead, 2u, s_hooks_of(&spent)));
+    CHECK(duct_x_slot_pool_init(&pool, 8u, 128u, k_lead, 0u, 2u, s_hooks_of(&spent)));
     for (unsigned i = 0u; i < 2u; ++i)
         got[i] = duct_x_slot_acquire(&pool);
     CHECK(got[0] != treiber_empty && got[1] != treiber_empty);
@@ -263,7 +264,7 @@ static void check_sweep(void)
     hook_log_t log = {};
     size_t page = duct_page_size();
     duct_x_slot_pool_t pool;
-    CHECK(duct_x_slot_pool_init(&pool, 8u, (uint32_t)(2u * page), k_lead, 2u, s_hooks_of(&log)));
+    CHECK(duct_x_slot_pool_init(&pool, 8u, (uint32_t)(2u * page), k_lead, 0u, 2u, s_hooks_of(&log)));
 
     uint32_t got[8];
     for (unsigned i = 0u; i < 8u; ++i)
@@ -333,27 +334,27 @@ static void check_sweep(void)
 static void check_class_pair(void)
 {
     duct_x_slot_pool_t pools[2];
-    CHECK(duct_x_slot_pool_init(&pools[0], 6u, 64u, 8u, 3u, k_no_hooks));
-    CHECK(duct_x_slot_pool_init(&pools[1], 2u, 512u, 8u, 1u, k_no_hooks));
-    CHECK(duct_x_slot_fits(pools, 504u) && !duct_x_slot_fits(pools, 505u));
-    CHECK(duct_x_slot_class_for(pools, 56u) == 0u && duct_x_slot_class_for(pools, 57u) == 1u);
+    CHECK(duct_x_slot_pool_init(&pools[0], 6u, 64u, 8u, 0u, 3u, k_no_hooks));
+    CHECK(duct_x_slot_pool_init(&pools[1], 2u, 512u, 8u, 0u, 1u, k_no_hooks));
+    CHECK(duct_x_slot_fits(pools, 496u) && !duct_x_slot_fits(pools, 497u));
+    CHECK(duct_x_slot_class_for(pools, 48u) == 0u && duct_x_slot_class_for(pools, 49u) == 1u);
 
-    uint32_t small = duct_x_slot_take(pools, 56u),
-             large = duct_x_slot_take(pools, 57u);
+    uint32_t small = duct_x_slot_take(pools, 48u),
+             large = duct_x_slot_take(pools, 49u);
     CHECK(small != treiber_empty && !(small & duct_x_slot_ref_large));
     CHECK(large != treiber_empty && (large & duct_x_slot_ref_large));
-    CHECK(duct_x_slot_span(pools, small).size == 56u && duct_x_slot_span(pools, large).size == 504u);
+    CHECK(duct_x_slot_span(pools, small).size == 48u && duct_x_slot_span(pools, large).size == 496u);
     CHECK(duct_x_slot_span(pools, small).data == duct_x_slot_payload(&pools[0], small));
     CHECK(duct_x_slot_span(pools, large).data
           == duct_x_slot_payload(&pools[1], large & ~duct_x_slot_ref_large));
 
-    uint32_t other = duct_x_slot_take(pools, 500u);
+    uint32_t other = duct_x_slot_take(pools, 492u);
     CHECK(other != treiber_empty && (other & duct_x_slot_ref_large));
-    CHECK(!duct_x_slot_has(pools, 500u));
-    CHECK(duct_x_slot_take(pools, 500u) == treiber_empty);
-    CHECK(duct_x_slot_has(pools, 56u));
+    CHECK(!duct_x_slot_has(pools, 496u));
+    CHECK(duct_x_slot_take(pools, 496u) == treiber_empty);
+    CHECK(duct_x_slot_has(pools, 48u));
     duct_x_slot_put(pools, large);
-    CHECK(duct_x_slot_has(pools, 500u) && duct_x_slot_take(pools, 500u) == large);
+    CHECK(duct_x_slot_has(pools, 496u) && duct_x_slot_take(pools, 496u) == large);
     duct_x_slot_put(pools, large);
     duct_x_slot_put(pools, other);
     duct_x_slot_put(pools, small);
@@ -380,7 +381,7 @@ static void check_reserve(void)
     size_t page = duct_page_size();
     duct_x_slot_pool_t pool;
     duct_x_slot_hooks_t hooks = { .up = s_lock_up, .ctx = &log, .reserve = true };
-    CHECK(duct_x_slot_pool_init(&pool, 4u, (uint32_t)page, 0u, 1u, hooks));
+    CHECK(duct_x_slot_pool_init(&pool, 4u, (uint32_t)page, 0u, 0u, 1u, hooks));
     CHECK(pool.range.base && duct_atomic_load(&pool.live, relaxed) == 0u);
 
     uint32_t first = duct_x_slot_acquire(&pool);
@@ -395,8 +396,9 @@ static void check_reserve(void)
     }
     /* A chunk is usable only once its hook ran: it reads zero, takes a write, and the next chunk is a page on. */
     auto p = (uint8_t *)duct_x_slot_payload(&pool, first);
-    CHECK(p[0] == 0u && p[page - 1u] == 0u);
-    p[0] = p[page - 1u] = 0x5au;
+    size_t last = duct_x_slot_cap(&pool) - 1u;
+    CHECK(p[0] == 0u && p[last] == 0u);
+    p[0] = p[last] = 0x5au;
     CHECK(duct_atomic_load(&pool.live, relaxed) == 1u && atomic_load(&log.ups) == 1u);
     uint32_t more[3];
     for (unsigned i = 0u; i < 3u; ++i) {
@@ -495,7 +497,7 @@ static void check_concurrent(void)
 {
     hook_log_t log = {};
     duct_x_slot_pool_t pool;
-    CHECK(duct_x_slot_pool_init(&pool, k_slots, 4u * (uint32_t)duct_page_size(), k_lead, 3u,
+    CHECK(duct_x_slot_pool_init(&pool, k_slots, 4u * (uint32_t)duct_page_size(), k_lead, 0u, 3u,
                                 s_hooks_of(&log)));
 
     static uint32_t _Atomic owner[k_slots];
@@ -540,18 +542,95 @@ static void check_concurrent(void)
     printf("  concurrent OK (%u slots taken, %u chunk registrations)\n", took, atomic_load(&log.ups));
 }
 
+/* AI-generated test code. */
+static void check_slot_word(void)
+{
+    duct_x_slot_pool_t plain, rec;
+    CHECK(duct_x_slot_pool_init(&plain, 4u, duct_x_slot_span_bytes(0u, 0u, 64u), 0u, 0u, 2u, k_no_hooks));
+    duct_x_slot_pool_engage(&plain);
+    CHECK(plain.release == duct_x_slot_release_obj);
+    uint32_t idx = duct_x_slot_acquire(&plain);
+    CHECK(idx != treiber_empty);
+    CHECK(duct_x_slot_obj(&plain, idx) == duct_x_slot_payload(&plain, idx));
+    auto obj = duct_x_slot_obj(&plain, idx);
+    CHECK(duct_x_slot_owner(obj) == (void *const *)duct_x_slot_data(&plain, idx));
+    CHECK(duct_x_slot_obj_is(obj));
+    CHECK(duct_x_slot_pool_of(obj) == &plain);
+    CHECK(duct_x_slot_obj_cap(obj) == 64u);
+    uint32_t second = duct_x_slot_acquire(&plain);
+    CHECK(second != treiber_empty && second != idx);
+    CHECK(duct_x_slot_pool_of(duct_x_slot_obj(&plain, second)) == &plain);
+    duct_x_slot_release(&plain, second);
+    duct_x_slot_release_obj(obj);
+    CHECK(duct_x_slot_acquire(&plain) == idx);
+    duct_x_slot_release(&plain, idx);
+    duct_x_slot_pool_free(&plain);
+
+    CHECK(duct_x_slot_pool_init(&rec, 4u, duct_x_slot_span_bytes(0u, duct_dgram_record_hdr_size, 64u),
+                                0u, duct_dgram_record_hdr_size, 2u, k_no_hooks));
+    duct_x_slot_pool_engage(&rec);
+    uint32_t ridx = duct_x_slot_acquire(&rec);
+    CHECK(ridx != treiber_empty);
+    CHECK(duct_x_slot_payload(&rec, ridx) == duct_x_slot_data(&rec, ridx) + 16u);
+    CHECK(duct_x_slot_payload(&rec, ridx) - duct_dgram_record_hdr_size
+          == duct_x_slot_data(&rec, ridx) + 12u);
+    CHECK((const void *)duct_x_slot_owner(duct_x_slot_obj(&rec, ridx))
+          == (const void *)duct_x_slot_data(&rec, ridx));
+    duct_x_slot_release(&rec, ridx);
+    duct_x_slot_pool_free(&rec);
+    printf("  slot_word OK\n");
+}
+
+/* AI-generated test code. */
+static bool s_reaped = false;
+
+static void s_reap_on_reap(duct_x_slot_pool_t *pool)
+{
+    s_reaped = true;
+    duct_x_slot_pool_free(pool);
+}
+
+static void check_retire_reap(void)
+{
+    duct_x_slot_pool_t pool;
+    CHECK(duct_x_slot_pool_init(&pool, 4u, duct_x_slot_span_bytes(0u, 0u, 64u), 0u, 0u, 2u,
+                                k_no_hooks));
+    duct_x_slot_pool_engage(&pool);
+    uint32_t held = duct_x_slot_acquire(&pool);
+    CHECK(held != treiber_empty);
+    CHECK(duct_atomic_load(&pool.outstanding, relaxed) == 1u);
+    duct_x_slot_pool_retire(&pool, s_reap_on_reap);
+    CHECK(!s_reaped);
+    duct_x_slot_pool_reap(&pool);
+    CHECK(!s_reaped);
+    duct_x_slot_release(&pool, held);
+    duct_x_slot_pool_reap(&pool);
+    CHECK(s_reaped);
+    s_reaped = false;
+    duct_x_slot_pool_t idle;
+    CHECK(duct_x_slot_pool_init(&idle, 4u, duct_x_slot_span_bytes(0u, 0u, 64u), 0u, 0u, 2u,
+                                k_no_hooks));
+    duct_x_slot_pool_engage(&idle);
+    duct_x_slot_pool_retire(&idle, s_reap_on_reap);
+    CHECK(s_reaped);
+    s_reaped = false;
+    printf("  retire_reap OK\n");
+}
+
 int main(void)
 {
     printf("x_slot_test\n");
     check_empty_pool();
     check_growth_by_chunk();
     check_addressing();
+    check_slot_word();
     check_claims();
     check_batch();
     check_hooks();
     check_sweep();
     check_class_pair();
     check_reserve();
+    check_retire_reap();
     check_concurrent();
     printf("x_slot: OK\n");
     return 0;

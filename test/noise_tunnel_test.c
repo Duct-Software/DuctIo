@@ -431,7 +431,7 @@ vpn_run_handshake(duct_noise_hs_t *hs, duct_view_u8 msg1, uint32_t recv_index,
     uint8_t remote_static[32],
             payload[64];
     size_t payload_len = 0u;
-    if (!duct_noise_hs_read_msg1(hs, msg1, remote_static, payload, sizeof payload, &payload_len)) {
+    if (!duct_noise_hs_read_msg1(hs, msg1, remote_static, sizeof payload, payload, &payload_len)) {
         duct_noise_hs_destroy(hs);
         return false;
     }
@@ -443,7 +443,7 @@ vpn_run_handshake(duct_noise_hs_t *hs, duct_view_u8 msg1, uint32_t recv_index,
     }
     vpn_put_index(resp, recv_index);
     size_t msg2_len = 0u;
-    if (!duct_noise_hs_write_msg2(hs, (duct_view_u8){}, resp + vpn_index_size, duct_noise_msg2_size, &msg2_len)) {
+    if (!duct_noise_hs_write_msg2(hs, (duct_view_u8){}, duct_noise_msg2_size, resp + vpn_index_size, &msg2_len)) {
         duct_del(resp);
         duct_noise_hs_destroy(hs);
         return false;
@@ -542,7 +542,7 @@ vpn_handle_transport(vpn_session_state_t *vst, const duct_frame_t *frame, duct_r
     uint8_t plain[512];
     size_t plain_len = 0u;
     duct_do_if(!duct_noise_transport_unseal(&vst->transport, sealed_in,
-                                            plain, sizeof plain, &plain_len),
+                                            sizeof plain, plain, &plain_len),
               return rc_drop);
 
     size_t sealed_cap = duct_noise_transport_seal_size(plain_len);
@@ -550,7 +550,7 @@ vpn_handle_transport(vpn_session_state_t *vst, const duct_frame_t *frame, duct_r
     duct_do_if(!sealed, return rc_drop);
     size_t sealed_len = duct_noise_transport_seal(&vst->transport,
                                                   &(duct_view_u8){ plain, plain_len }, 1u,
-                                                  sealed, sealed_cap);
+                                                  sealed_cap, sealed);
     if (!sealed_len) {
         duct_del(sealed);
         return rc_drop;
@@ -608,7 +608,7 @@ s_client_handshake(duct_sock_t fd, duct_noise_hs_t *hs_i, const uint8_t mac1_key
     msg1[0] = vpn_type_handshake;
     size_t msg1_len = 0u;
     duct_do_if(!duct_noise_hs_write_msg1(hs_i, (duct_view_u8){ (void *)hello, sizeof(hello) - 1u },
-                                         msg1 + 1u, sizeof(msg1) - 1u, &msg1_len),
+                                         sizeof(msg1) - 1u, msg1 + 1u, &msg1_len),
               return "write_msg1 failed");
     vpn_mac1_compute(mac1_key, msg1, 1u + msg1_len, msg1 + 1u + msg1_len);
     duct_do_if(uc_send(fd, msg1, 1u + msg1_len + vpn_mac1_size) != 0, return "send msg1 failed");
@@ -638,7 +638,7 @@ s_client_round(duct_sock_t fd, duct_noise_transport_t *t, uint32_t recv_index,
     out[0] = vpn_type_transport;
     vpn_put_index(out + 1u, recv_index);
     size_t sealed_len = duct_noise_transport_seal(t, &(duct_view_u8){ (void *)plain, plain_len }, 1u,
-                                                  out + 1u + vpn_index_size, 64u);
+                                                  64u, out + 1u + vpn_index_size);
     duct_do_if(!sealed_len, return "seal failed");
     duct_do_if(uc_send(fd, out, 1u + vpn_index_size + sealed_len) != 0, return "send failed");
 
@@ -649,7 +649,7 @@ s_client_round(duct_sock_t fd, duct_noise_transport_t *t, uint32_t recv_index,
     uint8_t opened[32];
     size_t opened_len = 0u;
     duct_do_if(!duct_noise_transport_unseal(t, (duct_view_u8){ rbuf, (size_t)got },
-                                            opened, sizeof opened, &opened_len),
+                                            sizeof opened, opened, &opened_len),
               return "unseal failed");
     duct_do_if(opened_len != plain_len || memcmp(opened, plain, opened_len) != 0,
               return "echoed payload mismatch");
@@ -855,7 +855,7 @@ int main(void)
         vpn_put_index(probe + 1u, recv_index);
         static const char msg[] = "probe";
         size_t sealed_len = duct_noise_transport_seal(&t_client_rekeyed,
-            &(duct_view_u8){ (void *)msg, sizeof(msg) - 1u }, 1u, probe + 1u + vpn_index_size, 64u);
+            &(duct_view_u8){ (void *)msg, sizeof(msg) - 1u }, 1u, 64u, probe + 1u + vpn_index_size);
         if (!sealed_len) { err = "post-reject-timeout probe seal failed"; goto cleanup; }
         if (uc_send(fd, probe, 1u + vpn_index_size + sealed_len) != 0) {
             err = "post-reject-timeout probe send failed";

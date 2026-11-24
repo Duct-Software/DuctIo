@@ -26,12 +26,12 @@ extern "C" {
  *  @return false when the source refuses; @p out then holds a partial draw and is
  *          not to be used.
  */
-[[nodiscard]] duct_nonnull(1) bool duct_random_bytes(void *out, size_t n);
+[[nodiscard]] duct_nonnull(1) duct_zero_regs bool duct_random_bytes(void *out, size_t n);
 
 /** @brief Compare @p n bytes of @p a and @p b in time that depends on @p n alone.
  *  @return true when every byte is equal, and for an @p n of 0.
  */
-[[nodiscard]] duct_nonnull(1, 2) bool duct_ct_equal(const void *a, const void *b, size_t n);
+[[nodiscard]] duct_nonnull(1, 2) duct_zero_regs bool duct_ct_equal(const void *a, const void *b, size_t n);
 
 #ifdef __cplusplus
 }

@@ -10,21 +10,18 @@ duct_file_t *duct_file_open(const char *path, unsigned flags)
 {
     bool refuse = duct_has_all(flags, duct_or(duct_file_app, duct_file_mapped));
     duct_do_if(refuse, return nullptr);
-    auto f = duct_new(duct_file_t);
+    duct_auto_del auto f = duct_new(duct_file_t);
     duct_do_if(!f, return nullptr);
     if (duct_has(flags, duct_file_mapped)) {
         f->mode = mapped;
         DWORD access = duct_has(flags, duct_file_out) ? GENERIC_READ | GENERIC_WRITE : GENERIC_READ;
         f->map.handle = CreateFileA(path, access, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
                                     FILE_ATTRIBUTE_NORMAL, nullptr);
-        if (f->map.handle == INVALID_HANDLE_VALUE) {
-            duct_del(f);
+        if (f->map.handle == INVALID_HANDLE_VALUE)
             return nullptr;
-        }
         LARGE_INTEGER size;
         if (!GetFileSizeEx(f->map.handle, &size) || size.QuadPart == 0) {
             CloseHandle(f->map.handle);
-            duct_del(f);
             return nullptr;
         }
         f->map.size = (size_t)size.QuadPart;
@@ -33,7 +30,6 @@ duct_file_t *duct_file_open(const char *path, unsigned flags)
                                             0u, 0u, nullptr);
         if (!section) {
             CloseHandle(f->map.handle);
-            duct_del(f);
             return nullptr;
         }
         f->map.base = (uint8_t *)MapViewOfFile(section, duct_has(flags, duct_file_out) ? FILE_MAP_ALL_ACCESS
@@ -42,10 +38,9 @@ duct_file_t *duct_file_open(const char *path, unsigned flags)
         CloseHandle(section);
         if (!f->map.base) {
             CloseHandle(f->map.handle);
-            duct_del(f);
             return nullptr;
         }
-        return f;
+        return duct_move(f);
     }
     /* Append wins over truncate, and out without in writes: the four flag shapes map
      * onto the CRT's own modes, read-write included for a file both read and written. */
@@ -53,29 +48,20 @@ duct_file_t *duct_file_open(const char *path, unsigned flags)
                         : duct_has(flags, duct_file_out) ? ((duct_has(flags, duct_file_in)) ? L"r+b" : L"wb")
                         : duct_has(flags, duct_file_in)  ? L"rb"
                                                          : nullptr;
-    if (!mode) {
-        duct_del(f);
+    if (!mode)
         return nullptr;
-    }
     int wide_n = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, nullptr, 0);
-    if (wide_n <= 0) {
-        duct_del(f);
+    if (wide_n <= 0)
         return nullptr;
-    }
-    auto wide = duct_new(wchar_t, (size_t)wide_n);
-    if (!wide) {
-        duct_del(f);
+    duct_auto_del auto wide = duct_new(wchar_t, (size_t)wide_n);
+    if (!wide)
         return nullptr;
-    }
     MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, duct_at(wide), wide_n);
     f->file = _wfopen(duct_at(wide), mode);
-    duct_del(wide);
-    if (!f->file) {
-        duct_del(f);
+    if (!f->file)
         return nullptr;
-    }
     f->mode = buffered;
-    return f;
+    return duct_move(f);
 }
 
 void duct_file_close(duct_file_t *f)

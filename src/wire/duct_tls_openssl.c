@@ -51,7 +51,7 @@ typedef struct {
     duct_ptr_t(uint8_t) scratch;
 } openssl_engine_t;
 
-static duct_seal_engine_t *s_create(const duct_seal_engine_vtbl_t *self, void *cfg, duct_seal_role_t role)
+duct_zero_regs static duct_seal_engine_t *s_create(const duct_seal_engine_vtbl_t *self, void *cfg, duct_seal_role_t role)
 {
     /* A role naming neither side is refused here as well as at wire
      * construction: duct_tls_openssl_vtbl and _vtbl_make are public, so this
@@ -86,7 +86,7 @@ static duct_seal_engine_t *s_create(const duct_seal_engine_vtbl_t *self, void *c
     if (!e)
         goto fail;
     e->ssl = ssl;
-    e->scratch = duct_new(uint8_t, s_record_ct_max);
+    e->scratch = duct_new_secret(uint8_t, s_record_ct_max);
     if (!e->scratch)
         goto fail;
     e->base.vtbl = self;
@@ -100,7 +100,7 @@ fail:
     return nullptr;
 }
 
-static void s_destroy(duct_seal_engine_t *eng)
+duct_zero_regs static void s_destroy(duct_seal_engine_t *eng)
 {
     auto e = DUCT_CAST(openssl_engine_t, base, eng);
     SSL_free(e->ssl);
@@ -248,7 +248,7 @@ static void s_seal(duct_seal_engine_t *eng, const duct_view_u8 *spans, size_t n_
     }
 }
 
-static void s_close_notify(duct_seal_engine_t *eng, duct_unseal_ctx_t *ctx)
+duct_zero_regs static void s_close_notify(duct_seal_engine_t *eng, duct_unseal_ctx_t *ctx)
 {
     auto e = DUCT_CAST(openssl_engine_t, base, eng);
     SSL_shutdown(e->ssl); /* first call sends our close_notify and returns
@@ -283,7 +283,7 @@ void duct_tls_openssl_vtbl_make(duct_seal_engine_vtbl_t *out, size_t hs_budget)
     out->engine_hs_budget = hs_budget != 0u ? hs_budget : s_engine_hs_budget;
 }
 
-static duct_seal_engine_t *s_client_create(const struct duct_seal_engine_vtbl *self, void *cfg, duct_seal_role_t role)
+duct_zero_regs static duct_seal_engine_t *s_client_create(const struct duct_seal_engine_vtbl *self, void *cfg, duct_seal_role_t role)
 {
     auto cc = (duct_tls_client_cfg_t *)cfg;
     duct_do_if(!cc || !cc->ctx, return nullptr);
@@ -296,7 +296,7 @@ static duct_seal_engine_t *s_client_create(const struct duct_seal_engine_vtbl *s
     return &e->base;
 }
 
-static void s_start(duct_seal_engine_t *eng, duct_unseal_ctx_t *ctx)
+duct_zero_regs static void s_start(duct_seal_engine_t *eng, duct_unseal_ctx_t *ctx)
 {
     auto e = DUCT_CAST(openssl_engine_t, base, eng);
     duct_discard SSL_do_handshake(e->ssl);

@@ -5,15 +5,11 @@
  * @file bench_stats.h
  * @brief Runtime benchmark counters and helpers.
  *
- * When DUCT_BENCH is defined (compile with -DDUCT_BENCH=1), the struct and
- * macros expand to real atomic counters.  Otherwise all ops are no-ops so the
- * production code path is untouched.
- *
- * Usage:
- *   1. Include this header in the benchmark TU.
- *   2. Define DUCT_BENCH_STATS before including (or pass -DDUCT_BENCH=1).
- *   3. Call bench_*_inc() from callbacks / hot paths.
- *   4. Call bench_print_*() to dump results.
+ * Include this header in the benchmark TU, call bench_*_inc() from callbacks /
+ * hot paths, call bench_print_*() to dump results. The frame+byte pairs are
+ * packed one word so a frame costs one relaxed fetch-add, not two -- the bench
+ * callbacks run on every engine worker and would otherwise bounce one cache
+ * line twice per frame across the cores.
  */
 
 #ifndef DUCT_BENCH_STATS_H
@@ -37,11 +33,18 @@ static inline uint64_t bench_ns_now(void)
 
 /* ── Stats struct ───────────────────────────────────────────────── */
 
+/** @brief Bits of a packed word's low field, the frame count; the rest of the
+ *  word is the payload byte count. Sized for one bench scenario between
+ *  @c bench_reset calls: runs last 1-3 s, so 2^28-1 frames clears a 10 Mf/s
+ *  run ~9x over and 2^36 bytes clears a 1024-byte-payload run ~2x over.
+ *  A frame-field overflow would carry into the byte field; a byte-field
+ *  overflow is dropped past the word's top. Neither is reachable. */
+static constexpr unsigned bench_frames_bits = 28u;
+static constexpr uint64_t bench_frames_mask = (1ull << bench_frames_bits) - 1ull;
+
 typedef struct bench_stats {
-    _Atomic(uint64_t) frames_rx;      /**< Server: frames received + dispatched. */
-    _Atomic(uint64_t) frames_tx;      /**< Server: response frames staged. */
-    _Atomic(uint64_t) bytes_rx;       /**< Server: payload bytes received. */
-    _Atomic(uint64_t) bytes_tx;       /**< Server: payload bytes staged. */
+    _Atomic(uint64_t) rx;             /**< Packed: low bits frames received, high bits payload bytes. */
+    _Atomic(uint64_t) tx;             /**< Packed: low bits response frames, high bits payload bytes. */
     _Atomic(uint64_t) sessions_open;  /**< Server: on_session_open calls. */
     _Atomic(uint64_t) sessions_close; /**< Server: on_session_close calls. */
     _Atomic(uint64_t) errors;         /**< Server: on_error calls. */
@@ -51,10 +54,8 @@ static bench_stats_t g_bench;
 
 static inline void bench_reset(void)
 {
-    duct_atomic_store(&g_bench.frames_rx, 0u, relaxed);
-    duct_atomic_store(&g_bench.frames_tx, 0u, relaxed);
-    duct_atomic_store(&g_bench.bytes_rx, 0u, relaxed);
-    duct_atomic_store(&g_bench.bytes_tx, 0u, relaxed);
+    duct_atomic_store(&g_bench.rx, 0u, relaxed);
+    duct_atomic_store(&g_bench.tx, 0u, relaxed);
     duct_atomic_store(&g_bench.sessions_open, 0u, relaxed);
     duct_atomic_store(&g_bench.sessions_close, 0u, relaxed);
     duct_atomic_store(&g_bench.errors, 0u, relaxed);
@@ -62,14 +63,12 @@ static inline void bench_reset(void)
 
 static inline void bench_inc_frame_rx(size_t bytes)
 {
-    duct_atomic_fetch(add, &g_bench.frames_rx, 1u, relaxed);
-    duct_atomic_fetch(add, &g_bench.bytes_rx, bytes, relaxed);
+    duct_atomic_fetch(add, &g_bench.rx, 1u | ((uint64_t)bytes << bench_frames_bits), relaxed);
 }
 
 static inline void bench_inc_frame_tx(size_t bytes)
 {
-    duct_atomic_fetch(add, &g_bench.frames_tx, 1u, relaxed);
-    duct_atomic_fetch(add, &g_bench.bytes_tx, bytes, relaxed);
+    duct_atomic_fetch(add, &g_bench.tx, 1u | ((uint64_t)bytes << bench_frames_bits), relaxed);
 }
 
 static inline void bench_inc_session_open(void)
@@ -151,9 +150,11 @@ static inline void bench_print_throughput(const char *scenario,
 
 static inline void bench_print_server_stats(void)
 {
+    auto rx = duct_atomic_load(&g_bench.rx, relaxed);
+    auto tx = duct_atomic_load(&g_bench.tx, relaxed);
     printf("  server: rx=%lu tx=%lu sessions=%lu/%lu errors=%lu\n",
-           (unsigned long)duct_atomic_load(&g_bench.frames_rx, relaxed),
-           (unsigned long)duct_atomic_load(&g_bench.frames_tx, relaxed),
+           (unsigned long)(rx & bench_frames_mask),
+           (unsigned long)(tx & bench_frames_mask),
            (unsigned long)duct_atomic_load(&g_bench.sessions_open, relaxed),
            (unsigned long)duct_atomic_load(&g_bench.sessions_close, relaxed),
            (unsigned long)duct_atomic_load(&g_bench.errors, relaxed));

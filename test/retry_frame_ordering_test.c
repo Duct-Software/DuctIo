@@ -143,13 +143,12 @@ static void s_fixture_init(s_fixture_t *f)
     f->conn->fd = conn_fd;
     f->conn->xport_type = x_tcp;
     /* Model the IO-side EAGAIN latch explicitly. A transient kernel EAGAIN
-     * can clear during fixture setup as ACKs arrive, even without a reader. */
-    duct_conn_state_set(f->conn, fl_conn_write_armed);
-
-    f->conn->rx_buf = duct_olb_rx_new(s_rx_olb_cap);
-    assert(f->conn->rx_buf);
-    f->conn->tx_buf = duct_olb_tx_new(s_tx_olb_cap);
-    assert(f->conn->tx_buf);
+     * can clear during fixture setup as ACKs arrive, even without a reader.
+     * The latch is the tx header's io-line value, resident in page 0 ahead
+     * of the carve. */
+    duct_olb_tx_write_armed_set(duct_conn_tx_hdr(f->conn), true);
+    duct_conn_carve_olb(f->conn, s_rx_olb_cap, s_tx_olb_cap);
+    assert(duct_conn_rx_olb(f->conn) && duct_conn_tx_olb(f->conn));
 
     duct_response_t out = {};
     f->s = duct_session_open(f->proto, duct_conn_id_primary,
@@ -167,7 +166,7 @@ static void s_fixture_init(s_fixture_t *f)
  *  the backpressure it parked on never clears, the peer socket never being
  *  read. The real route to that list is @c s_shutdown_drain, which returns
  *  at once without a WFQ this fixture has none of, so @c s_retry_clear runs
- *  straight — and ahead of @c duct_conn_teardown, which nulls the @c rx_buf
+ *  straight — and ahead of @c duct_conn_teardown_worker, which nulls the @c rx_buf
  *  the ring pin is dropped through. */
 static void s_fixture_release_parked_retry(s_fixture_t *f)
 {
@@ -179,7 +178,7 @@ static void s_fixture_fini(s_fixture_t *f)
     s_fixture_release_parked_retry(f);
     duct_timers_destroy(&f->w.timers);
     s_this_worker = nullptr;
-    duct_conn_teardown(f->conn);
+    duct_conn_teardown_worker(f->conn);
     duct_sock_close(f->peer_fd);
     duct_session_detach_leg(f->s, duct_conn_id_primary, close_normal);
     duct_conn_release(f->conn);
@@ -192,10 +191,10 @@ static void s_fixture_fini(s_fixture_t *f)
  */
 static duct_exec_rc_t s_post_frame(s_fixture_t *f, const char *payload, size_t len)
 {
-    auto rx = f->conn->rx_buf;
+    auto rx = duct_conn_rx_olb(f->conn);
     auto h = &rx->h;
     uint64_t prev = duct_atomic_load(&h->tail, relaxed);
-    uint8_t *dst = rx->data + prev;
+    uint8_t *dst = duct_olb_rx_data(rx) + prev;
     memcpy(dst, payload, len);
     uint64_t new_tail = prev + (uint64_t)len;
     h->stage = (uint32_t)new_tail;
@@ -214,12 +213,11 @@ static const char *run(void)
     s_fixture_t f;
     s_fixture_init(&f);
 
-    /* duct_olb_tx_new's requested capacity is a floor, not the literal
-     * buf_size -- the underlying duct_vm_new mapping rounds up to its own
-     * granularity. Query the real, empty-OLB space instead of assuming
-     * s_tx_olb_cap itself is exactly what's available, so filler/big/tiny
-     * stay correctly proportioned regardless of that rounding. */
-    size_t total_cap = duct_olb_tx_space(f.conn->tx_buf);
+    /* The ring's logical wire budget is what the carve placed, the
+     * descriptor ring's own ceiling. Query it rather than assuming
+     * s_tx_olb_cap itself, so filler/big/tiny stay correctly proportioned
+     * against what admission actually checks. */
+    size_t total_cap = duct_olb_tx_byte_cap(duct_conn_tx_olb(f.conn));
     if (total_cap < kbytes(4u)) {
         s_fixture_fini(&f);
         return "fixture: TX OLB smaller than this test's own assumptions need";
@@ -240,7 +238,7 @@ static const char *run(void)
         s_fixture_fini(&f);
         return "filler frame: on_frame not called exactly once";
     }
-    size_t after_filler = duct_olb_tx_published(f.conn->tx_buf);
+    size_t after_filler = duct_olb_tx_published(duct_conn_tx_olb(f.conn));
     if (after_filler == 0u) {
         s_fixture_fini(&f);
         return "filler frame: nothing published (fixture not saturating as expected)";
@@ -262,7 +260,7 @@ static const char *run(void)
         s_fixture_fini(&f);
         return "big frame: did not park as a retry_frame node (commit_internal not reached)";
     }
-    size_t after_big = duct_olb_tx_published(f.conn->tx_buf);
+    size_t after_big = duct_olb_tx_published(duct_conn_tx_olb(f.conn));
     if (after_big != after_filler) {
         s_fixture_fini(&f);
         return "big frame: published bytes changed despite commit_internal";
@@ -283,7 +281,7 @@ static const char *run(void)
         return "tiny frame: on_frame ran despite the gate -- it must not, or its response "
                "could publish ahead of the still-parked big one";
     }
-    size_t after_tiny = duct_olb_tx_published(f.conn->tx_buf);
+    size_t after_tiny = duct_olb_tx_published(duct_conn_tx_olb(f.conn));
     if (after_tiny != after_filler) {
         s_fixture_fini(&f);
         return "tiny frame: published bytes changed -- it published ahead of the still-parked big one";
@@ -291,9 +289,9 @@ static const char *run(void)
 
     /* Simulate the I/O thread draining the saturated ring. The parked big
      * frame must publish on the next TX-room wake, exactly once. */
-    duct_olb_tx_advance(f.conn->tx_buf, after_filler);
+    duct_olb_tx_advance(duct_conn_tx_olb(f.conn), after_filler, false);
     if (!s_retry_drain(&f.w) || f.w.retry_head ||
-        duct_olb_tx_published(f.conn->tx_buf) == 0u) {
+        duct_olb_tx_published(duct_conn_tx_olb(f.conn)) == 0u) {
         s_fixture_fini(&f);
         return "big frame: retry did not resume after TX room became available";
     }
@@ -308,9 +306,9 @@ static const char *run_blocked_retry_case(unsigned count)
 {
     s_fixture_t f;
     s_fixture_init(&f);
-    f.conn->tx_buf->tx_seq_serve = 0u;
+    duct_conn_tx_olb(f.conn)->tx_seq_serve = 0u;
     for (unsigned i = 0u; i < count; ++i) {
-        auto node = duct_new(retry_node_t);
+        auto node = s_retry_node_take(f.conn);
         assert(node);
         *node = (retry_node_t){
             .kind = retry_frame,
@@ -345,7 +343,7 @@ static const char *run_blocked_retry_case(unsigned count)
             s_fixture_fini(&f);
             return "room wake skipped an already attempted retry";
         }
-    auto fresh = duct_new(retry_node_t);
+    auto fresh = s_retry_node_take(f.conn);
     assert(fresh);
     *fresh = (retry_node_t){ .kind = retry_frame,
                                .frame = { .handle = f.handle, .ticket = 1u } };
@@ -381,9 +379,9 @@ static const char *run_serving_ticket_after_room_wake(void)
 {
     s_fixture_t f;
     s_fixture_init(&f);
-    f.conn->tx_buf->tx_seq_serve = 0u;
+    duct_conn_tx_olb(f.conn)->tx_seq_serve = 0u;
     for (unsigned i = 0u; i <= retry_drain_quota * 2u; ++i) {
-        auto node = duct_new(retry_node_t);
+        auto node = s_retry_node_take(f.conn);
         assert(node);
         *node = (retry_node_t){ .kind = retry_frame,
             .frame = { .handle = f.handle,
@@ -391,7 +389,7 @@ static const char *run_serving_ticket_after_room_wake(void)
         s_retry_enqueue(&f.w, node);
     }
     while (s_retry_drain(&f.w)) {}
-    f.conn->tx_buf->tx_seq_serve = 1u;
+    duct_conn_tx_olb(f.conn)->tx_seq_serve = 1u;
     duct_atomic_fetch(add, &f.w.retry_epoch, 1u, release);
     for (unsigned pass = 0u; pass < 3u; ++pass) {
         if (!s_retry_drain(&f.w)) {
@@ -399,7 +397,7 @@ static const char *run_serving_ticket_after_room_wake(void)
             return "room wake parked before reaching the serving ticket beyond the quota";
         }
     }
-    const char *error = f.conn->tx_buf->tx_seq_serve < 2u
+    const char *error = duct_conn_tx_olb(f.conn)->tx_seq_serve < 2u
         ? "serving ticket was not resolved after its predecessor released" : nullptr;
     /* Resolving the first ticket must also revisit earlier blocked nodes;
      * no new IO event is needed for the now-serving next ticket. */
@@ -416,9 +414,9 @@ static const char *run_new_arrival_during_lap(void)
 {
     s_fixture_t f;
     s_fixture_init(&f);
-    f.conn->tx_buf->tx_seq_serve = 0u;
+    duct_conn_tx_olb(f.conn)->tx_seq_serve = 0u;
     for (unsigned i = 0u; i < retry_drain_quota + 1u; ++i) {
-        auto node = duct_new(retry_node_t);
+        auto node = s_retry_node_take(f.conn);
         assert(node);
         *node = (retry_node_t){ .kind = retry_frame,
                                    .frame = { .handle = f.handle, .ticket = 1u } };
@@ -428,7 +426,7 @@ static const char *run_new_arrival_during_lap(void)
         s_fixture_fini(&f);
         return "multi-quota retry list parked before attempting its tail";
     }
-    auto fresh = duct_new(retry_node_t);
+    auto fresh = s_retry_node_take(f.conn);
     assert(fresh);
     *fresh = (retry_node_t){ .kind = retry_frame,
                                .frame = { .handle = f.handle, .ticket = 1u } };

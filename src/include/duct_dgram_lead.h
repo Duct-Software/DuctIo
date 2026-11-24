@@ -56,8 +56,8 @@ duct_dgram_lead_fits(size_t pdu_off, size_t len)
 /** @brief Compute the MAC of @p name and the PDU at @p pdu under @p key.
  *  @p pdu holds at least @c duct_dgram_lead_bind bytes. */
 static inline uint64_t
-duct_dgram_lead_mac(const uint8_t key[duct_siphash_key_size], const uint8_t name[2],
-                    const uint8_t *pdu)
+duct_dgram_lead_mac(const uint8_t key[static duct_siphash_key_size], const uint8_t name[static 2],
+                    const uint8_t pdu[static duct_dgram_lead_bind])
 {
     uint8_t in[2u + duct_dgram_lead_bind];
     memcpy(in, name, 2u);
@@ -69,10 +69,10 @@ duct_dgram_lead_mac(const uint8_t key[duct_siphash_key_size], const uint8_t name
  *  The bytes are exclusive-ored with 16 bits SipHash-2-4 draws from @p cover and
  *  the lead's @p mac, so one call does either direction. */
 static inline void
-duct_dgram_lead_cover(uint8_t name[2], const uint8_t cover[duct_siphash_key_size],
+duct_dgram_lead_cover(uint8_t name[static 2], const uint8_t cover[static duct_siphash_key_size],
                       uint64_t mac)
 {
-    duct_siphash_cover(name, 2u, cover, mac);
+    duct_siphash_cover(2u, name, cover, mac);
 }
 
 /** @brief Write the lead of datagram @p dgram into its first bytes, its PDU
@@ -81,16 +81,16 @@ duct_dgram_lead_cover(uint8_t name[2], const uint8_t cover[duct_siphash_key_size
  *  @p len counts the whole datagram; one @ref duct_dgram_lead_fits refuses is left
  *  as it is. */
 static inline void
-duct_dgram_lead_fill(uint8_t *dgram, size_t pdu_off, size_t len,
-                     const uint8_t key[duct_siphash_key_size],
-                     const uint8_t cover[duct_siphash_key_size], const uint8_t name[2])
+duct_dgram_lead_fill(size_t pdu_off, size_t len, uint8_t dgram[static len],
+                     const uint8_t key[static duct_siphash_key_size],
+                     const uint8_t cover[static duct_siphash_key_size], const uint8_t name[static 2])
 {
     if (!duct_dgram_lead_fits(pdu_off, len))
         return;
     uint64_t mac = duct_dgram_lead_mac(key, name, dgram + pdu_off);
     memcpy(dgram, name, 2u);
     duct_dgram_lead_cover(dgram, cover, mac);
-    duct_sip_put_le64(dgram + 2u, sizeof mac, mac);
+    duct_sip_put_le64(sizeof mac, dgram + 2u, mac);
 }
 
 #endif /* DUCT_DGRAM_LEAD_H */

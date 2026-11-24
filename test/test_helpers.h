@@ -382,7 +382,7 @@ static inline int th_read_exact(duct_sock_t fd, void *dst, size_t n)
  *  @param out_flags  Receives the frame's flags byte; null to ignore it.
  *  @return Payload size, which a bare control frame leaves at 0, or -1.
  */
-static inline int64_t th_recv_flags(duct_sock_t fd, char *buf, size_t bufsize,
+static inline int64_t th_recv_flags(duct_sock_t fd, size_t bufsize, char buf[static bufsize],
                                     uint8_t *out_flags)
 {
     uint8_t hdr[4] = {};
@@ -405,7 +405,7 @@ static inline int64_t th_recv_flags(duct_sock_t fd, char *buf, size_t bufsize,
 /** @brief Read one LP frame into @p buf (max @p bufsize). Returns payload size or -1. */
 static inline int64_t th_recv(duct_sock_t fd, char *buf, size_t bufsize)
 {
-    return th_recv_flags(fd, buf, bufsize, nullptr);
+    return th_recv_flags(fd, bufsize, buf, nullptr);
 }
 
 /** @brief Receive one LP frame and assert exact match with @p expected. */

@@ -122,8 +122,8 @@ static void s_ctx_reset(fake_ctx_t *f)
     f->bare_refuse_from = ~0u;
 }
 
-static size_t s_framed_len(const duct_seal_engine_vtbl_t *vt,
-                           const uint8_t *buf, size_t avail)
+static size_t s_framed_len(const duct_seal_engine_vtbl_t *vt, size_t avail,
+                           const uint8_t buf[static avail])
 {
     if (avail < vt->pdu_hdr_size)
         return 0u;
@@ -166,8 +166,8 @@ static const char *s_chunk_cuts(const duct_seal_engine_vtbl_t *vt, duct_seal_eng
         vt->seal(from, spans, 3u, sealed);
         s_ctx_reset(ctx);
         size_t off = 0u,
-               pdu = s_framed_len(vt, sealed, need);
-        for (; pdu != 0u; off += pdu, pdu = s_framed_len(vt, sealed + off, need - off))
+               pdu = s_framed_len(vt, need, sealed);
+        for (; pdu != 0u; off += pdu, pdu = s_framed_len(vt, need - off, sealed + off))
             if (vt->unseal(to, duct_view(duct_view_u8, sealed + off, pdu), &ctx->base) != rc_ok)
                 return "a PDU of a cleartext of more than one PDU was refused";
         if (off != need || ctx->ct_len != total || memcmp(ctx->ct, clear, total) != 0)
@@ -218,10 +218,10 @@ static const char *s_run(duct_noise_pattern_t pattern)
         s_ctx_reset(&actx);
         s_ctx_reset(&bctx);
         vt->start(b, &bctx.base);
-        size_t m1 = s_framed_len(vt, bctx.tx, bctx.tx_len);
+        size_t m1 = s_framed_len(vt, bctx.tx_len, bctx.tx);
         bool keyed_a = m1 != 0u
             && vt->unseal(a, duct_view(duct_view_u8, bctx.tx, m1), &actx.base) == rc_ok;
-        size_t m2 = keyed_a ? s_framed_len(vt, actx.tx, actx.tx_len) : 0u;
+        size_t m2 = keyed_a ? s_framed_len(vt, actx.tx_len, actx.tx) : 0u;
         vt->destroy(a);
         vt->destroy(b);
         if (!keyed_a || m2 == 0u) {
@@ -240,7 +240,7 @@ static const char *s_run(duct_noise_pattern_t pattern)
     }
 
     vt->start(cli, &cctx.base);
-    size_t msg1 = s_framed_len(vt, cctx.tx, cctx.tx_len);
+    size_t msg1 = s_framed_len(vt, cctx.tx_len, cctx.tx);
     if (msg1 == 0u || msg1 != cctx.tx_len) {
         err = "start did not emit exactly one framed message 1";
         goto done;
@@ -256,7 +256,7 @@ static const char *s_run(duct_noise_pattern_t pattern)
         err = "responder rejected message 1";
         goto done;
     }
-    size_t msg2 = s_framed_len(vt, sctx.tx, sctx.tx_len);
+    size_t msg2 = s_framed_len(vt, sctx.tx_len, sctx.tx);
     if (msg2 == 0u || msg2 != sctx.tx_len || sctx.ct_len != 0u) {
         err = "responder did not answer message 1 with exactly one message 2";
         goto done;
@@ -271,7 +271,7 @@ static const char *s_run(duct_noise_pattern_t pattern)
         err = "initiator rejected message 2";
         goto done;
     }
-    size_t confirm = s_framed_len(vt, cctx.tx, cctx.tx_len);
+    size_t confirm = s_framed_len(vt, cctx.tx_len, cctx.tx);
     if (confirm == 0u || confirm != cctx.tx_len) {
         err = "the initiator did not confirm its keys with exactly one PDU";
         goto done;
@@ -318,7 +318,7 @@ static const char *s_run(duct_noise_pattern_t pattern)
     s_ctx_reset(&hctx);
     bool genuine_after = vt->unseal(hardy, duct_view(duct_view_u8, recorded, msg1),
                                     &hctx.base) == rc_ok
-                      && s_framed_len(vt, hctx.tx, hctx.tx_len) != 0u;
+                      && s_framed_len(vt, hctx.tx_len, hctx.tx) != 0u;
     vt->destroy(hardy);
     if (!forged_rejected || !genuine_after) {
         err = "a forged message 1 left the responder unable to read the genuine one";
@@ -340,7 +340,7 @@ static const char *s_run(duct_noise_pattern_t pattern)
     }
     vt->seal(cli, &((duct_view_u8){ (void *)payload, pt_len }), 1u,
              sealed);
-    if (s_framed_len(vt, sealed, need) != need) {
+    if (s_framed_len(vt, need, sealed) != need) {
         err = "seal wrote a length prefix that disagrees with seal_size";
         goto done;
     }
@@ -481,7 +481,7 @@ static const char *s_run(duct_noise_pattern_t pattern)
 
     s_ctx_reset(&cctx);
     vt->rekey(cli, &cctx.base);
-    size_t re1 = s_framed_len(vt, cctx.tx, cctx.tx_len);
+    size_t re1 = s_framed_len(vt, cctx.tx_len, cctx.tx);
     if (re1 == 0u || re1 != cctx.tx_len) {
         err = "rekey did not emit exactly one framed message 1";
         goto done;
@@ -495,13 +495,13 @@ static const char *s_run(duct_noise_pattern_t pattern)
 
     s_ctx_reset(&sctx);
     if (vt->unseal(srv, duct_view(duct_view_u8, offered, re1), &sctx.base)
-        != rc_ok || s_framed_len(vt, sctx.tx, sctx.tx_len) == 0u) {
+        != rc_ok || s_framed_len(vt, sctx.tx_len, sctx.tx) == 0u) {
         err = "responder did not answer the offer whose answer gets dropped";
         goto done;
     }
     s_ctx_reset(&cctx);
     vt->rekey(cli, &cctx.base);
-    re1 = s_framed_len(vt, cctx.tx, cctx.tx_len);
+    re1 = s_framed_len(vt, cctx.tx_len, cctx.tx);
     if (re1 == 0u || re1 != cctx.tx_len) {
         err = "a lost message 2 left the initiator unable to offer again";
         goto done;
@@ -532,7 +532,7 @@ static const char *s_run(duct_noise_pattern_t pattern)
         err = "responder rejected a rekey message 1 on an established session";
         goto done;
     }
-    size_t re2 = s_framed_len(vt, sctx.tx, sctx.tx_len);
+    size_t re2 = s_framed_len(vt, sctx.tx_len, sctx.tx);
     if (re2 == 0u || re2 != sctx.tx_len || sctx.ct_len != 0u) {
         err = "responder did not answer a rekey with exactly one message 2";
         goto done;
@@ -627,7 +627,7 @@ static const char *s_run(duct_noise_pattern_t pattern)
     static fake_ctx_t ectx;
     s_ctx_reset(&ectx);
     vt->start(evil, &ectx.base);
-    size_t evil1 = s_framed_len(vt, ectx.tx, ectx.tx_len);
+    size_t evil1 = s_framed_len(vt, ectx.tx_len, ectx.tx);
     s_ctx_reset(&sctx);
     bool refused = evil1 != 0u
         && vt->unseal(srv, duct_view(duct_view_u8, ectx.tx, evil1),
@@ -659,7 +659,7 @@ static const char *s_run(duct_noise_pattern_t pattern)
     }
     s_ctx_reset(&cctx);
     vt->rekey(cli, &cctx.base);
-    size_t starved = s_framed_len(vt, cctx.tx, cctx.tx_len);
+    size_t starved = s_framed_len(vt, cctx.tx_len, cctx.tx);
     s_ctx_reset(&sctx);
     if (starved == 0u
         || vt->unseal(srv, duct_view(duct_view_u8, cctx.tx, starved),
@@ -676,7 +676,7 @@ static const char *s_run(duct_noise_pattern_t pattern)
     }
     s_ctx_reset(&cctx);
     vt->rekey(cli, &cctx.base);
-    size_t again = s_framed_len(vt, cctx.tx, cctx.tx_len);
+    size_t again = s_framed_len(vt, cctx.tx_len, cctx.tx);
     s_ctx_reset(&sctx);
     if (again == 0u
         || vt->unseal(srv, duct_view(duct_view_u8, cctx.tx, again),
@@ -685,7 +685,7 @@ static const char *s_run(duct_noise_pattern_t pattern)
         goto done;
     }
 
-    size_t cap_re2 = s_framed_len(vt, sctx.tx, sctx.tx_len);
+    size_t cap_re2 = s_framed_len(vt, sctx.tx_len, sctx.tx);
     static uint8_t capjunk[512];
     if (cap_re2 == 0u || cap_re2 > sizeof capjunk) {
         err = "the rekey answer does not fit the test's own buffer";
@@ -818,7 +818,7 @@ static const char *s_open_case(const duct_seal_engine_vtbl_t *vt, const duct_noi
         if (f.tx_len)
             return "a responder emitted at start";
     } else {
-        size_t msg1 = s_framed_len(vt, f.tx, f.tx_len);
+        size_t msg1 = s_framed_len(vt, f.tx_len, f.tx);
         if (msg1 == 0u || msg1 != f.tx_len)
             return "start did not emit exactly one framed message 1";
     }

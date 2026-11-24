@@ -21,11 +21,11 @@
  * thread's own kick. It asserts the outcome rather than reproducing the race,
  * which needs the io thread to win a wake the worker normally finishes first.
  *
- * pool_payload_gathers answers a separate question on the same listener: a
- * response built in a duct_tx_pool_acquire region, under a wire that writes a
- * header, goes out as two spans of one datagram with the payload never copied.
- * Nothing else in the suite produces a pool-owned payload on a shared
- * listener, so this case is what keeps that fork honest.
+ * static_payload_gathers answers a separate question on the same listener: a
+ * response over static bytes, under a wire that writes a header, goes out as
+ * two spans of one datagram with the payload never copied. Nothing else in
+ * the suite produces a static payload on a shared listener, so this case is
+ * what keeps that span fork honest.
  *
  * defer_reports_loss covers the one disposition this listener cannot honour:
  * a frame is off the inter_lane before on_frame runs, so rc_defer has no
@@ -73,7 +73,7 @@ static void s_reset(void)
     duct_atomic_store(&g_have_b, false, release);
 }
 
-static void s_put(uint8_t *out, uint8_t flags, uint32_t sid, char tag)
+static void s_put(uint8_t out[static 6], uint8_t flags, uint32_t sid, char tag)
 {
     out[0] = flags;
     out[1] = (uint8_t)(sid >> 24u); out[2] = (uint8_t)(sid >> 16u);
@@ -106,13 +106,19 @@ on_frame([[maybe_unused]] duct_session_t *s, [[maybe_unused]] duct_conn_id_t cid
     if (kind == 'x')
         return rc_defer;
     if (kind == 'p') {
-        auto p = (char *)duct_tx_pool_acquire(frame->payload.size);
-        if (!p)
+        /* Static bytes: taken once on the first round, echoed as a static
+         * span every round after. */
+        static alignas(4) uint8_t held[64];
+        static size_t held_n = 0u;
+        if (!held_n && frame->payload.size <= sizeof held) {
+            memcpy(held, body, frame->payload.size);
+            held_n = frame->payload.size;
+        }
+        if (held_n != frame->payload.size)
             return rc_again;
-        memcpy(p, body, frame->payload.size);
-        out->payload = duct_view(duct_view_u8, (void *)p, frame->payload.size);
+        out->payload = duct_view(duct_view_u8, held, held_n);
+        out->flags = fl_send_static;
         out->stream_id = frame->stream_id;
-        out->send_token = (uintptr_t)p;
         return rc_ok;
     }
     if (kind == 'o' || kind == 'i') {
@@ -149,9 +155,9 @@ on_error([[maybe_unused]] duct_session_t *s, duct_result_t error,
 
 static duct_result_t
 on_send_done([[maybe_unused]] duct_session_t *s, const duct_send_done_info_t *info,
-             [[maybe_unused]] duct_response_t *out, [[maybe_unused]] void *proto_state)
+             duct_response_t *out, [[maybe_unused]] void *proto_state)
 {
-    if (info->stream_id == sid_recurse) {
+    if (info->result == rc_ok && info->frontier >= 1u) {
         duct_atomic_fetch(add, &g_done_fins, 1, relaxed);
         out->control.stream_op = stream_op_fin;
         out->control.stream_op_stream_id = (duct_stream_id_t)sid_recurse;
@@ -337,7 +343,7 @@ static const char *sc_data_then_fin_order(void)
     return err;
 }
 
-static const char *sc_pool_payload_gathers(void)
+static const char *sc_static_payload_gathers(void)
 {
     s_fixture_t f;
     auto err = s_fixture_up(&f, true);
@@ -354,9 +360,9 @@ static const char *sc_pool_payload_gathers(void)
         s_put(msg, 0u, sid_under, 'A');
         msg[mux_lead + 1u] = 'p';
         if (uc_send(fa, msg, sizeof msg) != 0)
-            err = "pool-payload send failed";
+            err = "static-payload send failed";
         else if (uc_recv(fa, (char *)back, sizeof back) != (ssize_t)sizeof msg)
-            err = "the pool-backed reply did not come back whole";
+            err = "the static reply did not come back whole";
         else if ((((uint32_t)back[1] << 24u) | ((uint32_t)back[2] << 16u)
                 | ((uint32_t)back[3] <<  8u) |  (uint32_t)back[4]) != sid_under)
             err = "the gathered header named the wrong stream";
@@ -364,7 +370,7 @@ static const char *sc_pool_payload_gathers(void)
             err = "the gathered payload differs from what was sent";
     }
     if (!err && duct_atomic_load(&g_error_rc, acquire) != -1)
-        err = "a pool-backed response reported an error";
+        err = "a static response reported an error";
 
     if (fa != duct_sock_bad) close(fa);
     s_fixture_down(&f);
@@ -522,7 +528,7 @@ int main(void)
     int pass = 1;
     pass &= s_report("fin_reaches_its_client", sc_fin_reaches_its_client());
     pass &= s_report("data_then_fin_order", sc_data_then_fin_order());
-    pass &= s_report("pool_payload_gathers", sc_pool_payload_gathers());
+    pass &= s_report("static_payload_gathers", sc_static_payload_gathers());
     pass &= s_report("owned_payload_gathers", sc_owned_payload_gathers());
     pass &= s_report("send_done_fin_no_recurse", sc_send_done_fin_no_recurse());
     pass &= s_report("defer_reports_loss", sc_defer_reports_loss());

@@ -27,7 +27,9 @@
  */
 
 #include "duct_wire.h"
+#include "duct_wire_codec.h"
 #include "duct_wire_tx.h"
+#include "duct_conn_block.h"
 #include "duct_dgram_rec.h"
 #include "duct_olb_rx.h"
 #include "duct_olb_tx.h"
@@ -36,6 +38,14 @@
 #include "duct_types.h"
 #include <stdint.h>
 #include <string.h>
+
+/** @brief The vtable release behind the api's opaque destroy: the codec
+ *  struct is complete only here in the wire tier, consumers below hold it
+ *  by pointer. */
+duct_zero_regs void duct_wire_codec_destroy(duct_wire_codec_t *codec)
+{
+    codec->release(codec);
+}
 
 static constexpr size_t lp_max_frame = 1u << 20;
 /** @name Length-prefix header bits
@@ -374,14 +384,12 @@ static size_t s_mux_dgram_pack_header([[maybe_unused]] const duct_wire_t *self,
 }
 
 
-static duct_wire_parser_t *s_lp_create_parser([[maybe_unused]] const duct_wire_t *self)
-{
-    return duct_new(duct_wire_parser_t);
-}
+static_assert(sizeof(duct_wire_parser_t) <= duct_wire_parser_slot,
+              "the length-prefix parser exceeds the conn block's parser slot");
 
-static void s_lp_destroy_parser([[maybe_unused]] const duct_wire_t *self, duct_wire_parser_t *parser)
+static void s_lp_init_parser([[maybe_unused]] const duct_wire_t *self,
+                             [[maybe_unused]] duct_wire_parser_t *storage)
 {
-    duct_del(parser);
 }
 
 static void s_lp_destroy(duct_wire_t *self)
@@ -400,12 +408,12 @@ duct_wire_t *duct_wire_create_length_prefix(size_t max_frame)
         .header_size      = sizeof(lp_hdr_t),
         .max_frame        = max_frame ? max_frame : lp_max_frame,
         .max_batch_frames = duct_conn_rx_olb_cap / sizeof(lp_hdr_t),
+        .parser_max       = sizeof(duct_wire_parser_t),
         .destroy          = s_lp_destroy,
         .on_parse         = s_lp_parse,
         .on_pack          = s_pack_frame,
         .pack_header      = s_lp_pack_header,
-        .create_parser    = s_lp_create_parser,
-        .destroy_parser   = s_lp_destroy_parser,
+        .init_parser      = s_lp_init_parser,
     };
     return w;
 }
@@ -504,15 +512,27 @@ void *duct_wire_tx_span_open(duct_wire_tx_t *stage, size_t n)
 {
     if (stage->kind == wire_tx_gather)
         return nullptr;
-    if (stage->kind != wire_tx_vmq_view)
-        return duct_olb_tx_span_open(stage->olb, n);
-    auto v = &stage->vmq_view;
-    size_t end = 0u;
-    if (duct_ckd_add(&end, v->stage, n) || end > v->capacity)
+    if (stage->kind == wire_tx_vmq_view) {
+        auto v = &stage->vmq_view;
+        size_t end = 0u;
+        if (duct_ckd_add(&end, v->stage, n) || end > v->capacity)
+            return nullptr;
+        auto span = (uint8_t *)v->data + v->stage;
+        v->stage = end;
+        return span;
+    }
+    /* The ring's encrypt destination: the arena span a sealed codec writes
+     * its whole record into (§2.1). The reservation is the caller's to keep
+     * — on_pack's caller reads it back through the stage. */
+    auto r = &stage->ring;
+    if (r->sealed_len || stage->gathered)
         return nullptr;
-    auto span = (uint8_t *)v->data + v->stage;
-    v->stage = end;
-    return span;
+    void *at = duct_olb_tx_span_open(r->tx, n);
+    if (at) {
+        r->sealed_len = (uint32_t)n;
+        stage->gathered = true;
+    }
+    return at;
 }
 
 duct_result_t duct_wire_tx_stage(duct_wire_tx_t *stage, duct_view_u8 hdr, duct_view_u8 payload)
@@ -540,10 +560,20 @@ duct_result_t duct_wire_tx_stage(duct_wire_tx_t *stage, duct_view_u8 hdr, duct_v
             stage->gathered = true;
         }
         break;
-    case wire_tx_olb:
-        rc = duct_olb_tx_stage(stage->olb, hdr_bytes, hdr.size,
-                               payload.data, payload.size);
+    case wire_tx_ring: {
+        auto r = &stage->ring;
+        rc = stage->gathered || hdr.size > wire_tx_hdr_max
+           ? olb_tx_too_large : olb_tx_ok;
+        if (rc == olb_tx_ok) {
+            if (hdr.size) {
+                memcpy(r->hdr + r->hdr_len, hdr_bytes, hdr.size);
+                r->hdr_len += (uint32_t)hdr.size;
+            }
+            r->payload = payload;
+            stage->gathered = true;
+        }
         break;
+    }
     }
     return rc == olb_tx_ok ? rc_ok : rc == olb_tx_too_large ? rc_invalid_arg : rc_again;
 }

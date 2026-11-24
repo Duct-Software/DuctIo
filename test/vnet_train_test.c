@@ -3,20 +3,22 @@
 
 /**
  * @file vnet_train_test.c
- * @brief White-box test of the worker's vnet train over the cleartext region ring.
+ * @brief White-box test of the worker's vnet train over heap-block references.
  *
- * Includes duct_worker.c directly, as tx_pool_test.c does, to reach
- * s_vnet_train_take, s_vnet_train_flush and the ring's regions. A seqpacket
+ * Includes duct_worker.c directly, as handler_dispatch_test.c does, to reach
+ * s_vnet_train_take, s_vnet_train_flush and the train's blocks. A seqpacket
  * socketpair stands in for the tun: one gathered write is one record on the
  * peer, so what arrives is the packet the kernel would segment.
  *
- * Three ways a payload gets into a train are driven: by reference, where it lies
- * in the region of the packet in dispatch; copied into a region of its own,
- * where it lies anywhere else; and flushed at once, where the ring has no room
- * for the copy. Each ends with every reference returned and the ring drained.
- * A last train fills to its span bound out of copies. UDP datagrams join a train
- * only on a leg whose conn carries @c fl_conn_vnet_uso, and a train of them
- * closes at @c duct_vnet_udp_segs_max.
+ * Three ways a payload gets into a train are driven: by reference, where it
+ * lies in the decrypt block of the packet in dispatch (the train taking a
+ * @c duct_share of that block); copied into a heap block of its own, where it
+ * lies anywhere else; and flushed ahead of a second leg's boarding, a train
+ * bound to one conn never holding another's packets. Each ends with every
+ * block reference returned and the train drained. A last train fills to its
+ * span bound out of copies. UDP datagrams join a train only on a leg whose
+ * conn carries @c fl_conn_vnet_uso, and a train of them closes at
+ * @c duct_vnet_udp_segs_max.
  */
 
 #include "../src/duct_worker.c"
@@ -155,55 +157,60 @@ static void vt_setup(void)
     s_conn->vnet_hdr_len = vt_vnet;
 }
 
-/** @brief Every region back, the ring empty. */
+/** @brief Every block reference back, the train empty. */
 static bool vt_drained(void)
 {
-    s_tx_pool_reclaim(&s_w.ct_pool);
-    return s_w.ct_pool.head == s_w.ct_pool.tail;
+    if (s_w.vnet_train->gro.segs)
+        return false;
+    for (unsigned i = 0u; i < duct_vnet_gro_span_max; ++i)
+        if (s_w.vnet_train->blocks[i])
+            return false;
+    return true;
 }
 
-/** @brief Two segments lying in the region of the packet in dispatch are
- *  taken by reference: the spans point into the region, which holds one
- *  reference each until the flush. */
+/** @brief Two segments lying in the decrypt block of the packet in dispatch
+ * are taken by reference: the spans point into the block, whose holder count
+ * grows by one share per span until the flush. */
 static void vt_by_reference(void)
 {
     size_t room = 2u * (vt_hdr + vt_seg);
-    auto home = (uint8_t *)s_pool_acquire(&s_w.ct_pool, room);
+    auto home = duct_at(duct_new(uint8_t, room));
     CHECK(home);
     redirect_t r = { .ct = home, .cap = room };
     vt_packet(home, 0u, vt_seg);
     vt_packet(home + vt_hdr + vt_seg, 1u, vt_seg);
-    CHECK(s_vnet_train_take(s_conn, (duct_view_u8){ home, vt_hdr + vt_seg }, 0u, &r));
-    CHECK(s_vnet_train_take(s_conn, (duct_view_u8){ home + vt_hdr + vt_seg, vt_hdr + vt_seg }, 0u, &r));
-    auto region = s_tx_pool_hdr_of(home);
-    CHECK(region->refs == 2u);
+    CHECK(s_vnet_train_take(s_conn, (duct_view_u8){ home, vt_hdr + vt_seg }, 0u, &r, fl_send_copy));
+    CHECK(s_vnet_train_take(s_conn, (duct_view_u8){ home + vt_hdr + vt_seg, vt_hdr + vt_seg }, 0u, &r, fl_send_copy));
+    CHECK(duct_atomic_load(&duct_block_hdr(home)->holders, relaxed) == 3u);
     CHECK(s_w.vnet_train->gro.nspans == 2u);
     CHECK(s_w.vnet_train->gro.bufs[duct_vnet_gro_front].data == home + vt_hdr);
-    s_tx_pool_drop_hold(home);
+    CHECK(s_w.vnet_train->blocks[0] == home && s_w.vnet_train->blocks[1] == home);
     CHECK(!vt_drained());
     s_vnet_train_flush(&s_w);
-    CHECK(region->refs == 0u);
+    CHECK(duct_atomic_load(&duct_block_hdr(home)->holders, relaxed) == 1u);
     uint8_t got[vt_vnet + vt_hdr + 2u * vt_seg + 16u];
     ssize_t n = recv(s_peer, got, sizeof got, MSG_DONTWAIT);
     CHECK(vt_payloads(got, n, vt_hdr, 2u, vt_seg));
     CHECK(got[0] == 1u && got[1] == 1u);
     CHECK(duct_load_be16(got + vt_vnet + 2u) == vt_hdr + 2u * vt_seg);
+    void *held = home;
+    duct_del(held);
     CHECK(vt_drained());
 }
 
-/** @brief Segments lying anywhere else are copied into regions before the call
- *  returns, so the memory they came from may go. */
+/** @brief Segments lying anywhere else are copied into heap blocks of their
+ * own before the call returns, so the memory they came from may go. */
 static void vt_copied_in(void)
 {
     static uint8_t outside[2][vt_hdr + vt_seg];
     for (unsigned k = 0u; k < 2u; ++k) {
         vt_packet(outside[k], k, vt_seg);
-        CHECK(s_vnet_train_take(s_conn, (duct_view_u8){ outside[k], sizeof outside[k] }, 0u, nullptr));
+        CHECK(s_vnet_train_take(s_conn, (duct_view_u8){ outside[k], sizeof outside[k] }, 0u, nullptr, fl_send_copy));
     }
     for (unsigned k = 0u; k < 2u; ++k) {
-        auto at = (const uint8_t *)s_w.vnet_train->gro.bufs[duct_vnet_gro_front + k].data;
-        CHECK(at >= s_w.ct_pool.arena && at < s_w.ct_pool.arena + duct_worker_tx_pool_cap);
-        CHECK(s_w.vnet_train->regions[k]->refs == 1u && !s_w.vnet_train->regions[k]->hold);
+        auto block = s_w.vnet_train->blocks[k];
+        CHECK(block && duct_atomic_load(&duct_block_hdr(block)->holders, relaxed) == 1u);
+        CHECK(s_w.vnet_train->gro.bufs[duct_vnet_gro_front + k].data == block);
     }
     memset(outside, 0, sizeof outside);
     s_vnet_train_flush(&s_w);
@@ -213,21 +220,37 @@ static void vt_copied_in(void)
     CHECK(vt_drained());
 }
 
-/** @brief A copy the ring has no room for flushes the train at once, the
- *  segment going out in it from where it lies. */
-static void vt_ring_full(void)
+/** @brief A packet for a second leg flushes the first's train ahead of its
+ * own boarding: one train is bound to one conn, so neither leg's packets
+ * wait behind the other's. */
+static void vt_leg_change(void)
 {
-    auto big = s_pool_acquire(&s_w.ct_pool, duct_worker_tx_pool_cap - 256u);
-    CHECK(big);
-    static uint8_t outside[vt_hdr + vt_seg];
-    vt_packet(outside, 0u, vt_seg);
-    CHECK(s_vnet_train_take(s_conn, (duct_view_u8){ outside, sizeof outside }, 0u, nullptr));
-    CHECK(s_w.vnet_train->gro.segs == 0u);
+    static uint8_t p0[vt_hdr + vt_seg];
+    static uint8_t p1[vt_hdr + vt_seg];
+    vt_packet(p0, 0u, vt_seg);
+    vt_packet(p1, 0u, vt_seg);
+    CHECK(s_vnet_train_take(s_conn, (duct_view_u8){ p0, sizeof p0 }, 0u, nullptr, fl_send_copy));
+    CHECK(s_w.vnet_train->gro.segs == 1u);
+
+    int sv[2];
+    assert(socketpair(AF_UNIX, SOCK_SEQPACKET, 0, sv) == 0);
+    auto other = duct_conn_acquire();
+    assert(other);
+    other->fd = sv[0];
+    other->xport_type = x_raw_packet;
+    other->vnet_hdr_len = vt_vnet;
+    CHECK(s_vnet_train_take(other, (duct_view_u8){ p1, sizeof p1 }, 0u, nullptr, fl_send_copy));
     uint8_t got[vt_vnet + vt_hdr + vt_seg + 16u];
     ssize_t n = recv(s_peer, got, sizeof got, MSG_DONTWAIT);
-    CHECK(n == (ssize_t)(vt_vnet + sizeof outside));
-    CHECK(!memcmp(got + vt_vnet, outside, sizeof outside));
-    s_tx_pool_drop_hold(big);
+    CHECK(vt_payloads(got, n, vt_hdr, 1u, vt_seg));
+    CHECK(s_w.vnet_train->gro.segs == 1u);
+    CHECK(s_w.vnet_train->conn.word == duct_conn_handle_get(other).word);
+    s_vnet_train_flush(&s_w);
+    n = recv(sv[1], got, sizeof got, MSG_DONTWAIT);
+    CHECK(vt_payloads(got, n, vt_hdr, 1u, vt_seg));
+    close(sv[0]);
+    close(sv[1]);
+    duct_conn_release(other);
     CHECK(vt_drained());
 }
 
@@ -240,7 +263,7 @@ static void vt_bound(unsigned count, size_t hdr, uint8_t type,
     uint8_t p[vt_hdr + pay];
     for (unsigned k = 0u; k < count; ++k) {
         build(p, k, pay);
-        CHECK(s_vnet_train_take(s_conn, (duct_view_u8){ p, hdr + pay }, 0u, nullptr));
+        CHECK(s_vnet_train_take(s_conn, (duct_view_u8){ p, hdr + pay }, 0u, nullptr, fl_send_copy));
     }
     CHECK(s_w.vnet_train->gro.segs == 0u);
     static uint8_t got[vt_vnet + vt_hdr + duct_vnet_gro_span_max * pay + 16u];
@@ -260,7 +283,7 @@ static void vt_datagrams(void)
         vt_datagram(d[k], k, pay);
     duct_conn_state_set(s_conn, fl_conn_vnet_uso);
     for (unsigned k = 0u; k < 3u; ++k)
-        CHECK(s_vnet_train_take(s_conn, (duct_view_u8){ d[k], sizeof d[k] }, 0u, nullptr));
+        CHECK(s_vnet_train_take(s_conn, (duct_view_u8){ d[k], sizeof d[k] }, 0u, nullptr, fl_send_copy));
     CHECK(s_w.vnet_train->gro.segs == 3u);
     s_vnet_train_flush(&s_w);
     uint8_t got[vt_vnet + vt_udp + 3u * pay + 16u];
@@ -277,7 +300,7 @@ static void vt_datagrams(void)
     vt_bound(duct_vnet_udp_segs_max, vt_udp, 5u, vt_datagram);
 
     duct_conn_state_clear(s_conn, fl_conn_vnet_uso);
-    CHECK(!s_vnet_train_take(s_conn, (duct_view_u8){ d[0], sizeof d[0] }, 0u, nullptr));
+    CHECK(!s_vnet_train_take(s_conn, (duct_view_u8){ d[0], sizeof d[0] }, 0u, nullptr, fl_send_copy));
     CHECK(s_w.vnet_train->gro.segs == 0u);
     CHECK(vt_drained());
 }
@@ -287,7 +310,7 @@ int main(void)
     vt_setup();
     vt_by_reference();
     vt_copied_in();
-    vt_ring_full();
+    vt_leg_change();
     vt_bound(duct_vnet_gro_span_max, vt_hdr, 1u, vt_packet);
     vt_datagrams();
     s_this_worker = nullptr;

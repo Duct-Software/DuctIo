@@ -49,10 +49,15 @@
  *                   record before the socket actually closed.
  */
 
+#define _GNU_SOURCE
+
 #include "duct.h"
 #include "duct_tls.h"
 #include "duct_stream_ctx.h"
 #include "tls_engine_null.h"
+#include "duct_conn.h"
+#include "duct_conn_block.h"
+#include "duct_wire_codec.h"
 
 #include <stdatomic.h>
 #include <stdio.h>
@@ -160,17 +165,12 @@ mux_pack(const duct_wire_t *self, [[maybe_unused]] duct_session_t *s,
         duct_view(duct_view_u8, hdr, mux_hdr_size), frame->payload);
 }
 
-static duct_wire_parser_t *mux_create_parser([[maybe_unused]] const duct_wire_t *self)
-{
-    auto st = duct_new(mux_parser_t);
-    duct_do_if(!st, return nullptr);
-    return (duct_wire_parser_t *)st;
-}
+static_assert(sizeof(mux_parser_t) <= duct_wire_parser_slot,
+              "the test wire's parser exceeds the conn block's parser slot");
 
-static void mux_destroy_parser([[maybe_unused]] const duct_wire_t *self, duct_wire_parser_t *parser)
+static void mux_init_parser([[maybe_unused]] const duct_wire_t *self,
+                            [[maybe_unused]] duct_wire_parser_t *storage)
 {
-    auto st = (mux_parser_t *)parser;
-    duct_del(st);
 }
 
 static void mux_destroy(duct_wire_t *self) { duct_del(self); }
@@ -183,7 +183,7 @@ static duct_wire_t *mux_wire_create(void)
         .name = "tls-null-mux", .header_size = mux_hdr_size,
         .destroy = mux_destroy, .on_parse = mux_parse, .on_pack = mux_pack,
         .pack_header = mux_pack_header,
-        .create_parser = mux_create_parser, .destroy_parser = mux_destroy_parser,
+        .parser_max = sizeof(mux_parser_t), .init_parser = mux_init_parser,
     };
     return &w->base;
 }
@@ -577,6 +577,29 @@ static const char *sc_replay(duct_sock_t fd)
  *  re-sealed record must decode back to exactly the bytes sent — the only
  *  thing that could make this fail is on_pack, tx_bound, or duct_wire_codec_t
  *  wiring, since RX already has its own dedicated coverage above. */
+/* AI-generated test code. */
+static const char *sc_ct_chunk(void)
+{
+    for (unsigned idx = 0u; idx < duct_runtime_max_conns; ++idx) {
+        if (!duct_conn_block_live(idx))
+            continue;
+        auto conn = (duct_conn_t *)duct_conn_block_at(idx);
+        auto sc = duct_conn_sealed_ctx(conn);
+        if (!sc || !sc->codec || !sc->codec->ct_buf)
+            continue;
+        auto buf = duct_at(sc->codec->ct_buf);
+        if (!duct_x_slot_obj_is(buf))
+            return "the cleartext buffer is not a pool chunk";
+        if (duct_x_slot_obj_cap(buf) != duct_wire_ct_buf_max
+            || conn->wire->ct_buf_max > duct_wire_ct_buf_max)
+            return "the chunk does not answer the wire-declared ceiling";
+        if (duct_x_slot_index(duct_x_slot_pool_of(buf), buf) >= duct_wire_ct_chunks)
+            return "the chunk names no worker-pool slot";
+        return nullptr;
+    }
+    return "no sealed conn found carrying a cleartext chunk";
+}
+
 static const char *sc_echo(duct_sock_t fd)
 {
     uint8_t plain[32];
@@ -766,6 +789,7 @@ int main(void)
         if (!err) err = sc_parked(fd);
         if (!err) err = sc_replay(fd);
         if (!err) err = sc_echo(fd);
+        if (!err) err = sc_ct_chunk();
         if (!err) err = sc_chunked(fd);
         if (!err) err = sc_auth_fail(fd);
         duct_sock_close(fd);

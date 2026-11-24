@@ -14,8 +14,11 @@
 #define DUCT_RELAY_H
 
 #include "duct_types.h"
+#include "duct_exec.h"
 #include "duct_msg.h"
+#include "duct_protocol.h"
 #include "duct_seal_engine.h"
+#include "duct_vmq.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -31,6 +34,8 @@ typedef struct duct_vmq_mpsc      duct_vmq_mpsc_t;
 typedef struct duct_dgram_out     duct_dgram_out_t;
 typedef struct duct_x_gso_tally   duct_x_gso_tally_t;
 typedef struct duct_x_slot_pool   duct_x_slot_pool_t;
+typedef struct duct_stream_ctx    duct_stream_ctx_t;
+typedef struct duct_span          duct_span_t;
 
 /** @name Message lists
  *  Each list is called with a macro @c X(name), where @c name completes the type @c duct_msg_NAME.
@@ -43,10 +48,10 @@ typedef struct duct_x_slot_pool   duct_x_slot_pool_t;
 /** @brief Kinds the io sweep gives back, each also the kind @c msg_kind_NAME. */
 #define duct_msg_sweep_io(X)                                              \
     X(attach_device) X(attach_fd) X(open_packet_fd) X(io_connect)         \
-    X(pre_parse) X(listener_register) X(listener_close)
+    X(dgram_hop) X(pre_parse) X(listener_register) X(listener_close)
 
 /** @brief Kinds the worker sweep gives back, each also the kind @c msg_kind_NAME. */
-#define duct_msg_sweep_ctrl(X) X(session_open) X(session_invoke)
+#define duct_msg_sweep_ctrl(X) X(session_open) X(session_invoke) X(proto_post)
 
 /** @brief Types an io trunk accepts: its sweep kinds, the plain @c attach_inter and the embedded
  *  @c dgram_tx_kick and @c rx_resume.
@@ -54,11 +59,11 @@ typedef struct duct_x_slot_pool   duct_x_slot_pool_t;
 #define duct_msg_post_io(X) duct_msg_sweep_io(X) X(attach_inter) X(dgram_tx_kick) X(rx_resume)
 
 /** @brief Types a worker ctrl stack accepts: its sweep kinds, @c pre_parse, which the worker returns
- *  to the trunk, and the plain @c conn_join, @c connect_error, @c connect_leg_error and @c timer_start.
+ *  to the trunk, and the plain @c conn_join, @c connect_error, @c leg_error and @c timer_start.
  */
 #define duct_msg_post_ctrl(X)                                             \
     duct_msg_sweep_ctrl(X) X(pre_parse) X(conn_join) X(connect_error)     \
-    X(connect_leg_error) X(timer_start)
+    X(leg_error) X(timer_start) X(worker_post)
 /** @} */
 
 /** @brief Kind of a message on an io trunk or worker ctrl stack, stored in @c duct_msg_t::arg.
@@ -161,52 +166,17 @@ duct_nonnull(2) duct_result_t
 duct_worker_post_timer_start(unsigned worker_id, const duct_proto_t *proto, void *user_ctx,
                              uint64_t delay_us, uintptr_t arg);
 
-/** @brief Post a leg-dial failure on an already-live session —
- *  @c control.open_leg == @c leg_kind_connect.
+/** @brief Post a leg's error on an already-live session: a dial's failure
+ *  (@c control.open_leg == @c leg_kind_connect) or a live leg's wire refusing a
+ *  frame for its size (@c rc_frame_too_large).
  *
  *  Resolves @p h on @p worker_id and fires @c cfg->on_error(s, err, ...).
  *  No-op if @p h no longer resolves, e.g. session is closing/closed.
  */
 duct_nonnull(2) void
-duct_worker_post_connect_leg_error(unsigned worker_id,
-                                   const duct_session_handle_t *h,
-                                   duct_result_t err);
-
-/** @brief Invoke-completion callback.
- *  Runs on whichever thread learns the invoke is finished —
- *  worker after a normal commit or the posting thread itself when
- *  @ref duct_worker_post_session_invoke fails before reaching the
- *  worker. @p rc is @p fn's return value or the post failure code.
- */
-typedef void (*duct_session_invoke_done_fn)(duct_result_t rc, void *done_ctx);
-
-/** @brief Post a host-driven invoke onto the owning worker.
- *  Backs @ref duct_session_invoke and @ref duct_session_invoke_sync.
- *
- *  Resolves @p h on @p worker_id, runs @p fn(s, out, ctx) and commits @c
- *  out through @ref duct_response_commit. The commit's @c in_conn/ @c in_stream
- *  anchors are @ref duct_conn_id_primary / @ref duct_stream_id_default — the
- *  same pair @ref duct_session_exec_open uses for @c on_session_open's @c out.
- *  No-op if @p h no longer resolves on @p worker_id.
- *
- *  @note @p on_done, when non-null, runs once per invocation with @p fn ret
- *  once the commit finishes, or synchronously on the caller's thread with the
- *  post failure rc if this call returns @c false.
- *  Pass @c nullptr for a fire-and-forget post.
- *
- *  @retval true   The message is posted, @p on_done still pending.
- *  @retval false  @p worker_id is out of range or allocation failed;
- *                 @p on_done already ran by the time this returns.
- */
-duct_nonnull(2) bool
-duct_worker_post_session_invoke(unsigned worker_id,
-                                const duct_session_handle_t *h,
-                                duct_session_fn fn, void *ctx,
-                                duct_session_invoke_done_fn on_done,
-                                void *done_ctx);
-
-/** @brief Return the calling worker's id, or @c conn_worker_none off a worker thread. */
-unsigned duct_worker_self(void);
+duct_worker_post_leg_error(unsigned worker_id,
+                           const duct_session_handle_t *h,
+                           duct_result_t err);
 
 /** @brief Subscribe I/O thread @p io_id to a wake after its push to
  *  @p worker_id's normal WFQ lane hit lane-full.
@@ -243,6 +213,9 @@ void duct_worker_wake_id(unsigned worker_id);
  */
 void duct_worker_inter_arm(unsigned worker_id, unsigned conn_idx);
 
+/** @brief Arm @p conn_idx's bit in @p worker_id's drain-completion frontier bitmap. */
+void duct_worker_done_arm(unsigned worker_id, unsigned conn_idx);
+
 /** @brief Flush the calling worker's @c x_udp_peer and vnet trains bound for
  *  @p conn.
  *  A close request runs it first, so the close finds those records published
@@ -266,6 +239,94 @@ uint32_t _Atomic *duct_worker_wake_latch(unsigned worker_id);
  *  with no bridge.
  *  @{
  */
+
+/** @brief TX egress for a push-mode inter conn.
+ *
+ *  The leg kind @ref duct_conn_attach_inter opens. Enqueues @p pkt for host
+ *  delivery via @c on_packet_out. Copies @p pkt into the worker egress lane
+ *  for asynchronous batch dispatch via @c run. Worker-thread only.
+ *
+ *  @retval rc_ok             Queued, or the no-bridge case alike — @ref
+ *                            duct_host_init left @c on_packet_out / @c run
+ *                            unset, a silent no-op by design.
+ *  @retval rc_again          Lane full: backpressure signal to retry.
+ *  @retval rc_invalid_arg    @p pkt outgrows an empty lane, or its size
+ *                            overflows the message header.
+ *  @retval rc_invalid_order  Called off a worker thread.
+ */
+duct_nonnull(1) duct_result_t
+duct_host_packet_out(const duct_session_handle_t *tok,
+                     duct_conn_id_t conn_id, duct_view_u8 pkt);
+
+duct_nonnull(1, 3) duct_result_t
+duct_host_packet_out_span(const duct_session_handle_t *tok,
+                          duct_conn_id_t conn_id, const duct_span_t *span);
+
+/** @brief One egress slot carved and not yet resolved.
+ *  Opaque to the holder: filled by @ref duct_host_egress_reserve, handed back
+ *  to exactly one of @ref duct_host_egress_publish or
+ *  @ref duct_host_egress_abandon.
+ */
+typedef struct duct_host_egress_hold {
+    duct_vmq_lane_t        ln;        /**< Calling worker's egress lane view. */
+    duct_vmq_reserve_pos_t pos;       /**< Carved slot, header included. */
+    void                  *pkt;       /**< Message header the payload trails. */
+    unsigned               worker_id; /**< Lane owner, re-resolved at drain. */
+} duct_host_egress_hold_t;
+
+/** @brief Carve @p size payload bytes on the calling worker's egress lane,
+ *  addressed to @p conn_id of @p tok, and hand them back to write into.
+ *
+ *  The zero-copy half of @ref duct_host_packet_out: the bytes are written
+ *  where they will be delivered from, so nothing copies them a second time.
+ *  Producer work continues behind the hold and stays invisible until it
+ *  resolves, so one is open at a time and only across the callback that fills
+ *  it. Worker-thread only, same as @ref duct_host_packet_out.
+ *
+ *  @return Payload span, @p out filled; @c nullptr with @p out untouched when
+ *          no bridge is configured, the lane has no room, or @p size outgrows
+ *          an empty lane.
+ */
+duct_nonnull(1, 4) void *
+duct_host_egress_reserve(const duct_session_handle_t *tok,
+                         duct_conn_id_t conn_id, size_t size,
+                         duct_host_egress_hold_t *out);
+
+/** @brief Deliver @p len bytes of @p hold's span, and everything queued behind
+ *  it, to @c on_packet_out.
+ *  @p len at most the @c size the reserve was given; the rest of the span
+ *  returns to the lane.
+ */
+duct_nonnull(1) void
+duct_host_egress_publish(duct_host_egress_hold_t *hold, size_t len);
+
+/** @brief Close @p hold without delivering its span.
+ *  Whatever was queued behind it while it was open becomes visible here, so a
+ *  response that took the copy path still reaches @c on_packet_out.
+ */
+duct_nonnull(1) void
+duct_host_egress_abandon(duct_host_egress_hold_t *hold);
+
+/** @brief True once the bridge has both a packet sink and a queue to run on.
+ *  Decides whether the worker pool allocates egress lanes at all, so an engine
+ *  with no inter conns carries none of this.
+ */
+bool duct_host_egress_enabled(void);
+
+/** @brief True when a response of @p max_response bytes fits an empty egress lane.
+ *  Evaluated at leg creation to reject protocols whose response caps exceed
+ *  lane capacity. True when no bridge or lane exists.
+ */
+bool duct_host_egress_fits(size_t max_response);
+
+/** @brief Fire the host's @c on_inter_resume hint through @c run,
+ *  once a worker's drain pass moved any inter-conn traffic.
+ *
+ *  A coarse "retry a deferred push" signal untied to one push or
+ *  one conn. No-op when @c run or @c on_inter_resume is not configured.
+ */
+void duct_host_inter_resume_fire(void);
+
 duct_vmq_mpsc_t *duct_worker_egress_lane(unsigned worker_id);
 
 /** @brief The calling worker's id, or @c conn_worker_none off a worker thread
@@ -276,6 +337,146 @@ unsigned duct_worker_egress_self(void);
  *  The deliberate leak @ref duct_host_egress_quiesce falls back on when a
  *  drain it cannot wait out is still scheduled against that memory. */
 void duct_worker_egress_abandon(unsigned worker_id);
+/** @} */
+
+/** @name Session → worker calls
+ *  The session module's entries into the worker's data plane, kept beside the
+ *  crossing posts they ride with.
+ *  @{
+ */
+
+/** @brief Check if the conn has TX room for @p need bytes. */
+bool duct_worker_admit_leg(duct_conn_handle_t conn, size_t need);
+
+/** @brief Reservation size for the next callback transaction.
+ *
+ *  Scaled by @p reserve.
+ *  @retval 0         No explicit cap — fall back to
+ *                    @c duct_worker_admit_leg's coarse backpressure check.
+ *  @retval SIZE_MAX  The reservation size overflowed at
+ *                    @c duct_proto_create; treat as blocked.
+ */
+duct_nonnull(1) static inline size_t
+duct_worker_admit_need(const duct_proto_t *proto,
+                       duct_admit_reserve_t reserve)
+{
+    return proto->admit_need[reserve - 1u];
+}
+
+/** @brief Close one leg of a session, on the session's worker.
+ *
+ *  A @c close_normal, @c close_peer or @c close_protocol_error close of a leg
+ *  with a TX ring follows the leg's output: while an earlier ticket waits, the
+ *  engine park holds bytes or the ring has no room for the engine's
+ *  @c close_notify, the close takes a ticket and waits parked. In
+ *  its turn it stages the @c close_notify of a sealed wire, for a
+ *  @c close_normal or @c close_peer close alone, and posts the close request,
+ *  which io carries out once the ring drains. Any other reason, and a leg
+ *  without a ring, posts at once.
+ */
+void duct_worker_conn_close(duct_conn_handle_t handle,
+                            duct_close_reason_t reason);
+
+/** @brief Client-first-flight hook.
+ *
+ *  Lazily creates @p handle conn's sealed-wire codec if missing, then
+ *  — on that fresh creation — runs the engine's @c start, so a client-role
+ *  engine can emit its first flight. No-op for a stale handle, a plain wire,
+ *  an unbound conn, or a codec that already exists. Idempotent.
+ *
+ *  A fresh codec takes @p tx_prefix, the one its dial declared: over the
+ *  codec prefix at the wire's width, or on an @c x_tcp conn as the stream's lead ahead
+ *  of @c start.
+ *  @return false only for a nonempty @p tx_prefix no codec of the conn takes:
+ *          a plain wire, a failed build or a width fitting neither form.
+ */
+bool duct_worker_tls_ensure_started(duct_conn_handle_t handle, duct_view_u8 tx_prefix);
+
+/** @brief Bound the handshake of leg @p handle of @p s.
+ *  A sealed leg whose engine names peers and has not named this one by
+ *  @c join_auth_timeout_ms is closed with @c close_timeout, the session
+ *  standing while another leg does. Runs as a leg joins and as a session's
+ *  first leg opens. Arms nothing for a plain wire or an engine naming no
+ *  peer. */
+duct_nonnull(1) void duct_worker_join_deadline_arm(duct_session_t *s, duct_conn_handle_t handle);
+
+/** @brief Wire-rebind fence node executor.
+ *
+ *  Decrements @c switch_pending, finishes the switch once every leg
+ *  has confirmed. @p self is a byte-copied VMQ payload (@ref
+ *  duct_msg_wire_fence is a plain @c duct_msg_decl, not chainable) — it is
+ *  never heap-owned and must not be freed here. No-op if the session is
+ *  gone or the switch was already abandoned (session close clears
+ *  @c switch_next first). Runs ahead of its conn's conn_lost: io posts no
+ *  fence for a conn it has quiesced.
+ */
+duct_exec_rc_t duct_session_exec_wire_fence(void *self);
+
+/** @brief Start the idle bound of @p s from its protocol's @c idle_timeout_ms.
+ *  Arms nothing for a protocol without a bound or a session whose timer is
+ *  pending. Runs on the session's worker, at session open and when a protocol
+ *  switch completes. */
+duct_nonnull(1) void duct_worker_idle_arm(duct_session_t *s);
+
+/** @brief Session timer cancellation.
+ *
+ *  Cancels every timer owned by @p h's session and drops every retry node
+ *  its parked timer fires hold, ahead of the session block's return. Called
+ *  from last-detach session teardown before @c destroy_state. No-op off the
+ *  worker thread.
+ */
+duct_nonnull(1) void
+duct_worker_session_timers_cancel(const duct_session_handle_t *h);
+
+duct_nonnull(1) void duct_worker_session_defer_discard(const duct_session_t *s);
+
+duct_nonnull(1) void duct_worker_reclaim_add(duct_session_t *s);
+
+void duct_worker_reclaim_reset_all(void);
+
+/** @brief Deferred-frame discard for one conn.
+ *
+ *  Acks @p conn's remaining unprocessed frames (no callback invoked) and
+ *  clears its defer mask bit. Called from
+ *  @ref duct_session_exec_conn_lost before leg detach, while @p conn's
+ *  rx_buf is still valid to ack against.
+ */
+duct_nonnull(1) void
+duct_worker_conn_defer_discard(const duct_conn_handle_t *conn);
+
+/** @brief Retry-list discard for one conn.
+ *
+ *  Drops every parked output that leaves on @p conn, its ticket going with
+ *  the conn's TX ring, and lands the carried ack and drops the pin of every
+ *  answer read on @p conn that leaves on another leg, its payload copied off
+ *  @p conn's buffers first, or voided where no copy is to be had. Called from
+ *  @ref duct_session_exec_conn_lost ahead of the retire confirm, past which
+ *  io frees @p conn's rings while its handle still resolves.
+ */
+duct_nonnull(1) void
+duct_worker_conn_retry_discard(const duct_conn_handle_t *conn);
+
+/** @brief Idempotently force-settle unfinished @c fl_send_done responses on closing @p conn. */
+duct_nonnull(1, 3) void
+duct_worker_conn_done_close(duct_session_t *s, duct_conn_id_t conn_id, duct_conn_t *conn);
+
+duct_nonnull(1) bool duct_worker_session_tx_parked(const duct_session_t *s);
+
+/** @brief Stream handler cancellation.
+ *
+ *  Removes the coroutine from its run queue, releases its slot if
+ *  stackless or destroys it if stackful, then frees the context.
+ */
+void duct_stream_cancel(duct_stream_ctx_t *hctx);
+
+/** @brief Response commit: route, TX stage, io wake, control effects.
+ *
+ *  Called by the worker's on_frame/on_batch path and by the session
+ *  ctrl executors, which also run in worker context.
+ */
+void duct_response_commit(duct_session_t *s, duct_conn_id_t in_conn,
+                          duct_stream_id_t in_stream,
+                          duct_response_t *out);
 /** @} */
 
 /** @} */
@@ -407,17 +608,6 @@ duct_nonnull(1) void duct_io_dgram_tx_kick_init(duct_listener_t *listener);
  */
 duct_nonnull(1) void duct_io_rx_slot_drop(duct_x_slot_pool_t *pool, uint32_t idx, bool claim);
 
-/** @brief Count one conn whose lane its worker holds behind a parked answer
- *  into @p pool's pins.
- *  While pinned, the pool reader copies unslotted datagrams directly and
- *  resumes an active stall. A conn counts into one pool at most, tracked
- *  on the worker.
- */
-duct_nonnull(1) void duct_io_rx_pin(duct_x_slot_pool_t *pool);
-
-/** @brief Take one count back out of @p pool's pins. */
-duct_nonnull(1) void duct_io_rx_unpin(duct_x_slot_pool_t *pool);
-
 /** @brief The request-exec function a conn pool slot binds to.
  *  The I/O request executor bound across each slot's embedded @c req_msg
  *  in @c duct_conn_pool_ctor.
@@ -438,21 +628,21 @@ duct_nonnull(1) void
 duct_io_post_wire_rebind(const duct_conn_handle_t *conn,
                          const duct_proto_t *next);
 
+/** @brief Post @p conn's device holds and @c ops->release to its owning io
+ *  thread, one unit of @c conn->refs borrowed for the posted finish.
+ *  The conn-lost consume calls this past its lane drain: a host callback
+ *  keeps its io thread contract, and the borrow keeps the slot resolvable
+ *  until the finish drops it.
+ */
+duct_nonnull(1) void duct_io_conn_device_release_post(duct_conn_t *conn);
+
 /** @brief Post RX resume for @p conn.
  *
  *  Restarts reading after RX-full or suspend backpressure. The assigned I/O
- *  thread clears @c fl_conn_rx_full and runs @ref duct_events_drive_rx.
- *  Coalesced via @c fl_req_rx_resume.
+ *  thread disarms the rx header's value latch and runs
+ *  @ref duct_events_drive_rx. Coalesced via @c fl_req_rx_resume.
  */
 duct_nonnull(1) void duct_io_post_rx_read(const duct_conn_handle_t *conn);
-
-/** @brief Request retire of a conn, confirmed @c fence_retire_ready by worker.
- *
- *  The assigned I/O thread CASes @c conn_fence to @c fence_retired and tears
- *  the conn down, releasing the slot.
- *  Coalesced via @c fl_req_retire, generation-checked against a raced reclaim.
- */
-duct_nonnull(1) void duct_io_retire_request(const duct_conn_handle_t *conn);
 
 /** @brief Post listener registration to @p listener->io_id.
  *  On successful post, lifecycle of @p listener passes to the target I/O thread.
@@ -500,13 +690,16 @@ duct_io_dgram_shared_send_batch(duct_listener_t *listener,
  *  TX ring, from the calling worker thread.
  *  The span runs from the published tail to the staging cursor. A run of
  *  equal-length records leaves as one segmented write where the stack cuts
- *  datagrams, a lone record through a plain send. Callable only while io has
- *  no published byte of that ring left to drain. @c fl_conn_write_armed is
- *  io's, read relaxed, and @c conn->fd stays open until
- *  @ref duct_conn_teardown, which for a bound conn waits on its worker's
- *  retire confirm.
- *  @param out_sent bytes of whole records taken, or refused as too large for
- *         the path, the prefix the caller settles with
+ *  datagrams, a lone record through a plain send. A record the path refuses
+ *  for its size counts as taken and the run sends on behind it, the refusal
+ *  reported to the conn's protocol once per call, through the same leg error
+ *  channel io's own drain reports it. Callable only while io has
+ *  no published byte of that ring left to drain. The TX header's
+ *  @c write_armed is io's, read relaxed, and @c conn->fd stays open until
+ *  @ref duct_conn_teardown_worker, which for a bound conn runs at its
+ *  worker's conn_lost consume.
+ *  @param out_sent bytes of whole records taken, sent or refused as too large
+ *         for the path, the prefix the caller settles with
  *         @ref duct_olb_tx_advance_worker.
  *  @param tally gains each segmented write and the datagrams it carried.
  *  Counts send declines and refusals in internal statistics.
@@ -621,6 +814,7 @@ typedef struct {
     uint32_t                 egress_if; /**< Index of the interface the dial's
                                         *  socket is bound to before it
                                         *  connects, 0 for none. */
+    uint32_t                 worker;
     duct_seal_prefix_t       tx_prefix; /**< Leading bytes of the opened conn's first
                                         *  send: a session dial's @c duct_io_connect_via
                                         *  prefix, a leg's @c open_leg.tx_prefix. The
@@ -763,6 +957,18 @@ duct_io_post_attach_fd(unsigned io_id, const duct_session_handle_t *h,
  */
 duct_nonnull(3) bool
 duct_io_post_open_packet_fd(unsigned io_id, duct_sock_t fd, duct_proto_t *proto, void *user_ctx);
+
+/** @brief Parse a @c host:port IPv4/IPv6 literal string into @p out. */
+duct_nonnull(1, 2) bool
+duct_connect_parse_peer(const char *addr, duct_peer_t *out);
+
+/** @brief Post @c dgram_hop to @p conn's I/O thread: the swap consumes the
+ *  leg's parked spare socket or opens one, connects to @p peer and swaps.
+ *  Sets @c fl_conn_hopping ahead of the post; the I/O side clears it when the
+ *  swap gave up, the leg then staying on its current tuple. */
+duct_nonnull(1, 3) duct_result_t
+duct_io_dgram_hop_start(duct_conn_t *conn, duct_conn_handle_t handle,
+                        const duct_peer_t *peer, uint32_t egress_if);
 
 /** @brief Attach device callbacks on @p io_id's I/O thread.
  *  @c ops is copied into the message; device context lifetime moves to the I/O

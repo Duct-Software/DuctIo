@@ -104,8 +104,8 @@ static bool duel_open(duel_t *d, const world_t *w, const uint8_t *psk_resp, size
     d->resp = duct_noise_hs_create_for(w->pattern, &w->server, nullptr, psk_resp, false, (duct_view_u8){});
     duct_view_u8 body = { (void *)zeros, payload };
     return d->init && d->resp
-        && (xk(d) ? duct_noise_hs_write_msg1_xk(d->init, body, d->m1, sizeof d->m1, &d->n1)
-                  : duct_noise_hs_write_msg1(d->init, body, d->m1, sizeof d->m1, &d->n1));
+        && (xk(d) ? duct_noise_hs_write_msg1_xk(d->init, body, sizeof d->m1, d->m1, &d->n1)
+                  : duct_noise_hs_write_msg1(d->init, body, sizeof d->m1, d->m1, &d->n1));
 }
 
 /** @brief Have the responder read @p n bytes of message 1 at @p m1. */
@@ -114,8 +114,8 @@ static bool duel_read1(duel_t *d, const uint8_t *m1, size_t n)
     uint8_t learned[duct_noise_key_size], pay[duct_noise_hs_pad_max];
     size_t got = 0u;
     duct_view_u8 msg = { (void *)m1, n };
-    return xk(d) ? duct_noise_hs_read_msg1_xk(d->resp, msg, pay, sizeof pay, &got)
-                 : duct_noise_hs_read_msg1(d->resp, msg, learned, pay, sizeof pay, &got);
+    return xk(d) ? duct_noise_hs_read_msg1_xk(d->resp, msg, sizeof pay, pay, &got)
+                 : duct_noise_hs_read_msg1(d->resp, msg, learned, sizeof pay, pay, &got);
 }
 
 /** @brief Have the responder answer with a zero payload of @p payload bytes. */
@@ -123,8 +123,8 @@ static bool duel_write2(duel_t *d, size_t payload)
 {
     static const uint8_t zeros[duct_noise_hs_pad_max] = {};
     duct_view_u8 body = { (void *)zeros, payload };
-    return xk(d) ? duct_noise_hs_write_msg2_xk(d->resp, body, d->m2, sizeof d->m2, &d->n2)
-                 : duct_noise_hs_write_msg2(d->resp, body, d->m2, sizeof d->m2, &d->n2);
+    return xk(d) ? duct_noise_hs_write_msg2_xk(d->resp, body, sizeof d->m2, d->m2, &d->n2)
+                 : duct_noise_hs_write_msg2(d->resp, body, sizeof d->m2, d->m2, &d->n2);
 }
 
 /** @brief Have the initiator read @p n bytes of message 2 at @p m2. */
@@ -151,9 +151,9 @@ static bool duel_last(duel_t *d, const world_t *w, size_t payload)
     uint8_t learned[duct_noise_key_size], pay[duct_noise_hs_pad_max];
     size_t got = 0u;
     return !xk(d)
-        || (duct_noise_hs_write_msg3_xk(d->init, (duct_view_u8){ (void *)zeros, payload }, d->m3, sizeof d->m3, &d->n3)
+        || (duct_noise_hs_write_msg3_xk(d->init, (duct_view_u8){ (void *)zeros, payload }, sizeof d->m3, d->m3, &d->n3)
             && duct_noise_hs_read_msg3_xk(d->resp, (duct_view_u8){ d->m3, d->n3 }, world_psk, (void *)w, learned,
-                                          pay, sizeof pay, &got));
+                                          sizeof pay, pay, &got));
 }
 
 /** @brief Run one handshake to its end, keeping each message's leading key and

@@ -96,8 +96,8 @@ duct_join_derive(const duct_seal_engine_vtbl_t *vt, duct_seal_engine_t *engine,
  *  @return the session's handle, or one with a @c handle_null word for a
  *          datagram it does not take, one that @c duct_dgram_lead_fits refuses
  *          included. */
-duct_nonnull(1, 3) duct_session_handle_t
-duct_join_dgram_match(const uint8_t *dgram, size_t len, const duct_proto_t *proto);
+duct_nonnull(2, 3) duct_session_handle_t
+duct_join_dgram_match(size_t len, const uint8_t dgram[static len], const duct_proto_t *proto);
 
 #ifdef __cplusplus
 }

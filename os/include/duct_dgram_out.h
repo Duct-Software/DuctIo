@@ -33,13 +33,26 @@ extern "C" {
  *  the send.
  */
 typedef struct duct_dgram_out {
-    duct_peer_t peer; /**< Destination address. */
-    duct_view_u8  hdr;  /**< Wire header packed apart from the payload.
-                        *  Zero-sized when the header sits at the head of
-                        *  @c body. */
-    duct_view_u8  body; /**< Payload bytes, or header-plus-payload when @c hdr
-                        *  is empty. */
+    duct_peer_t  peer;  /**< Destination address. */
+    duct_peer_t  local; /**< Source address when set (@c family != 0),
+                          *  written as @c PKTINFO on shared UDP sends. */
+    duct_view_u8 hdr;   /**< Wire header packed apart from the payload.
+                          *  Zero-sized when the header sits at the head of
+                          *  @c body. */
+    duct_view_u8 body;  /**< Payload bytes, or header-plus-payload when @c hdr
+                          *  is empty. */
 } duct_dgram_out_t;
+
+/** @brief One record of a connected socket's TX descriptor ring: its inline
+ *  header and its payload span — the two iovec a segmented or plain send
+ *  posts, the header's bytes and the payload's living where their record
+ *  keeps them.
+ */
+typedef struct duct_tx_rec {
+    duct_view_u8 hdr;  /**< The record's inline header; zero-sized when the
+                        *  record carries none. */
+    duct_view_u8 body; /**< The record's payload span. */
+} duct_tx_rec_t;
 
 /** @brief Place of one datagram in a segmented send led by a datagram of
  *  segment size. */
@@ -81,6 +94,14 @@ duct_x_same_peer(const duct_peer_t *a, const duct_peer_t *b)
     return memcmp(a, b, sizeof *a) == 0;
 }
 
+/** @brief Report whether @p a and @p b share both destination peer and local source. */
+duct_nonnull(1, 2) static inline bool
+duct_x_same_out(const duct_dgram_out_t *a, const duct_dgram_out_t *b)
+{
+    return duct_x_same_peer(&a->peer, &b->peer)
+        && duct_x_same_peer(&a->local, &b->local);
+}
+
 /** @name Per-entry datagram length a group scanner reads
  *  The whole datagram, header span included.
  *  @{ */
@@ -92,6 +113,11 @@ duct_nonnull(1) static inline size_t duct_x_dgram_len_buf(const duct_view_u8 *b)
 duct_nonnull(1) static inline size_t duct_x_dgram_len_out(const duct_dgram_out_t *m)
 {
     return m->hdr.size + m->body.size;
+}
+
+duct_nonnull(1) static inline size_t duct_x_dgram_len_rec(const duct_tx_rec_t *r)
+{
+    return r->hdr.size + r->body.size;
 }
 /** @} */
 
@@ -115,8 +141,7 @@ duct_nonnull(1) static inline size_t duct_x_dgram_len_out(const duct_dgram_out_t
                                         duct_x_gso_segs_max));                \
         unsigned i = 1u;                                                      \
         for (bool open = true; open && i < n;) {                              \
-            bool same = true __VA_OPT__(&&                                    \
-                duct_x_same_peer(&m[i].__VA_ARGS__, &m[0].__VA_ARGS__));      \
+            bool same = true __VA_OPT__(&& __VA_ARGS__(&m[i], &m[0]));       \
             auto fit = same ? duct_x_gso_fit(len_fn(&m[i]), seg)              \
                             : x_gso_fit_none;                                 \
             switch (fit) {                                                    \
@@ -131,7 +156,8 @@ duct_nonnull(1) static inline size_t duct_x_dgram_len_out(const duct_dgram_out_t
 
 DUCT_X_GSO_GROUP_DECLARE(duct_x_gso_group_bufs, duct_view_u8, duct_x_dgram_len_buf)
 DUCT_X_GSO_GROUP_DECLARE(duct_x_gso_group_peers, duct_dgram_out_t,
-                         duct_x_dgram_len_out, peer)
+                         duct_x_dgram_len_out, duct_x_same_out)
+DUCT_X_GSO_GROUP_DECLARE(duct_x_gso_group_recs, duct_tx_rec_t, duct_x_dgram_len_rec)
 
 /** @brief Count the entries from @p m one segmented write carries.
  *  @p m is a @c duct_view_u8 array of a connected conn's records, or a
@@ -145,7 +171,9 @@ DUCT_X_GSO_GROUP_DECLARE(duct_x_gso_group_peers, duct_dgram_out_t,
         duct_view_u8 *:             duct_x_gso_group_bufs,    \
         const duct_view_u8 *:       duct_x_gso_group_bufs,    \
         duct_dgram_out_t *:       duct_x_gso_group_peers,   \
-        const duct_dgram_out_t *: duct_x_gso_group_peers)((m), (n))
+        const duct_dgram_out_t *: duct_x_gso_group_peers,   \
+        duct_tx_rec_t *:          duct_x_gso_group_recs,    \
+        const duct_tx_rec_t *:    duct_x_gso_group_recs)((m), (n))
 
 /** @brief Send the @p n datagrams at @p m as one segmented write.
  *  @p m holds a connected conn's @c duct_view_u8 records or addressed
@@ -158,7 +186,9 @@ DUCT_X_GSO_GROUP_DECLARE(duct_x_gso_group_peers, duct_dgram_out_t,
         duct_view_u8 *:             duct_xsend_gso_bufs,      \
         const duct_view_u8 *:       duct_xsend_gso_bufs,      \
         duct_dgram_out_t *:       duct_xsend_gso_peers,     \
-        const duct_dgram_out_t *: duct_xsend_gso_peers)((fd), (m), (n))
+        const duct_dgram_out_t *: duct_xsend_gso_peers,     \
+        duct_tx_rec_t *:          duct_xsend_gso_recs,      \
+        const duct_tx_rec_t *:    duct_xsend_gso_recs)((fd), (m), (n))
 
 /** @brief Send the @p n datagrams at @p m unsegmented.
  *  @p m holds a connected conn's @c duct_view_u8 records or addressed
@@ -173,7 +203,9 @@ DUCT_X_GSO_GROUP_DECLARE(duct_x_gso_group_peers, duct_dgram_out_t,
         duct_view_u8 *:             duct_xsend_bufs,          \
         const duct_view_u8 *:       duct_xsend_bufs,          \
         duct_dgram_out_t *:       duct_xsend_peers,         \
-        const duct_dgram_out_t *: duct_xsend_peers)((fd), (m), (n), (out_sent))
+        const duct_dgram_out_t *: duct_xsend_peers,         \
+        duct_tx_rec_t *:          duct_xsend_recs,          \
+        const duct_tx_rec_t *:    duct_xsend_recs)((fd), (m), (n), (out_sent))
 
 /** @brief Segmented writes one send loop made, and the datagrams they carried. */
 typedef struct duct_x_gso_tally {

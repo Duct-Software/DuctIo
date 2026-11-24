@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: AGPL-3.0-only */
 /* Copyright (c) 2026 Duct Software */
+/* AI-generated test code. */
 
 /**
  * @file close_order_test.c
@@ -9,7 +10,10 @@
  * A raw client with a small receive buffer reads nothing while frame_count
  * frames of frame_size bytes go out to it: more than the TX ring and both
  * socket buffers hold, pinned small on the listening socket for the accepted
- * one to inherit, so the later frames park. Once the ring holds still, a close
+ * one to inherit, and pinned again on the engine's windows and darwin send
+ * buffer through DUCT_TCP_SNDBUF, whose four-mebibyte default would swallow
+ * the run whole before the ring parks, so the later frames park. Once the
+ * ring holds still, a close
  * comes in, and only then does the client read:
  * - leg: the host posts the frames, then an invoke closes the leg with
  *   close_normal. The session stays, its parked frames are the leg's output
@@ -53,21 +57,26 @@ typedef enum : uint8_t { scope_leg, scope_session, scope_peer, scope_malformed }
 static atomic_int    g_opened;
 static atomic_int    g_lost;
 static duct_handle_t g_tok;
-static uint8_t       g_scratch[frame_size];
+/* One frame buffer per frame of the run, so a parked answer can carry its
+ * bytes as fl_send_static: the conn block's TX retry copy region parks a
+ * bounded number of copy-mode payloads per conn (DUCT_CONN_RETRY_TX_COPIES),
+ * and this scenario's point is the close's order behind dozens of parked
+ * frames, not the copy itself. Each buffer is written once and read until its
+ * frame leaves, exactly what fl_send_static promises. */
+static uint8_t       g_frames[frame_count][frame_size];
 
 static uint8_t s_fill_byte(uint32_t i)
 {
     return (uint8_t)(i * 13u + 5u);
 }
 
-/** @brief Frame @p i of the run into @p out; the commit copies the shared
- *  scratch before the next frame is built. */
+/** @brief Frame @p i of the run into @p out, on its own static buffer. */
 static void s_frame(duct_response_t *out, uint32_t i)
 {
-    memcpy(g_scratch, &i, sizeof i);
-    memset(g_scratch + sizeof i, s_fill_byte(i), frame_size - sizeof i);
-    duct_response_same(out, duct_view(duct_view_u8, g_scratch, frame_size),
-                       fl_send_copy, 0);
+    memcpy(g_frames[i], &i, sizeof i);
+    memset(g_frames[i] + sizeof i, s_fill_byte(i), frame_size - sizeof i);
+    duct_response_same(out, duct_view(duct_view_u8, g_frames[i], frame_size),
+                       fl_send_static, 0);
 }
 
 static duct_result_t
@@ -337,6 +346,15 @@ static const char *s_scenario(scope_t scope, bool say)
 int main(void)
 {
     setvbuf(stdout, nullptr, _IOLBF, 0);
+#ifdef _WIN32
+    char pin[32];
+    duct_discard snprintf(pin, sizeof pin, "DUCT_TCP_SNDBUF=%d", sock_buf);
+    duct_discard _putenv(pin);
+#else
+    char val[16];
+    duct_discard snprintf(val, sizeof val, "%d", sock_buf);
+    duct_discard setenv("DUCT_TCP_SNDBUF", val, 1);
+#endif
     for (unsigned i = 0u; i < sizeof s_scope_names / sizeof s_scope_names[0]; ++i) {
         /* The requests of the peer and malformed scopes are answered from the dispatch batch, where a train can open
          * on the leg between two looks at the ring; the order it breaks shows in one run of about fifty. */

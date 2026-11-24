@@ -1,32 +1,41 @@
 /* SPDX-License-Identifier: Apache-2.0 */
-/* Copyright (c) 2026 Duct Software, author: Constantin Papizh */
+/* Copyright (c) 2026 Duct Software, author: Constantin П */
 
 /** @file duct_olb_tx.h
- *  @brief Transmit-side buffer: allocation, worker pack glue, io flush.
+ *  @brief Transmit-side descriptor ring: the byte arena is gone, a record is a
+ *  32-byte descriptor and the payload rides where its author built it.
  *
- *  The worker thread stages outgoing bytes and publishes them through
- *  @c tail. The io thread drains them through @ref duct_olb_tx_readable
- *  and @ref duct_olb_tx_advance.
+ *  The worker stage stages @b descriptors — one @c duct_tx_desc_t per wire
+ *  record, its inline header and a @c duct_span_t naming the payload — and
+ *  publishes them through @c tail. The io thread gathers iovecs straight from
+ *  the sources (@c duct_olb_tx_peek_iov), advances a byte cursor inside the
+ *  head record on a short write, and unpins a span only at its record's full
+ *  completion (§5.2's stepper: @c duct_olb_tx_advance).
+ *
+ *  The byte area shrank, it did not vanish (§2.1): a @b materialize arena
+ *  beside the descriptors carries what cannot ride a reference — sealed
+ *  ciphertext (the encrypt destination), vnet GSO prefixes and sub-threshold
+ *  copies. It is a byte ring of its own, freed in record completion order.
+ *
+ *  Ordering is unchanged: descriptors publish behind the @c tx_seq tickets,
+ *  and the public metrics keep counting logical wire bytes — @c stream_end is
+ *  the conn's byte-stream end, @c drained the position io has completed up
+ *  to, so @c duct_olb_tx_published answers the bytes queued ahead of io
+ *  without distortion (§2.2: pacing and AQM estimators read logical wire
+ *  bytes, while admission checks @c byte_cap and descriptor occupancy both).
  *
  *  @c head is io's, with one exception: a worker that sent part of its own
- *  span directly, before publishing it, settles that with io through
- *  @ref duct_olb_tx_advance_worker.
- *
- *  Staging runs in passes over the linear buffer. A pass ends where it stands
- *  once out of room, or once @ref duct_olb_tx_rewind_idle finds io drained up to it;
- *  the next starts at offset 0, bounded by io's head in the one before, which
- *  io drains to its end first. A frame never straddles two passes.
- *
- *  Every byte the worker hands on, published to io or written to the socket
- *  past the ring, lands on one byte stream, the one the socket carries:
- *  @c stream_end is its end and @ref duct_olb_tx_drained the point the socket
- *  has taken up to.
+ *  staged, still-unpublished records directly settles that with io through
+ *  @ref duct_olb_tx_advance_worker — it only ever completes records io has
+ *  never seen, past @c tail, so the two writers never touch the same value.
  */
 
 #ifndef DUCT_OLB_TX_H
 #define DUCT_OLB_TX_H
 
 #include "duct_olb.h"
+#include "duct_span.h"
+#include "duct_wire.h"
 #include "duct_xsock.h"
 
 #include <assert.h>
@@ -40,538 +49,386 @@
 extern "C" {
 #endif
 
-
-/** @brief Divisor giving @c min_room from @c buf_size while no frame budget
- *  is known. */
+/** @brief Divisor of the byte budget giving the coarse backpressure floor
+ *  while no protocol frame budget is known. */
 static constexpr unsigned olb_tx_compact_div = 8u;
 
-/** @brief Multiplier turning a protocol's frame budget into @c min_room. */
-static constexpr unsigned olb_tx_th_factor = 2u;
-
-/** @brief Divisor capping @c min_room against @c buf_size. */
-static constexpr unsigned olb_tx_th_div = 2u;
-
-/** @brief Factor between a pass and the drained one after it that marks a drop
- *  in load.
- *  Passes within it keep their pages, so a steady load makes no system call. */
-static constexpr unsigned olb_tx_trim_div = 8u;
+/** @name The tx region's split, out of the build's TX capacity
+ *  The descriptor area and the materialize arena share the bytes the carve's
+ *  tx region serves: half the records a 32-byte descriptor each can fill the
+ *  ring with, half the §2.1 byte area. The region's placement — where inside
+ *  the conn block those bytes sit — is @c duct_conn_block.h's; these two are
+ *  the ring's own shape, every cursor arithmetic reading them.
+ *  @{
+ */
+static constexpr uint32_t duct_conn_tx_mat_cap = (uint32_t)(duct_conn_tx_olb_cap / 2u);
+static constexpr uint32_t duct_conn_tx_desc_n =
+    (uint32_t)((duct_conn_tx_olb_cap - duct_conn_tx_mat_cap)
+               / (2u * (uint32_t)sizeof(duct_span_t)));
+/** @} */
 
 /** @brief Outcome of a stage request. */
 typedef enum duct_olb_tx_result : uint8_t {
-    olb_tx_ok = 0,      /**< The bytes were staged. */
-    olb_tx_full,        /**< Not enough room right now: io has not drained
-                          *  enough, and no new pass can open either. */
-    olb_tx_too_large,   /**< The bytes can never fit; they exceed @c buf_size
-                          *  outright. */
+    olb_tx_ok = 0,      /**< The record was staged. */
+    olb_tx_full,        /**< Not enough room right now: io has not completed
+                          *  enough, and the byte budget or the descriptor
+                          *  count has no headroom — backpressure, not loss. */
+    olb_tx_too_large,   /**< The bytes can never fit; they exceed the byte
+                          *  budget or the materialize arena outright. */
     olb_tx_result_count /**< Size sentinel. */
 } duct_olb_tx_result_t;
 
-/** @brief A snapshot of the staging cursor.
- *  Taken so a caller can later rewind to it, or measure what happened since.
- */
+/** @brief One staged wire record: a span naming the payload where its author
+ *  built it, plus the inline wire header — 32 bytes whole, two descriptors per
+ *  cache line (§2.1). @c hdr_len and the dgram @c gso flag ride the span's own
+ *  spare bits, so the record's length is @c duct_span_wire_len and the
+ *  datagram record header with its backfilled length dies. */
+typedef struct duct_tx_desc {
+    duct_span_t span;                      /**< The payload reference. */
+    uint8_t     hdr[wire_tx_hdr_max];      /**< The inline wire header. */
+} duct_tx_desc_t;
+
+static_assert(sizeof(duct_tx_desc_t) == 2u * sizeof(duct_span_t),
+              "a descriptor is exactly 32 bytes: no field may grow it");
+
+/** @brief A snapshot of the staging state.
+ *  Taken so a caller can later rewind to it, or measure what happened since. */
 typedef struct duct_olb_tx_mark {
-    uint64_t staged;    /**< The packed staging cursor at the time the mark
-                          *  was taken. @ref duct_olb_tx_unmark rewinds
-                          *  staging back to this value. */
+    uint64_t tail;    /**< The published tail at the time the mark was taken. */
+    uint32_t stage;   /**< The staged-record count then. */
+    uint64_t mat_tail;/**< The materialize arena's write position then. */
+    uint32_t bytes;   /**< Staged wire bytes then. */
 } duct_olb_tx_mark_t;
 
-/** @brief The transmit-side buffer.
- *  The first line is the staging worker's, @c min_room aside, which io stores
- *  when it binds a wire; the members @c duct_x_sock_stats_fields adds for the
- *  socket's stats reads sit in it. The second holds what io touches besides
- *  @c head and @c tail in the shared header: @c pass_end, and the members
- *  @c duct_x_sock_tx_fields adds for the socket's send state, which a worker's
- *  direct write reads.
+/** @brief The transmit-side descriptor ring.
+ *  The first own line is the staging worker's: the commit tickets, the byte
+ *  budget, the staged-bytes accumulator with the materialize cursor, the
+ *  stream end, the TX-wait target and the members @c duct_x_sock_stats_fields
+ *  adds. The next two are io's: the completion counters the worker's
+ *  admission reads (@c drained, @c mat_head, the head record's byte cursor)
+ *  with @c write_armed, then the members @c duct_x_sock_tx_fields adds for
+ *  the socket's send state, which a worker's direct write reads.
  */
 duct_olb_decl(duct_olb_tx,
-    size_t _Atomic min_room;  /**< The minimum free staging space the
-                                *  worker wants, bytes.
-                                *  @ref duct_olb_tx_backpressure reports
-                                *  true once free space drops below this.
-                                *  Zero disables backpressure reporting. */
-
-    uint32_t stage_gen, /**< Pass counter: how many times staging has
-                          *  restarted at offset 0. An offset repeats
-                          *  every pass, so @c head and @c tail carry
-                          *  this beside it.
-                          *  Incremented by @ref duct_olb_tx_wrap. */
-
-            tx_seq_next,  /**< Next commit ticket to issue on this
-                            *  OLB. Monotonic, never decremented —
+    uint32_t tx_seq_next;  /**< Next commit ticket to issue on this ring.
+                            *  Monotonic, never decremented —
                             *  worker-exclusive. */
 
-            tx_seq_serve; /**< Ticket currently allowed to publish.
+    uint32_t tx_seq_serve; /**< Ticket currently allowed to publish.
                             *  A commit whose own ticket does not
                             *  match must wait its turn regardless
-                            *  of free space, preserving request
-                            *  order on this OLB's one wire; advances
-                            *  only when the ticket ahead of it
-                            *  actually resolves (success or terminal
+                            *  of room, preserving request order on
+                            *  this ring's one wire; advances only
+                            *  when the ticket ahead of it actually
+                            *  resolves (success or terminal
                             *  failure), never on a still-blocked
                             *  retry. */
 
-    uint32_t pass_free; /**< End of the span the current pass may stage
-                          *  into, bytes. Never above the real bound: io's
-                          *  offset while io still drains the previous
-                          *  pass, @c buf_size otherwise. Refreshed from
-                          *  @c head when a stage outgrows it. */
+    uint32_t byte_cap;     /**< The ring's logical wire-byte budget (§2.2's
+                            *  tx_byte_cap): the pinned and materialized bytes
+                            *  of every unfinished record, staged ones
+                            *  included, stay under it. The carve sets it from
+                            *  the protocol's per-conn capacity, so admission
+                            *  checks it beside the descriptor count and the
+                            *  pacing and AQM estimators read the logical wire
+                            *  bytes undistorted. */
 
-    uint64_t stream_end; /**< End of the conn's byte stream, bytes: every
-                           *  byte published and every byte the worker
-                           *  wrote to the socket past the ring. Moved by
-                           *  @ref duct_olb_tx_publish,
-                           *  @ref duct_olb_tx_sent_staged and
-                           *  @ref duct_olb_tx_sent_direct alone. */
+    uint32_t staged_bytes; /**< Wire bytes staged but not yet published.
+                            *  Joins @c stream_end in the budget arithmetic;
+                            *  @ref duct_olb_tx_publish folds it into
+                            *  @c stream_end. Worker exclusive. */
+
+    uint64_t mat_tail;     /**< The materialize arena's write position, bytes
+                            *  from the arena's base, monotonic. Worker
+                            *  exclusive; @c duct_olb_tx_mat_open writes it,
+                            *  @ref duct_olb_tx_unmark rewinds it. */
+
+    uint64_t stream_end;   /**< End of the conn's byte stream, logical wire
+                            *  bytes: every record published and every byte the
+                            *  worker wrote to the socket past the ring. Moved
+                            *  by @ref duct_olb_tx_publish,
+                            *  @ref duct_olb_tx_sent_staged and
+                            *  @ref duct_olb_tx_advance_worker alone. */
 
     duct_x_sock_stats_fields
 
+    /** @brief Drained-position target at which a refused TX room wait
+     *  resolves; 0 while unarmed. The worker's single-writer value latch (§6):
+     *  a turn the ring refused — admission, an engine park flush, a parked
+     *  retry node — stores the monotonic wire position it waits for (release)
+     *  ahead of a @c seq_cst fence and then re-checks its room condition. Io,
+     *  on each completion advance @c prev → @c new, fences, loads this word
+     *  and wakes the conn's worker strictly on the crossing edge @c prev <
+     *  T ≤ @c new — no bit, no clear, no RMW, and no disarm write on wake: the
+     *  drained position is monotonic, so a spent target can never cross
+     *  again. The next arm overwrites with a fresh target computed past the
+     *  current position; a lane conn arms here too, its zeroed ring words
+     *  yielding the "any signal" form the device wake takes. */
+    uint64_t _Atomic resume_at;
+
     duct_cacheline_struct(
-        uint32_t _Atomic pass_end; /**< End of the previous pass, bytes.
-                                     *  Stored with release before the
-                                     *  @c tail that opens the next pass;
-                                     *  io loads it with acquire only while
-                                     *  its head is one pass behind @c tail. */
+        uint64_t _Atomic drained; /**< Wire bytes fully completed, from the
+                                    *  stream's start — whoever completed
+                                    *  them: io's stepper over the published
+                                    *  records, the worker's over its own
+                                    *  still-staged ones, the close paths'
+                                    *  purge over what it drops. All through
+                                    *  @c duct_olb_tx_complete_one's one
+                                    *  fetch-add, so the adds never lose one
+                                    *  another; the worker's admission and
+                                    *  the public queued metric read it. */
+
+        uint64_t _Atomic mat_head; /**< The materialize arena's free position,
+                                    *  bytes from the arena's base, monotonic:
+                                    *  what record completions have handed
+                                    *  back. Io writes; the worker's arena
+                                    *  room reads it. Never past @c mat_tail. */
+
+        uint32_t _Atomic cursor_off; /**< Bytes of the head record already
+                                       *  sent, its inline header first —
+                                       *  §5.2's stepper cursor inside the
+                                       *  record the head names. Zero while
+                                       *  the record is untouched; a short
+                                       *  write advances it without copying
+                                       *  any tail, and the record's
+                                       *  completion (its span's unpin with
+                                       *  it) waits for the cursor to reach
+                                       *  @c duct_span_wire_len. Atomic plain
+                                       *  word: io writes it inside published
+                                       *  records, the worker inside its own
+                                       *  still-staged ones — the tail publish
+                                       *  orders the hand-off, and the two
+                                       *  writers never touch the same
+                                       *  record's cursor. */
+
+        uint8_t _Atomic write_armed; /**< Current write-interest state for
+                                       *  reactive backend registration, 1 while
+                                       *  the io thread holds the socket armed —
+                                       *  same contract as @c
+                                       *  duct_listener_t::dgram_tx_write_armed.
+                                       *  Io-written (plain store — the one
+                                       *  writer) on this its own line; the
+                                       *  worker-side TX fast path reads it as a
+                                       *  stale-tolerant hint and falls back to
+                                       *  the io drain on a stale 1. iocp never
+                                       *  touches it. */
+
         duct_x_sock_tx_fields
     );
 );
 
-static_assert(sizeof(duct_olb_tx_t) == sizeof(duct_olb_hdr_t) + 2u * duct_cacheline_size,
-    "the TX ring header is the common header and two lines, the staging worker's and io's");
+static_assert(offsetof(duct_olb_tx_t, drained)
+                  == sizeof(duct_olb_hdr_t) + duct_cacheline_size,
+    "the staging worker's own fields — the platform's sock-stats members"
+    " padded within it — fill exactly one line past the common header,"
+    " io's completion lines starting CL-aligned behind them");
+static_assert(sizeof(duct_olb_tx_t) % duct_cacheline_size == 0u,
+    "the TX ring header ends on a cache-line boundary");
 
-/** @brief Initialize @c min_room and @c pass_free for a freshly allocated
- *  buffer.
- *  @c min_room takes @c buf_size divided by @ref olb_tx_compact_div, the
- *  value that stands until a protocol's frame budget replaces it.
- */
-duct_nonnull(1) static inline void
-duct_olb_tx_cold_init(duct_olb_tx_t *tx)
+/** @brief The ring's logical wire-byte budget (§2.2's tx_byte_cap). */
+duct_nonnull(1) static inline uint32_t
+duct_olb_tx_byte_cap(const duct_olb_tx_t *tx)
 {
-    duct_atomic_store(&tx->min_room,
-        tx->h.buf_size / olb_tx_compact_div, relaxed);
-    tx->pass_free = (uint32_t)tx->h.buf_size;
+    return tx->byte_cap;
 }
 
-/** @brief Allocate a new transmit buffer with the given byte capacity. */
-static inline duct_olb_tx_t *duct_olb_tx_new(size_t capacity)
+/** @brief Records a packed cursor stands past, generations included. */
+static inline uint64_t
+duct_olb_tx_unrolled(uint64_t packed)
 {
-    return duct_olb_new(duct_olb_tx_t, capacity, duct_olb_tx_cold_init);
+    return olb_gen(packed) * (uint64_t)duct_conn_tx_desc_n + olb_off(packed);
 }
 
-/** @brief Current @c min_room, bytes. */
-duct_nonnull(1) static inline size_t
-duct_olb_tx_min_room_get(const duct_olb_tx_t *tx)
+/** @brief Pack an unrolled record position back into cursor form. */
+static inline uint64_t
+duct_olb_tx_packed(uint64_t unrolled)
 {
-    return duct_atomic_load(&tx->min_room, relaxed);
+    return olb_pack((uint32_t)(unrolled / duct_conn_tx_desc_n),
+                    (uint32_t)(unrolled % duct_conn_tx_desc_n));
 }
 
-/** @brief Set min_room from the protocol's frame budget.
- *  The value is @c frame_budget × @c olb_tx_th_factor, capped at
- *  @c buf_size ÷ @c olb_tx_th_div. When @c frame_budget is 0,
- *  it falls back to @c buf_size ÷ @c olb_tx_compact_div.
- */
-duct_nonnull(1) static inline void
-duct_olb_tx_min_room_set(duct_olb_tx_t *tx, size_t frame_budget)
-{
-    size_t room_max = tx->h.buf_size / olb_tx_th_div,
-           room = frame_budget
-                ? frame_budget * olb_tx_th_factor
-                : tx->h.buf_size / olb_tx_compact_div;
-    if (room > room_max)
-        room = room_max;
-    duct_atomic_store(&tx->min_room, room, relaxed);
-}
-
-/** @brief Pack stage_gen and the current stage offset into one word. */
-duct_nonnull(1) static inline uint64_t
-duct_olb_tx_stage_packed(const duct_olb_tx_t *tx)
-{
-    auto h = &tx->h;
-    return olb_pack(tx->stage_gen, (uint32_t)h->stage);
-}
-
-/** @brief Bytes from io's @p head_g up to packed position @p to_g.
- *  A @p to_g one pass ahead counts the older pass's rest through
- *  @c pass_end first. */
-duct_nonnull(1) static inline size_t
-duct_olb_tx_span_to(const duct_olb_tx_t *tx, uint64_t head_g, uint64_t to_g)
-{
-    size_t head = olb_off(head_g),
-           to = olb_off(to_g);
-    if (olb_gen(to_g) != olb_gen(head_g))
-        return duct_atomic_load(&tx->pass_end, relaxed) - head + to;
-    return to > head ? to - head : 0u;
-}
-
-/** @brief Bytes published but not yet drained by io. */
+/** @brief Bytes queued ahead of io: published but not completed. The logical
+ *  wire-byte metric the public queued figures read (§2.2). */
 duct_nonnull(1) static inline size_t
 duct_olb_tx_published(const duct_olb_tx_t *tx)
 {
-    auto h = &tx->h;
-    uint64_t tail_g = duct_atomic_load(&h->tail, relaxed);
-    return duct_olb_tx_span_to(tx, duct_atomic_load(&h->head, acquire), tail_g);
+    return (size_t)(tx->stream_end
+                    - duct_atomic_load(&tx->drained, acquire));
 }
 
-/** @brief Stream offset io and the worker have handed the socket up to, bytes.
- *  @c stream_end less the published bytes io has not drained. Staging worker
- *  only. */
+/** @brief Stream offset io and the worker have handed the socket up to, bytes. */
 duct_nonnull(1) static inline uint64_t
 duct_olb_tx_drained(const duct_olb_tx_t *tx)
 {
-    return tx->stream_end - duct_olb_tx_published(tx);
+    return duct_atomic_load(&tx->drained, acquire);
 }
 
-/** @brief Stream offset of the staging cursor, bytes.
- *  @c stream_end plus the span staged and not yet published. Staging worker
- *  only. */
+/** @brief Stream offset of the staging cursor, bytes: what a full publish or
+ *  worker-side send of everything staged would move @c stream_end to. */
 duct_nonnull(1) static inline uint64_t
 duct_olb_tx_stream_pos(const duct_olb_tx_t *tx)
 {
-    uint64_t tail_g = duct_atomic_load(&tx->h.tail, relaxed);
-    return tx->stream_end + duct_olb_tx_span_to(tx, tail_g, duct_olb_tx_stage_packed(tx));
+    return tx->stream_end + tx->staged_bytes;
 }
 
-/** @brief End of the span the current pass may stage into, given io's
- *  @p head_g.
- *  @c buf_size once io is in this pass or done with the previous one; io's
- *  offset in the previous pass while it still drains it.
- */
+/** @brief Wire bytes the budget holds right now: queued ahead of io plus the
+ *  staged-but-unpublished ones. The admission arithmetic's byte limb. */
 duct_nonnull(1) static inline size_t
-duct_olb_tx_lim(const duct_olb_tx_t *tx, uint64_t head_g)
+duct_olb_tx_bytes_held(const duct_olb_tx_t *tx)
 {
-    size_t head = olb_off(head_g);
-    return olb_gen(head_g) == tx->stage_gen
-        || head >= duct_atomic_load(&tx->pass_end, relaxed)
-         ? tx->h.buf_size : head;
+    return (size_t)(duct_olb_tx_stream_pos(tx)
+                    - duct_atomic_load(&tx->drained, acquire));
 }
 
-/** @brief Bytes a new pass may take from offset 0, given io's @p head_g.
- *  Zero while io is still a pass behind, or while bytes are staged but not
- *  published: they open a frame, and a frame stays within one pass. The
- *  whole buffer once io has drained this pass, its head offset otherwise.
- */
+/** @brief Descriptors the ring holds right now: published and unfinished plus
+ *  the staged-but-unpublished ones. The admission arithmetic's count limb. */
+duct_nonnull(1) static inline uint64_t
+duct_olb_tx_descs_held(const duct_olb_tx_t *tx)
+{
+    auto h = &tx->h;
+    return duct_olb_tx_unrolled(duct_atomic_load(&h->tail, relaxed))
+         + duct_atomic_load(&h->stage, relaxed)
+         - duct_olb_tx_unrolled(duct_atomic_load(&h->head, relaxed));
+}
+
+/** @brief The coarse backpressure floor the byte budget derives (§2.2:
+ *  @c min_room re-derived against the byte budget, no stored field). */
 duct_nonnull(1) static inline size_t
-duct_olb_tx_wrap_room(const duct_olb_tx_t *tx, uint64_t head_g)
+duct_olb_tx_min_room(const duct_olb_tx_t *tx)
 {
-    auto h = &tx->h;
-    if (olb_gen(head_g) != tx->stage_gen
-        || h->stage != olb_off(duct_atomic_load(&h->tail, relaxed)))
-        return 0u;
-    size_t head = olb_off(head_g);
-    return head >= h->stage ? h->buf_size : head;
+    return tx->byte_cap / olb_tx_compact_div;
 }
 
-/** @brief Open the next pass at offset 0, @p room bytes long.
- *  The pass end goes out before @c tail, so io drains the rest of the
- *  previous pass before it folds into this one. @p room comes from
- *  @ref duct_olb_tx_wrap_room.
- */
-duct_nonnull(1) static inline void duct_olb_tx_wrap(duct_olb_tx_t *tx, size_t room)
-{
-    auto h = &tx->h;
-    duct_atomic_store(&tx->pass_end, h->stage, release);
-    ++tx->stage_gen;
-    h->stage = 0u;
-    tx->pass_free = (uint32_t)room;
-    duct_atomic_store(&h->tail, olb_pack(tx->stage_gen, 0u), release);
-}
-
-/** @brief Bytes ready for io to drain, starting from @p out_head.
- *
- *  While @c head is one pass behind @c tail, the rest of the previous pass up
- *  to @c pass_end comes first, and @c head folds into @c tail's pass once that
- *  is drained. A @c head already past the @c tail this call loaded, a worker
- *  fold that raced it, answers 0. @p out_head is set to the offset io starts
- *  draining from.
- */
-duct_nonnull(1, 2) static inline size_t
-duct_olb_tx_readable(duct_olb_tx_t *tx, uint64_t *out_head)
-{
-    auto h = &tx->h;
-    uint64_t tail_g = duct_atomic_load(&h->tail, acquire),
-             head_g = duct_atomic_load(&h->head, relaxed);
-    uint32_t gen = olb_gen(tail_g);
-    for (;;) {
-        size_t head = olb_off(head_g);
-        *out_head = (uint64_t)head;
-        if (olb_gen(head_g) == gen) {
-            size_t tail = olb_off(tail_g);
-            return tail > head ? tail - head : 0u;
-        }
-        if (olb_gen(head_g) != gen - 1u)
-            return 0u;
-        /* pass_end belongs to head's pass only while head has not moved: a
-         * worker fold and a second pass in between store the next one's. */
-        size_t end = duct_atomic_load(&tx->pass_end, acquire);
-        uint64_t now = duct_atomic_load(&h->head, relaxed);
-        if (now != head_g)
-            head_g = now;
-        else if (head < end)
-            return end - head;
-        /* Compare-exchange, not a plain store: this is the one write
-         * @ref duct_olb_tx_advance_worker also makes, and whichever lands
-         * second must not undo the other. Landing offset 0 over a worker
-         * that already sent the front of the span replays those bytes. */
-        else if (duct_atomic_cas(weak, &h->head, &head_g,
-                                 olb_pack(gen, 0u), acq_rel, acquire))
-            head_g = olb_pack(gen, 0u);
-    }
-}
-
-/** @brief Mark @p nbytes as drained after a successful send. */
-duct_nonnull(1) static inline void
-duct_olb_tx_advance(duct_olb_tx_t *tx, size_t nbytes)
-{
-    auto h = &tx->h;
-    uint64_t head_g = duct_atomic_load(&h->head, relaxed);
-    duct_atomic_store(&h->head,
-                      olb_pack(olb_gen(head_g), olb_off(head_g) + nbytes),
-                      release);
-}
-
-/** @brief Account for @p sent bytes the worker sent itself off the front of
- *  its own staged, still-unpublished span.
- *
- *  The worker-side counterpart of @ref duct_olb_tx_advance.
- *  Folds @c head into @c stage_gen when io has not folded it yet,
- *  otherwise advances it in place. Only the fold can collide with io, and
- *  it compare-exchanges against the same expected value io's own fold in
- *  @ref duct_olb_tx_readable uses: exactly one lands, and the loser reads
- *  back a @c head already in @c stage_gen, which io then never rewrites.
- *
- *  Caller must hold: every published byte drained when its commit began, so
- *  io has no readable span, and no other advance can interleave.
- */
-duct_nonnull(1) static inline void
-duct_olb_tx_advance_worker(duct_olb_tx_t *tx, size_t sent)
-{
-    auto h = &tx->h;
-    uint64_t head_g = duct_atomic_load(&h->head, acquire);
-    while (olb_gen(head_g) != tx->stage_gen)
-        if (duct_atomic_cas(weak, &h->head, &head_g,
-                            olb_pack(tx->stage_gen, sent), acq_rel, acquire))
-            return;
-    duct_atomic_store(&h->head,
-                      olb_pack(olb_gen(head_g), olb_off(head_g) + sent),
-                      release);
-}
-
-/** @brief Buffer bytes io has nothing left to drain in.
- *  One stage takes only what @ref duct_olb_tx_align finds at the cursor, which
- *  the split between the end of a pass and the start of the next can make
- *  smaller.
- */
-duct_nonnull(1) static inline size_t
-duct_olb_tx_space(const duct_olb_tx_t *tx)
-{
-    return tx->h.buf_size - duct_olb_tx_published(tx);
-}
-
-/** @brief True when free staging space has dropped below @c min_room. */
+/** @brief True when the bytes the budget holds have eaten the coarse
+ *  backpressure floor's headroom. */
 duct_nonnull(1) static inline bool
 duct_olb_tx_backpressure(const duct_olb_tx_t *tx)
 {
-    size_t min_room = duct_olb_tx_min_room_get(tx);
-    return min_room && duct_olb_tx_space(tx) < min_room;
+    return duct_olb_tx_bytes_held(tx) + duct_olb_tx_min_room(tx) > tx->byte_cap;
 }
 
-/** @brief Take a snapshot of the staging cursor. */
-duct_nonnull(1) static inline duct_olb_tx_mark_t
-duct_olb_tx_mark(const duct_olb_tx_t *tx)
-{
-    return (duct_olb_tx_mark_t){ .staged = duct_olb_tx_stage_packed(tx) };
-}
-
-/** @brief Make @p need bytes stageable at the cursor, opening the next pass
- *  when this one has no room left.
- *  @return false when @p need exceeds the buffer, or when this pass lacks
- *          the room and no new pass can take it: io still a pass behind,
- *          bytes staged but unpublished, or io's head too near offset 0.
- */
-duct_nonnull(1) static inline bool
-duct_olb_tx_align(duct_olb_tx_t *tx, size_t need)
-{
-    auto h = &tx->h;
-    if (need > h->buf_size)
-        return false;
-    if (h->stage + need <= tx->pass_free)
-        return true;
-    uint64_t head_g = duct_atomic_load(&h->head, acquire);
-    tx->pass_free = (uint32_t)duct_olb_tx_lim(tx, head_g);
-    if (h->stage + need <= tx->pass_free)
-        return true;
-    size_t room = duct_olb_tx_wrap_room(tx, head_g);
-    if (need > room)
-        return false;
-    duct_olb_tx_wrap(tx, room);
-    return true;
-}
-
-/** @brief True when @p need bytes can be staged now.
- *  The answer @ref duct_olb_tx_align gives, without opening a pass.
- */
+/** @brief Room for one more record of @p need wire bytes: a free descriptor
+ *  and the byte budget's headroom both (§2.2's admission limbs). */
 duct_nonnull(1) static inline bool
 duct_olb_tx_room_contig(const duct_olb_tx_t *tx, size_t need)
 {
-    auto h = &tx->h;
-    if (need > h->buf_size)
+    if (need > tx->byte_cap)
         return false;
-    if (h->stage + need <= tx->pass_free)
-        return true;
-    uint64_t head_g = duct_atomic_load(&h->head, acquire);
-    return h->stage + need <= duct_olb_tx_lim(tx, head_g)
-        || need <= duct_olb_tx_wrap_room(tx, head_g);
+    if (duct_olb_tx_descs_held(tx) >= duct_conn_tx_desc_n)
+        return false;
+    return duct_olb_tx_bytes_held(tx) + need <= tx->byte_cap;
 }
 
-/** @brief Stage bytes, opening the next pass first when this one is out of
- *  room.
- *
- *  Copies @p hdr (if non-null) immediately followed by @p data (if
- *  @p len is nonzero) as one all-or-nothing span.
- */
-duct_nonnull(1) static inline duct_olb_tx_result_t
-duct_olb_tx_stage(duct_olb_tx_t *tx, const uint8_t *hdr,
-                  size_t hdr_size, const void *data, size_t len)
+/** @brief Take a snapshot of the staging state. */
+duct_nonnull(1) static inline duct_olb_tx_mark_t
+duct_olb_tx_mark(const duct_olb_tx_t *tx)
 {
-    auto h = &tx->h;
-    size_t total = (hdr ? hdr_size : 0u) + len;
-    if (total > h->buf_size)
-        return olb_tx_too_large;
-    if (!duct_olb_tx_align(tx, total))
-        return olb_tx_full;
-    auto off = tx->data + h->stage;
-    if (hdr) {
-        memcpy(off, hdr, hdr_size);
-        off += hdr_size;
-    }
-    if (len)
-        memcpy(off, data, len);
-    h->stage += total;
-    return olb_tx_ok;
+    return (duct_olb_tx_mark_t){
+        .tail = duct_atomic_load(&tx->h.tail, relaxed),
+        .stage = duct_atomic_load(&tx->h.stage, relaxed),
+        .mat_tail = tx->mat_tail,
+        .bytes = tx->staged_bytes,
+    };
 }
 
-/** @brief Reserve writable space at the staging cursor.
- *
- *  The caller writes directly into the returned span. Space must fit within
- *  the current pass without advancing past boundaries (@ref duct_olb_tx_align
- *  handles pass rollover).
- *
- *  @return Pointer to the reserved space;
- *          nullptr if @p len does not fit.
- */
-duct_nonnull(1) static inline void *
-duct_olb_tx_span_open(duct_olb_tx_t *tx, size_t len)
-{
-    auto h = &tx->h;
-    if (len > h->buf_size)
-        return nullptr;
-    if (h->stage + len > tx->pass_free) {
-        tx->pass_free = (uint32_t)duct_olb_tx_lim(tx, duct_atomic_load(&h->head, acquire));
-        if (h->stage + len > tx->pass_free)
-            return nullptr;
-    }
-    auto ptr = tx->data + h->stage;
-    h->stage += len;
-    return ptr;
-}
-
-/** @brief Publish the staging cursor into tail.
- *  Makes staged bytes visible to io and moves @c stream_end past them.
- */
-duct_nonnull(1) static inline void
-duct_olb_tx_publish(duct_olb_tx_t *tx)
-{
-    auto h = &tx->h;
-    uint64_t stage_g = duct_olb_tx_stage_packed(tx);
-    tx->stream_end += duct_olb_tx_span_to(tx, duct_atomic_load(&h->tail, relaxed), stage_g);
-    duct_atomic_store(&h->tail, stage_g, release);
-}
-
-/** @brief Account for @p sent bytes the worker wrote to the socket past the ring.
- *  Moves @c stream_end alone. */
-duct_nonnull(1) static inline void
-duct_olb_tx_sent_direct(duct_olb_tx_t *tx, size_t sent)
-{
-    tx->stream_end += sent;
-}
-
-/** @brief Rewind the staging cursors back to mark.
- *  Does not touch the published tail. @p mark has to be taken in the current
- *  pass: one taken before @ref duct_olb_tx_align opened a new pass lies in a
- *  pass io may already be draining.
- */
+/** @brief Rewind the staging cursors back to @p mark.
+ *  Records staged since the mark die unpublished — their spans' references
+ *  the caller drops first — and the materialize arena's writes with them. */
 duct_nonnull(1) static inline void
 duct_olb_tx_unmark(duct_olb_tx_t *tx, duct_olb_tx_mark_t mark)
 {
     auto h = &tx->h;
-    tx->stage_gen = olb_gen(mark.staged);
-    h->stage = olb_off(mark.staged);
+    duct_atomic_store(&h->tail, mark.tail, relaxed);
+    duct_atomic_store(&h->stage, mark.stage, relaxed);
+    tx->mat_tail = mark.mat_tail;
+    tx->staged_bytes = mark.bytes;
 }
 
-/** @brief Bytes staged since @p mark was taken.
- *
- *  Assumes at most one wrap happened in between, which holds for one
- *  bounded @c on_pack call.
- */
-duct_nonnull(1) static inline size_t
-duct_olb_tx_staged_since(const duct_olb_tx_t *tx, duct_olb_tx_mark_t mark)
-{
-    auto now = duct_olb_tx_stage_packed(tx);
-    return olb_gen(now) == olb_gen(mark.staged)
-         ? olb_off(now) - olb_off(mark.staged)
-         : olb_off(now);
-}
-
-/** @brief Overwrite @p size bytes ending at @p mark's position with
- *  @p data.
- *
- *  For writing a value that is only known after more data has already
- *  been staged, such as a length prefix: stage a placeholder, take a
- *  mark right after it, stage the payload, then call this once
- *  @ref duct_olb_tx_staged_since reports the payload's length.
- */
-duct_nonnull(1, 3) static inline void
-duct_olb_tx_backfill(duct_olb_tx_t *tx, duct_olb_tx_mark_t mark,
-                     const void *data, size_t size)
-{
-    memcpy(tx->data + olb_off(mark.staged) - size, data, size);
-}
-
-/** @brief Account for the worker sending its whole staged, unpublished span
- *  itself, and rewind staging onto tail.
- *  @c stream_end moves past the span; the buffer's bytes stay as they are. */
+/** @brief Count @p n wire bytes into the staged records' budget arithmetic. */
 duct_nonnull(1) static inline void
-duct_olb_tx_sent_staged(duct_olb_tx_t *tx)
+duct_olb_tx_staged_bytes_add(duct_olb_tx_t *tx, uint32_t n)
 {
-    auto h = &tx->h;
-    uint64_t tail_g = duct_atomic_load(&h->tail, acquire);
-    tx->stream_end += duct_olb_tx_span_to(tx, tail_g, duct_olb_tx_stage_packed(tx));
-    tx->stage_gen = olb_gen(tail_g);
-    h->stage = olb_off(tail_g);
+    tx->staged_bytes += n;
 }
 
-/** @brief Report whether io has drained every published byte, and start a
- *  drained ring's next pass at offset 0.
- *  Bytes staged but not published keep their pass. A drained pass the one
- *  before outran by more than @c olb_tx_trim_div times gives the pages past
- *  its end, or past @c min_room where that lies further, back to the system.
- *  Staging worker only. */
-duct_nonnull(1) static inline bool duct_olb_tx_rewind_idle(duct_olb_tx_t *tx)
+/** @brief Publish the staged records into tail.
+ *  Makes them visible to io and moves @c stream_end past their bytes. The
+ *  fold runs even over a window the worker already completed itself
+ *  (@c duct_olb_tx_advance_worker left nothing to publish): those bytes ride
+ *  the completions' drained advance, and the stream end must take them too
+ *  or the held metrics underflow. */
+duct_nonnull(1) static inline void
+duct_olb_tx_publish(duct_olb_tx_t *tx)
 {
-    if (duct_olb_tx_published(tx))
-        return false;
     auto h = &tx->h;
-    size_t end = h->stage;
-    if (!end || end != olb_off(duct_atomic_load(&h->tail, relaxed)))
-        return true;
-    size_t prev = duct_atomic_load(&tx->pass_end, relaxed),
-           keep = duct_max(end, duct_olb_tx_min_room_get(tx));
-    duct_olb_tx_wrap(tx, h->buf_size);
-    size_t from_off = duct_align_up(offsetof(duct_olb_tx_t, data) + keep, duct_page_size());
-    char *from = (char *)tx + from_off,
-         *last = (char *)tx + h->total_size;
-    if (prev > keep * olb_tx_trim_div)
-        duct_vm_discard(from, (size_t)(last - from));
-    return true;
+    tx->stream_end += tx->staged_bytes;
+    tx->staged_bytes = 0u;
+    uint32_t staged = duct_atomic_load(&h->stage, relaxed);
+    if (!staged)
+        return;
+    uint64_t tail = duct_olb_tx_unrolled(duct_atomic_load(&h->tail, relaxed));
+    duct_atomic_store(&h->tail, duct_olb_tx_packed(tail + staged), release);
+    duct_atomic_store(&h->stage, 0u, relaxed);
+}
+
+/** @brief True while @p tx's io thread holds the socket armed for write
+ *  readiness. Worker-side stale-tolerant hint read. */
+duct_nonnull(1) static inline bool
+duct_olb_tx_write_armed(const duct_olb_tx_t *tx)
+{
+    return duct_atomic_load(&tx->write_armed, relaxed);
+}
+
+/** @brief Record @p tx's write-interest state. Io thread only. */
+duct_nonnull(1) static inline void
+duct_olb_tx_write_armed_set(duct_olb_tx_t *tx, bool armed)
+{
+    duct_atomic_store(&tx->write_armed, armed, relaxed);
+}
+
+/** @brief True when the completion shift @p prev → @p new crosses the armed
+ *  wait target @p target: strictly the edge @c prev < T ≤ @c new, the
+ *  unarmed zero never crossing. The one expression both io's completion wake
+ *  and the edge tests answer the crossing by. */
+static inline bool
+duct_olb_tx_wait_crossed(uint64_t prev, uint64_t new, uint64_t target)
+{
+    return target != 0u && prev < target && new >= target;
+}
+
+/** @brief Arm @p tx's TX room wake at @p target.
+ *  The store publishes first, the @c seq_cst fence pairs with io's
+ *  post-completion load, and the caller re-checks its room condition after
+ *  this returns: either that recheck sees the room io freed, or io sees the
+ *  target and its next completion crosses it. Staging worker only. */
+duct_nonnull(1) static inline void
+duct_olb_tx_wait_arm(duct_olb_tx_t *tx, uint64_t target)
+{
+    duct_atomic_store(&tx->resume_at, target, release);
+    atomic_thread_fence(memory_order_seq_cst);
+}
+
+/** @brief Drained-position target at which the staging worker's TX room wait
+ *  resolves — the value @c resume_at carries while armed.
+ *
+ *  @p need names the wire bytes a refused @c duct_olb_tx_room_contig check
+ *  demanded; 0 falls to the coarse form, the backpressure floor. The target is
+ *  the exact flip point of the byte limb, clamped one past the current
+ *  drained position, so an armed word always names a position io has not
+ *  reached — a target behind it never crosses, and the caller's own post-arm
+ *  recheck answers the room io already freed.
+ *  Staging worker only. */
+duct_nonnull(1) static inline uint64_t
+duct_olb_tx_wait_target(duct_olb_tx_t *tx, size_t need)
+{
+    size_t room = need ? need : duct_olb_tx_min_room(tx);
+    uint64_t held = duct_olb_tx_bytes_held(tx),
+             drained = duct_atomic_load(&tx->drained, acquire);
+    /* The budget frees its headroom once drained reaches held + room - cap;
+     * a deficit already covered resolves at the very next completion. */
+    uint64_t target = held + room > tx->byte_cap
+                    ? drained + (held + room - tx->byte_cap) : drained + 1u;
+    return target > drained ? target : drained + 1u;
 }
 
 #ifdef __cplusplus

@@ -85,7 +85,7 @@ static size_t s_back(const void *p)
 }
 
 /* True when the header in memory equals one built here from its named fields alone, with the
- * count at 0: the holes read zero, whatever bits the compiler gave them. */
+ * count at 1: the holes read zero, whatever bits the compiler gave them. */
 static bool s_header_clean(const void *p, bool secret)
 {
     auto h = s_hdr(p);
@@ -95,6 +95,7 @@ static bool s_header_clean(const void *p, bool secret)
     ref.back = h->back;
     ref.secret = secret;
     ref.size = h->size;
+    ref.holders = 1u;
     return memcmp(h, &ref, sizeof ref) == 0;
 }
 
@@ -135,7 +136,7 @@ static int t_single(void)
     CHECK(h->size == sizeof(obj_t), "the header holds the bytes asked for");
     CHECK(s_back(p) == sizeof(duct_alloc_hdr_t), "an object on 8 sits right behind its header");
     CHECK(s_header_clean(p, false) && !h->secret, "a plain block carries no flag");
-    CHECK(s_holders(p) == 0u, "a new block has one holder, counted 0");
+    CHECK(s_holders(p) == 1u, "a new block has one holder, counted 1");
     void *base = atomic_load(&s_based);
     unsigned before = atomic_load(&s_frees);
     duct_del(p);
@@ -300,6 +301,7 @@ static int t_refuse(void)
     CHECK(!duct_new(uint8_t, 0), "a constant count of 0 answers nullptr");
     CHECK(!duct_new(uint8_t, 100, 24), "a constant alignment that is no power of two answers nullptr");
     CHECK(!duct_new(uint8_t, 100, 2 * duct_alloc_align_max), "a constant alignment past the cap answers nullptr");
+    CHECK(!refuse(1u << alloc_size_bits, 0u), "a size at the size field's cap answers nullptr");
     CHECK(!refuse(SIZE_MAX, 0u), "a size_t count that overflows the size answers nullptr");
     CHECK(!refuse_wide(SIZE_MAX / sizeof(obj_t) + 1u), "a product past size_t answers nullptr");
 #if SIZE_MAX > UINT32_MAX
@@ -367,6 +369,41 @@ static int t_share(void)
     CHECK(atomic_load(&s_wiped) == -1 && keep->a != 0u, "a drop that leaves a holder wipes nothing");
     duct_del(keep);
     CHECK(s_released_zero(kept_at, sizeof(obj_t), kept_arena), "the last drop of a shared secret wipes it");
+    return 0;
+}
+
+static int t_try_share(void)
+{
+    unsigned before = atomic_load(&s_frees);
+    auto p = duct_new(obj_t);
+    for (unsigned i = 2u; i <= UINT8_MAX; ++i)
+        CHECK(duct_try_share(p) == p && s_holders(p) == i,
+              "a claim under the ceiling answers the pointer and counts one more holder");
+    CHECK(!duct_try_share(p) && s_holders(p) == UINT8_MAX,
+          "the ceiling of 255 holders answers nullptr and adds none");
+    for (unsigned i = 1u; i < UINT8_MAX; ++i)
+        duct_del_fn(p);
+    duct_del(p);
+    CHECK(!p && atomic_load(&s_frees) == before + 1u,
+          "every dropped claim leaves the last drop to free the block once");
+    return 0;
+}
+
+static int t_touched(void)
+{
+    static_assert(sizeof(duct_alloc_hdr_t) == 8u, "the touched halves keep the header at 8 bytes");
+    auto p = duct_new(obj_t);
+    auto h = s_hdr(p);
+    CHECK(duct_alloc_touched(h) == 0u, "a fresh block carries no touched bytes");
+    duct_alloc_touched_set(h, 1u);
+    CHECK(duct_alloc_touched(h) == 1u, "the low half alone reads back");
+    duct_alloc_touched_set(h, 256u);
+    CHECK(duct_alloc_touched(h) == 256u, "a value across the halves reads back");
+    duct_alloc_touched_set(h, (1u << alloc_touched_bits) - 1u);
+    CHECK(duct_alloc_touched(h) == (1u << alloc_touched_bits) - 1u, "the field cap reads back");
+    CHECK(h->size == sizeof(obj_t) && s_holders(p) == 1u && h->back != 0u,
+          "a touched write leaves the size word, the count and the back intact");
+    duct_del(p);
     return 0;
 }
 
@@ -485,7 +522,7 @@ static int t_auto_del(void)
     before = atomic_load(&s_frees);
     CHECK(!s_make(true) && atomic_load(&s_frees) == before + 1u, "a failure after the allocation releases");
     auto kept = s_make(false);
-    CHECK(kept && kept->a == 7u && s_holders(kept) == 0u && atomic_load(&s_frees) == before + 1u,
+    CHECK(kept && kept->a == 7u && s_holders(kept) == 1u && atomic_load(&s_frees) == before + 1u,
           "duct_move hands the block out and disarms the release");
     duct_del(kept);
 
@@ -598,8 +635,8 @@ static int t_decl(void)
 int main(void)
 {
     static int (*const tests[])(void) = {
-        t_single, t_array, t_typed, t_align, t_place, t_refuse, t_secret, t_share, t_threads, t_del_fn,
-        t_auto_del, t_zero, t_decl,
+        t_single, t_array, t_typed, t_align, t_place, t_refuse, t_secret, t_share, t_try_share,
+        t_touched, t_threads, t_del_fn, t_auto_del, t_zero, t_decl,
     };
     for (size_t i = 0u; i < sizeof tests / sizeof tests[0]; ++i)
         if (tests[i]())

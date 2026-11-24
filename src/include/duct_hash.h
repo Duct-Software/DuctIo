@@ -19,6 +19,8 @@
 #ifndef DUCT_HASH_H
 #define DUCT_HASH_H
 
+#include "duct_core.h"
+
 #include <stddef.h>
 #include <stdint.h>
 
@@ -52,7 +54,7 @@ static constexpr size_t duct_siphash_key_size = 16u;
  *  defines them.
  *  @{
  */
-static inline uint64_t duct_sip_le64(const uint8_t *p, size_t n)
+static inline uint64_t duct_sip_le64(size_t n, const uint8_t p[static n])
 {
     uint64_t v = 0u;
     for (size_t i = 0u; i < n; ++i)
@@ -60,7 +62,7 @@ static inline uint64_t duct_sip_le64(const uint8_t *p, size_t n)
     return v;
 }
 
-static inline void duct_sip_put_le64(uint8_t *p, size_t n, uint64_t v)
+static inline void duct_sip_put_le64(size_t n, uint8_t p[static n], uint64_t v)
 {
     for (size_t i = 0u; i < n; ++i)
         p[i] = (uint8_t)(v >> (8u * i));
@@ -93,8 +95,8 @@ static inline void duct_sip_absorb(uint64_t v[4], uint64_t m)
 static inline uint64_t duct_siphash24(const uint8_t key[duct_siphash_key_size],
                                       const void *data, size_t len)
 {
-    uint64_t k0 = duct_sip_le64(key, 8u),
-             k1 = duct_sip_le64(key + 8u, 8u);
+    uint64_t k0 = duct_sip_le64(8u, key),
+             k1 = duct_sip_le64(8u, key + 8u);
     uint64_t v[4] = {
         UINT64_C(0x736f6d6570736575) ^ k0, UINT64_C(0x646f72616e646f6d) ^ k1,
         UINT64_C(0x6c7967656e657261) ^ k0, UINT64_C(0x7465646279746573) ^ k1,
@@ -102,8 +104,8 @@ static inline uint64_t duct_siphash24(const uint8_t key[duct_siphash_key_size],
     auto p = (const uint8_t *)data;
     size_t whole = len & ~(size_t)7u;
     for (size_t i = 0u; i < whole; i += 8u)
-        duct_sip_absorb(v, duct_sip_le64(p + i, 8u));
-    duct_sip_absorb(v, ((uint64_t)len << 56u) | duct_sip_le64(p + whole, len - whole));
+        duct_sip_absorb(v, duct_sip_le64(8u, p + i));
+    duct_sip_absorb(v, ((uint64_t)len << 56u) | duct_sip_le64(len - whole, p + whole));
     v[2] ^= 0xffu;
     for (unsigned i = 0u; i < 4u; ++i)
         duct_sip_round(v);
@@ -114,12 +116,12 @@ static inline uint64_t duct_siphash24(const uint8_t key[duct_siphash_key_size],
  *  They are exclusive-ored with the first @p n bytes of the SipHash-2-4 of
  *  @p salt, as 8 little-endian bytes, under @p key, so the same call does either
  *  direction. @p n is at most 8, the bytes of one SipHash output. */
-static inline void duct_siphash_cover(uint8_t *bytes, size_t n,
-                                      const uint8_t key[duct_siphash_key_size],
+static inline void duct_siphash_cover(size_t n, uint8_t bytes[static n],
+                                      const uint8_t key[static duct_siphash_key_size],
                                       uint64_t salt)
 {
     uint8_t in[sizeof salt];
-    duct_sip_put_le64(in, sizeof in, salt);
+    duct_sip_put_le64(sizeof in, in, salt);
     uint64_t draw = duct_siphash24(key, in, sizeof in);
     for (size_t i = 0u; i < n; ++i)
         bytes[i] ^= (uint8_t)(draw >> (8u * i));

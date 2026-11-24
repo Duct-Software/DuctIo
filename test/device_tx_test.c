@@ -43,7 +43,14 @@ static atomic_int g_attempts   = 0;
 static unsigned g_left = pkt_total;
 static unsigned g_seq  = 0u;
 static constexpr unsigned read_batch = 32u;
-static uint8_t g_pkt[read_batch][pkt_bytes];
+/* One row per packet of the whole run, not one per read batch: the echo
+ * hands the row on as fl_send_static, and a parked answer must keep reading
+ * its bytes while later batches arrive — the conn block's TX retry copy
+ * region parks a bounded number of copy-mode payloads
+ * (DUCT_CONN_RETRY_TX_COPIES), while this run parks one answer per refused
+ * reservation. A row is written once and read until its packet commits,
+ * exactly what fl_send_static promises. */
+static uint8_t g_pkt[pkt_total][pkt_bytes];
 
 static char     g_ring[ring_slots][pkt_bytes];
 static unsigned g_ring_next = 0u;
@@ -79,8 +86,9 @@ static duct_result_t device_read([[maybe_unused]] void *ctx, duct_view_u8 *out,
 {
     unsigned produced = 0u;
     while (produced < max && produced < read_batch && g_left > 0u) {
-        memcpy(g_pkt[produced], &g_seq, sizeof g_seq);
-        out[produced] = duct_view(duct_view_u8, g_pkt[produced], pkt_bytes);
+        auto row = g_pkt[g_seq];
+        memcpy(row, &g_seq, sizeof g_seq);
+        out[produced] = duct_view(duct_view_u8, row, pkt_bytes);
         ++produced;
         ++g_seq;
         --g_left;
@@ -89,6 +97,13 @@ static duct_result_t device_read([[maybe_unused]] void *ctx, duct_view_u8 *out,
     return produced ? rc_ok : rc_again;
 }
 
+/* TEMP-DIAG device_tx: the commit history and the refusal points, printed
+ * only once a disorder shows — no per-commit output, the timing stays. */
+static unsigned g_commit_log[pkt_total];
+static unsigned g_commit_log_n;
+static unsigned g_refuse_at[64];
+static unsigned g_refuse_at_n;
+
 static void *device_write_reserve([[maybe_unused]] void *ctx, size_t size)
 {
     if (size > pkt_bytes)
@@ -96,6 +111,8 @@ static void *device_write_reserve([[maybe_unused]] void *ctx, size_t size)
     duct_discard duct_atomic_fetch(add, &g_attempts, 1, release);
     if (++g_reserves % 4u == 0u) {
         duct_discard duct_atomic_fetch(add, &g_refused, 1, relaxed);
+        if (g_refuse_at_n < 64u)
+            g_refuse_at[g_refuse_at_n++] = g_reserves;
         return nullptr;
     }
     auto slot = g_ring[g_ring_next];
@@ -114,8 +131,19 @@ static duct_result_t device_write_commit([[maybe_unused]] void *ctx,
     }
     unsigned seq = 0u;
     memcpy(&seq, buf, sizeof seq);
-    if ((int)seq <= duct_atomic_load(&g_out_order, acquire))
-        duct_discard duct_atomic_fetch(add, &g_bad_write, 1, release);
+    if ((int)seq <= duct_atomic_load(&g_out_order, acquire)) {
+        fprintf(stderr, "b47-dtx: disorder at commit %u: seq=%u prev=%d\n",
+                g_commit_log_n, seq, (int)duct_atomic_load(&g_out_order, acquire));
+        fprintf(stderr, "b47-dtx: commits:");
+        for (unsigned k = 0u; k < g_commit_log_n; ++k)
+            fprintf(stderr, " %u", g_commit_log[k]);
+        fprintf(stderr, "\nb47-dtx: refused reserves:");
+        for (unsigned k = 0u; k < g_refuse_at_n; ++k)
+            fprintf(stderr, " %u", g_refuse_at[k]);
+        fprintf(stderr, "\n");
+    }
+    if (g_commit_log_n < pkt_total)
+        g_commit_log[g_commit_log_n++] = seq;
     duct_atomic_store(&g_out_order, (int)seq, release);
     duct_discard duct_atomic_fetch(add, &g_committed, 1, release);
     return rc_ok;
@@ -159,7 +187,10 @@ on_frame([[maybe_unused]] duct_session_t *s, duct_conn_id_t conn_id,
 {
     if (conn_id != 1u)
         return rc_ok;
-    duct_response_echo(out, frame);
+    /* Echo on the row's own static bytes (see g_pkt): each row belongs to one
+     * packet for the whole run, so a parked answer keeps valid bytes without
+     * a copy. */
+    duct_response_same(out, frame->payload, fl_send_static, frame->flags);
     return rc_ok;
 }
 

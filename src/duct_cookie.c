@@ -18,7 +18,7 @@ static_assert(duct_cookie_size == sizeof(uint64_t),
  *  families never share a cookie. The port rides behind the family, so one
  *  address's endpoints never share a mint.
  */
-static void s_mac(const uint8_t *secret, const duct_peer_t *peer, uint8_t *out)
+duct_zero_regs static void s_mac(const uint8_t secret[static duct_cookie_secret_size], const duct_peer_t *peer, uint8_t out[static 8])
 {
     uint8_t msg[sizeof peer->addr.v6 + sizeof peer->family + sizeof peer->port];
     memcpy(msg, peer->addr.v6, sizeof peer->addr.v6);
@@ -37,7 +37,7 @@ static void s_mac(const uint8_t *secret, const duct_peer_t *peer, uint8_t *out)
  *  so the write meets no read. A draw that fails restores the time and retries
  *  at the next call.
  */
-static void s_rotate_if_due(duct_cookie_t *c, uint64_t now)
+duct_zero_regs static void s_rotate_if_due(duct_cookie_t *c, uint64_t now)
 {
     uint64_t since = duct_atomic_load(&c->rotated_ns, acquire);
     if (now < since + duct_cookie_rotate_ns
@@ -51,24 +51,24 @@ static void s_rotate_if_due(duct_cookie_t *c, uint64_t now)
     duct_atomic_store(&c->epoch, epoch + 1u, release);
 }
 
-bool duct_cookie_init(duct_cookie_t *c, uint64_t now)
+duct_zero_regs bool duct_cookie_init(duct_cookie_t *c, uint64_t now)
 {
     duct_atomic_store(&c->epoch, 0u, relaxed);
     duct_atomic_store(&c->rotated_ns, now, relaxed);
     return duct_random_bytes(c->secret, sizeof c->secret);
 }
 
-void duct_cookie_mint(duct_cookie_t *c, const duct_peer_t *peer, uint8_t out[duct_cookie_size])
+duct_zero_regs void duct_cookie_mint(duct_cookie_t *c, const duct_peer_t *peer, uint8_t out[duct_cookie_size])
 {
     s_mac(c->secret[duct_atomic_load(&c->epoch, acquire) % 3u], peer, out);
 }
 
-bool duct_cookie_valid(duct_cookie_t *c, const duct_peer_t *peer,
+duct_zero_regs bool duct_cookie_valid(duct_cookie_t *c, const duct_peer_t *peer,
                        const uint8_t cookie[duct_cookie_size], uint64_t now)
 {
     s_rotate_if_due(c, now);
     uint32_t epoch = duct_atomic_load(&c->epoch, acquire);
-    uint8_t want[duct_cookie_size];
+    duct_secret_array(uint8_t, want, duct_cookie_size);
     bool ok = false;
     for (unsigned back = 0u; back < 2u; ++back) {
         s_mac(c->secret[(epoch + 3u - back) % 3u], peer, want);

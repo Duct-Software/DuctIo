@@ -79,7 +79,7 @@ capture([[maybe_unused]] void *ctx, [[maybe_unused]] const duct_peer_t *peer, du
 
 static duct_proto_t g_proto = { .cfg = { .preparse = capture, .preparse_mode = resolve_sync } };
 
-static void fill(uint8_t *bytes, uint8_t seed)
+static void fill(uint8_t bytes[static sent_len], uint8_t seed)
 {
     for (unsigned i = 0u; i < sent_len; ++i)
         bytes[i] = (uint8_t)(seed + i);
@@ -106,14 +106,14 @@ static void check_scratch_read(duct_vmq_mpsc_t *wfq)
     auto tx = uc_connect(port);
     assert(rx != duct_sock_bad && tx != duct_sock_bad);
 
-    duct_x_slot_pool_t pool = {};
+    auto pool = duct_new(duct_x_slot_pool_t);
     auto protos = duct_at(duct_new(const duct_proto_t *, 1u));
     auto l = duct_new(duct_listener_t);
-    assert(protos && l);
+    assert(pool && protos && l);
     protos[0] = &g_proto;
     l->listen_fd = rx;
     l->xport_type = x_udp;
-    l->rx_slots = &pool;
+    l->rx_slots = pool;
     l->protos = protos;
     l->n_protos = 1u;
 

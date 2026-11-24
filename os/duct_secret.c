@@ -90,13 +90,13 @@ static duct_x_slot_pool_t *s_pool_of(unsigned c)
     auto pool = duct_atomic_load(&s_pools[c], acquire);
     if (pool)
         return pool;
-    auto fresh = duct_new(duct_x_slot_pool_t);
+    duct_auto_del auto fresh = duct_new(duct_x_slot_pool_t);
     duct_do_if(!fresh, return nullptr);
     uint32_t per = s_per_page(c);
-    bool ok = duct_x_slot_pool_init(fresh, s_run_pages(c) * per, (uint32_t)s_slot_size(c), 0u, per,
-                                    (duct_x_slot_hooks_t){ .up = s_lock, .reserve = true });
-    duct_do_if(!ok, duct_del(fresh); return nullptr);
-    return duct_x_slot_pool_publish(&s_pools[c], fresh);
+    bool ok = duct_x_slot_pool_init(fresh, s_run_pages(c) * per, (uint32_t)s_slot_size(c), 0u, 0u,
+                                    per, (duct_x_slot_hooks_t){ .up = s_lock, .reserve = true });
+    duct_do_if(!ok, return nullptr);
+    return duct_x_slot_pool_publish(&s_pools[c], duct_move(fresh));
 }
 
 /** @brief Pop a free slot of class @p c, the pool growing a page when none is free.
@@ -125,11 +125,12 @@ void *duct_secret_adopt(void *obj)
     moved->back = 1u;
     moved->secret = 1;
     moved->size = h->size;
+    duct_atomic_store(&moved->holders, (uint8_t)1u, relaxed);
     free((unsigned char *)obj - (size_t)h->back * sizeof *h);
     return slot + sizeof *h;
 }
 
-bool duct_secret_release(void *obj)
+duct_zero_regs bool duct_secret_release(void *obj)
 {
     auto h = duct_block_hdr(obj);
     unsigned c = h->arena;

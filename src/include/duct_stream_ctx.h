@@ -12,44 +12,11 @@
 #define DUCT_STREAM_CTX_H
 
 #include "duct_protocol.h"
+#include "duct_span.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
-
-/** @brief Which member of duct_frame_ack_t's union is live. */
-typedef enum duct_frame_ack_kind : uint8_t {
-    ack_ring,  /**< RX ring byte span. */
-    ack_ct,    /**< Sealed connection's decrypted record span. */
-    ack_owned, /**< Handler-owned copy, not aliased into any ring; freed
-                 *  via duct_del. */
-    ack_slot,  /**< Claim on a datagram RX slot, dropped through
-                 *  duct_io_rx_slot_drop. */
-    ack_count, /**< Not a valid kind — array sizing, loop bounds. */
-} duct_frame_ack_kind_t;
-
-/** @brief Acknowledgment record for the held frame's bytes. */
-typedef struct duct_frame_ack {
-    duct_frame_ack_kind_t kind;
-    union {
-        struct {
-            size_t   task_len; /**< Bytes to release from the RX buf. */
-            uint32_t end_off;  /**< RX buf offset where the acknowledged
-                                 *  span ends. */
-        } ring;
-        duct_view_u8 ct; /**< Acknowledged span of a sealed record's cleartext.
-                         *  @c data is the codec's cleartext buffer, never an
-                         *  address inside it; @c size is the decrypted bytes
-                         *  acknowledged. */
-        struct {
-            void *ptr; /**< Handler-owned copy. */
-        } owned;
-        struct {
-            struct duct_x_slot_pool *pool; /**< Pool of the claimed slot. */
-            uint32_t                  idx; /**< Index of the claimed slot. */
-        } slot;
-    };
-} duct_frame_ack_t;
 
 /** @brief Context for one running stream handler. */
 typedef struct duct_stream_ctx {
@@ -58,31 +25,24 @@ typedef struct duct_stream_ctx {
     duct_conn_id_t   conn_id;   /**< Leg the current frame arrived on. */
 
     duct_frame_t frame; /**< The frame currently being handled. Payload
-                          *  points into the RX buf, a sealed connection's
-                          *  decrypted buffer, a datagram RX slot the frame
-                          *  holds a claim on (@c ack.kind == ack_slot), or
-                          *  (@c ack.kind == ack_owned) a private copy owned
-                          *  by this hctx, and stays valid only until @c ack
-                          *  releases it. */
+                          * points where @c span names — the conn's RX
+                          * ring, a sealed record's cleartext chunk, a
+                          * datagram RX slot the span holds a claim on, or
+                          * a private copy this hctx owns outright — and
+                          * stays valid only until @c span releases it. */
 
-    /** @brief How to release @c frame's bytes: which pool they came from —
-     *  the RX buf, a sealed connection's decrypted buffer, a claimed RX
-     *  slot, or a private copy this hctx owns outright. Set once, when the frame is
-     *  dispatched to the handler, mirrors whichever memory
-     *  @c frame.payload actually points into.
-     */
-    duct_frame_ack_t ack;
-
-    /** @brief True once @c ack has been applied for flow control while
-     *  @c frame is still pinned. This happens when the handler emits a
-     *  response that still points at the frame's own bytes but staging
-     *  it hits TX backpressure: the response is parked for retry, so the
-     *  frame cannot be released yet, but the RX ring still needs the
-     *  bytes accounted as consumed. Stops those bytes from being
-     *  acknowledged a second time if the handler is cancelled before
-     *  that retry resolves.
-     */
-    bool frame_acked;
+    /** @brief The held frame's payload reference, §1.1's one span per held
+     *  payload: the substrate named by @c tagged_base pinned for the
+     *  handler's hold — an RX ring span through @c rx->pins and the §2.3
+     *  refs unit, a cleartext chunk through its pool's record holders, a
+     *  claimed RX slot, an owned block — released at the frame's ack or
+     *  cancel, whichever comes first.
+     *
+     *  The span's window closes as the ack applies: @c len reads 0 once
+     *  the frame's bytes are accounted, the substrate staying named for
+     *  the pin's release alone. A parked answer aliasing the frame keeps
+     *  the span past its ack; the cancel paths release it whole. */
+    duct_span_t span;
 
     void *stream_state; /**< State the author keeps for this stream. */
     duct_async_t *au;   /**< Stackless coroutine running this handler,
@@ -91,7 +51,7 @@ typedef struct duct_stream_ctx {
                          *  or nullptr. */
 
     duct_response_t out; /**< Response to send. Resets to the framework
-                           *  default before every handler invocation. */
+                           * default before every handler invocation. */
 } duct_stream_ctx_t;
 
 #ifdef __cplusplus

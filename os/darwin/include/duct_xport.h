@@ -26,6 +26,8 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/filio.h>
+#include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/uio.h>
 #include <unistd.h>
@@ -35,6 +37,17 @@
  *  @c POLLOUT: a send side ended under armed @c POLLOUT shows as @c POLLHUP,
  *  and the send it drives fails and closes the conn. */
 static constexpr duct_io_ev_flags_t duct_x_poll_hup = (duct_io_ev_flags_t)(io_ev_read | io_ev_write);
+
+/** @brief Read how many bytes the socket still holds undelivered.
+ *  @return false where the kernel refuses the reading, @p out untouched. */
+duct_nonnull(2) static inline bool duct_x_dgram_held(int fd, size_t *out)
+{
+    int held = 0u;
+    if (ioctl(fd, FIONREAD, &held) != 0)
+        return false;
+    *out = held > 0 ? (size_t)held : 0u;
+    return true;
+}
 
 /** @brief One message of a batched send or receive, with the bytes the call moved.
  *  Darwin has no @c sendmmsg / @c recvmmsg: @ref duct_xsendmmsg and
@@ -231,6 +244,12 @@ static inline uint64_t duct_xget_tx_unsent([[maybe_unused]] int fd)
     return duct_tx_unsent_unread;
 }
 
+/** @brief Nothing: this backend reads no wire state on a close. */
+static inline void duct_x_tcp_close_diag([[maybe_unused]] int fd,
+                                         [[maybe_unused]] duct_close_reason_t reason)
+{
+}
+
 /** @brief Bound how long TCP socket @p fd retransmits unanswered before the
  *  stack ends it, @p ms rounded up to whole seconds.
  *  0 restores the stack's own bound. @c TCP_RXT_CONNDROPTIME carries it, and
@@ -259,22 +278,39 @@ typedef enum duct_x_follow : uint8_t {
     x_follow_set,
 } duct_x_follow_t;
 
+/** @brief The send buffer a new conn's TCP socket asks the stack for, bytes.
+ *  The kernel's @c sendspace default stays small and nothing grows it: a
+ *  single flow stops at the bytes it may leave unacknowledged, which caps
+ *  every bulk leg on a long-fat path. The @c DUCT_TCP_SNDBUF environment
+ *  variable takes another figure for a bench. */
+static constexpr uint32_t duct_x_tcp_sndbuf = 4u << 20;
+
 /** @brief Apply a new conn's send options to its socket @p fd and record in @p x
  *  the bound it was created with.
  *  A connected UDP socket records its granted send buffer, a TCP socket the
  *  @c TCP_NOTSENT_LOWAT it took, 0 where none was asked or the stack refused
- *  it. The lowat stays fixed and the congestion control is the stack's, so
- *  @p lowat_us and @p congestion go unused. */
+ *  it, and takes @ref duct_x_tcp_sndbuf as its send buffer. The lowat stays
+ *  fixed and the congestion control is the stack's, so @p lowat_us and
+ *  @p congestion go unused. */
 duct_nonnull(1) static inline void
 duct_xset_sock_tx(duct_x_sock_tx_t *x, int fd, duct_xport_t xport,
                   uint32_t notsent_lowat,
                   [[maybe_unused]] uint32_t lowat_us,
                   [[maybe_unused]] const char *congestion)
 {
-    if (xport == x_udp_peer)
+    if (xport == x_udp_peer) {
         x->lowat_max = duct_xget_sndbuf(fd);
-    else if (xport == x_tcp)
+    } else if (xport == x_tcp) {
+        static thread_local int sndbuf_env = -1; /* per-thread resolve: no shared write */
+        if (sndbuf_env < 0) {
+            const char *s = getenv("DUCT_TCP_SNDBUF");
+            sndbuf_env = s ? atoi(s) : 0;
+        }
+        duct_discard setsockopt(fd, SOL_SOCKET, SO_SNDBUF,
+                                &(int){ sndbuf_env > 0 ? sndbuf_env : (int)duct_x_tcp_sndbuf },
+                                sizeof(int));
         x->lowat_max = duct_xset_tcp_lowat(fd, notsent_lowat);
+    }
 }
 
 duct_nonnull(1) static inline duct_x_follow_t
@@ -426,6 +462,11 @@ duct_xread(int fd, duct_xport_t t, duct_view_u8 dst, size_t *out_read, void *ctx
         switch (errno) {
         case EAGAIN:
             return rc_again;
+        case EMSGSIZE:
+            /* Queued EMSGSIZE consumed by recv; report size refusal on datagrams. */
+            if (t == x_udp || t == x_udp_peer)
+                return rc_frame_too_large;
+            [[fallthrough]];
         default:
             duct_dbg_errf("errno %d", errno);
             return rc_fatal;
@@ -554,6 +595,11 @@ duct_xwritev(int fd, duct_xport_t t, const duct_view_u8 *bufs, unsigned n,
         switch (errno) {
         case EAGAIN:
             return rc_again;
+        case EMSGSIZE:
+            /* The wire refuses the frame's size: the datagram dies whole, the
+             * queue moves, the conn lives -- same as the batched send. */
+            duct_dbg_errf("EMSGSIZE, %zu bytes", bufs[0].size);
+            return rc_drop;
         default:
             duct_dbg_errf("errno %d", errno);
             return rc_fatal;
@@ -586,6 +632,14 @@ duct_xsend_dgram(int fd, const struct sockaddr *addr, socklen_t addrlen, duct_vi
         n = sendto(fd, payload.data, payload.size, MSG_NOSIGNAL, addr, addrlen);
     while (n < 0 && errno == EINTR);
     return duct_x_send_consumed(n);
+}
+
+/** @brief @ref duct_xsend_dgram ignoring @p local on platforms without @c PKTINFO. */
+duct_nonnull(2) static inline bool
+duct_xsend_dgram_from(int fd, const struct sockaddr *addr, socklen_t addrlen,
+                      [[maybe_unused]] const duct_peer_t *local, duct_view_u8 payload)
+{
+    return duct_xsend_dgram(fd, addr, addrlen, payload);
 }
 
 /** @brief Batch-write @p n already-framed buffers out @p fd for @p t.
@@ -659,6 +713,19 @@ duct_xsend_gso_peers([[maybe_unused]] int fd,
     return rc_not_supported;
 }
 
+/** @brief Send @p n records out connected socket @p fd as one segmented
+ *  write.
+ *  @return @c rc_not_supported always: Darwin's UDP has no segmentation
+ *  offload, and the caller sends the group unsegmented.
+ */
+duct_nonnull(2) static inline duct_result_t
+duct_xsend_gso_recs([[maybe_unused]] int fd,
+                    [[maybe_unused]] const duct_tx_rec_t *recs,
+                    [[maybe_unused]] unsigned n)
+{
+    return rc_not_supported;
+}
+
 /** @brief Send @p n already wire-packed datagrams to @p fd, each from its own
  *  descriptor's two spans, unsegmented.
  *
@@ -710,6 +777,65 @@ duct_xsend_peers(int fd, const duct_dgram_out_t *msgs_in, unsigned n, unsigned *
     return rc_ok;
 }
 
+/** @brief Send @p n records out the connected socket @p fd unsegmented, each
+ *  its inline header and its payload span.
+ *
+ *  One @c sendmmsg through @ref duct_xwrite_batch, or one @c sendmsg for a
+ *  single record. A record's header and payload become two iovecs of one
+ *  message, so the payload reaches the kernel from wherever its record's
+ *  span keeps it; an empty header contributes no iovec. A record a send
+ *  will never carry counts as taken, the datagram discipline of the
+ *  connected socket's ring.
+ *
+ *  @param out_sent records the kernel took, a prefix of @p n.
+ *  @return @c rc_ok with @p out_sent up to @p n; @c rc_again on a retryable
+ *          code; @c rc_drop for a first record too large for the path;
+ *          @c rc_fatal for a socket to close.
+ */
+duct_nonnull(2, 4) static inline duct_result_t
+duct_xsend_recs(int fd, const duct_tx_rec_t *recs, unsigned n, unsigned *out_sent)
+{
+    *out_sent = 0u;
+    assert(n && n <= duct_dgram_tx_batch);
+    struct iovec   iovs[2u * n];
+    duct_x_mmsg_t  msgs[n];
+    unsigned cnt = 0u;
+    for (unsigned i = 0u; i < n; ++i) {
+        unsigned start = cnt;
+        if (recs[i].hdr.size)
+            iovs[cnt++] = (struct iovec){ .iov_base = recs[i].hdr.data,
+                                          .iov_len = recs[i].hdr.size };
+        if (recs[i].body.size)
+            iovs[cnt++] = (struct iovec){ .iov_base = recs[i].body.data,
+                                          .iov_len = recs[i].body.size };
+        msgs[i] = (duct_x_mmsg_t){
+            .msg_hdr = { .msg_iov = &iovs[start], .msg_iovlen = cnt - start },
+        };
+    }
+
+    if (n > 1u) {
+        duct_discard duct_xwrite_batch(fd, x_udp, msgs, n, out_sent);
+        return rc_ok;
+    }
+    ssize_t sent;
+    do
+        sent = sendmsg(fd, &msgs[0].msg_hdr, MSG_NOSIGNAL);
+    while (sent < 0 && errno == EINTR);
+    if (sent >= 0) {
+        *out_sent = 1u;
+        return rc_ok;
+    }
+    if (!duct_x_send_retryable(errno)) {
+        if (errno == EMSGSIZE) {
+            duct_dbg_errf("EMSGSIZE, %zu bytes", duct_x_dgram_len_rec(&recs[0]));
+            return rc_drop;
+        }
+        duct_dbg_errf("errno %d", errno);
+        return rc_fatal;
+    }
+    return rc_again;
+}
+
 /** @brief Fill up to @p n of @p bufs from @p fd, reporting each datagram's
  *  length in @p out_lens.
  *  One @c recvmsg each, through @ref duct_xrecvmmsg. @p out_peers takes each
@@ -719,11 +845,13 @@ duct_xsend_peers(int fd, const duct_dgram_out_t *msgs_in, unsigned n, unsigned *
  *  its entry.
  *
  *  @return @c rc_ok with @p out_n >= 1; @c rc_again when the socket is empty;
- *  @c rc_fatal otherwise. @p out_n < @p n means the socket ran dry mid-batch.
+ *  @c rc_frame_too_large on queued @c EMSGSIZE; @c rc_fatal otherwise.
+ *  @p out_n < @p n means the socket ran dry mid-batch.
  */
-duct_nonnull(2, 5, 7) static inline duct_result_t
+duct_nonnull(2, 6, 8) static inline duct_result_t
 duct_xrecv_peers(int fd, const duct_view_u8 *bufs, uint32_t n,
-                 duct_peer_t *out_peers, uint32_t *out_lens, uint32_t *out_segs,
+                 duct_peer_t *out_peers, duct_peer_t *out_locals,
+                 uint32_t *out_lens, uint32_t *out_segs,
                  uint32_t *out_n)
 {
     *out_n = 0u;
@@ -747,6 +875,9 @@ duct_xrecv_peers(int fd, const duct_view_u8 *bufs, uint32_t n,
         switch (errno) {
         case EAGAIN:
             return rc_again;
+        case EMSGSIZE:
+            /* Queued EMSGSIZE consumed by recv; datagrams behind it wait for next read. */
+            return rc_frame_too_large;
         default:
             duct_dbg_errf("errno %d", errno);
             return rc_fatal;
@@ -756,6 +887,8 @@ duct_xrecv_peers(int fd, const duct_view_u8 *bufs, uint32_t n,
                     ? duct_dgram_len_truncated : msgs[i].msg_len;
         if (out_peers)
             out_peers[i] = duct_io_peer_from_sockaddr((struct sockaddr *)&addrs[i]);
+        if (out_locals)
+            out_locals[i] = (duct_peer_t){};
         if (out_segs)
             out_segs[i] = 0u;
     }

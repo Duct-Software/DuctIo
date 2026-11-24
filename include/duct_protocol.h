@@ -31,7 +31,7 @@ extern "C" {
  *
  *  Exactly one of fl_send_copy, fl_send_static, fl_send_owned per response.
  *  fl_send_copy is the default when @c flags == 0 — not a combinable bit.
- *  fl_send_done is orthogonal — requests proto_cfg.on_send_done with send_token.
+ *  fl_send_done is orthogonal — requests drain-completion frontier notifications via proto_cfg.on_send_done.
  *  Combining @c fl_send_static and @c fl_send_owned is asserted against in
  *  debug builds (@ref duct_response_commit); in release builds @c fl_send_owned
  *  silently wins.
@@ -40,8 +40,7 @@ typedef enum duct_send_flags : uint8_t {
     fl_send_copy     = 0u,        /**< Default: runtime copies buf when flags == 0. */
     fl_send_static   = 1u << 0,   /**< Zero-copy, immutable data. */
     fl_send_owned    = 1u << 1,   /**< Runtime takes ownership and releases the payload once staged or dropped. */
-    fl_send_done     = 1u << 2,   /**< on_send_done via proto_cfg; set send_token for correlation. */
-    fl_send_pool_keep = 1u << 3,  /**< Payload is a TX-pool region, held one worker pass longer. @see duct_tx_pool_acquire */
+    fl_send_done     = 1u << 2,   /**< Notify @c proto_cfg.on_send_done when wire-drained (or on pre-stage refusal / conn close). */
 } duct_send_flags_t;
 
 static_assert(sizeof(duct_send_flags_t) == sizeof(uint8_t),
@@ -177,7 +176,6 @@ typedef struct duct_response {
     duct_stream_id_t    stream_id;     /**< duct_stream_id_same = proto->route. */
     void (*release)(void *);           /**< Release hook for fl_send_owned; nullptr takes the default @c duct_del. */
     void  *release_arg;                /**< Argument of @c release, or the @c duct_new block @c duct_del frees; nullptr names @c payload.data. */
-    uintptr_t           send_token;    /**< for on_send_done. */
     /* Control: session/conn side-effects, applied by the worker after return.
      * Each is a declaration, not a request — the runtime applies what the
      * session can take and absorbs what it cannot, so no failure reaches an
@@ -280,6 +278,23 @@ typedef struct duct_response {
         duct_close_reason_t close_reason;
     } control;
 } duct_response_t;
+
+/** @brief Release the owned payload of @p out.
+ *  Nothing without @c fl_send_owned. With it, a set @c release is called on @c release_arg; with
+ *  none, @c duct_del frees @c release_arg, or @c payload.data where that is nullptr. It clears
+ *  nothing in @p out: a second call releases a second time.
+ */
+static inline void duct_response_release_owned(duct_response_t *out)
+{
+    if (!duct_has(out->flags, fl_send_owned))
+        return;
+    if (out->release) {
+        out->release(out->release_arg);
+        return;
+    }
+    void *block = out->release_arg ? out->release_arg : out->payload.data;
+    duct_del(block);
+}
 
 /** @brief Echo: copy the frame's payload back on the same routing, preserving its frame flags. */
 static inline void duct_response_echo(duct_response_t *out, const duct_frame_t *frame) {
@@ -429,7 +444,7 @@ typedef void (*duct_session_close_fn)(duct_session_t *s,
  *  @c out is control-only: the framework applies @c out->control (stream
  *  fin/reset, timer, RX pause/resume, close) on @c rc_ok exactly like a frame
  *  callback's, via the same @c s_ctl_apply path — but @c
- *  out->payload / @c flags / @c release / @c send_token are ignored, no TX
+ *  out->payload / @c flags / @c release are ignored, no TX
  *  commit runs: error sites may fire from paths already mid-failure, where
  *  re-entering the TX machinery is unsafe. Any return other than @c rc_ok
  *  discards @c out->control entirely. Return @c rc_ok with @c *out left
@@ -441,6 +456,9 @@ typedef void (*duct_session_close_fn)(duct_session_t *s,
  *  @c leg_kind_connect dial failure is the ordinary form by contrast: @p s is
  *  the live session the leg was meant to join, @p proto_state its real
  *  state, and @p out's control effects apply.
+ *
+ *  A datagram leg whose socket refused a frame for size reports
+ *  @c rc_frame_too_large while the conn stands.
  */
 typedef duct_result_t (*duct_error_fn)(duct_session_t *s,
                                        duct_result_t error,
@@ -860,6 +878,40 @@ duct_nonnull(1, 3) duct_result_t duct_conn_path_mtu(duct_session_t *s,
 duct_nonnull(1) duct_result_t duct_conn_addrs(duct_session_t *s, duct_conn_id_t conn_id,
                                               duct_peer_t *local, duct_peer_t *remote);
 
+/** @brief Migrate a connected @c x_udp_peer leg onto a fresh local ephemeral
+ *  port (and optional new remote IP:port literal @p addr) without disturbing
+ *  the session or its wire keys.
+ *
+ *  Posts a swap onto the leg's I/O thread: there the leg's parked spare
+ *  socket, or a fresh open, connects to @p peer and takes the leg over, the
+ *  previous socket draining delayed packets for ~250 ms before closing. The
+ *  swap itself parks the next hop's spare. A failed open leaves the leg on
+ *  its current tuple, and the next threshold hop retries.
+ *
+ *  @param s          Live session holding @p conn_id.
+ *  @param conn_id    Target @c x_udp_peer leg.
+ *  @param addr       New @c host:port IPv4/IPv6 literal, or @c nullptr / empty
+ *                    to keep the leg's current peer address and rotate the
+ *                    local ephemeral port alone.
+ *  @param egress_if  Interface index to bind the new socket to, 0 for none.
+ *
+ *  @retval rc_ok             Hop scheduled onto I/O thread.
+ *  @retval rc_invalid_arg    Bad arguments or unparsable @p addr literal.
+ *  @retval rc_invalid_order  No live leg there, wrong thread, or leg closing.
+ *  @retval rc_again          Another hop is already in flight on this leg.
+ *  @retval rc_not_supported  Leg is not @c x_udp_peer, or IOCP backend.
+ *  @retval rc_fatal / rc_no_memory  Socket open/connect or message allocation failed.
+ */
+duct_nonnull(1) duct_result_t duct_conn_hop_dgram(duct_session_t *s,
+                                                  duct_conn_id_t conn_id,
+                                                  const char *addr,
+                                                  uint32_t egress_if);
+
+/** @brief True while @ref duct_conn_hop_dgram has a socket swap in flight on
+ *  leg @p conn_id. */
+duct_nonnull(1) bool duct_conn_hopping(const duct_session_t *s,
+                                       duct_conn_id_t conn_id);
+
 /** @brief Read the IP version packets to @p peer travel as.
  *  An IPv4 address, and an IPv6 one in the IPv4-mapped range ::ffff:0:0/96, give
  *  @c fl_ip_v4. Any other IPv6 address gives @c fl_ip_v6, and a peer of neither
@@ -951,6 +1003,7 @@ duct_nonnull(1) uint16_t duct_conn_gso_max(const duct_session_t *s, duct_conn_id
 
 duct_nonnull(1) bool duct_conn_has_vnet_uso(const duct_session_t *s, duct_conn_id_t conn_id);
 duct_nonnull(1) duct_result_t duct_conn_set_uso(duct_session_t *s, duct_conn_id_t conn_id, bool on);
+duct_nonnull(1) duct_result_t duct_conn_set_dgram_env(duct_session_t *s, duct_conn_id_t conn_id, bool on);
 
 /** @brief Point in one leg's byte stream.
  *  @ref duct_conn_tx_end reads it and @ref duct_conn_tx_sent compares it; two
@@ -1034,6 +1087,15 @@ duct_nonnull(1) uint64_t duct_conn_tx_unsent(duct_session_t *s, duct_conn_id_t c
  *  session callbacks.
  */
 duct_nonnull(1) size_t duct_conn_tx_cap(duct_session_t *s, duct_conn_id_t conn_id);
+
+/** @brief The remote queue verdict of leg @p conn_id's datagram peer, read afresh.
+ *
+ *  The queue figure the leg's sealed codec recorded off the peer's last report,
+ *  0 where the codec never heard one or its reading is older than the owd
+ *  baseline's staleness bound. Call from session callbacks.
+ */
+duct_nonnull(1) uint64_t
+duct_conn_dgram_remote_q(const duct_session_t *s, duct_conn_id_t conn_id, uint64_t now);
 
 /** @brief Traffic tally of one leg slot, kept by the session's worker.
  *
@@ -1206,31 +1268,38 @@ typedef duct_result_t (*duct_timer_fn)(duct_session_t *s,
                                         void *proto_state,
                                         uint64_t arg);
 
+/** @brief One @c on_work tour: runs on the addressed worker, outside any
+ *  session; @c arg is the tag supplied at @c duct_proto_post.
+ */
+typedef void (*duct_proto_work_fn)(duct_engine_t *e, unsigned worker,
+                                   void *user_ctx, uintptr_t arg);
+
 /** @brief Outcome passed to @c on_send_done. */
 typedef struct duct_send_done_info {
-    duct_conn_id_t   conn_id;     /**< Conn the send targeted. */
-    duct_stream_id_t stream_id;   /**< Logical stream the send targeted. */
-    uintptr_t        send_token;  /**< Response token, echoed back. */
-    duct_result_t    result;      /**< Pack and enqueue outcome. */
+    duct_conn_id_t conn_id;  /**< Conn whose frontier settled (or refused pre-stage). */
+    uint64_t       frontier; /**< 1-based monotonic count of settled @c fl_send_done
+                              *   responses on @p conn_id (unchanged on pre-stage refusal). */
+    duct_result_t  result;   /**< @c rc_ok once drained; @c rc_closed when conn close
+                              *   forces unfinished responses; refusal code on pre-stage error. */
 } duct_send_done_info_t;
 
-/** @brief Send-done callback; reports the pack/enqueue outcome, not a peer ACK.
+/** @brief Send-done callback; advances the per-conn @c fl_send_done frontier.
  *
  *  @c out is control-only — same contract as @ref duct_error_fn's @c out: the
  *  framework applies @c out->control on @c rc_ok, ignoring @c payload,
- *  @c flags, @c release and @c send_token; any other return discards it.
- *  Declaring @c rx_op_resume once a paused conn's held response is out is the
- *  case it exists for.
+ *  @c flags and @c release; any other return discards it.
  *
- *  Fires once for a response carrying @c fl_send_done, on whichever
- *  disposition resolves it: the send itself, a stage that failed for good, or
- *  a parked retry resolving later. A response still outstanding when its
- *  stream is cancelled or the engine stops fires nothing, teardown running no
- *  protocol callback at all. The stream emit API is closed here — this
- *  callback runs inside the send path it reports on.
+ *  Reports a 1-based monotonic frontier count per @c conn_id once accepted
+ *  responses up to that count have left the TX ring / queue for the wire (or
+ *  resolved immediately when the path takes them inline). Multiple completions
+ *  in one batch coalesce into a single callback at the latest frontier. A
+ *  response rejected before staging fires with the unchanged frontier and its
+ *  refusal @c result; a closing conn forces unfinished responses with @c rc_closed.
+ *  A response still parked when its stream is cancelled or when the session is
+ *  tearing down fires nothing.
  *
  *  @param s            Session that issued the send.
- *  @param info         Conn, stream, send token, and result of the send.
+ *  @param info         Conn, frontier, and result of the settlement.
  *  @param out          Control-only output, zero-init'd by the framework.
  *  @param proto_state  Per-session protocol state.
  */
@@ -1346,6 +1415,7 @@ typedef struct duct_proto_cfg {
     duct_error_fn         on_error;         /**< Transport or runtime error. */
     duct_send_done_fn     on_send_done;     /**< Pack/enqueue completion for @c fl_send_done responses. */
     duct_timer_fn         on_timer;         /**< Timer fire (keepalive / idle / re-arm); null = no timers. */
+    duct_proto_work_fn    on_work;          /**< Worker tour outside a session; null = none. */
 
     /* Listener resolve — optional; @c preparse == NULL means always-new fast
      * path / fallback. */
@@ -1417,6 +1487,28 @@ typedef struct duct_proto_cfg {
     duct_proto_flags_t flags;               /**< Capability flags. */
 } duct_proto_cfg_t;
 
+/** @brief How many encoded-response slots a callback transaction needs. */
+typedef enum duct_admit_reserve : uint8_t {
+    admit_reserve_response  = 1u, /**< Just the data response. */
+    admit_reserve_with_push = 2u, /**< The data response, plus a possible
+                                     *  stream-open push riding along. */
+} duct_admit_reserve_t;
+
+/** @brief Encoded-response slot count for the next callback transaction.
+ *
+ *  @retval admit_reserve_with_push  @p cfg's stream-open push may ride along
+ *                                   with the data response, multiplexed +
+ *                                   @c on_stream_open.
+ *  @retval admit_reserve_response   Otherwise.
+ */
+duct_nonnull(1) static inline duct_admit_reserve_t
+duct_admit_slots(const duct_proto_cfg_t *cfg)
+{
+    return duct_has(cfg->flags, fl_proto_multiplexed)
+        && cfg->on_stream_open
+            ? admit_reserve_with_push : admit_reserve_response;
+}
+
 /** @brief Protocol handle — the config, borrowed pointers and all, by value.
  *
  *  Completed here (public) so the runtime and worker can read callbacks and
@@ -1437,6 +1529,10 @@ struct duct_proto {
      *  runtime state the author never sets.
      */
     size_t admit_need[2];
+    /** Hold word owned by the runtime: the top byte is the proto state, the low
+     *  bits count outstanding @c duct_proto_post holds. Never written by
+     *  callers; a protocol with outstanding holds must not be destroyed. */
+    uint64_t _Atomic life;
 };
 
 /** @brief Borrow the live config off a protocol handle. */
@@ -1450,7 +1546,8 @@ duct_proto_cfg_of(const duct_proto_t *p)
  *
  *  The runtime borrows the protocol from @c duct_io_listen, @c duct_io_connect,
  *  or @c duct_listener_bind until @c duct_engine_destroy; keep it alive that long, then
- *  release it with @ref duct_proto_destroy. @c cfg.on_frame is required.
+ *  release it with @ref duct_proto_destroy. @c cfg must set at least one of @c on_frame,
+ *  @c on_work, or @c on_timer.
  *
  *  @param cfg  Configuration read during the call only.
  *  @return Protocol handle, or @c nullptr on invalid config or allocation failure.

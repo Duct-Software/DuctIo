@@ -120,10 +120,26 @@ typedef struct duct_wire_codec {
      *  every datagram sealed, so it sits with the prefix the lead replaces.
      */
     duct_lead_state_t lead_state;
+    bool env_capable;
+    bool env_on;
 
     uint64_t rekey_timer; /**< Handle of this codec's last lifetime timer;
                             *  a fire carrying another belongs to a codec this
                             *  one replaced and marks nothing. */
+
+    struct {
+        uint64_t half_at,
+                 rx_q_at,
+                 floor_at,
+                 remote_q_at,
+                 remote_q_ns;
+        uint32_t mins[2],
+                 floor_us,
+                 rx_q_us;
+        uint8_t  slot;
+        bool     have,
+                 remote_q_have;
+    } owd;
 
     uint16_t opening_ceiling; /**< Largest opening packet, bytes: the wire's
                                 *  @c opening_ceiling, 0 for a wire with none. */
@@ -139,28 +155,30 @@ typedef struct duct_wire_codec {
                 name[2];
     } lead;
 
-    uint32_t engine_park_len; /**< Bytes waiting in @c engine_park, 0 for an
-                                *  empty park. */
+    uint32_t engine_park_len; /**< Bytes waiting in the conn block's engine
+                                *  park, 0 for an empty park. */
 
-    /** @brief Release this codec.
-     *  Frees the inner parser, the seal engine, @c engine_park and @c self, and
-     *  drops the codec's hold on @c ct_buf: a pin keeps the buffer until it is
-     *  released. Callable at any time.
+    /** @brief Release this codec's resources.
+     *  Frees the seal engine and @c ct_buf — a pin keeps the cleartext
+     *  buffer until it is dropped — and wipes the codec's block slot, whose
+     *  storage the conn block owns and reuses. The engine park is the block's
+     *  own region and needs no release. Callable at any time.
      */
-    void (*destroy)(struct duct_wire_codec *self);
-    duct_ptr_t(uint8_t) engine_park; /**< Engine egress that met a full TX ring or bytes
-                            *  parked ahead of it, as whole records leaving
-                            *  ahead of every later byte of the conn. Allocated
-                            *  at its first use, freed with the codec; its
-                            *  @c duct_byte_len is the capacity. Worker only. */
+    void (*release)(struct duct_wire_codec *self);
 } duct_wire_codec_t;
+
+static_assert(offsetof(duct_wire_codec_t, engine) + sizeof(void *) <= duct_cacheline_size,
+              "the pointers and cursors the parse and unseal paths read fill the first"
+              " cache line exactly");
+static_assert(sizeof(duct_wire_codec_t) <= duct_wire_codec_slot,
+              "the conn block's codec slot ceiling holds the codec struct");
 
 /** @brief Derive @p c's lead key at the first datagram after the handshake and
  *  write the lead into @p dgram.
  *  A datagram sealed before the engine can derive the key keeps the prefix it
  *  has. Callers go through @ref duct_wire_codec_lead, which has checked
  *  @c lead_state. */
-void duct_wire_codec_lead_write(duct_wire_codec_t *c, uint8_t *dgram, size_t len);
+void duct_wire_codec_lead_write(duct_wire_codec_t *c, size_t len, uint8_t dgram[static len]);
 
 /** @brief Lead datagram @p dgram with @p c's join lead.
  *
@@ -169,10 +187,10 @@ void duct_wire_codec_lead_write(duct_wire_codec_t *c, uint8_t *dgram, size_t len
  *  codec in @c lead_state_none keeps the prefix it has. The first call after the
  *  handshake derives the key.
  */
-static inline void duct_wire_codec_lead(duct_wire_codec_t *c, uint8_t *dgram, size_t len)
+static inline void duct_wire_codec_lead(duct_wire_codec_t *c, size_t len, uint8_t dgram[static len])
 {
     if (c->lead_state != lead_state_none)
-        duct_wire_codec_lead_write(c, dgram, len);
+        duct_wire_codec_lead_write(c, len, dgram);
 }
 
 /** @brief Advance @p pdu past this codec's RX prefix.
@@ -193,6 +211,36 @@ static inline bool duct_wire_codec_rx_strip(const duct_wire_codec_t *c,
     pdu->size -= c->rx_prefix_len;
     return true;
 }
+
+static constexpr uint64_t duct_owd_window_ns = 15000000000ull; /**< One OWD minimum half-window. */
+static constexpr uint64_t duct_owd_stale_ns  =  1000000000ull; /**< Queue estimates older than this read 0. */
+static constexpr uint64_t duct_owd_hold_ns   =  1000000000ull;
+static constexpr uint64_t duct_owd_step_ns   =   250000000ull;
+static constexpr uint64_t duct_owd_gap_ns    =   200000000ull; /**< A receive pause this long resets the decay. */
+
+/** @brief The 8-byte datagram trailer: the sender's TX stamp in µs (low 32 of
+ *  the monotonic clock) and its last receive-queue estimate in µs.
+ */
+typedef struct duct_dgram_env {
+    uint32_t tx_us;
+    uint32_t peer_q_us;
+} duct_dgram_env_t;
+
+static_assert(sizeof(duct_dgram_env_t) == 8u, "duct_dgram_env_t must be 8 bytes");
+
+/** @brief Drop the OWD estimate: a new path — roam, rekey, peer change — starts fresh. */
+duct_nonnull(1) void duct_wire_codec_owd_reset(duct_wire_codec_t *c);
+/** @brief Fill @p out for the next datagram: the TX stamp and our latest
+ *  receive-queue estimate when younger than @c duct_owd_stale_ns, 0 otherwise.
+ */
+duct_nonnull(1, 2) void duct_wire_codec_owd_tx(const duct_wire_codec_t *c,
+                                               duct_dgram_env_t *out, uint64_t now_ns);
+/** @brief Account a received trailer: the two-half-window OWD minimum feeds the
+ *  excess-queue estimate — fast rise, 3/4 decay, reset after a pause — and the
+ *  peer's reported queue is recorded for @c duct_conn_dgram_remote_q.
+ */
+duct_nonnull(1, 2) void duct_wire_codec_owd_rx(duct_wire_codec_t *c,
+                                               const duct_dgram_env_t *env, uint64_t now_ns);
 
 #ifdef __cplusplus
 }

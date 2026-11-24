@@ -9,7 +9,7 @@
 
 /* The reads are volatile and the result is the OR of every difference, so no
  * compiler ends the scan at the first mismatch. */
-bool duct_ct_equal(const void *a, const void *b, size_t n)
+duct_zero_regs bool duct_ct_equal(const void *a, const void *b, size_t n)
 {
     auto x = (const volatile uint8_t *)a;
     auto y = (const volatile uint8_t *)b;

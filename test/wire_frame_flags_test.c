@@ -132,7 +132,7 @@ static const char *sc_roundtrip(duct_frame_flags_t sent, unsigned split_pause_ms
 
     if (th_send_flags(fd, m, sizeof m - 1u, (uint8_t)sent, split_pause_ms) != 0)
         err = "send failed";
-    else if (th_recv_flags(fd, buf, sizeof buf, &back) != (int64_t)(sizeof m - 1u)
+    else if (th_recv_flags(fd, sizeof buf, buf, &back) != (int64_t)(sizeof m - 1u)
              || memcmp(buf, m, sizeof m - 1u) != 0)
         err = "echo lost or corrupted";
     else if (duct_atomic_load(&g_seen_flags, acquire) != (int)sent)
@@ -160,7 +160,7 @@ static const char *sc_standalone(const char *op, duct_frame_flags_t want,
     int64_t want_len = is_rst ? 4 : 0;
 
     int64_t got = th_send(fd, op, 4u) != 0
-                ? -1 : th_recv_flags(fd, buf, sizeof buf, &back);
+                ? -1 : th_recv_flags(fd, sizeof buf, buf, &back);
     if (got < 0)
         err = "no control frame arrived";
     else if (got != want_len)
@@ -346,7 +346,9 @@ static const char *sc_dgram_record_gso(void)
 {
     auto w = duct_wire_create_dgram_batch(0u, false);
     if (!w) return "wire create failed";
-    auto parser = duct_wire_parser_create(w);
+    alignas(duct_cacheline_size) uint8_t parser_buf[duct_wire_parser_slot] = {};
+    auto parser = (duct_wire_parser_t *)parser_buf;
+    duct_wire_parser_init(w, parser);
     uint8_t buf[duct_dgram_record_hdr_size + 5u] = { 0u, 0u, 0u, 0u, 'r', 'e', 'c', 'o', 'r' };
     duct_dgram_rec_hdr_encode(buf, 5u | duct_dgram_rec_gso);
     duct_frame_t frame = {};
@@ -358,7 +360,6 @@ static const char *sc_dgram_record_gso(void)
         err = "a record prefix carrying the GSO bit did not parse as its own length";
     else if (frame.flags != fl_frame_gso)
         err = "the record prefix's GSO bit did not reach the frame";
-    duct_wire_parser_destroy(w, parser);
     duct_wire_destroy(w);
     return err;
 }

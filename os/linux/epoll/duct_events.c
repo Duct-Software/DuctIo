@@ -131,8 +131,8 @@ static void s_epoll_busy_poll_arm(int epoll_fd)
 
 duct_events_env_t *duct_events_init(void)
 {
-    auto env = duct_new(duct_events_env_t);
-    duct_do_if(!env, goto fail);
+    duct_auto_del auto env = duct_new(duct_events_env_t);
+    duct_do_if(!env, return nullptr);
 
     env->cancel_io = nullptr;
     env->epoll_fd = epoll_create1(EPOLL_CLOEXEC);
@@ -148,13 +148,12 @@ duct_events_env_t *duct_events_init(void)
     };
     int rc = epoll_ctl(env->epoll_fd, EPOLL_CTL_ADD, env->wake_fd, &kev);
     duct_do_if(rc < 0, goto fail);
-    return env;
+    return duct_move(env);
 fail:
     if (env->epoll_fd != duct_sock_bad)
         close(env->epoll_fd);
     if (env->wake_fd != duct_sock_bad)
         close(env->wake_fd);
-    duct_del(env);
     return nullptr;
 }
 
@@ -179,32 +178,37 @@ void duct_events_rx_stall([[maybe_unused]] duct_sock_t fd,
 void duct_events_drive_rx(void *tag)
 {
     duct_result_t rc = rc_again;
+    bool refused = false;
     duct_io_xfer_t r;
     while (duct_io_rx_reserve(tag, &r)) {
-        if (r.units > 1u) {
-            rc = duct_io_dgram_rx_units(tag, &r);
-            if (rc != rc_ok)
-                break;
-            continue;
-        }
         size_t nread = 0u,
                seg = 0u;
-        rc = duct_xread(r.fd, r.xport_type, (duct_view_u8){ .data = r.buf, .size = r.size },
-                             &nread, r.ctx, 0, &seg);
-        if (rc == rc_ok) {
+        rc = r.units > 1u
+           ? duct_io_dgram_rx_units(tag, &r)
+           : duct_xread(r.fd, r.xport_type, (duct_view_u8){ .data = r.buf, .size = r.size },
+                        &nread, r.ctx, 0, &seg);
+        if (r.units == 1u && rc == rc_ok) {
             duct_io_rx_commit(tag, nread, seg);
             continue;
         }
-        if (rc == rc_drop) {
-            /* Truncated datagram, already dequeued by recv() itself —
-             * nothing to commit, keep draining. Reset rc so a stale
-             * rc_drop never reaches duct_io_rx_done below. */
+        switch (rc) {
+        case rc_ok:
+            continue;
+        case rc_frame_too_large:
+            refused = true;
+            [[fallthrough]];
+        case rc_drop:
+            /* Queued EMSGSIZE or truncated datagram consumed; keep draining. */
             rc = rc_again;
             continue;
+        default:
+            break;
         }
         break;
     }
     duct_io_rx_done(tag, rc);
+    if (refused)
+        duct_io_frame_refused(tag);
 }
 
 void duct_events_drive_tx(void *tag)
@@ -217,7 +221,7 @@ void duct_events_drive_tx(void *tag)
             break;
     }
     duct_io_tx_write_armed_set(tag, filled);
-    duct_io_tx_done(tag, rc); /* no-op unless rc is rc_fatal */
+    duct_io_tx_done(tag, rc); /* reports a refused frame once; closes on rc_fatal */
 }
 
 bool duct_events_watch(duct_events_env_t *env, duct_sock_t fd,
@@ -268,14 +272,17 @@ bool duct_events_watch(duct_events_env_t *env, duct_sock_t fd,
 bool duct_events_promote(duct_events_env_t *env, duct_sock_t fd, void *tag_ptr)
 {
     duct_do_if(fd == duct_sock_bad, return false);
-    /* MOD not ADD: fd is already in this epoll instance's set, a second
-     * ADD fails EEXIST. Full conn set regardless of what the pre_conn
-     * carried — pre_conn_probe arms EPOLLIN alone. */
+    /* MOD when fd is already in this epoll instance's set (the dial's
+     * pre_conn carried it), ADD for a fresh one -- the hop's swapped-in
+     * socket was never watched. Full conn set regardless of what the
+     * pre_conn carried -- pre_conn_probe arms EPOLLIN alone. */
     struct epoll_event ev = {
         .events = EPOLLIN | EPOLLOUT | EPOLLET,
         .data.u64 = s_tag_pack(io_tag_conn, tag_ptr),
     };
-    return epoll_ctl(env->epoll_fd, EPOLL_CTL_MOD, fd, &ev) >= 0;
+    if (epoll_ctl(env->epoll_fd, EPOLL_CTL_MOD, fd, &ev) >= 0)
+        return true;
+    return epoll_ctl(env->epoll_fd, EPOLL_CTL_ADD, fd, &ev) >= 0;
 }
 
 /* EPOLLIN alone, level-triggered. The drive loop is bounded and stops with the
@@ -319,7 +326,8 @@ void duct_events_unwatch(duct_events_env_t *env, duct_sock_t fd,
 
 void duct_events_kick(duct_events_env_t *env)
 {
-    duct_discard write(env->wake_fd, &(uint64_t){ 1 }, sizeof(uint64_t));
+    ssize_t kicked = write(env->wake_fd, &(uint64_t){ 1 }, sizeof(uint64_t));
+    duct_discard kicked;
 }
 
 /** @brief Rewrite @p listener's level-triggered mask: EPOLLIN for @p rx,

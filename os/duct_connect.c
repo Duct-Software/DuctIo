@@ -16,6 +16,7 @@
 #include "duct_dgram_rec.h"
 #include "duct_listener.h"
 #include "duct_protocol.h"
+#include "duct_str.h"
 #include "duct_xport.h"
 
 #ifdef _WIN32
@@ -70,6 +71,15 @@ static bool s_peer_from_literal(const char *host, uint16_t port, duct_peer_t *ou
         return true;
     }
     return false;
+}
+
+bool duct_connect_parse_peer(const char *addr, duct_peer_t *out)
+{
+    char host[256];
+    uint16_t port = 0u;
+    if (!duct_connect_parse_addr(addr, host, sizeof host, &port))
+        return false;
+    return s_peer_from_literal(host, port, out);
 }
 
 duct_ip_flags_t duct_peer_ip_flags(const duct_peer_t *peer)

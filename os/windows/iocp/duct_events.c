@@ -12,6 +12,7 @@
 #include "duct_events.h"
 #include "duct_io.h"
 
+#include "duct_conn_block.h"
 #include "duct_listener.h"
 #include "duct_olb.h"
 #include "duct_pre_conn.h"
@@ -150,11 +151,9 @@ typedef struct iocp_dgram_tx iocp_dgram_tx_t;
 typedef struct {
     OVERLAPPED         ov;
     uint64_t           packed;
-    WSAMSG             wsamsg;
-    WSABUF             buf;
-    INT                addrlen;
-    uint32_t           ref;
     iocp_dgram_tx_t   *st;
+    uint32_t           refs[duct_x_gso_segs_max];
+    uint8_t            nrefs;
 } iocp_dgram_tx_ctl_t;
 
 static constexpr unsigned iocp_dgram_tx_pool_depth = 64u;
@@ -391,11 +390,11 @@ static void s_cancel_io(duct_sock_t fd)
 
 duct_events_env_t *duct_events_init(void)
 {
-    auto env = duct_new(duct_events_env_t);
+    duct_auto_del auto env = duct_new(duct_events_env_t);
     duct_do_if(!env, return nullptr);
     env->cancel_io = s_cancel_io;
     env->iocp = CreateIoCompletionPort(INVALID_HANDLE_VALUE, nullptr, 0, 1u);
-    duct_do_if(!env->iocp, duct_del(env); return nullptr);
+    duct_do_if(!env->iocp, return nullptr);
     if (s_rio) {
         env->rio_notify_op.packed = s_tag_pack(iocp_op_rio, nullptr);
         env->rio_cq = duct_rio_cq_create(s_rio,
@@ -406,7 +405,7 @@ duct_events_env_t *duct_events_init(void)
             &env->rio_cq_depth, &env->rio_cq_used);
     }
     s_port = env->iocp;
-    return env;
+    return duct_move(env);
 }
 
 void (*duct_events_cancel_io_of(duct_events_env_t *env))(duct_sock_t fd)
@@ -441,9 +440,11 @@ static void s_drain_completions(duct_events_env_t *env, bool armed)
                 case iocp_op_rx:
                 case iocp_op_rx_msg:
                 case iocp_op_rx_failed:
+                    duct_olb_io_done(s_op_hdr(op), duct_conn_of_olb_rx(s_op_hdr(op)));
+                    break;
                 case iocp_op_tx:
                 case iocp_op_tx_records:
-                    duct_discard duct_olb_io_done(s_op_hdr(op));
+                    duct_olb_io_done(s_op_hdr(op), duct_conn_of_olb_tx(s_op_hdr(op)));
                     break;
                 case iocp_op_connect:
                 case iocp_op_probe:
@@ -520,7 +521,7 @@ void duct_events_rx_stall([[maybe_unused]] duct_sock_t fd,
 }
 
 /* A read the kernel refuses is queued back to this thread's port on its own op, so its close runs
- * in the loop and never inside the registration that posts a conn's first read. A port that
+ * in the loop and never inside a registration that posts a conn's first read. A port that
  * refuses the post leaves the close here, at once. */
 void duct_events_drive_rx(void *tag)
 {
@@ -529,6 +530,8 @@ void duct_events_drive_rx(void *tag)
         return; /* OLB is full (self-repost already posted) or stale tag */
     if (duct_olb_io_begin(r.olb_hdr))
         return; /* another recv is already in flight */
+    auto conn = duct_conn_of_olb_rx(r.olb_hdr);
+    duct_conn_ref_take(conn);
     auto op = (iocp_op_t *)r.olb_hdr->ext;
     auto recvmsg_fn = duct_x_wsa_recvmsg();
     int rc;
@@ -555,8 +558,10 @@ void duct_events_drive_rx(void *tag)
         default:
             duct_dbg_errf("WSA error %d", rc);
             op->packed = s_tag_pack(iocp_op_rx_failed, tag);
-            if (!PostQueuedCompletionStatus(s_port, 0u, 0u, &op->ov) && !duct_olb_io_done(r.olb_hdr))
+            if (!PostQueuedCompletionStatus(s_port, 0u, 0u, &op->ov)) {
+                duct_olb_io_done(r.olb_hdr, conn);
                 duct_io_rx_done(tag, rc_fatal);
+            }
         }
 }
 
@@ -570,43 +575,57 @@ static int s_tx_post_err(int rc)
     return err == WSA_IO_PENDING ? NO_ERROR : err;
 }
 
-/** @brief Post one overlapped @c WSASendMsg of @p n records from @p bufs,
- *  segmented when @p n is above 1.
+/** @brief Post one overlapped @c WSASendMsg of @p n records, segmented when
+ *  @p n is above 1.
  *  @return @c NO_ERROR once posted, the Winsock code otherwise. */
 static int s_tx_post_msg(void *tag, duct_sock_t fd, iocp_op_t *op,
-                         const duct_view_u8 *bufs, unsigned n)
+                         const duct_tx_rec_t *recs, unsigned n)
 {
     *op = (iocp_op_t){ .packed = s_tag_pack(iocp_op_tx_records, tag), .records = n };
     /* Winsock copies the message, its spans and its cmsg at the call, so a
-     * pending send needs only the record bytes, which stay in the ring until
-     * its completion advances past them. */
+     * pending send needs only the record bytes, which stay held by their
+     * descriptors until their completion advances past them. */
     duct_x_gso_msg_t m;
-    return s_tx_post_err(WSASendMsg(fd, duct_x_gso_msg_bufs(&m, bufs, n), 0u, nullptr, &op->ov, nullptr));
+    return s_tx_post_err(WSASendMsg(fd, duct_x_gso_msg_recs(&m, recs, n), 0u, nullptr, &op->ov, nullptr));
 }
 
-/** @brief Post one overlapped @c WSASend of the span @p p addresses.
+/** @brief Post one overlapped @c WSASend of the spans @p p gathered.
  *  @return @c NO_ERROR once posted, the Winsock code otherwise. */
 static int s_tx_post_stream(void *tag, const duct_io_xfer_t *p, iocp_op_t *op)
 {
-    *op = (iocp_op_t){ .packed = s_tag_pack(iocp_op_tx, tag), .buf = { p->size, (char *)p->buf } };
-    return s_tx_post_err(WSASend(p->fd, &op->buf, 1u, &(DWORD){0u}, 0u, &op->ov, nullptr));
+    /* Winsock copies the spans at the call, so the stack array and the
+     * records' bytes — held by their descriptors — outlive the post as they
+     * stand; the word's length half keeps the offered byte count the
+     * completion's advance reads. */
+    WSABUF wb[2u * duct_tx_peek_recs];
+    ULONG offered = 0u;
+    DWORD cnt = 0u;
+    for (unsigned i = 0u; i < p->iov_n; ++i)
+        if (p->iov[i].size) {
+            wb[cnt++] = (WSABUF){ .len = (ULONG)p->iov[i].size,
+                                  .buf = (CHAR *)p->iov[i].data };
+            offered += (ULONG)p->iov[i].size;
+        }
+    *op = (iocp_op_t){ .packed = s_tag_pack(iocp_op_tx, tag),
+                       .buf = { offered, nullptr } };
+    return s_tx_post_err(WSASend(p->fd, wb, cnt, &(DWORD){0u}, 0u, &op->ov, nullptr));
 }
 
 /** @brief Post the records at @p tag's ring head, a segmented group where the
  *  stack cuts one.
  *  A group refused synchronously goes again as its head record alone.
  *  @return @c NO_ERROR once posted; otherwise the refusal of the head record
- *  posted alone, which the drive judges as that one record's.
+ *          posted alone, which the drive judges as that one record's.
  */
 static int s_tx_post_records(void *tag, const duct_io_xfer_t *p, iocp_op_t *op)
 {
-    duct_view_u8 bufs[duct_dgram_tx_batch];
-    unsigned n = duct_io_tx_peek_bufs(tag, bufs, duct_dgram_tx_batch);
+    duct_tx_rec_t recs[duct_tx_peek_recs];
+    unsigned n = duct_io_tx_peek_recs(tag, recs, duct_tx_peek_recs);
     assert(n);
-    unsigned group = duct_x_has_gso() ? duct_x_gso_group(bufs, n) : 1u;
-    int err = s_tx_post_msg(tag, p->fd, op, bufs, group);
+    unsigned group = duct_x_has_gso() ? duct_x_gso_group(recs, n) : 1u;
+    int err = s_tx_post_msg(tag, p->fd, op, recs, group);
     if (err != NO_ERROR && group > 1u)
-        err = s_tx_post_msg(tag, p->fd, op, bufs, 1u);
+        err = s_tx_post_msg(tag, p->fd, op, recs, 1u);
     return err;
 }
 
@@ -615,37 +634,53 @@ static int s_tx_post_records(void *tag, const duct_io_xfer_t *p, iocp_op_t *op)
  * synchronous success still completes through the port, so the chain continues
  * from s_on_tx_completion, or s_on_tx_records_completion for an x_udp_peer
  * send, and that is also where an in-flight send's duct_olb_io_done lands. A
- * send that failed outright pairs it here. */
-void duct_events_drive_tx(void *tag)
+ * send that failed outright pairs it here.
+ * @return true once the turn stepped over a record the wire refused for its
+ *         size, which the drive reports once. */
+static bool s_tx_turn(void *tag)
 {
     duct_io_xfer_t p;
+    bool refused = false;
     /* nothing to send, if respond-then-close is already handled, or stale tag */
     while (duct_io_tx_peek(tag, &p)) {
         if (duct_olb_io_begin(p.olb_hdr))
-            return; /* a send is already in flight */
+            break; /* a send is already in flight */
+        auto conn = duct_conn_of_olb_tx(p.olb_hdr);
+        duct_conn_ref_take(conn);
         auto op = (iocp_op_t *)p.olb_hdr->ext;
         int err = p.xport_type == x_udp_peer ? s_tx_post_records(tag, &p, op)
                                              : s_tx_post_stream(tag, &p, op);
         switch (err) {
         case NO_ERROR:
-            return;
-        case WSAEMSGSIZE:
-            duct_dbg_errf("WSAEMSGSIZE, %zu bytes", p.size);
-            if (duct_olb_io_done(p.olb_hdr))
-                return;
+            return refused;
+        case WSAEMSGSIZE: {
+            size_t drop_len = 0u;
+            for (unsigned i = 0u; i < p.iov_n; ++i)
+                drop_len += p.iov[i].size;
+            duct_dbg_errf("WSAEMSGSIZE, %zu bytes", drop_len);
+            duct_olb_io_done(p.olb_hdr, conn);
             if (!duct_xport_delimited(p.xport_type)) {
                 duct_io_tx_done(tag, rc_fatal);
-                return;
+                return false;
             }
-            duct_discard duct_io_tx_advance(tag, p.size, 0u);
+            refused = true;
+            duct_discard duct_io_tx_advance(tag, drop_len, drop_len);
             continue;
+        }
         default:
             duct_dbg_errf("WSA error %d", err);
-            if (!duct_olb_io_done(p.olb_hdr))
-                duct_io_tx_done(tag, rc_fatal);
-            return;
+            duct_olb_io_done(p.olb_hdr, conn);
+            duct_io_tx_done(tag, rc_fatal);
+            return false;
         }
     }
+    return refused;
+}
+
+void duct_events_drive_tx(void *tag)
+{
+    if (s_tx_turn(tag))
+        duct_io_frame_refused(tag);
 }
 
 /** @brief Post @c AcceptEx for @p ctx's listener.
@@ -653,7 +688,9 @@ void duct_events_drive_tx(void *tag)
  *  IPv4 where an IPv6 socket cannot be made.
  *  @return @c rc_ok with the @c AcceptEx out; @c rc_defer when no accept socket can be made
  *          or @c AcceptEx answers @c WSAEMFILE or @c WSAENOBUFS; @c rc_fatal on any other
- *          error, which leaves the listener with no @c AcceptEx out. */
+ *          error, which leaves the listener with no @c AcceptEx out — the caller reports
+ *          it up its own line (@c s_listener_create at the first post) or parks on it
+ *          (@c s_accept_rearm past the first). */
 static duct_result_t s_post_accept(listener_ctx_t *ctx)
 {
     auto fd = ctx->listener->listen_fd;
@@ -680,26 +717,33 @@ static duct_result_t s_post_accept(listener_ctx_t *ctx)
         case ERROR_IO_PENDING:
             break;
         default:
-            duct_dbg_errf("WSA error %d", rc);
+            duct_diag("iocp: AcceptEx post error %d leaves listener %p unarmed",
+                      rc, (void *)ctx->listener);
             closesocket(ctx->accept_fd);
             ctx->accept_fd = duct_sock_bad;
-            /* TODO: handle error */
             return rc == WSAEMFILE || rc == WSAENOBUFS ? rc_defer : rc_fatal;
         }
     }
     return rc_ok;
 }
 
-/** @brief Post @p ctx's next @c AcceptEx, parking its listener when no accept socket can be made.
- *  The post is tried once more past the park, so a socket closed in between is taken; a
- *  later close puts the listener back through @ref duct_events_listener_rx_interest, which
- *  posts again. */
+/** @brief Post @p ctx's next @c AcceptEx, parking its listener whenever the
+ *  post did not go out.
+ *  Both refusal kinds park: @c rc_defer — no accept socket to make, or the
+ *  stack's @c WSAEMFILE / @c WSAENOBUFS — and @c rc_fatal alike leave the
+ *  listener with no @c AcceptEx out, and a listener that is neither armed
+ *  nor parked is engine silence nothing reports and nothing re-arms. Parked,
+ *  the refusal is visible state (@c rx_parked, the @c accept_parked count)
+ *  and @ref duct_io_accept_resume — a conn fd closed anywhere — or a slot
+ *  unstall walks it back through @ref duct_events_listener_rx_interest. The
+ *  post is tried once more past the park, so a socket closed in between is
+ *  taken; only a post that actually went out unparks. */
 static void s_accept_rearm(listener_ctx_t *ctx)
 {
-    if (s_post_accept(ctx) != rc_defer)
+    if (s_post_accept(ctx) == rc_ok)
         return;
     duct_io_accept_park(ctx->listener);
-    if (s_post_accept(ctx) != rc_defer)
+    if (s_post_accept(ctx) == rc_ok)
         duct_io_accept_unpark(ctx->listener);
 }
 
@@ -715,7 +759,7 @@ static bool s_post_dgram(listener_ctx_t *ctx)
               : (duct_view_u8){ .data = ctx->rx_priv, .size = duct_listener_dgram_span(ctx->listener) };
     ctx->op = (iocp_op_t) {
         .packed = s_tag_pack(iocp_op_dgram, ctx),
-        .buf = { (ULONG)span.size, span.data },
+        .buf = { (ULONG)span.size, (char *)span.data },
     };
     auto recvmsg_fn = duct_x_wsa_recvmsg();
     int rc;
@@ -942,12 +986,13 @@ bool duct_events_watch(duct_events_env_t *env, duct_sock_t fd,
     return false;
 }
 
-bool duct_events_promote([[maybe_unused]] duct_events_env_t *env,
-                         [[maybe_unused]] duct_sock_t fd, void *tag_ptr)
+bool duct_events_promote(duct_events_env_t *env, duct_sock_t fd, void *tag_ptr)
 {
-    /* fd is already associated by duct_events_watch's io_tag_pre_conn
-     * case, dial or probe alike — just post the first WSARecv, same as a
-     * fresh io_tag_conn. */
+    duct_do_if(fd == duct_sock_bad, return false);
+    /* Already associated by duct_events_watch on the dial/probe path; a
+     * hopped-in socket was never watched and associates here first (s_iocp_assoc
+     * treats an existing association as success). */
+    duct_do_if(!s_iocp_assoc(env, fd), return false);
     duct_events_drive_rx(tag_ptr);
     return true;
 }
@@ -967,18 +1012,18 @@ bool duct_events_watch_device(duct_events_env_t *env, void *handle, void *tag_pt
     duct_do_if(!pfnNtCreateWaitCompletionPacket, return false);
     auto dup = s_device_find(env, handle);
     duct_do_if(dup, return false);
-    auto d = duct_new(iocp_device_t);
+    duct_auto_del auto d = duct_new(iocp_device_t);
     duct_do_if(!d, return false);
     d->ev = (HANDLE)handle;
     d->tag = tag_ptr;
     d->op.packed = s_tag_pack(iocp_op_device, d);
     auto made = pfnNtCreateWaitCompletionPacket(&d->packet, events_wait_packet_set_state, nullptr);
-    duct_do_if(made < 0, duct_del(d); return false);
+    duct_do_if(made < 0, return false);
     d->state = device_armed;
     auto armed = s_device_arm(d);
-    duct_do_if(!armed, s_device_free(d); return false);
+    duct_do_if(!armed, s_device_free(duct_move(d)); return false);
     d->next = env->devices;
-    env->devices = d;
+    env->devices = duct_move(d);
     return true;
 }
 
@@ -1018,13 +1063,13 @@ void duct_events_unwatch(duct_events_env_t *env, duct_sock_t fd,
             duct_discard duct_rio_rx_close(s_rio,ctx->rio_rx);
         return;
     }
-    /* Conn fd: duct_conn_teardown's close, at actual reclaim, may run
+    /* Conn fd: duct_conn_teardown_worker's close may run
      * well after this call -- a worker's TX fast path can still be
      * mid-send on it. A pending overlapped WSARecv/WSASend on this fd
      * otherwise never completes once the peer is already gone --
      * nothing else forces it -- so cancel it here, same as the listener
-     * case above; duct_olb_del / duct_olb_io_done at teardown still
-     * settle the resulting completion. */
+     * case above; each resulting completion still drains its own unit of
+     * the conn's release count through duct_olb_io_done. */
     s_cancel_io(fd);
 }
 
@@ -1073,13 +1118,10 @@ bool duct_events_dgram_tx_pool_alloc(duct_listener_t *listener)
     duct_do_if(!made, return false);
     if (s_rio)
         return true;
-    auto st = duct_new(iocp_dgram_tx_t);
-    auto ctls = duct_new(iocp_dgram_tx_ctl_t, iocp_dgram_tx_pool_depth);
-    auto free_stack = duct_at(duct_new(unsigned, iocp_dgram_tx_pool_depth));
+    duct_auto_del auto st = duct_new(iocp_dgram_tx_t);
+    duct_auto_del auto ctls = duct_new(iocp_dgram_tx_ctl_t, iocp_dgram_tx_pool_depth);
+    duct_auto_del auto free_stack = duct_at(duct_new(unsigned, iocp_dgram_tx_pool_depth));
     duct_do_if(!st || !ctls || !free_stack,
-        duct_del(st);
-        duct_del(ctls);
-        duct_del(free_stack);
         duct_listener_tx_slots_free(listener->tx_slots);
         listener->tx_slots = nullptr;
         return false
@@ -1089,9 +1131,9 @@ bool duct_events_dgram_tx_pool_alloc(duct_listener_t *listener)
     st->free_count = iocp_dgram_tx_pool_depth;
     st->listener = listener;
     st->pools = listener->tx_slots;
-    st->ctls = ctls;
-    st->free_stack = free_stack;
-    listener->dgram_tx_pool = st;
+    st->ctls = duct_move(ctls);
+    st->free_stack = duct_move(free_stack);
+    listener->dgram_tx_pool = duct_move(st);
     return true;
 }
 
@@ -1117,49 +1159,63 @@ void duct_events_dgram_tx_pool_free(duct_listener_t *listener)
         s_dgram_tx_release(st);
 }
 
-static bool s_dgram_tx_post(void *arg, const duct_dgram_tx_entry_t *entry)
+static unsigned s_dgram_tx_post(void *arg, const duct_dgram_tx_entry_t *const *entries, unsigned n)
 {
     auto st = (iocp_dgram_tx_t *)arg;
-    duct_do_if(!st->free_count, return false);
+    duct_do_if(!st->free_count, return 0u);
     auto pools = st->pools;
+    bool gso_ok = duct_x_has_gso()
+        && !atomic_load_explicit(&st->listener->dgram_tx_gso_off, memory_order_relaxed);
+    duct_dgram_out_t msgs[duct_x_gso_segs_max];
+    unsigned scan = gso_ok ? n : 1u;
+    for (unsigned i = 0u; i < scan; ++i) {
+        auto data = duct_x_slot_span(pools, entries[i]->staged.slot);
+        msgs[i] = (duct_dgram_out_t){
+            .peer = entries[i]->peer,
+            .body = { .data = data.data, .size = entries[i]->staged.len },
+        };
+    }
+    unsigned group = gso_ok && scan > 1u ? duct_x_gso_group(msgs, scan) : 1u;
     unsigned at = st->free_stack[--st->free_count];
     auto ctl = &duct_at(st->ctls)[at];
-    uint32_t ref = entry->slot;
-    auto addr = (struct sockaddr_storage *)duct_x_slot_data(duct_x_slot_ref_pool(pools, ref),
-                                                            ref & ~duct_x_slot_ref_large);
-    auto data = duct_x_slot_span(pools, ref);
-    *ctl = (iocp_dgram_tx_ctl_t){
-        .packed = s_tag_pack(iocp_op_dgram_tx, nullptr),
-        .buf = { entry->len, data.data },
-        .addrlen = duct_io_sockaddr_from_peer(&entry->peer, addr),
-        .ref = ref, .st = st,
-    };
-    ctl->wsamsg = (WSAMSG){
-        .name = (LPSOCKADDR)addr,
-        .namelen = ctl->addrlen,
-        .lpBuffers = &ctl->buf,
-        .dwBufferCount = 1u,
-    };
-    int rc = WSASendMsg(st->listener->listen_fd, &ctl->wsamsg, 0u, &(DWORD){0u}, &ctl->ov, nullptr);
-    if (rc != 0 && WSAGetLastError() != WSA_IO_PENDING) {
-        st->free_stack[st->free_count++] = at;
-        duct_x_slot_put(pools, ref);
-        return true;
+    *ctl = (iocp_dgram_tx_ctl_t){ .packed = s_tag_pack(iocp_op_dgram_tx, nullptr), .st = st };
+
+    duct_x_gso_msg_t msg;
+    int err = s_tx_post_err(WSASendMsg(st->listener->listen_fd,
+                                       duct_x_gso_msg_peers(&msg, msgs, group),
+                                       0u, &(DWORD){0u}, &ctl->ov, nullptr));
+    if (err != NO_ERROR && group > 1u) {
+        if (err != WSAEWOULDBLOCK && err != WSAENOBUFS)
+            atomic_store_explicit(&st->listener->dgram_tx_gso_off, 1u, memory_order_relaxed);
+        group = 1u;
+        ctl->ov = (OVERLAPPED){};
+        err = s_tx_post_err(WSASendMsg(st->listener->listen_fd,
+                                       duct_x_gso_msg_peers(&msg, msgs, 1u),
+                                       0u, &(DWORD){0u}, &ctl->ov, nullptr));
     }
+    if (err != NO_ERROR) {
+        st->free_stack[st->free_count++] = at;
+        duct_x_slot_put(pools, entries[0]->staged.slot);
+        return 1u;
+    }
+    ctl->nrefs = (uint8_t)group;
+    for (unsigned i = 0u; i < group; ++i)
+        ctl->refs[i] = entries[i]->staged.slot;
     ++st->inflight;
-    return true;
+    return group;
 }
 
 static void s_dgram_tx_drain(iocp_dgram_tx_t *st)
 {
-    duct_io_dgram_send_drain(st->listener, s_dgram_tx_post, st);
+    duct_io_dgram_send_drain(st->listener, s_dgram_tx_post, st, (unsigned)duct_x_gso_segs_max);
 }
 
 static void s_dgram_tx_settle(iocp_dgram_tx_ctl_t *ctl, bool redrain)
 {
     auto st = ctl->st;
     st->free_stack[st->free_count++] = (unsigned)(ctl - duct_at(st->ctls));
-    duct_x_slot_put(st->pools, ctl->ref);
+    for (unsigned i = 0u; i < ctl->nrefs; ++i)
+        duct_x_slot_put(st->pools, ctl->refs[i]);
     if (--st->inflight == 0u && st->closing)
         s_dgram_tx_release(st);
     else if (redrain && !st->closing)
@@ -1193,23 +1249,20 @@ static inline duct_result_t s_empty_read_rc(ULONG_PTR status, duct_result_t canc
          : status == events_status_cancelled ? cancelled : rc_fatal;
 }
 
-/** @brief RX completion handler for a conn's @c WSARecv or @c WSARecvMsg read of kind @p kind.
+/** @brief RX completion handler for a conn's @c WSARecv or @c WSARecvMsg read.
  *  @p status is the completion's @c Internal NTSTATUS: @ref
- *  events_status_buffer_overflow means Winsock already discarded a datagram too
- *  large for the posted buffer, nothing to commit. @p seg is the segment size a
- *  coalesced @c WSARecvMsg read reported, 0 otherwise. A zero-byte @c iocp_op_rx read ends
- *  a stream's input, or closes the conn with an error under a failed status other than a
- *  cancel, as a reset peer leaves; a zero-byte @c iocp_op_rx_msg read is an empty datagram.
- *  Every completion chains the next read, which the reserve refuses once the input has ended
- *  or the conn is closed.
+ *  events_status_buffer_overflow drops an oversized datagram with nothing to
+ *  commit; @p bytes == 0u reduces @p status through @ref s_empty_read_rc, so a
+ *  clean EOF or cancel passes @c rc_closed (no-op on UDP, EOF on stream) while
+ *  a failed status such as ICMP port unreachable closes the conn with @c rc_fatal.
+ *  Every completion chains the next read.
  */
-static inline void s_on_rx_completion(iocp_op_kind_t kind, void *tag, DWORD bytes,
-                                      ULONG_PTR status, size_t seg)
+static inline void s_on_rx_completion(void *tag, DWORD bytes, ULONG_PTR status, size_t seg)
 {
     if (status == events_status_buffer_overflow)
         duct_io_rx_done(tag, rc_drop);
     else if (bytes == 0u)
-        duct_io_rx_done(tag, kind == iocp_op_rx ? s_empty_read_rc(status, rc_closed) : rc_closed);
+        duct_io_rx_done(tag, s_empty_read_rc(status, rc_closed));
     else {
         duct_io_rx_commit(tag, (size_t)bytes, seg);
         duct_io_rx_done(tag, rc_again);
@@ -1306,28 +1359,34 @@ static inline void s_on_completion(duct_events_env_t *env, OVERLAPPED_ENTRY *ent
     auto tag = s_tag_unpack(op->packed, &kind);
     switch (kind) {
     case iocp_op_rx:
-        if (!duct_olb_io_done(s_op_hdr(op)))
-            s_on_rx_completion(kind, tag, entries[i].dwNumberOfBytesTransferred, entries[i].Internal, 0u);
-        break;
     case iocp_op_rx_msg:
-        if (!duct_olb_io_done(s_op_hdr(op)))
-            s_on_rx_completion(kind, tag, entries[i].dwNumberOfBytesTransferred, entries[i].Internal,
-                               duct_x_gro_seg(op->rx_msg->Control));
-        break;
-    case iocp_op_rx_failed:
-        /* No kernel op behind it: duct_events_drive_rx queued the refusal of a read, and the
-         * close it ends in runs here. */
-        if (!duct_olb_io_done(s_op_hdr(op)))
+    case iocp_op_rx_failed: {
+        /* Fields read ahead of duct_olb_io_done: its release may finalize the
+         * slot and hand the block to its next occupant. */
+        size_t seg = kind == iocp_op_rx_msg ? duct_x_gro_seg(op->rx_msg->Control) : 0u;
+        auto hdr = s_op_hdr(op);
+        duct_olb_io_done(hdr, duct_conn_of_olb_rx(hdr));
+        if (kind == iocp_op_rx_failed)
             duct_io_rx_done(tag, rc_fatal);
+        else
+            s_on_rx_completion(tag, entries[i].dwNumberOfBytesTransferred,
+                               entries[i].Internal, seg);
         break;
-    case iocp_op_tx:
-        if (!duct_olb_io_done(s_op_hdr(op)))
-            s_on_tx_completion(tag, entries[i].dwNumberOfBytesTransferred, (size_t)op->buf.len);
+    }
+    case iocp_op_tx: {
+        size_t offered = (size_t)op->buf.len;
+        auto hdr = s_op_hdr(op);
+        duct_olb_io_done(hdr, duct_conn_of_olb_tx(hdr));
+        s_on_tx_completion(tag, entries[i].dwNumberOfBytesTransferred, offered);
         break;
-    case iocp_op_tx_records:
-        if (!duct_olb_io_done(s_op_hdr(op)))
-            s_on_tx_records_completion(tag, op->records);
+    }
+    case iocp_op_tx_records: {
+        unsigned records = op->records;
+        auto hdr = s_op_hdr(op);
+        duct_olb_io_done(hdr, duct_conn_of_olb_tx(hdr));
+        s_on_tx_records_completion(tag, records);
         break;
+    }
     case iocp_op_connect:
         duct_del(op);
         auto pre_conn = (duct_pre_conn_t *)tag;
@@ -1407,8 +1466,15 @@ void duct_events_run_loop(duct_events_env_t *env, bool _Atomic *shutdown)
             case WAIT_TIMEOUT:
                 break;
             default:
-                /* TODO: handle error */
-                return;
+                /* No completion will ever arrive again: the port this loop
+                 * is the whole pump of just refused it. A bare return would
+                 * strand every park behind this thread's silence — the
+                 * engine hangs with no word said. The loop has no
+                 * degradation path, so the refusal is explicit: named, then
+                 * fatal. */
+                duct_diag("iocp: GetQueuedCompletionStatusEx error %d — io loop cannot continue",
+                          rc);
+                duct_fatal(true);
             }
         in_window = duct_spin_next(&spin, n > 0u, duct_ticks_mono_ns());
         if (n == 0u)

@@ -1,28 +1,6 @@
 /* SPDX-License-Identifier: AGPL-3.0-only */
 /* Copyright (c) 2026 Duct Software */
 
-/** @file pmtu_drive_test.c
- *  @brief The path-MTU drive: probe waits, sends and echoes on a synthetic
- *  clock, and the search cut to the kernel's figure on real legs.
- *
- *  @c sc_wait expects a probe's wait to be four round trips, at least 50 ms,
- *  doubled per try and held at 2 s, whatever the try count. @c sc_sent expects
- *  a send to be recorded and to answer the wait for the try the search is on.
- *  @c sc_echo expects only the probe out to be confirmed, once, and only a
- *  probe answered on its first try to set the round trip.
- *
- *  @c sc_loopback opens the drive on a connected datagram leg, which reports
- *  65535, and on a shared datagram leg, which reports none and takes the
- *  default: ceilings, a base over its ceiling, three unanswered tries failing a
- *  size and a loss with no probe out counting nothing. @c sc_kernel, Linux only
- *  and run in a user and network namespace the test enters before any thread
- *  exists, lowers an interface to 1400 and expects the ceiling to follow the
- *  kernel, a probe over it to reopen the search under it keeping a confirmed
- *  size that fits and falling to the floor otherwise, and a probe at the
- *  figure to be judged as an ordinary loss. A host that refuses the namespace
- *  skips @c sc_kernel with a note.
- */
-
 #define _GNU_SOURCE
 
 #include "duct.h"
@@ -34,20 +12,14 @@
 #include "netns_helpers.h"
 #endif
 
-#include <limits.h>
 #include <stdatomic.h>
 
-/** @brief Return @p msg from the calling check when @p cond fails. */
 #define expect(cond, msg) do { if (!(cond)) return msg; } while (0)
 
-/** @brief Synthetic clock origin, nanoseconds. */
-static constexpr uint64_t t0     = 1'000'000'000'000u;
-/** @brief One millisecond, nanoseconds. */
-static constexpr uint64_t ms     = 1'000'000u;
-/** @brief Longest wait for a session to open, milliseconds. */
+static constexpr uint64_t t0      = 1'000'000'000'000u;
+static constexpr uint64_t ms      = 1'000'000u;
 static constexpr unsigned wait_ms = 5000u;
 
-/** @brief A drive over @p base to @p max with round trip @p rtt, no probe out. */
 static duct_pmtu_drive_t s_drive(uint16_t base, uint16_t max, uint64_t rtt)
 {
     duct_pmtu_drive_t d = { .floor = base, .rtt = rtt };
@@ -55,121 +27,125 @@ static duct_pmtu_drive_t s_drive(uint16_t base, uint16_t max, uint64_t rtt)
     return d;
 }
 
-/** @brief Read the wait of each try on a floor, a measured, a short and a long round trip.
- *  @return the text of the first failed check, nullptr when all hold.
- */
 static const char *sc_wait(void)
 {
-    static const uint64_t floor_wait[] = { 50u, 100u, 200u, 400u, 800u, 1600u, 2000u, 2000u };
-    auto d = s_drive(1280u, 1500u, 0u);
-    for (unsigned tries = 0u; tries < sizeof floor_wait / sizeof floor_wait[0]; ++tries)
-        expect(duct_pmtu_drive_wait_ms(&d, tries) == floor_wait[tries],
-               "the wait of a probe on no measured trip is not 50 ms doubled per try to 2 s");
-    expect(duct_pmtu_drive_wait_ms(&d, UINT_MAX) == 2000u, "a probe tried without end waits past the ceiling");
+    auto d = s_drive(duct_pmtu_base_min, 1500u, 0u);
+    expect(duct_pmtu_drive_wait_ms(&d) == 50u,
+           "the wait on zero rtt does not clamp to 50 ms");
     d.rtt = 100u * ms;
-    expect(duct_pmtu_drive_wait_ms(&d, 0u) == 400u && duct_pmtu_drive_wait_ms(&d, 1u) == 800u
-               && duct_pmtu_drive_wait_ms(&d, 2u) == 1600u && duct_pmtu_drive_wait_ms(&d, 3u) == 2000u,
-           "the wait of a probe is not four round trips doubled per try to 2 s");
+    expect(duct_pmtu_drive_wait_ms(&d) == 400u,
+           "the wait is not four round trips");
     d.rtt = 10u * ms;
-    expect(duct_pmtu_drive_wait_ms(&d, 0u) == 50u, "four short round trips wait under the floor");
+    expect(duct_pmtu_drive_wait_ms(&d) == 50u,
+           "four short round trips wait under the floor");
     d.rtt = 5'000u * ms;
-    expect(duct_pmtu_drive_wait_ms(&d, 0u) == 2000u, "four long round trips wait past the ceiling");
+    expect(duct_pmtu_drive_wait_ms(&d) == 2000u,
+           "four long round trips wait past the ceiling");
     return nullptr;
 }
 
-/** @brief Send a probe on the first and on a later try and read the record and the wait.
- *  @return the text of the first failed check, nullptr when all hold.
- */
-static const char *sc_sent(void)
+static const char *sc_burst_and_close(void)
 {
-    auto d = s_drive(1280u, 1500u, 100u * ms);
-    expect(duct_pmtu_drive_sent(&d, 1500u, t0) == 400u, "a probe's first wait is not the first try's");
-    expect(d.probing == 1500u && d.probe_at == t0, "a sent probe is not recorded");
-    d.search.unanswered = 2u;
-    expect(duct_pmtu_drive_sent(&d, 1500u, t0 + 5u * ms) == 1600u,
-           "a probe's wait does not follow the unanswered tries");
-    expect(d.probe_at == t0 + 5u * ms, "a second send does not date the probe afresh");
+    auto d = s_drive(duct_pmtu_base_min, 1500u, 100u * ms);
+    uint8_t n = duct_pmtu_drive_burst(&d, t0);
+    expect(n == 4u && d.burst_count == 4u && d.burst_acked == 0u && d.burst_at == t0,
+           "drive_burst did not open an active 4-rung burst");
+    expect(duct_pmtu_drive_echo(&d, 1400u, t0 + 10u * ms) == pmtu_echo_none,
+           "echo outside the current burst did not return none");
+    expect(duct_pmtu_drive_echo(&d, d.rungs[3], t0 + 20u * ms) == pmtu_echo_rung,
+           "first valid rung echo did not return pmtu_echo_rung");
+    expect(duct_pmtu_drive_echo(&d, d.rungs[3], t0 + 25u * ms) == pmtu_echo_none,
+           "duplicate rung echo did not return none");
+    expect(duct_pmtu_drive_echo(&d, d.rungs[2], t0 + 30u * ms) == pmtu_echo_rung,
+           "second rung echo did not leave burst open");
+    expect(duct_pmtu_drive_echo(&d, d.rungs[0], t0 + 40u * ms) == pmtu_echo_closed,
+           "ceiling echo did not close burst early");
+    expect(d.burst_count == 0u && d.burst_acked == 0u && duct_pmtu_mtu(&d.search) == 1500u,
+           "early close did not clear burst state or confirm ceiling");
+    expect(duct_pmtu_drive_echo(&d, d.rungs[1], t0 + 50u * ms) == pmtu_echo_none,
+           "echo after closed burst did not return none");
     return nullptr;
 }
 
-/** @brief Echo with no probe out, a wrong size, the right size twice and a retried probe.
- *  @return the text of the first failed check, nullptr when all hold.
- */
-static const char *sc_echo(void)
+static const char *sc_rtt_hygiene(void)
 {
-    auto d = s_drive(1280u, 1500u, 100u * ms);
-    expect(!duct_pmtu_drive_echo(&d, 1500u, t0) && d.search.good == 1280u,
-           "an echo is confirmed with no probe out");
-    duct_discard duct_pmtu_drive_sent(&d, 1500u, t0);
-    expect(!duct_pmtu_drive_echo(&d, 1400u, t0 + 30u * ms) && d.probing == 1500u && d.rtt == 100u * ms,
-           "an echo of another size confirms the probe out");
-    expect(duct_pmtu_drive_echo(&d, 1500u, t0 + 30u * ms), "the echo of the probe out is not confirmed");
-    expect(d.search.good == 1500u && !d.probing && d.rtt == 30u * ms,
-           "a confirmed echo does not raise the size, clear the probe and take the round trip");
-    expect(!duct_pmtu_drive_echo(&d, 1500u, t0 + 60u * ms) && d.rtt == 30u * ms,
-           "an echo is confirmed twice");
-    d = s_drive(1280u, 1500u, 100u * ms);
-    duct_discard duct_pmtu_drive_sent(&d, 1500u, t0);
-    d.search.unanswered = 1u;
-    expect(duct_pmtu_drive_echo(&d, 1500u, t0 + 30u * ms) && d.rtt == 100u * ms,
-           "a probe that took a second try measures the round trip");
+    auto d = s_drive(duct_pmtu_base_min, 1500u, 100u * ms);
+    d.search.good = 1232u;
+    d.search.failed = 1433u;
+    d.search.failed_strikes = 1u;
+
+    uint8_t n = duct_pmtu_drive_burst(&d, t0);
+    expect(n == 4u && d.rungs[3] == 1433u, "refine burst did not include failed rung");
+    expect(duct_pmtu_drive_echo(&d, d.rungs[3], t0 + 250u * ms) == pmtu_echo_rung,
+           "failed rung echo did not advance D1");
+    expect(d.rtt == 100u * ms,
+           "failed rung polluted rtt sample");
+    expect(duct_pmtu_drive_echo(&d, d.rungs[2], t0 + 300u * ms) == pmtu_echo_rung,
+           "second rung in D1 burst did not return rung");
+    expect(d.rtt == 100u * ms,
+           "second echo overwrote rtt");
+
+    d.burst_count = 0u;
+    d.burst_acked = 0u;
+    n = duct_pmtu_drive_burst(&d, t0 + 1000u * ms);
+    expect(n > 0u, "coarse burst after D1 returned empty");
+    expect(duct_pmtu_drive_echo(&d, d.rungs[n - 1u], t0 + 1015u * ms) != pmtu_echo_none,
+           "clean lower rung did not echo");
+    expect(d.rtt == 15u * ms, "first clean non-failed rung did not update rtt");
+    if (n > 1u) {
+        duct_discard duct_pmtu_drive_echo(&d, d.rungs[0], t0 + 1200u * ms);
+        expect(d.rtt == 15u * ms, "larger congested rung polluted rtt after first echo");
+    }
     return nullptr;
 }
 
-/** @brief Check the client session runs in its @c on_session_open. */
-static const char *(*g_client_check)(duct_session_t *s);
-/** @brief Check the shared-leg server session runs in its @c on_session_open. */
-static const char *(*g_server_check)(duct_session_t *s);
-/** @brief What the client check answered. */
-static const char *g_client_err;
-/** @brief What the server check answered. */
-static const char *g_server_err;
-/** @brief Sessions whose check has run. */
-static atomic_int  g_done = 0;
+static const char *(*g_client_check)(duct_session_t *);
+static const char *(*g_server_check)(duct_session_t *);
+static const char *g_client_err,
+                  *g_server_err;
+static _Atomic int g_done;
 
-/** @brief Open the drive on a connected datagram leg and drive it through opens, losses and a failed size.
- *  @return the text of the first failed check, nullptr when all hold.
- */
 static const char *client_check(duct_session_t *s)
 {
     duct_pmtu_drive_t d;
-    duct_pmtu_drive_open(&d, s, duct_conn_id_primary, 1280u, 1500u, 7u * ms);
-    expect(d.search.base == 1280u && d.search.max == 1500u && d.search.good == 1280u && d.floor == 1280u
-               && d.rtt == 7u * ms && !d.probing,
+    duct_pmtu_drive_open(&d, s, duct_conn_id_primary, duct_pmtu_base_min, 1500u, 7u * ms);
+    expect(d.search.base == duct_pmtu_base_min && d.search.max == 1500u
+               && d.search.good == duct_pmtu_base_min && d.floor == duct_pmtu_base_min
+               && d.rtt == 7u * ms && d.burst_count == 0u,
            "a search over a connected leg does not open at the bounds it was given");
-    duct_pmtu_drive_open(&d, s, duct_conn_id_primary, 1500u, 1400u, 0u);
-    expect(d.search.max == 1500u, "a search opens under its own base");
-    duct_pmtu_drive_open(&d, s, duct_conn_id_primary, 1280u, 1500u, 0u);
-    expect(!duct_pmtu_drive_lost(&d, s, duct_conn_id_primary) && d.search.unanswered == 0u,
-           "a loss with no probe out counts");
-    for (unsigned i = 0u; i < duct_pmtu_unanswered_max; ++i) {
-        duct_discard duct_pmtu_drive_sent(&d, 1500u, t0);
-        bool moved = duct_pmtu_drive_lost(&d, s, duct_conn_id_primary);
-        expect(moved == (i + 1u == duct_pmtu_unanswered_max), "a size does not fail at its last unanswered try");
-        expect(!d.probing, "a lost probe stays out");
+    expect(duct_pmtu_drive_settle(&d, s, duct_conn_id_primary) == false && d.burst_count == 0u,
+           "settle with no active burst changed search state");
+
+    duct_discard duct_pmtu_drive_burst(&d, t0);
+    expect(duct_pmtu_drive_echo(&d, 1232u, t0 + 5u * ms) == pmtu_echo_rung,
+           "floor rung echo failed");
+    bool done = duct_pmtu_drive_settle(&d, s, duct_conn_id_primary);
+    expect(!done && d.search.failed == 1366u && d.search.failed_strikes == 1u && !d.burst_count,
+           "first settle did not bracket failed rung with strike");
+
+    for (unsigned b = 0u; b < 3u && !done; ++b) {
+        expect(duct_pmtu_drive_burst(&d, t0 + (uint64_t)(b + 1u) * 100u * ms) > 0u,
+               "refine burst stopped early");
+        done = duct_pmtu_drive_settle(&d, s, duct_conn_id_primary);
     }
-    expect(d.search.failed == 1500u && d.search.good == 1280u && d.search.max == 1500u,
-           "a failed size does not bound the search");
+    expect(done && duct_pmtu_mtu(&d.search) == duct_pmtu_base_min,
+           "silent drops did not settle search at floor");
     return nullptr;
 }
 
-/** @brief Open the drive on a shared datagram leg, which reports no path MTU, and lose a probe.
- *  @return the text of the first failed check, nullptr when all hold.
- */
 static const char *server_check(duct_session_t *s)
 {
     duct_pmtu_drive_t d;
-    duct_pmtu_drive_open(&d, s, duct_conn_id_primary, 1280u, 9000u, 0u);
+    duct_pmtu_drive_open(&d, s, duct_conn_id_primary, duct_pmtu_base_min, 9000u, 0u);
     expect(d.search.max == 1500u, "a leg with no kernel figure does not search up to the default");
-    duct_pmtu_drive_open(&d, s, duct_conn_id_primary, 1280u, 1400u, 0u);
+    duct_pmtu_drive_open(&d, s, duct_conn_id_primary, duct_pmtu_base_min, 1400u, 0u);
     expect(d.search.max == 1400u, "a ceiling under the default is raised to it");
-    duct_discard duct_pmtu_drive_sent(&d, 1400u, t0);
-    expect(!duct_pmtu_drive_lost(&d, s, duct_conn_id_primary) && d.search.unanswered == 1u && !d.probing,
-           "a leg with no kernel figure does not count a loss against the search");
+    expect(duct_pmtu_drive_burst(&d, t0) == 4u, "shared leg did not emit burst");
+    expect(!duct_pmtu_drive_settle(&d, s, duct_conn_id_primary) && d.search.failed == 0u,
+           "total blackout with no confirmed rungs falsely narrowed search");
     return nullptr;
 }
 
-/** @brief Run the client check as the session opens and send one datagram, which opens the server's session. */
 static duct_result_t cli_on_open(duct_session_t *s, [[maybe_unused]] duct_handle_t tok,
                                  [[maybe_unused]] void *user_ctx, duct_response_t *out,
                                  [[maybe_unused]] void *proto_state)
@@ -182,7 +158,6 @@ static duct_result_t cli_on_open(duct_session_t *s, [[maybe_unused]] duct_handle
     return rc_ok;
 }
 
-/** @brief Run the server check as the shared-leg session opens. */
 static duct_result_t srv_on_open(duct_session_t *s, [[maybe_unused]] duct_handle_t tok,
                                  [[maybe_unused]] void *user_ctx,
                                  [[maybe_unused]] duct_response_t *out,
@@ -193,7 +168,6 @@ static duct_result_t srv_on_open(duct_session_t *s, [[maybe_unused]] duct_handle
     return rc_ok;
 }
 
-/** @brief Take every frame and answer none. */
 static duct_result_t on_frame([[maybe_unused]] duct_session_t *s,
                               [[maybe_unused]] duct_conn_id_t conn_id,
                               [[maybe_unused]] const duct_frame_t *frame,
@@ -203,9 +177,6 @@ static duct_result_t on_frame([[maybe_unused]] duct_session_t *s,
     return rc_ok;
 }
 
-/** @brief A datagram-batch protocol @p name with @p flags and @p on_open, owning its wire.
- *  @return nullptr when the wire or the protocol is not built.
- */
 static duct_proto_t *s_proto(const char *name, duct_proto_flags_t flags, duct_session_open_fn on_open)
 {
     auto wire = duct_wire_create_dgram_batch(0u, false);
@@ -222,13 +193,6 @@ static duct_proto_t *s_proto(const char *name, duct_proto_flags_t flags, duct_se
     return proto;
 }
 
-/** @brief Run an engine until @p sessions sessions have opened and run their checks.
- *  The client dials @p host over a connected datagram leg. With @p serve the
- *  engine also binds a shared datagram listener on @p host for it to reach;
- *  without, the client dials port 9 and no peer answers.
- *  @return the engine's failure, else the client check's, else the server's;
- *          nullptr when all hold.
- */
 static const char *s_run(const char *host, bool serve, int sessions)
 {
     duct_atomic_store(&g_done, 0, relaxed);
@@ -268,9 +232,6 @@ static const char *s_run(const char *host, bool serve, int sessions)
     return err ? err : g_client_err ? g_client_err : g_server_err;
 }
 
-/** @brief Run the connected-leg check and the shared-leg check over loopback.
- *  @return the text of the first failed check, nullptr when all hold.
- */
 static const char *sc_loopback(void)
 {
     g_client_check = client_check;
@@ -280,45 +241,42 @@ static const char *sc_loopback(void)
 
 #ifdef __linux__
 
-/** @brief Hold the kernel's 1400 against the drive's open, a probe over it, a confirmed size on each side of it and a probe at it.
- *  @return the text of the first failed check, nullptr when all hold.
- */
 static const char *kernel_check(duct_session_t *s)
 {
     uint16_t path = 0u;
     expect(duct_conn_path_mtu(s, duct_conn_id_primary, &path) == rc_ok && path == 1400u,
            "the kernel does not hold the interface's size for the leg");
     duct_pmtu_drive_t d;
-    duct_pmtu_drive_open(&d, s, duct_conn_id_primary, 1280u, 1500u, 0u);
-    expect(d.search.max == 1400u && d.search.good == 1280u, "a search is not cut to the kernel's figure");
+    duct_pmtu_drive_open(&d, s, duct_conn_id_primary, duct_pmtu_base_min, 1500u, 0u);
+    expect(d.search.max == 1400u && d.search.good == duct_pmtu_base_min,
+           "a search is not cut to the kernel's figure");
 
-    duct_discard duct_pmtu_drive_sent(&d, 1500u, t0);
-    expect(duct_pmtu_drive_lost(&d, s, duct_conn_id_primary), "a probe over the kernel's figure does not move the size");
-    expect(d.search.max == 1400u && d.search.good == 1280u && d.search.base == 1280u && !d.search.failed
-               && !d.probing,
-           "a probe over the kernel's figure does not reopen the search under it");
+    duct_pmtu_init(&d.search, duct_pmtu_base_min, 1500u);
+    expect(duct_pmtu_drive_burst(&d, t0) > 0u, "burst failed");
+    expect(!duct_pmtu_drive_settle(&d, s, duct_conn_id_primary),
+           "cut below 1500 collapsed the search unexpectedly");
+    expect(d.search.max == 1400u && d.search.good == duct_pmtu_base_min && d.search.base == duct_pmtu_base_min
+               && !d.search.failed && !d.burst_count,
+           "settle under kernel figure did not reopen the search under it");
 
     duct_pmtu_ack(&d.search, 1350u);
-    duct_discard duct_pmtu_drive_sent(&d, 1500u, t0);
-    expect(duct_pmtu_drive_lost(&d, s, duct_conn_id_primary), "the second probe over the kernel's figure does not move the size");
+    duct_pmtu_init(&d.search, 1350u, 1500u);
+    duct_discard duct_pmtu_drive_burst(&d, t0);
+    expect(!duct_pmtu_drive_settle(&d, s, duct_conn_id_primary),
+           "second kernel cut did not keep open range");
     expect(d.search.max == 1400u && d.search.good == 1350u && d.search.base == 1350u,
-           "a confirmed size under the kernel's figure is not kept");
+           "confirmed size under kernel figure was not kept");
 
+    duct_pmtu_init(&d.search, duct_pmtu_base_min, 1500u);
     duct_pmtu_ack(&d.search, 1450u);
-    duct_discard duct_pmtu_drive_sent(&d, 1500u, t0);
-    expect(duct_pmtu_drive_lost(&d, s, duct_conn_id_primary), "a probe over a lowered figure does not move the size");
-    expect(d.search.max == 1400u && d.search.good == 1280u && d.search.base == 1280u,
-           "a confirmed size over the kernel's figure is not dropped to the floor");
-
-    duct_discard duct_pmtu_drive_sent(&d, 1400u, t0);
-    expect(!duct_pmtu_drive_lost(&d, s, duct_conn_id_primary) && d.search.unanswered == 1u,
-           "a probe at the kernel's figure is judged by it");
+    duct_discard duct_pmtu_drive_burst(&d, t0);
+    expect(!duct_pmtu_drive_settle(&d, s, duct_conn_id_primary),
+           "cut below confirmed size collapsed range");
+    expect(d.search.max == 1400u && d.search.good == duct_pmtu_base_min && d.search.base == duct_pmtu_base_min,
+           "confirmed size over kernel figure did not fall back to floor");
     return nullptr;
 }
 
-/** @brief Open a tun at 1400, dial through it and run the kernel check on that leg.
- *  @return the text of the first failed check, nullptr when all hold.
- */
 static const char *sc_kernel(void)
 {
     auto tun = tun_open("dpm-l6");
@@ -343,12 +301,12 @@ int main(void)
     netns = !th_enter_netns();
 #endif
     static const struct { const char *name; const char *(*fn)(void); } cases[] = {
-        { "wait",     sc_wait },
-        { "sent",     sc_sent },
-        { "echo",     sc_echo },
-        { "loopback", sc_loopback },
+        { "wait",            sc_wait },
+        { "burst and close", sc_burst_and_close },
+        { "rtt hygiene",     sc_rtt_hygiene },
+        { "loopback",        sc_loopback },
 #ifdef __linux__
-        { "kernel",   sc_kernel },
+        { "kernel",          sc_kernel },
 #endif
     };
     for (size_t i = 0u; i < sizeof cases / sizeof cases[0]; ++i) {

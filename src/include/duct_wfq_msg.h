@@ -90,9 +90,18 @@ typedef struct duct_msg_frame_batch {
     uint32_t           n;           /**< Frame count in @c frames[].
                                       *  Capped by
                                       *  @ref duct_frame_rx_ctx_t::frame_ceiling. */
-    duct_msg_frame_t   frames[];    /**< Payload: sizeof(base) + n ×
+    duct_msg_frame_t   frames[] duct_counted_by(n);    /**< Payload: sizeof(base) + n ×
                                       *  sizeof(duct_msg_frame_t). */
 } duct_msg_frame_batch_t;
+
+/** @brief WFQ-full batch retry node: inline batch copy + push cursor, at most
+ *  one live per conn and carried by that conn block's retry region — the
+ *  link form stays a message, the storage is the region. */
+duct_msg_chain_decl(batch_retry_node_t,
+    unsigned worker_id;
+    uint32_t from;
+    alignas(alignof(duct_handle_t)) duct_msg_frame_batch_t batch;
+);
 
 /** @brief One host-pushed inter packet. */
 typedef struct duct_msg_inter_pkt {
@@ -118,6 +127,12 @@ typedef struct duct_msg_inter_batch {
      *  single-thread-owned.
      */
     duct_peer_t            peer;
+    /** @brief Classified destination local address (@c PKTINFO).
+     *  @c x_udp_shared only; zero-family when unknown. */
+    duct_peer_t            local;
+    /** @brief Candidate migration sequence assigned by I/O when this batch
+     *  originated from a candidate node; 0 otherwise. */
+    uint64_t               cand_seq;
     /** @brief Where the payload bytes live.
      *  An RX slot when set, inline in this batch's own lane slot when null;
      *  each packet's @c offset counts from whichever of the two it selects.
@@ -162,15 +177,38 @@ duct_msg_inter_holds(duct_msg_inter_batch_t *b)
  */
 static constexpr uint8_t inter_msg_batch = 0u;
 
+/** @brief Bytes of each flat half of a @c duct_dgram_tx_entry's descriptor
+ *  form: the inline wire header and the @c duct_span_t, both 16. The entry
+ *  carries them as bytes — the channels tier cannot name the span type — and
+ *  the io-tier writer and reader cast, the arrangement @c tx_hold already
+ *  uses. */
+static constexpr unsigned dgram_tx_desc_half = 16u;
+
 /** @brief One queued send in a listener's @c dgram_tx_outbox.
  *  Worker-filled, drained by that listener's I/O thread.
+ *
+ *  Which member of the union is live is constructive: a listener holding TX
+ *  slot pools (RIO, overlapped @c WSASendMsg) takes the staged form — its
+ *  sends read registered memory the pools own — and every other listener the
+ *  descriptor form, the §2.4 zero-copy outbox: the inline wire header and a
+ *  flat 16-byte @c duct_span_t naming the payload where its author built it,
+ *  the span's pin held from staging until the io thread's send drops it.
  */
 typedef struct duct_dgram_tx_entry {
-    duct_peer_t peer;       /**< Destination address. */
-    uint32_t    len;        /**< Payload length, bytes. */
-    uint32_t    slot;       /**< Reference of the TX slot holding the payload; @c treiber_empty when the
-                              *  payload follows in @c data. */
-    alignas(8) uint8_t data[]; /**< Inline datagram payload bytes, present only when @c slot is @c treiber_empty. */
+    duct_peer_t peer;    /**< Destination address. */
+    duct_peer_t local;   /**< Source address (@c PKTINFO) when @c family != 0. */
+    uint64_t    handle;  /**< Origin conn handle word for drain-completion frontier. */
+    union {
+        struct {
+            uint32_t len;        /**< Staged form: payload length, bytes. */
+            uint32_t slot;       /**< Staged form: reference of the TX slot holding the
+                                  *  payload. */
+            uint32_t done_delta; /**< Staged form: settled fl_send_done count. */
+        } staged;
+        alignas(8) uint8_t desc[2u * dgram_tx_desc_half]; /**< Descriptor form:
+            * flat @c { hdr[16], duct_span_t } in that order, the span's
+            * @c hdr_len naming the header bytes the entry carries. */
+    };
 } duct_dgram_tx_entry_t;
 
 /** @brief Outbox tag for a datagram TX entry.
@@ -250,6 +288,18 @@ typedef uint64_t _Atomic duct_wfq_io_waiters_t;
  *  The width of @ref duct_wfq_io_waiters_t.
  */
 static constexpr unsigned duct_wfq_io_waiters_max = 64u;
+
+/** @brief Wire-rebind fence node.
+ *
+ *  Pushed by the I/O thread directly onto the owner worker's normal WFQ lane
+ *  (not the ctrl_stack) so it drains after every frame batch this conn
+ *  already posted under the old wire. @c session is the token captured at
+ *  post time; the worker finds the leg via
+ *  @ref duct_session_conn_id_by_handle, a stale/absent leg is idempotent.
+ */
+duct_msg_decl(duct_msg_wire_fence,
+    uint64_t      conn;
+    duct_handle_t session);
 
 #ifdef __cplusplus
 }

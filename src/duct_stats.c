@@ -33,7 +33,7 @@ struct duct_stats {
     size_t                stride;  /**< Bytes from one shard to the next: the shard size rounded up to a cache line. */
     unsigned              n_shards, /**< Shards, one for each I/O thread and each worker. */
                           n_fields; /**< Rows in @c fields. */
-    duct_stat_field_t     fields[]; /**< Copy of the table, stored behind this struct. */
+    duct_stat_field_t     fields[] duct_counted_by(n_fields); /**< Copy of the table, stored behind this struct. */
 };
 
 void duct_stats_bind(unsigned index)
@@ -95,16 +95,16 @@ duct_stats_t *duct_stats_list_add(duct_stats_t *_Atomic *list, unsigned n_shards
     duct_do_if(!st, return nullptr);
     duct_auto_del auto shards = duct_at(duct_new(uint8_t, (size_t)n_shards * stride, duct_cacheline_size));
     duct_do_if(!shards, return nullptr);
+    st->shards = duct_move(shards);
+    st->stride = stride;
+    st->n_shards = n_shards;
+    st->n_fields = cfg->n_fields;
     auto fields = st->fields;
     char *at = (char *)fields + fields_size;
     st->name = s_text_copy(&at, cfg->name);
     for (unsigned i = 0u; i < cfg->n_fields; ++i)
         fields[i] = (duct_stat_field_t){ .name = s_text_copy(&at, cfg->fields[i].name),
                                          .offset = cfg->fields[i].offset };
-    st->shards = duct_move(shards);
-    st->stride = stride;
-    st->n_shards = n_shards;
-    st->n_fields = cfg->n_fields;
     /* The release on the head lets a reading that loads it with acquire see the section whole. */
     auto head = duct_atomic_load(list, relaxed);
     do

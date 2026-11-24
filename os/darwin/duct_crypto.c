@@ -4,7 +4,7 @@
 
 #include <stdlib.h>
 
-bool duct_random_bytes(void *out, size_t n)
+duct_zero_regs bool duct_random_bytes(void *out, size_t n)
 {
     /* Public on macOS and iOS; no sys/random.h dependency on iOS. */
     if (n != 0u)

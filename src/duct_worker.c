@@ -23,13 +23,15 @@
 
 #include "duct_worker.h"
 #include "duct_build_config.h"
+#include "duct_conn_block.h"
+#include "duct_session_block.h"
+#include "../pool/duct_block_pool.h"
 #include "duct_relay.h"
 #include "duct_dgram_out.h"
-#include "duct_host.h"
 #include "duct_protocol.h"
 #include "duct_session.h"
 #include "duct_stats.h"
-#include "duct_tx_pool.h"
+#include "duct_span.h"
 #include "duct_vmq.h"
 #include "duct_vnet.h"
 #include "duct_wfq.h"
@@ -88,8 +90,9 @@ typedef struct { uint32_t *next,
 static inline tx_seq_ref_t s_tx_seq_of(duct_conn_t *conn)
 {
     if (!duct_conn_has_olb(conn))
-        return (tx_seq_ref_t){ &conn->tx_seq.next, &conn->tx_seq.serve };
-    auto tx = conn->tx_buf;
+        return (tx_seq_ref_t){ &duct_conn_tx_seq(conn)->next,
+                               &duct_conn_tx_seq(conn)->serve };
+    auto tx = duct_conn_tx_olb(conn);
     duct_do_if(!tx, return (tx_seq_ref_t){});
     return (tx_seq_ref_t){ &tx->tx_seq_next, &tx->tx_seq_serve };
 }
@@ -171,12 +174,14 @@ static bool s_tx_held(const duct_session_t *s, duct_tx_hold_t *h, const duct_con
  *  inter lane's on a conn without a ring. */
 static duct_tx_hold_t *s_conn_tx_hold(const duct_conn_t *conn)
 {
+    static_assert(sizeof(duct_tx_hold_t) == vmq_hold_bytes,
+                  "the lane's parking slot holds the conn layer's hold word");
     auto rx = duct_conn_rx_olb(conn);
     if (rx)
         return &rx->tx_hold;
     auto lane = duct_conn_lane(conn);
     assert(lane);
-    return &duct_mpsc_ctrl(lane, 0u)->tx_hold;
+    return (duct_tx_hold_t *)(void *)&duct_mpsc_ctrl(lane, 0u)->tx_hold;
 }
 
 /** @brief Unbounded drain quota sentinel. */
@@ -224,125 +229,44 @@ typedef enum duct_handler_outcome : uint8_t {
 
 typedef struct retry_node retry_node_t;
 
+/** @brief The worker's defer FIFO with its conn mask.
+ *  The queue holds @c batch_defer_node_t copies alone; @c mask carries a
+ *  bit per conn index with a node queued, so a conn's teardown finds its
+ *  deferred batches without walking the queue.
+ */
 typedef struct duct_deferred_queue {
     duct_msg_queue_t    q;
     uint64_t _Atomic    mask[DUCT_BITMAP_WORDS];
 } duct_deferred_queue_t;
 
-/** @brief Arena bytes of a worker's region ring, one @c dgram_tx_outbox lane's
- *  capacity.
- *  The TX pool's arena holds a pass's @c x_udp_shared batch entries and every
- *  region an author takes through @ref duct_tx_pool_acquire, several at once;
- *  the cleartext ring's holds the datagram being decrypted and the payloads a
- *  vnet train still references.
- */
-static constexpr size_t duct_worker_tx_pool_cap = duct_dgram_tx_outbox_cap;
-
-/** @brief In-arena header preceding every acquired region, immediately
- *  followed by @c len bytes of payload.
- *
- *  @ref duct_tx_pool_acquire hands the region out, and
- *  @c s_tx_pool_region_bytes rounds the whole footprint up to keep the
- *  next header 8-byte aligned too.
- *
- *  @c refs counts live @c duct_worker_dgram_batch_entry_t entries still
- *  referencing this region, resolved back down at every flush, retry-save or
- *  terminal-drop point; in the cleartext ring it counts the spans of the vnet
- *  train that point into the region.
- *  @c hold is the claim of whoever took the region, set by @c s_pool_acquire.
- *  @c s_tx_pool_pass_end clears a TX region's unless @c keep carries it one pass
- *  on, @c s_tx_pool_drop_hold a cleartext region's. A region frees only once
- *  both are zero.
- *
- *  @c refs and @c hold share one 32-bit word: the ring is worker-owned and
- *  single-threaded, so neither is atomic and the header stays 8 in-arena bytes.
- */
-typedef struct {
-    uint32_t len;
-    uint32_t refs : 30;
-    uint32_t hold : 1;
-    uint32_t keep : 1;
-} duct_tx_pool_hdr_t;
-
-/** @brief Arena grid, in bytes.
- *  Header and payload both round up to it and the arena starts on it, so
- *  regions bump-allocate with no inter-region padding and every header and
- *  payload lands aligned to it. */
-static constexpr uint32_t duct_tx_pool_align = 8u;
-
-/** @brief Region header size, rounded up to the arena grid.
- *  @ref duct_tx_pool_hdr_t padded to @ref duct_tx_pool_align keeps the
- *  payload (and hence the next region's own header) on that grid. Plain
- *  arithmetic, not @ref duct_align_up: that macro's statement-expression form
- *  is not a constant expression a file-scope @c constexpr initializer
- *  accepts. */
-
-static constexpr uint32_t duct_tx_pool_hdr_bytes =
-    ((uint32_t)sizeof(duct_tx_pool_hdr_t) + duct_tx_pool_align - 1u)
-    & ~(duct_tx_pool_align - 1u);
-
-/** @brief Offset @c s_tx_pool_place answers when no room is left for a region.
- *  No offset of the arena equals it. */
-static constexpr uint32_t duct_tx_pool_no_room = UINT32_MAX;
-
-/** @brief Total in-arena footprint of a region holding @p len payload
- *  bytes: header plus 8-aligned payload, so consecutive regions bump-
- *  allocate cleanly without any inter-region padding logic. */
-static inline uint32_t s_tx_pool_region_bytes(uint32_t len)
-{
-    return duct_tx_pool_hdr_bytes + (uint32_t)duct_align_up(len, duct_tx_pool_align);
-}
-
-/** @brief Single-threaded, variable-region ring over @c arena, the type of a
- *  worker's TX staging pool and of its cleartext ring.
- *  The owning worker alone touches it, so every field is a plain counter.
- */
-typedef struct {
-    uint32_t head,       /**< Start of the oldest not-yet-reclaimed region. */
-             tail,       /**< Next bump-allocate offset. */
-             high_water; /**< Where the skipped fragment's own tail end was,
-                           *  read by reclaim while @c wrapped; meaningless
-                           *  otherwise. */
-    bool     wrapped;    /**< A pending wrap: a region that did not fit in
-                           *  @c [tail, cap) skipped that leftover fragment and
-                           *  continued at offset 0. Set, live data spans
-                           *  @c [head, high_water) from the lap before the wrap
-                           *  plus @c [0, tail) from the new one, and a fresh
-                           *  allocation may grow @c tail only up to @c head --
-                           *  never past it, never a second wrap ahead of the
-                           *  first one draining. Unset, live data is the plain
-                           *  span @c [head, tail). */
-    alignas(duct_tx_pool_align) uint8_t arena[duct_worker_tx_pool_cap];
-} duct_tx_pool_t;
+/** @brief Payload byte floor under which an outbound record copies its
+ *  source instead of pinning it: the share/pin RMW pair costs more than
+ *  staging a sub-MTU frame, and control datagrams live under it (§2.2's
+ *  knob). Static and already-owned sources reference regardless — they pin
+ *  with nothing at all or ride a share the send's own release path already
+ *  owed. */
+static constexpr uint32_t duct_tx_span_threshold = 128u;
 
 /** @brief One @c x_udp_shared send this drain pass has staged but not yet
- *  handed to the kernel. @c ptr is either a pool region's own payload
- *  (zero-copy: the author's response payload already lived there) or a
- *  region this same commit call packed the wire's bytes into (the
- *  fallback: a foreign buffer, or a wire whose @c on_pack writes a real
- *  header) — either way @c region (that region's header, @c ptr minus
- *  @ref duct_tx_pool_hdr_bytes) owns one reference this entry is
- *  responsible for releasing exactly once, at whichever point (send,
- *  lane-copy, retry-save, or terminal drop) resolves this entry — see
- *  @ref s_worker_dgram_flush. @c handle is re-resolved at flush time; callback
- *  state for @ref s_fire_send_done is copied into this entry to outlive
- *  transient handler context.
+ *  handed to the kernel: the payload as one @c duct_span_t reference
+ *  (§2.4's batch entry shape — inline wire header plus span), pinned at
+ *  append and unpinned at whichever point resolves this entry (send,
+ *  lane-copy, retry-save, or terminal drop) — see @ref s_worker_dgram_flush.
+ *  A @c span_ptr entry's base is a whole @c duct_new-style block (heap,
+ *  ct chunk or x_slot object) so its single duct_del drops the share the
+ *  pin took; a @c span_rx entry's pin rides the inbound conn's refs unit.
+ *  @c handle is re-resolved at flush time; callback state for
+ *  @ref s_fire_send_done is copied into this entry to outlive transient
+ *  handler context.
  */
 typedef struct {
     duct_conn_handle_t handle;
-    duct_peer_t         peer;
-    duct_conn_id_t      conn_id;
-    duct_stream_id_t    stream_id;
-    duct_send_flags_t   flags;
-    uintptr_t           send_token;
-    uint8_t             *ptr;
-    union {
-        duct_tx_pool_hdr_t *region;
-        void               *block;
-    };
-    uint32_t            len;
-    uint8_t             hdr[wire_tx_hdr_max];
-    uint8_t             hdr_len;
+    duct_peer_t        peer;
+    duct_peer_t        local;
+    duct_span_t        span;
+    uint8_t            hdr[wire_tx_hdr_max];
+    uint8_t            hdr_len;
+    bool               send_done;
 } duct_worker_dgram_batch_entry_t;
 
 /** @brief One worker drain pass's @c x_udp_shared batching state -- the
@@ -351,9 +275,8 @@ typedef struct {
  *  one @c duct_coop_cycle call can produce. The kick array has the same size, and @c n and
  *  @c kick_n stay under it. This struct only borrows those arrays and is
  *  handed to @c s_commit_response's @c x_udp_shared case through @ref
- *  duct_worker_t::dgram_pass, reset per pass. Entry bytes live in the
- *  worker's persistent @ref duct_tx_pool_t; this struct carries no byte
- *  storage of its own.
+ *  duct_worker_t::dgram_pass, reset per pass. Entry payloads ride their
+ *  spans; this struct carries no byte storage of its own.
  */
 typedef struct {
     duct_worker_dgram_batch_entry_t *entries;
@@ -376,16 +299,19 @@ typedef struct {
 
 /** @brief This worker's train of TCP segments or UDP datagrams bound for one vnet tun leg.
  *  No pass ends with a train open; @c gro.segs of 0 marks it empty. Each payload
- *  span points into a region of the worker's cleartext ring, which the train
- *  holds by a reference until the write. */
+ *  span rides a block the train holds a @c duct_share reference on until the
+ *  write — the sealed packet's own decrypt block where the payload lies in
+ *  one, a private copy otherwise. */
 typedef struct {
     duct_conn_handle_t conn; /**< Leg the train is bound for; a handle, so a leg
                                *  gone by the flush resolves to nothing. */
     duct_vnet_gro_t    gro;  /**< Segments merged so far. */
-    duct_tx_pool_hdr_t *regions[duct_vnet_gro_span_max]; /**< Region behind each
-                               *  payload span of @c gro, by span. The span of a
-                               *  payload the ring had no room to copy has none:
+    void              *blocks[duct_vnet_gro_span_max]; /**< Block behind each
+                               *  payload span of @c gro, by span, held by the
+                               *  train's own share. The span of a payload the
+                               *  copy's allocation could not serve has none:
                                *  nullptr, its train written at once. */
+    uint64_t           done_pending; /**< Settled fl_send_done delta held on this train. */
 } vnet_train_t;
 
 /** @brief This worker's train of frames staged, unpublished, on one
@@ -420,12 +346,6 @@ typedef struct duct_worker {
     duct_cacheline_struct(
         /* A declaration of its own: the group's alignas aligns every declarator
          * of the first declaration to a line. */
-        uint32_t _Atomic        inter_pending; /**< Count of @c inter_armed bits set.
-                                                 *  An arm adds 1 where it finds the
-                                                 *  bit clear, and the scan subtracts
-                                                 *  1 per bit it grabs. Zero lets
-                                                 *  s_inter_drain skip its scan of
-                                                 *  the DUCT_BITMAP_WORDS words. */
         uint32_t _Atomic        wake_latch;    /**< Wake flag of this worker's park.
                                                  *  A producer exchanges it to 1 and
                                                  *  wakes the futex when it read 0.
@@ -448,6 +368,11 @@ typedef struct duct_worker {
                                                  *  @c s_drain_kick_io_waiters takes
                                                  *  the word and wakes each io thread
                                                  *  whose bit it held. */
+    );
+    duct_cacheline_struct(
+        uint64_t _Atomic        inter_summary[(DUCT_BITMAP_WORDS + bits_index_mask) >> bits_word_shift];
+    );
+    duct_cacheline_struct(
         uint64_t _Atomic        inter_armed[DUCT_BITMAP_WORDS]; /**< Bit per conn
                                                  *  index with an unconsumed
                                                  *  inter_lane push. Producers arm it
@@ -455,6 +380,12 @@ typedef struct duct_worker {
                                                  *  and this worker's drain grabs
                                                  *  every word, dropping the bit of a
                                                  *  conn not bound to it. */
+    );
+    duct_cacheline_struct(
+        uint64_t _Atomic        done_summary[(DUCT_BITMAP_WORDS + bits_index_mask) >> bits_word_shift];
+    );
+    duct_cacheline_struct(
+        uint64_t _Atomic        done_armed[DUCT_BITMAP_WORDS];
     );
     duct_timers_t           timers;
     duct_deferred_queue_t   defer_q;
@@ -469,6 +400,11 @@ typedef struct duct_worker {
      */
     retry_node_t         *retry_head,
                            *retry_tail;
+    /** @brief The worker's dead sessions awaiting their grace ticks; the
+     *  owner alone pushes and drains, so the links are plain. */
+    duct_session_t       *reclaim_head;
+    /** @brief This worker's private sweep cursor for the session block pool. */
+    duct_sweep_cursor_t    sess_sweep;
     /** @brief Runtime-wide WFQ; this worker drains its assigned lanes. */
     duct_vmq_mpsc_t        *wfq;
     unsigned                worker_id;
@@ -490,10 +426,12 @@ typedef struct duct_worker {
                                              *  its changes feed busy_enter/exit. */
     bool _Atomic            shutdown;
     unsigned _Atomic        started;
-    duct_tx_pool_t          tx_pool; /**< Worker TX staging pool. */
-    duct_tx_pool_t          ct_pool; /**< Region ring for the cleartext of the
-                               *  sealed datagrams this worker decrypts off the
-                               *  inter lane. */
+    duct_x_slot_pool_t      ct_chunks; /**< Cleartext chunks of the sealed
+                               *  codecs this worker builds, one per conn,
+                               *  sized by the wire-declared ct_buf_max
+                               *  ceiling. Built by its first sealed codec,
+                               *  freed with the worker. */
+    bool                    ct_chunks_live;
     /** @brief This worker's @c x_udp_shared batching state, null outside its
      *  run loop.
      *  Bound once at loop entry and cleared at exit, so a null here tells
@@ -520,14 +458,17 @@ typedef struct duct_worker {
                                             *  invoke and elsewhere. A frame or
                                             *  fin parked meanwhile records its
                                             *  handle. */
-    duct_frame_ack_t         *rx_ack;    /**< Ack of the frame whose answer is
+    duct_span_t              *rx_ack;    /**< Span of the frame whose answer is
                                             *  being taken, null elsewhere; a
                                             *  park aliasing the frame takes it
                                             *  over and clears this. */
-    const duct_frame_ack_t   *slot_now;   /**< RX slot of the inter batch in dispatch,
-                                            *  null for a batch that carries none and
-                                            *  outside a dispatch. @ref s_slot_pin pins
+    const duct_msg_inter_batch_t *slot_now; /**< Inter batch in dispatch whose
+                                            *  RX slot may hold an answer's
+                                            *  bytes, null for a batch that
+                                            *  carries none and outside a
+                                            *  dispatch. @ref s_slot_pin pins
                                             *  an answer that lies in it. */
+    duct_ptr_t(uint8_t)     host_hold;
     tx_train_t             tx_train;    /**< This worker's @c x_udp_peer or
                                             *  @c x_tcp train. */
 #if DUCT_RUNTIME_STATS
@@ -540,46 +481,6 @@ static_assert(alignof(duct_worker_t) == duct_cacheline_size,
 static_assert(offsetof(duct_worker_t, wake_latch) < offsetof(duct_worker_t, timers)
               && offsetof(duct_worker_t, timers) % duct_cacheline_size == 0u,
     "the fields other threads write fill cachelines of their own");
-
-/** @brief Argument of a timer node: the worker, timer handle, and exec fields.
- *
- *  The node's @c exec picks the variant. A session timer holds the owning
- *  session's handle, a word @c token and the @c key it was started under, 0 for
- *  none: @c token is the protocol's argument under @ref s_timer_fire, the conn
- *  handle under @ref s_rekey_fire, @ref s_join_deadline_fire and
- *  @ref s_hs_retry_fire, and 0 under
- *  @ref s_idle_fire. @ref duct_worker_session_timers_cancel matches on
- *  @c session_tok, so every session kind retires with its session. A free timer,
- *  armed for @ref s_timer_fire_free, belongs to no session and holds the
- *  protocol, its @c user_ctx and the token.
- *
- *  Handles throughout, never a raw @c duct_session_t* or @c duct_conn_t*: the
- *  target is resolved again on each fire, and one reclaimed between arm and
- *  fire is a safe drop. Allocated via @c duct_new, released by the timer module
- *  through @c duct_del_fn on fire-done, cancel or destroy.
- */
-typedef struct {
-    duct_worker_t *w;
-    union {
-        struct {
-            duct_handle_t  session_tok;
-            uint64_t       token;
-            uint32_t       key;
-        };
-        struct {
-            const duct_proto_t *proto;
-            void               *user_ctx;
-            uintptr_t           arg;
-        };
-    };
-    duct_timer_handle_t   self;     /* Own handle, for self-cancel on stale
-                                      * resolve or a closing session — the
-                                      * only way to stop a recurring timer;
-                                      * the heap ignores exec's return value.
-                                      * s_rekey_fire matches it against its
-                                      * codec's rekey_timer; a keyed timer's slot
-                                      * and its parked fire name it too. */
-} timer_ctx_t;
 
 typedef struct {
     duct_worker_t   *workers;
@@ -616,170 +517,6 @@ void duct_worker_rtstat_fast_miss(bool armed)
     duct_rtstat_obj_inc(s_this_worker, rtstats.fastpath_eagain, !armed);
 }
 #endif
-
-/** @brief Reclaim @p pool head past every fully dead region.
- *  Dead regions (@c refs == 0 && !hold) are reclaimed in ring order. An
- *  out-of-order-dead region (a live successor already resolved while this one
- *  is still held/referenced) waits for its predecessors; the only long-holder
- *  is one retried chunk against a pool sized for many. Crossing @c high_water
- *  while wrapped flips back to the plain single-lap regime and the walk
- *  continues from offset 0.
- */
-static void s_tx_pool_reclaim(duct_tx_pool_t *pool)
-{
-    for (;;) {
-        if (pool->wrapped && pool->head == pool->high_water) {
-            pool->head = 0u;
-            pool->wrapped = false;
-        }
-        if (pool->head == pool->tail) {
-            /* Unambiguously empty -- a wrapped tail never catches head
-             * exactly (s_tx_pool_place). Rewind to offset 0 so a
-             * following large acquire never fails on the cursor's
-             * parking spot alone: head == tail mid-arena otherwise
-             * splits the free space in two. */
-            assert(!pool->wrapped);
-            pool->head = 0u;
-            pool->tail = 0u;
-            return;
-        }
-        auto hdr = (duct_tx_pool_hdr_t *)(pool->arena + pool->head);
-        if (hdr->refs != 0u || hdr->hold)
-            return;
-        pool->head += s_tx_pool_region_bytes(hdr->len);
-    }
-}
-
-/** @brief End a worker pass: release the hold of every region not marked
- *  @c keep.
- *  A region marked @c keep spends the mark here and survives into the next
- *  pass instead, so cross-pass reuse is re-declared every pass. An author who
- *  acquires and never emits cannot wedge the ring this way — @ref
- *  s_tx_pool_reclaim frees in ring order, so one region left held blocks every
- *  region behind it.
- *  @return true when a region was still held: released here, or at the next
- *  pass end for one that carried @c keep.
- */
-static bool s_tx_pool_pass_end(duct_tx_pool_t *pool)
-{
-    uint32_t off = pool->head;
-    uint32_t end = pool->wrapped ? pool->high_water : pool->tail;
-    bool held = false;
-    for (;;) {
-        if (off >= end) {
-            if (!pool->wrapped || end == pool->tail)
-                break;
-            off = 0u;
-            end = pool->tail;
-            continue;
-        }
-        auto hdr = (duct_tx_pool_hdr_t *)(pool->arena + off);
-        held |= hdr->hold;
-        if (hdr->keep)
-            hdr->keep = 0u;
-        else
-            hdr->hold = 0u;
-        off += s_tx_pool_region_bytes(hdr->len);
-    }
-    return held;
-}
-
-/** @brief True if @p ptr falls inside @p pool arena.
- *
- *  The range check @c s_commit_dgram_shared uses to tell a pool-backed
- *  response payload from an ordinary author buffer. Two compares: a pointer
- *  outside this worker arena cannot alias into it.
- */
-static inline bool s_tx_pool_owns(const duct_tx_pool_t *pool, const uint8_t *ptr)
-{
-    return ptr >= pool->arena
-        && ptr < pool->arena + duct_worker_tx_pool_cap;
-}
-
-/** @brief Bump-allocate @p need bytes at @p pool tail, wrapping once behind @c head.
- *  @p limit is how far @c tail may grow this call without touching live data:
- *  @c head once already wrapped (nothing past it is reusable until reclaim
- *  proves otherwise), the arena end otherwise. A not-yet-wrapped pool that
- *  does not fit before the end wraps once; an already-wrapped pool that does
- *  not fit before @c head fails with @ref duct_tx_pool_no_room.
- *  @return Offset where the region header starts, or @ref duct_tx_pool_no_room.
- */
-static uint32_t s_tx_pool_place(duct_tx_pool_t *pool, uint32_t need)
-{
-    uint32_t tail = pool->tail;
-    uint32_t limit = pool->wrapped ? pool->head : duct_worker_tx_pool_cap;
-    assert(tail <= limit);
-    /* While wrapped, tail must never catch head exactly: head == tail is
-     * the ring's one "empty" sentinel (s_tx_pool_reclaim's rewind), so a
-     * full-to-the-byte wrapped pool reads as a drained one and reclaim
-     * deadlocks on it. One byte of the
-     * wrapped gap stays unusable by design; same for entering a wrap. */
-    bool fits = pool->wrapped ? need < limit - tail : need <= limit - tail;
-    if (!fits) {
-        if (pool->wrapped || need >= pool->head)
-            return duct_tx_pool_no_room;
-        pool->high_water = tail;
-        pool->wrapped = true;
-        tail = 0u;
-    }
-    uint32_t placed_at = tail;
-    tail += need;
-    if (tail == duct_worker_tx_pool_cap && pool->head != 0u) {
-        /* Landed exactly on the boundary -- zero-waste wrap, no dead
-         * space to skip. head == 0 keeps the unwrapped tail == cap form
-         * instead: wrapping there recreates the ambiguous
-         * head == tail == 0 full state. */
-        pool->high_water = duct_worker_tx_pool_cap;
-        pool->wrapped = true;
-        tail = 0u;
-    }
-    pool->tail = tail;
-    return placed_at;
-}
-
-/** @brief Take a region of @p size payload bytes from @p pool, held for its taker.
- *  Reclaims the dead regions at the head first.
- *  @return The payload, 8-byte aligned; nullptr when @p size can never fit or the
- *  ring has no room now. */
-static void *s_pool_acquire(duct_tx_pool_t *pool, size_t size)
-{
-    duct_do_if(size > UINT32_MAX, return nullptr);
-    s_tx_pool_reclaim(pool);
-    uint32_t need = s_tx_pool_region_bytes((uint32_t)size);
-    duct_do_if(need > duct_worker_tx_pool_cap, return nullptr); /* can never fit, ever */
-
-    uint32_t off = s_tx_pool_place(pool, need);
-    duct_do_if(off == duct_tx_pool_no_room, return nullptr);
-    auto hdr = (duct_tx_pool_hdr_t *)(pool->arena + off);
-    *hdr = (duct_tx_pool_hdr_t){ .len = (uint32_t)size, .refs = 0u, .hold = true };
-    return (char *)hdr + duct_tx_pool_hdr_bytes;
-}
-
-void *duct_tx_pool_acquire(size_t size)
-{
-    auto w = s_this_worker;
-    duct_do_if(!w, return nullptr);
-    void *region = s_pool_acquire(&w->tx_pool, size);
-    duct_rtstat_obj_inc(w, rtstats.tx_pool_acquire_fail, !region);
-    return region;
-}
-
-/** @brief The region header behind a payload pointer.
- *  Valid only for a pointer @c s_pool_acquire handed out, never an interior
- *  one. */
-static inline duct_tx_pool_hdr_t *s_tx_pool_hdr_of(void *ptr)
-{
-    return (duct_tx_pool_hdr_t *)((char *)ptr - duct_tx_pool_hdr_bytes);
-}
-
-/** @brief Drop the hold on the region behind @p ptr, leaving @c refs to govern it.
- *  Its callers are the packing of @c x_udp_shared responses into the TX pool, a
- *  branch the iocp build compiles out in favour of the outbox lane, and the
- *  cleartext ring: a packet's end and a vnet train's copy of a payload. */
-static void s_tx_pool_drop_hold(void *ptr)
-{
-    s_tx_pool_hdr_of(ptr)->hold = 0u;
-}
 
 static duct_exec_rc_t s_dispatch_msg(duct_vmq_hdr_t *hdr);
 static duct_exec_rc_t s_dispatch_batch(duct_vmq_hdr_t *hdr, duct_worker_t *w,
@@ -837,6 +574,170 @@ typedef struct {
                                           *  @c ct, set ahead of the unseal. */
 } redirect_t;
 
+/** @brief A payload source's §2.1 classification verdict. */
+typedef enum : uint8_t {
+    payload_ref,  /**< @c out_span is held — a pin or a free reference. */
+    payload_copy, /**< Copy the bytes; ownership hooks fire at the copy. */
+} payload_class_t;
+
+/** @brief Recognize an outbound payload's substrate (§2.1): a recognized
+ *  engine substrate rides a pinned reference, every other source copies.
+ *
+ *  The range check runs against the dispatch's own substrates: the inbound
+ *  frame's RX ring (@c w->hold_conn — its span pinning through the §2.3 refs
+ *  unit), the sealed packet's decrypt block (@p redirect->ct), the inter
+ *  batch's RX slot (@c w->slot_now), and a block the response already owns
+ *  with no release hook. Static bytes and an owned-without-release block
+ *  reference unconditionally — they pin with nothing at all or with the
+ *  share the send's own release path already owed. Every other source — a
+ *  foreign @c fl_send_copy pointer, a custom @c release payload, a
+ *  sub-threshold frame (§2.2's knob: the share RMW costs more than a small
+ *  memcpy), a share at the 255-holder ceiling — answers @c payload_copy,
+ *  the caller staging the bytes into the carrier its record owns (§2.1: a
+ *  descriptor never carries a release hook, so the hook fires at the copy).
+ */
+static payload_class_t
+s_payload_classify(duct_view_u8 payload, duct_send_flags_t flags,
+                   void (*release)(void *), void *release_arg,
+                   redirect_t *redirect, duct_span_t *out_span)
+{
+    auto w = s_this_worker;
+    auto at = (const uint8_t *)payload.data;
+    uint32_t len = (uint32_t)payload.size;
+
+    bool static_src = duct_has(flags, fl_send_static);
+    bool owned_plain = !static_src && duct_has(flags, fl_send_owned)
+                    && !release;
+    if (static_src && !((uintptr_t)at & duct_span_tag_mask)) {
+        /* 4-aligned static bytes ride as-is; the tag bits must not alias
+         * the address, and an unaligned literal copies like any foreign
+         * buffer. */
+        *out_span = duct_span_of_static(at, len);
+        return payload_ref;
+    }
+    void *share_base = nullptr;
+    if (owned_plain) {
+        share_base = release_arg ? release_arg : (void *)at;
+    } else if (!static_src && redirect && redirect->ct) {
+        auto base = (const uint8_t *)redirect->ct;
+        if (at >= base && at + len <= base + redirect->cap)
+            share_base = redirect->ct;
+    } else if (!static_src && w && w->host_hold) {
+        auto base = (const uint8_t *)duct_at(w->host_hold);
+        size_t cap = duct_byte_len(w->host_hold);
+        if (at >= base && (size_t)(at - base) <= cap
+            && len <= cap - (size_t)(at - base))
+            share_base = (void *)w->host_hold;
+    }
+    if (!share_base && !static_src && w && w->slot_now) {
+        /* The inter batch's RX slot. The slot's lifetime authority is its
+         * pool's claim count — the lane's release respects a claim, while a
+         * @c duct_try_share of the slot object's own word touches a header
+         * nothing on the slot path reads — so the pin is the claim the emit
+         * answer's slot pin already takes (@c duct_x_slot_claim), past the
+         * bound of which the copy below answers. */
+        auto pool = w->slot_now->rx_pool;
+        auto idx = w->slot_now->rx_slot;
+        auto base = (const uint8_t *)duct_x_slot_data(pool, idx);
+        auto obj = duct_x_slot_obj(pool, idx);
+        if (len >= duct_tx_span_threshold
+            && at >= base && at + len <= base + pool->slot_bytes
+            && duct_x_slot_claim(pool, idx)) {
+            *out_span = duct_span_of_ptr(obj, (uint32_t)(at - (const uint8_t *)obj), len);
+            return payload_ref;
+        }
+    }
+    if (share_base) {
+        auto base = (const uint8_t *)share_base;
+        uint32_t off = (uint32_t)(at - base);
+        if (len >= duct_tx_span_threshold
+            && duct_try_share(share_base)) {
+            *out_span = duct_span_of_ptr(share_base, off, len);
+            return payload_ref;
+        }
+    }
+    if (!share_base && !static_src && !owned_plain && w && w->hold_conn) {
+        /* The dispatched frame's RX ring: a relay answer reading its own
+         * inbound bytes (§2.3 — the pin's refs unit holds the block while
+         * the record lives). */
+        auto rx = duct_conn_rx_olb(w->hold_conn);
+        auto base = duct_conn_rx_data(w->hold_conn);
+        if (rx && at >= base && at + len <= base + rx->h.buf_size
+            && len >= duct_tx_span_threshold) {
+            *out_span = duct_span_of_rx((duct_conn_t *)w->hold_conn,
+                                        (uint32_t)(at - base), len);
+            if (duct_span_pin(out_span, rx))
+                return payload_ref;
+        }
+    }
+    return payload_copy;
+}
+
+#if !DUCT_EVENTS_MODEL_IOCP /* the lane-tx batch entries are the reactive
+                             * backends' alone; iocp's outbox packs views */
+/** @brief Build the payload span of one @c x_udp_shared batch entry
+ *  (§2.4: @c { hdr[16], duct_span_t }): §2.1's recognition over the response,
+ *  the copy class landing in a heap block the entry owns.
+ *
+ *  @return true with @p out_span held (pin or owned copy); false when the
+ *          copy's allocation fails — the caller's @c rc_again path.
+ */
+static bool s_dgram_span_take(duct_response_t *out, redirect_t *redirect,
+                              duct_span_t *out_span)
+{
+    if (s_payload_classify(out->payload, out->flags, out->release,
+                           out->release_arg, redirect, out_span)
+        == payload_ref)
+        return true;
+    /* Copy: foreign or sub-threshold. A custom release or owned free fires
+     * here, once, on the worker — and the response must leave holding
+     * nothing, or the commit's own cleanup releases a second time
+     * (@c duct_response_release_owned clears nothing by contract). The copy's
+     * single holder is the span's reference. */
+    uint32_t len = (uint32_t)out->payload.size;
+    auto copy = duct_at(duct_new(uint8_t, len));
+    duct_do_if(!copy, return false);
+    memcpy(copy, out->payload.data, len);
+    if (!duct_has(out->flags, fl_send_static)
+        && (out->release || duct_has(out->flags, fl_send_owned))) {
+        duct_response_release_owned(out);
+        out->flags = duct_and(out->flags, duct_not(fl_send_owned));
+        out->release = nullptr;
+        out->release_arg = nullptr;
+    }
+    *out_span = duct_span_of_ptr(copy, 0u, len);
+    return true;
+}
+#endif /* !DUCT_EVENTS_MODEL_IOCP */
+
+/** @brief A span's payload view: the shared §5.3 resolver. */
+static duct_view_u8 s_dgram_span_body(duct_span_t *span)
+{
+    return duct_span_body(span);
+}
+
+/** @brief The entry's payload view: the span's bytes where they live. */
+static duct_view_u8 s_dgram_entry_body(duct_worker_dgram_batch_entry_t *e)
+{
+    return s_dgram_span_body(&e->span);
+}
+
+/** @brief Drop a dgram descriptor's payload reference at whichever point
+ *  resolved it — send, lane-copy, retry-save's takeover or terminal drop:
+ *  the shared §5.3 payload drop, rx pins running the §2.3 step and
+ *  slot-obj spans dropping the claim that is the slot's lifetime
+ *  authority. */
+static void s_dgram_span_drop(duct_span_t *span)
+{
+    duct_span_payload_drop(span);
+}
+
+/** @brief Drop one batch entry's payload reference. */
+static void s_dgram_entry_span_drop(const duct_worker_dgram_batch_entry_t *e)
+{
+    s_dgram_span_drop((duct_span_t *)&e->span);
+}
+
 static duct_nonnull(1, 4, 5) duct_commit_rc_t s_commit_response(duct_session_t *s,
                                                                 duct_conn_id_t in_conn,
                                                                 duct_stream_id_t in_stream,
@@ -870,29 +771,29 @@ typedef struct {
     duct_vmq_lane_t        ln;    /**< This worker's lane of the listener's outbox. */
     duct_vmq_reserve_pos_t pos;   /**< Position of the reserved entry in the lane. */
     duct_dgram_tx_entry_t *entry; /**< The reserved entry, carrying the peer and the slot reference. */
-    duct_x_slot_pool_t    *pools; /**< The listener's TX slot pools, null where the entry carries the bytes itself. */
+    duct_x_slot_pool_t    *pools; /**< The listener's TX slot pools, null where the entry takes the descriptor form. */
     uint32_t               ref;   /**< Reference of the TX slot taken, @c treiber_empty without one. */
-    duct_view_u8             span;  /**< Writable payload: the slot's bytes, or the entry's own. */
+    duct_view_u8             span;  /**< Staged form alone: the slot's writable payload. */
 } dgram_out_t;
 
 /** @brief Open a staged send of @p need payload bytes to @p peer on @p listener, on this worker's lane.
  *  A listener with TX slot pools stages into a slot of the class @p need asks for, and the lane entry
- *  carries its reference alone; without pools the entry carries the bytes. A class found empty arms the
- *  lane's wait latch and is tried once more, which closes the race with the io thread's drain wake.
+ *  carries its reference alone; without pools the entry takes the §2.4 descriptor form, and the
+ *  caller fills it through @ref s_dgram_out_desc — the payload never copies. A class found empty arms
+ *  the lane's wait latch and is tried once more, which closes the race with the io thread's drain
+ *  wake.
  *  @return true with @p o set and its span writable for @p need bytes; false with @p rc the cause,
  *          @c vmq_push_too_large for a size past the large class, @c vmq_push_full for a dry class,
  *          or the lane's own refusal.
  */
-static bool s_dgram_out_open(duct_listener_t *listener, const duct_peer_t *peer, size_t need,
+static bool s_dgram_out_open(duct_listener_t *listener, const duct_peer_t *peer,
+                             const duct_peer_t *local, size_t need,
                              dgram_out_t *o, duct_vmq_push_rc_t *rc)
 {
     o->ln = duct_mpsc_lane(duct_io_dgram_shared_outbox(listener), s_this_worker->worker_id);
     o->pools = duct_io_dgram_shared_tx_slots(listener);
     o->ref = treiber_empty;
-    size_t entry_bytes = sizeof(duct_dgram_tx_entry_t);
-    if (!o->pools)
-        entry_bytes += need;
-    else {
+    if (o->pools) {
         if (!duct_x_slot_fits(o->pools, need)) {
             *rc = vmq_push_too_large;
             return false;
@@ -910,17 +811,35 @@ static bool s_dgram_out_open(duct_listener_t *listener, const duct_peer_t *peer,
         }
         o->span = duct_x_slot_span(o->pools, o->ref);
     }
-    o->entry = s_dgram_tx_lane_reserve(&o->ln, entry_bytes, &o->pos, rc);
+    o->entry = s_dgram_tx_lane_reserve(&o->ln, sizeof(duct_dgram_tx_entry_t), &o->pos, rc);
     if (!o->entry) {
         if (o->pools)
             duct_x_slot_put(o->pools, o->ref);
         return false;
     }
     o->entry->peer = *peer;
-    o->entry->slot = o->ref;
-    if (!o->pools)
-        o->span = (duct_view_u8){ .data = o->entry->data, .size = need };
+    o->entry->local = local ? *local : (duct_peer_t){};
+    o->entry->handle = 0u;
+    if (o->pools) {
+        o->entry->staged.len = 0u;
+        o->entry->staged.slot = o->ref;
+        o->entry->staged.done_delta = 0u;
+    }
     return true;
+}
+
+/** @brief Fill @p o's reserved entry with the descriptor form: the batch
+ *  entry's inline header and its span, the span's pin moving to the lane
+ *  record — from the publish on, the io thread's send owns the reference
+ *  and drops it at delivery. */
+static void s_dgram_out_desc(dgram_out_t *o, const duct_worker_dgram_batch_entry_t *e)
+{
+    static_assert(wire_tx_hdr_max == dgram_tx_desc_half,
+                  "the descriptor's inline header half is the wire header ceiling");
+    static_assert(sizeof(duct_span_t) == dgram_tx_desc_half,
+                  "the descriptor's span half is one span");
+    memcpy(o->entry->desc, e->hdr, wire_tx_hdr_max);
+    memcpy(o->entry->desc + dgram_tx_desc_half, &e->span, sizeof(duct_span_t));
 }
 
 /** @brief Give back the slot of a staged send that is not published. */
@@ -931,12 +850,14 @@ static void s_dgram_out_abort(const dgram_out_t *o)
 }
 
 /** @brief Publish the staged send as @p len payload bytes.
- *  An entry that carries its bytes shrinks to them; a slot's entry stays one record.
+ *  A slot's entry stays one record; a descriptor entry publishes as it
+ *  stands, its span's length already inside it.
  */
 static void s_dgram_out_publish(dgram_out_t *o, size_t len)
 {
-    o->entry->len = (uint32_t)len;
-    duct_vmq_publish_shrink(&o->ln, &o->pos, sizeof(duct_dgram_tx_entry_t) + (o->pools ? 0u : len));
+    if (o->pools)
+        o->entry->staged.len = (uint32_t)len;
+    duct_vmq_publish_shrink(&o->ln, &o->pos, sizeof(duct_dgram_tx_entry_t));
 }
 
 /** @brief Test whether this worker's lane and the TX pools of @p listener take a send of @p need payload bytes now. */
@@ -944,8 +865,8 @@ static bool s_dgram_out_fits(duct_listener_t *listener, size_t need)
 {
     auto ln = duct_mpsc_lane(duct_io_dgram_shared_outbox(listener), s_this_worker->worker_id);
     auto pools = duct_io_dgram_shared_tx_slots(listener);
-    size_t entry_bytes = sizeof(duct_dgram_tx_entry_t) + (pools ? 0u : need);
-    return duct_vmq_room(&ln) >= vmq_msg_aligned(entry_bytes) && (!pools || duct_x_slot_has(pools, need));
+    return duct_vmq_room(&ln) >= vmq_msg_aligned(sizeof(duct_dgram_tx_entry_t))
+        && (!pools || duct_x_slot_has(pools, need));
 }
 
 static void s_ctl_apply_now(duct_session_t *s, const duct_response_t *out);
@@ -968,7 +889,7 @@ typedef enum : uint8_t {
     own_copied, /**< Copied into a buffer the response owns. */
     own_failed, /**< The copy found no memory, the payload staying where it was. */
 } own_t;
-static own_t s_retry_payload_own(duct_response_t *out);
+static own_t s_retry_emit_payload_own(duct_response_t *out);
 static bool s_retry_emit_save(duct_worker_t *w, duct_stream_ctx_t *hctx, uint32_t ticket);
 static void s_retry_emit_discard(duct_worker_t *w, duct_stream_ctx_t *target);
 
@@ -989,26 +910,31 @@ static constexpr uint32_t s_dispatch_frontier_skip = UINT32_MAX;
 
 /** @brief The frame batch in flight on this worker.
  *  @c conn is its leg while the batch dispatches; @c owed records that an ack
- *  of that leg left its read-latch check to the batch end.
+ *  of that leg left its read-latch check to the batch end, @c prev the acked
+ *  total the first of those acks shifted from — the edge the batch-end check
+ *  crosses is that first shift's, so a latch armed anywhere inside the batch
+ *  still gets its one post.
  */
 static thread_local struct {
     const duct_conn_t *conn;
     bool               owed;
+    uint64_t           prev;
 } s_rx_ack_batch;
 
-/** @brief Repost @p conn's read when @p acked reaches its latched resume
- *  target.
+/** @brief Post @p conn's read resume strictly on the ack crossing edge
+ *  @c prev_acked < R ≤ new_acked.
  *  The @c seq_cst fence pairs with @ref s_rx_latch's: either this sees the
- *  latch, or the io thread's recheck after latching sees @p acked. A stalled
- *  reactive backend never re-signals backlog already signaled, so this repost
- *  is what resumes the read.
+ *  armed target, or the io thread's recheck after arming sees the acked
+ *  total and disarms. A stalled reactive backend never re-signals backlog
+ *  already signaled, so this post is what resumes the read — exactly one
+ *  per latch: the edge fires for the single shift that crosses R, and io's
+ *  disarm store answers it.
  */
-static void s_rx_ack_check(duct_conn_t *conn, uint64_t acked)
+static void s_rx_ack_check(duct_conn_t *conn, uint64_t prev_acked, uint64_t new_acked)
 {
     atomic_thread_fence(memory_order_seq_cst);
-    if (duct_has(duct_conn_state(conn), fl_conn_rx_full)
-        && acked >= duct_atomic_load(&conn->rx_buf->resume_at, relaxed)) {
-        duct_conn_state_clear(conn, fl_conn_rx_full);
+    uint64_t target = duct_atomic_load(&duct_conn_rx_olb(conn)->resume_at, relaxed);
+    if (duct_olb_rx_resume_crossed(prev_acked, new_acked, target)) {
         auto ch = duct_conn_handle_get(conn);
         duct_io_post_rx_read(&ch);
         duct_rtstat_obj_inc(s_this_worker, rtstats.rx_resume_post, 1);
@@ -1024,13 +950,18 @@ static void s_rx_ack_check(duct_conn_t *conn, uint64_t acked)
  */
 static inline void s_rx_ack(duct_conn_t *conn, size_t len, uint32_t end_off)
 {
-    uint64_t acked = duct_olb_rx_ack(conn->rx_buf, len);
+    auto rx = duct_conn_rx_olb(conn);
+    uint64_t prev_acked = duct_atomic_load(&rx->acked, relaxed);
+    uint64_t acked = duct_olb_rx_ack(rx, len);
     if (end_off != s_dispatch_frontier_skip)
-        duct_atomic_store(&conn->rx_buf->dispatch_frontier, end_off, release);
-    if (s_rx_ack_batch.conn == conn)
-        s_rx_ack_batch.owed = true;
-    else
-        s_rx_ack_check(conn, acked);
+        duct_atomic_store(&rx->dispatch_frontier, end_off, release);
+    if (s_rx_ack_batch.conn == conn) {
+        if (!s_rx_ack_batch.owed) {
+            s_rx_ack_batch.owed = true;
+            s_rx_ack_batch.prev = prev_acked;
+        }
+    } else
+        s_rx_ack_check(conn, prev_acked, acked);
 }
 
 /** @brief Sealed-codec cleartext-buffer compaction.
@@ -1043,9 +974,11 @@ static inline void s_rx_ack(duct_conn_t *conn, size_t len, uint32_t end_off)
  */
 static void s_codec_compact(duct_wire_codec_t *codec)
 {
-    /* One holder reads 0 until the buffer is first shared and 1 once its pins have
-     * dropped back; a pin beside the codec makes it 2 and up. */
-    if (duct_atomic_load(&duct_block_hdr(codec->ct_buf)->holders, relaxed) > 1u
+    /* The codec alone reads 0 or 1 on the chunk's record — the lane's own
+     * count. A pin beside the codec makes it 2 and up. */
+    auto buf = duct_at(codec->ct_buf);
+    auto pool = duct_x_slot_pool_of(buf);
+    if (duct_x_slot_hold_count(pool, duct_x_slot_index(pool, buf)) > 1u
         || codec->ct_ack_off != codec->ct_parse_off)
         return;
     size_t tail = codec->ct_len - codec->ct_parse_off;
@@ -1055,6 +988,25 @@ static void s_codec_compact(duct_wire_codec_t *codec)
     codec->ct_len = (uint32_t)tail;
     codec->ct_parse_off = 0u;
     codec->ct_ack_off = 0u;
+}
+
+static bool s_codec_spill(duct_wire_codec_t *codec, duct_x_slot_pool_t *chunks, size_t need)
+{
+    size_t tail = codec->ct_len - codec->ct_parse_off;
+    size_t cap = duct_x_slot_obj_cap(duct_at(codec->ct_buf));
+    duct_do_if(!chunks || tail + need > cap, return false);
+    uint32_t idx = duct_x_slot_acquire(chunks);
+    duct_do_if(idx == treiber_empty, return false);
+    auto fresh = (duct_ptr_t(uint8_t))duct_x_slot_obj(chunks, idx);
+    auto old = duct_at(codec->ct_buf);
+    if (tail)
+        memcpy(duct_at(fresh), old + codec->ct_parse_off, tail);
+    codec->ct_buf = duct_move(fresh);
+    codec->ct_len = (uint32_t)tail;
+    codec->ct_parse_off = 0u;
+    codec->ct_ack_off = 0u;
+    duct_x_slot_release_obj(old);
+    return true;
 }
 
 /** @brief The codec of @p conn, if it is still the one that owns cleartext buffer @p block.
@@ -1068,45 +1020,66 @@ static duct_wire_codec_t *s_ct_codec_of(duct_conn_t *conn, const void *block)
 
 /** @brief Drop one pin on cleartext buffer @p block, compacting the buffer where
  *  @p conn's codec still owns it.
- *  The last holder frees the block, which can be this pin once the codec is gone. */
+ *  The block is the codec's cleartext chunk — its pin drops on the chunk's
+ *  record, the last pin releasing the chunk once the codec is gone too — or
+ *  the record's decrypt block, a heap share. */
 static void s_ct_pin_release(duct_conn_t *conn, void *block)
 {
-    auto codec = s_ct_codec_of(conn, block);
-    duct_del(block);
-    if (codec)
-        s_codec_compact(codec);
+    if (duct_x_slot_obj_is(block)) {
+        auto pool = duct_x_slot_pool_of(block);
+        uint32_t idx = duct_x_slot_index(pool, block);
+        if (duct_x_slot_unpin(pool, idx))
+            duct_x_slot_release(pool, idx);
+    } else {
+        duct_del(block);
+    }
+    auto sc = conn ? duct_conn_sealed_ctx(conn) : nullptr;
+    if (sc && sc->codec)
+        s_codec_compact(sc->codec);
 }
 
-/** @brief One frame's ack, ring or sealed.
- *
- *  Acks ring bytes via @ref s_rx_ack, or a sealed record's cleartext span
- *  via @c ct_ack_off of @p conn's codec, which counts only while that codec
- *  still owns the span's buffer, opportunistically compacting @c ct_buf now
- *  that this ack may have just made it possible. Replaces every direct @c
- *  s_rx_ack(conn, task->len, ...) call in @ref s_dispatch_one_frame and
- *  the deferred-handler completion path.
- */
-static void s_frame_ack_apply(duct_conn_t *conn, duct_frame_ack_t ack)
+/** @brief True when @p base is a cleartext chunk of this worker's chunk
+ *  pool — the sealed record substrate, whose pin rides the chunk's record
+ *  holders (@c duct_x_slot_pin), never the claim counter a listener RX
+ *  slot's lifetime answers. The one pool this worker carves codecs'
+ *  cleartext from decides by address. */
+static bool s_ct_chunk_is(const void *base)
 {
-    switch (ack.kind) {
-    case ack_ring:
-        s_rx_ack(conn, ack.ring.task_len, ack.ring.end_off);
+    return duct_x_slot_obj_is(base)
+        && duct_x_slot_pool_of(base) == &s_this_worker->ct_chunks;
+}
+
+/** @brief One held frame's ack, the §1.1 span form.
+ *
+ *  Acks an RX ring span's bytes via @ref s_rx_ack — the window's end is the
+ *  span's own @c off + @c len — or a sealed record's cleartext span through
+ *  @c ct_ack_off of @p conn's codec, which counts only while that codec
+ *  still owns the span's chunk, opportunistically compacting @c ct_buf now
+ *  that this ack may have just made it possible. The claimed-slot and
+ *  owned-copy substrates carry no ack of their own: their bytes sit outside
+ *  every ring, accounted nowhere but their reference, which the caller
+ *  drops at the same resolution.
+ */
+static void s_frame_ack_apply(duct_conn_t *conn, duct_span_t span)
+{
+    switch (duct_span_kind_of(&span)) {
+    case span_rx:
+        s_rx_ack(conn, duct_span_len(&span),
+                 duct_span_off(&span) + duct_span_len(&span));
         break;
-    case ack_ct:
-        auto codec = s_ct_codec_of(conn, ack.ct.data);
-        if (codec) {
-            codec->ct_ack_off += (uint32_t)ack.ct.size;
-            s_codec_compact(codec);
+    case span_ptr: {
+        auto base = duct_span_base(&span);
+        if (s_ct_chunk_is(base)) {
+            auto codec = s_ct_codec_of(conn, base);
+            if (codec) {
+                codec->ct_ack_off += duct_span_len(&span);
+                s_codec_compact(codec);
+            }
         }
         break;
-    case ack_owned:
-        duct_del(ack.owned.ptr);
-        break;
-    case ack_slot:
-        duct_io_rx_slot_drop(ack.slot.pool, ack.slot.idx, true);
-        break;
+    }
     default:
-        duct_unreachable();
+        break;
     }
 }
 
@@ -1115,31 +1088,88 @@ static_assert(duct_session_max_streams + 3u <= UINT8_MAX,
 
 /** @brief Held-frame source pin against compaction.
  *
- *  Pins @c rx->held_frames (RX ring, cross-thread with the io thread's own
- *  compaction check, so atomic) or the codec's cleartext buffer, one more
- *  holder of its block, while a multiplexed handler owns the frame.
- *  @ref s_hctx_hold_release is the release of both.
+ *  Raises an RX ring span's @c rx->pins — the §2.3 window pin, whose 0 → 1
+ *  edge takes the conn's refs unit — or the cleartext chunk's record-hold
+ *  count, while a multiplexed handler owns the frame. A claimed RX slot and
+ *  an owned copy arrive already held: the claim was the pin's own act at
+ *  dispatch, the copy is the handler's outright. @ref s_hctx_hold_release
+ *  is the release of all four.
  */
-static void s_frame_hold_pin(duct_conn_t *conn, duct_frame_ack_t ack)
+static void s_frame_hold_pin(duct_conn_t *conn, duct_span_t span)
 {
-    switch (ack.kind) {
-    case ack_ring:
-        duct_discard duct_atomic_fetch(add, &conn->rx_buf->held_frames, 1u, release);
+    switch (duct_span_kind_of(&span)) {
+    case span_rx:
+        duct_span_rx_pin(conn, duct_conn_rx_olb(conn));
         break;
-    case ack_ct:
-        duct_discard duct_share(ack.ct.data);
+    case span_ptr: {
+        auto base = duct_span_base(&span);
+        if (s_ct_chunk_is(base)) {
+            auto pool = duct_x_slot_pool_of(base);
+            duct_x_slot_pin(pool, duct_x_slot_index(pool, base));
+        }
         break;
-    case ack_owned:
-    case ack_slot:
-        break;
-    default:
-        duct_unreachable();
     }
+    default:
+        break;
+    }
+}
+
+/** @brief Drop a held frame's substrate reference, pinned — the release
+ *  half of §1.1's one span per held payload.
+ *
+ *  A ring span runs the §2.3 unpin step; a pointer span resolves by its
+ *  base: a cleartext chunk through its pool's record holders, a claimed RX
+ *  slot through the claim, an owned block by the delete. Nothing else holds.
+ *  @p conn is the span's own leg where the substrate needs one, null where
+ *  the caller knows it resolves none.
+ */
+static void s_ingress_drop_pinned(duct_conn_t *conn, duct_span_t *span)
+{
+    switch (duct_span_kind_of(span)) {
+    case span_rx:
+        if (conn && duct_conn_rx_olb(conn))
+            duct_span_unpin(span, duct_conn_rx_hdr(conn));
+        break;
+    case span_ptr: {
+        auto base = duct_span_base(span);
+        if (duct_x_slot_obj_is(base)) {
+            if (s_ct_chunk_is(base))
+                s_ct_pin_release(conn, base);
+            else {
+                auto pool = duct_x_slot_pool_of(base);
+                duct_io_rx_slot_drop(pool, duct_x_slot_index(pool, base), true);
+            }
+        } else
+            duct_del(base);
+        break;
+    }
+    default:
+        break;
+    }
+}
+
+/** @brief Drop what a frame's producer created before any hold was raised:
+ *  the copy it materialized, the claim it took on its RX slot. A ring span
+ *  and a cleartext chunk pin only at the hold, so nothing of theirs drops
+ *  here — the sites ahead of @c s_frame_hold_pin resolve through this. */
+static void s_ingress_drop_created(duct_span_t span)
+{
+    if (duct_span_kind_of(&span) != span_ptr)
+        return;
+    auto base = duct_span_base(&span);
+    if (!duct_x_slot_obj_is(base)) {
+        duct_del(base);
+        return;
+    }
+    if (s_ct_chunk_is(base))
+        return;
+    auto pool = duct_x_slot_pool_of(base);
+    duct_io_rx_slot_drop(pool, duct_x_slot_index(pool, base), true);
 }
 
 /** @brief Conditional on_error fire, control-only.
  *  Fires @c cfg->on_error if set, applies its control-only out on rc_ok;
- *  out->payload/flags/release/send_token are not read — see duct_error_fn.
+ *  out->payload/flags/release are not read — see duct_error_fn.
  */
 static void s_fire_error(duct_session_t *s,
                                 const duct_proto_cfg_t *cfg, duct_result_t err)
@@ -1152,22 +1182,98 @@ static void s_fire_error(duct_session_t *s,
         s_response_take_control(s, &out);
 }
 
-static void s_fire_send_done(duct_session_t *s,
-                                    const duct_proto_cfg_t *cfg,
-                                    duct_conn_id_t cid, duct_stream_id_t sid,
-                                    const duct_response_t *out,
-                                    duct_result_t result)
+static void s_fire_send_done_raw(duct_session_t *s,
+                                 const duct_proto_cfg_t *cfg,
+                                 duct_conn_id_t cid,
+                                 uint64_t frontier,
+                                 duct_result_t result)
 {
-    if (!duct_has(out->flags, fl_send_done) || !cfg->on_send_done)
+    duct_do_if(!cfg, return);
+    if (!cfg->on_send_done)
         return;
     duct_send_done_info_t info = {
-        .conn_id = cid, .stream_id = sid,
-        .send_token = out->send_token, .result = result,
+        .conn_id = cid, .frontier = frontier, .result = result,
     };
     duct_response_t done_out;
     duct_response_reset(&done_out);
     if (cfg->on_send_done(s, &info, &done_out, s->proto_state) == rc_ok)
         s_response_take_control(s, &done_out);
+}
+
+static uint32_t s_tx_done_take_delta(duct_conn_t *conn)
+{
+    auto txq = duct_conn_tx_seq(conn);
+    uint32_t extra = duct_span_done_max - 1u;
+    uint32_t take_ctl = txq->done_ctl < extra ? txq->done_ctl : extra;
+    txq->done_ctl -= take_ctl;
+    extra -= take_ctl;
+    uint32_t take_skip = txq->done_skip < extra ? txq->done_skip : extra;
+    txq->done_skip -= take_skip;
+    return 1u + take_ctl + take_skip;
+}
+
+static uint64_t s_tx_done_take_all(duct_conn_t *conn)
+{
+    auto txq = duct_conn_tx_seq(conn);
+    uint64_t delta = 1u + (uint64_t)txq->done_ctl + txq->done_skip;
+    txq->done_ctl = 0u;
+    txq->done_skip = 0u;
+    return delta;
+}
+
+static void s_conn_done_flush(duct_session_t *s, duct_conn_id_t conn_id, duct_conn_t *conn)
+{
+    duct_do_if(!s || !s->proto || conn_id >= duct_session_max_legs, return);
+    auto txq = duct_conn_tx_seq(conn);
+    auto txd = duct_conn_tx_done(conn);
+    uint64_t done_seq = duct_atomic_load(&txd->seq, acquire);
+    if (txq->done_ctl && done_seq + txq->done_skip + txq->done_ctl == txq->done_posted) {
+        uint64_t carry = (uint64_t)txq->done_ctl + txq->done_skip;
+        txq->done_ctl = 0u;
+        txq->done_skip = 0u;
+        done_seq = duct_atomic_fetch(add, &txd->seq, carry, relaxed) + carry;
+    }
+    if (done_seq <= txq->done_reported)
+        return;
+    if (done_seq > txq->done_posted)
+        done_seq = txq->done_posted;
+    txq->done_reported = done_seq;
+    s_fire_send_done_raw(s, duct_proto_cfg_of(s->proto), conn_id, done_seq, rc_ok);
+}
+
+static void s_conn_done_flush_handle(duct_conn_handle_t handle)
+{
+    auto conn = duct_conn_by_handle(handle);
+    if (!conn)
+        return;
+    auto s = duct_session_by_conn(conn);
+    if (!s || !s->proto)
+        return;
+    auto cid = duct_session_conn_id_by_handle(s, handle);
+    if (cid < duct_session_max_legs) {
+        s_conn_done_flush(s, cid, conn);
+        s_response_switch(s);
+    }
+}
+
+void duct_worker_conn_done_close(duct_session_t *s, duct_conn_id_t conn_id, duct_conn_t *conn)
+{
+    if (!s->proto)
+        return;
+    s_conn_done_flush(s, conn_id, conn);
+    if (!s->proto)
+        return;
+    auto txq = duct_conn_tx_seq(conn);
+    if (txq->done_posted - txq->done_reported <= txq->done_skip) {
+        txq->done_reported = txq->done_posted;
+        return;
+    }
+    uint64_t done_seq = duct_atomic_load(&duct_conn_tx_done(conn)->seq, acquire);
+    duct_result_t res = done_seq >= txq->done_posted ? rc_ok : rc_closed;
+    uint64_t frontier = txq->done_posted;
+    txq->done_reported = frontier;
+    s_fire_send_done_raw(s, duct_proto_cfg_of(s->proto), conn_id, frontier, res);
+    s_response_switch(s);
 }
 
 /** @brief Stage @p frame onto @p stage through @p wire @c on_pack.
@@ -1191,20 +1297,6 @@ s_wire_pack_into(const duct_wire_t *wire, duct_session_t *s,
     return wrc == rc_ok ? olb_tx_ok : wrc == rc_invalid_arg ? olb_tx_too_large : olb_tx_full;
 }
 
-/** @brief Record-header bytes @p conn TX ring carries per packet.
- *
- *  Nonzero on a record-framed conn, whose ring holds several packets at once
- *  and needs each boundary written down for @ref duct_io_tx_peek. The engine's
- *  handshake egress and the TX reservation taken ahead of an unseal size
- *  themselves from here; @ref s_tx_stage_frame writes the same header off the
- *  same predicate, so a transport reaching one path and not the other stages a
- *  boundary the drain never finds.
- */
-static size_t s_tx_rec_size(const duct_conn_t *conn)
-{
-    return duct_conn_record_framed(conn) ? duct_dgram_record_hdr_size : 0u;
-}
-
 /** @brief Bytes @p conn's wire packs @p payload_size into, its header
  *  included.
  *  @return false when the size overflows or the wire @c tx_bound
@@ -1221,37 +1313,43 @@ static bool s_tx_wire_need(const duct_conn_t *conn, size_t payload_size, size_t 
                          conn->wire ? conn->wire->header_size : 0u);
 }
 
-/** @brief Bytes @p conn TX ring needs to hold a @p payload_size frame,
- *  the record header on a framed leg included.
+/** @brief Wire bytes @p conn's TX ring holds a @p payload_size frame under:
+ *  what the wire packs, plus a vnet leg's inline virtio header — the record
+ *  the descriptor carries, its header half included.
  *  @return false on the same terms as @ref s_tx_wire_need.
  */
 static bool s_tx_frame_need(const duct_conn_t *conn, size_t payload_size, size_t *out_need)
 {
     return s_tx_wire_need(conn, payload_size, out_need)
-        && !duct_ckd_add(out_need, *out_need, s_tx_rec_size(conn));
+        && !duct_ckd_add(out_need, *out_need, conn->vnet_hdr_len);
 }
 
-/** @brief Transactional frame stage onto @p conn's TX OLB.
+/** @brief Transactional record stage onto @p conn's TX descriptor ring.
  *
- *  On a record-framed conn, wraps the frame in the datagram record header:
- *  placeholder reclen → wire pack → backfill with the measured length. On any
- *  other transport, stages the wire-packed, or raw wireless, bytes directly.
- *  All-or-nothing: on failure (@c olb_tx_full or @c olb_tx_too_large), the
- *  TX cursor is preserved and placeholders are rewound via
- *  @ref duct_olb_tx_unmark. Callers publish after @c olb_tx_ok.
+ *  The wire packs its header into the record's inline half and the payload
+ *  rides §2.1's classification: a recognized substrate pinned by reference,
+ *  a sealed codec's whole record sealed into the materialize arena (the
+ *  ciphertext does not exist before staging — the encrypt destination), a
+ *  sub-threshold or foreign source copied into it with the response's
+ *  ownership hooks fired at the copy. On a vnet leg the inline header
+ *  carries the record's virtio header, its GSO prefix built here — the map's
+ *  one materialize-class backfill — and the gso flag rides the span's own
+ *  bit; the datagram record header and its two-phase backfill are dead.
+ *  All-or-nothing: on failure (@c olb_tx_full or @c olb_tx_too_large) the
+ *  staging cursors rewind through @c duct_olb_tx_unmark and any pin taken is
+ *  dropped before the answer. Callers publish after @c olb_tx_ok.
  */
 static duct_olb_tx_result_t
-s_tx_stage_frame(duct_conn_t *conn, duct_session_t *s, const duct_frame_t *frame)
+s_tx_stage_frame(duct_conn_t *conn, duct_session_t *s, const duct_frame_t *frame,
+                 duct_response_t *own, redirect_t *redirect)
 {
-    bool dgram_framed = duct_conn_record_framed(conn);
+    auto tx = duct_conn_tx_olb(conn);
     size_t need = 0u;
     if (!s_tx_frame_need(conn, frame->payload.size, &need))
         return olb_tx_too_large;
-    /* align answers for the whole frame, opening the next pass when this one
-     * is out of room, so the placeholder and every span on_pack stages below
-     * land in one pass and the unmark rewinds within it. */
-    if (!duct_olb_tx_align(conn->tx_buf, need))
+    if (!duct_olb_tx_room_contig(tx, need)) {
         return olb_tx_full;
+    }
 
     /* conn->wire->unseal gates the sealed-only s_tls_codec call: guards a
      * client-first protocol reaching TX before session bind or a wire-fence
@@ -1259,36 +1357,105 @@ s_tx_stage_frame(duct_conn_t *conn, duct_session_t *s, const duct_frame_t *frame
      * on_pack above/below), so a plain wire never touches ctx's cold cache
      * line to rule this out. */
     auto codec = conn->wire && conn->wire->unseal ? s_tls_codec(conn) : nullptr;
-    auto mark = duct_olb_tx_mark(conn->tx_buf);
-    auto rec_mark = mark;
-    duct_olb_tx_result_t st = olb_tx_ok;
-    if (dgram_framed) {
-        uint8_t placeholder[duct_dgram_record_hdr_size] = {};
-        st = duct_olb_tx_stage(conn->tx_buf, placeholder, sizeof(placeholder), nullptr, 0u);
-        if (st == olb_tx_ok)
-            rec_mark = duct_olb_tx_mark(conn->tx_buf);
+    /* A sealed record's cut is the codec's own: a vnet leg's gso prefix
+     * segments the ciphertext mid-PDU, so the flag refuses instead of staging
+     * a record the kernel would cut. */
+    duct_do_if(codec && conn->vnet_hdr_len
+               && duct_has(frame->flags, fl_frame_gso), return olb_tx_too_large);
+    auto mark = duct_olb_tx_mark(tx);
+    duct_wire_tx_t stage = {};
+    stage.kind = wire_tx_ring;
+    stage.ring.tx = tx;
+    auto wrc = s_wire_pack_into(conn->wire, s, frame, &stage, codec);
+    if (wrc != olb_tx_ok) {
+        duct_olb_tx_unmark(tx, mark);
+        return wrc;
     }
-    if (st == olb_tx_ok) {
-        auto stage = (duct_wire_tx_t){ .kind = wire_tx_olb, .olb = conn->tx_buf };
-        st = s_wire_pack_into(conn->wire, s, frame, &stage, codec);
-        if (st != olb_tx_ok)
-            /* Rewinds the header placeholder above too, on dgram_framed --
-             * a partial stage (e.g. just the wire header) must never leak
-             * the cursor forward: stage left past tail holds
-             * duct_olb_tx_wrap_room at zero, and no new pass opens for this
-             * conn again. */
-            duct_olb_tx_unmark(conn->tx_buf, mark);
-        else if (dgram_framed) {
-            /* A vnet leg's GSO record carries its flag in the prefix, where
-             * duct_io_tx_send reads it back to build the record's header. */
-            uint8_t rec[duct_dgram_record_hdr_size];
-            bool gso = conn->vnet_hdr_len && duct_has(frame->flags, fl_frame_gso);
-            duct_dgram_rec_hdr_encode(rec, duct_olb_tx_staged_since(conn->tx_buf, rec_mark)
-                                           | (gso ? duct_dgram_rec_gso : 0u));
-            duct_olb_tx_backfill(conn->tx_buf, rec_mark, rec, sizeof(rec));
+    auto d = duct_olb_tx_desc_open(tx);
+    if (!d) {
+        duct_olb_tx_unmark(tx, mark);
+        return olb_tx_full;
+    }
+    /* The wire's packed prefix rides the record's inline header — the vnet
+     * leg overwrites it below with its virtio header, the sealed record
+     * folded its prefix into the ciphertext span ahead of it. */
+    duct_span_t span;
+    uint32_t hdr_len = stage.ring.hdr_len;
+    bool gso = false;
+    if (stage.ring.sealed_len) {
+        assert(!stage.ring.hdr_len);
+        /* §2.1's encrypt-destination class: the codec sealed its whole
+         * record — prefix and ciphertext — into the arena run span_open
+         * took at the arena's write position. */
+        uint32_t off = (uint32_t)((tx->mat_tail - stage.ring.sealed_len)
+                                  % duct_conn_tx_mat_cap);
+        span = duct_span_of_mat(duct_conn_tx_mat(conn), off,
+                                stage.ring.sealed_len);
+        /* The vnet leg still names its record with the virtio header, zeroed:
+         * the sealed PDU's cut is the codec's own. */
+        if (conn->vnet_hdr_len) {
+            memcpy(d->hdr, duct_vnet_zero, conn->vnet_hdr_len);
+            duct_span_meta_set(&span, conn->vnet_hdr_len, false);
+        }
+    } else {
+        if (conn->vnet_hdr_len) {
+            /* The vnet leg's inline header is the record's virtio header, its
+             * GSO prefix built off the payload here (§2.1's cut class). A wire
+             * staging header bytes of its own has nowhere to put them past
+             * this overwrite, so such a record refuses. */
+            duct_do_if(stage.ring.hdr_len,
+                       duct_olb_tx_unmark(tx, mark); return olb_tx_too_large);
+            duct_view_u8 pkt = stage.ring.payload;
+            uint8_t vh[duct_vnet_hdr_max];
+            if (duct_has(frame->flags, fl_frame_gso)) {
+                duct_do_if(!duct_vnet_gso_open(&pkt, vh),
+                           duct_olb_tx_unmark(tx, mark); return olb_tx_too_large);
+                gso = true;
+            } else
+                memcpy(vh, duct_vnet_zero, conn->vnet_hdr_len);
+            memcpy(d->hdr, vh, conn->vnet_hdr_len);
+            hdr_len = conn->vnet_hdr_len;
+        } else if (stage.ring.hdr_len)
+            memcpy(d->hdr, stage.ring.hdr, stage.ring.hdr_len);
+        if (s_payload_classify(stage.ring.payload,
+                               own ? own->flags : fl_send_copy,
+                               own ? own->release : nullptr,
+                               own ? own->release_arg : nullptr,
+                               redirect, &span) == payload_ref) {
+            duct_span_meta_set(&span, hdr_len, gso);
+        } else {
+            /* §2.1's copy class: foreign or sub-threshold bytes, and a custom
+             * release or owned free firing here, once, on the worker — the response
+             * leaving holding nothing, or the commit's own cleanup releases a
+             * second time (@c duct_response_release_owned clears nothing by
+             * contract). */
+            size_t len = stage.ring.payload.size;
+            size_t off = duct_olb_tx_mat_open(tx, len);
+            if (off == SIZE_MAX) {
+                duct_olb_tx_unmark(tx, mark);
+                duct_do_if(len > duct_conn_tx_mat_cap, return olb_tx_too_large);
+                return olb_tx_full;
+            }
+            if (len)
+                memcpy(duct_olb_tx_mat_at(tx, off), stage.ring.payload.data, len);
+            span = duct_span_of_mat(duct_conn_tx_mat(conn), (uint32_t)off,
+                                    (uint32_t)len);
+            duct_span_meta_set(&span, hdr_len, gso);
+            if (own && !duct_has(own->flags, fl_send_static)
+                && (own->release || duct_has(own->flags, fl_send_owned))) {
+                duct_response_release_owned(own);
+                own->flags = duct_and(own->flags, duct_not(fl_send_owned));
+                own->release = nullptr;
+                own->release_arg = nullptr;
+            }
         }
     }
-    return st;
+    if (own && duct_has(own->flags, fl_send_done))
+        duct_span_done_set(&span, s_tx_done_take_delta(conn));
+    d->span = span;
+    duct_olb_tx_staged_bytes_add(tx, duct_span_wire_len(&d->span));
+    duct_conn_tx_staged(conn, need);
+    return olb_tx_ok;
 }
 
 static void s_wake(unsigned worker_id)
@@ -1320,10 +1487,12 @@ unsigned duct_worker_egress_self(void)
     return w && w->host_egress ? w->worker_id : conn_worker_none;
 }
 
+static_assert(conn_worker_none == duct_worker_none, "worker none sentinels must match");
+
 unsigned duct_worker_self(void)
 {
     auto w = s_this_worker;
-    return w ? w->worker_id : conn_worker_none;
+    return w ? w->worker_id : duct_worker_none;
 }
 
 void duct_worker_egress_abandon(unsigned worker_id)
@@ -1339,18 +1508,44 @@ uint32_t _Atomic *duct_worker_wake_latch(unsigned worker_id)
     return &s_wmod.workers[worker_id].wake_latch;
 }
 
+static inline void s_bitmap_arm_2lvl(uint64_t _Atomic *armed, uint64_t _Atomic *summary,
+                                     unsigned conn_idx)
+{
+    if (duct_bits_set_if_new(armed, conn_idx)) {
+        atomic_thread_fence(memory_order_seq_cst);
+        duct_bits_set_if_new(summary, conn_idx >> bits_word_shift);
+    }
+}
+
+static inline void s_worker_inter_arm(duct_worker_t *w, unsigned conn_idx)
+{
+    s_bitmap_arm_2lvl(w->inter_armed, w->inter_summary, conn_idx);
+}
+
 void duct_worker_inter_arm(unsigned worker_id, unsigned conn_idx)
 {
-    if (worker_id >= s_wmod.n_workers)
-        return;
+    duct_do_if(worker_id >= s_wmod.n_workers, return);
+    s_worker_inter_arm(&s_wmod.workers[worker_id], conn_idx);
+}
+
+void duct_worker_done_arm(unsigned worker_id, unsigned conn_idx)
+{
+    duct_do_if(worker_id >= s_wmod.n_workers, return);
     auto w = &s_wmod.workers[worker_id];
-    /* set_if_new, not a bare duct_bits_set: a redundant arm on an
-     * already-set bit must not double-count inter_pending, or the counter
-     * drifts upward forever and s_inter_drain's zero-skip never fires
-     * again once it happens once (grab clears the bit exactly once
-     * regardless of how many times it was armed). */
-    if (duct_bits_set_if_new(w->inter_armed, conn_idx))
-        duct_atomic_fetch(add, &w->inter_pending, 1u, relaxed);
+    s_bitmap_arm_2lvl(w->done_armed, w->done_summary, conn_idx);
+}
+
+static inline void s_tx_done_skip(duct_conn_t *conn)
+{
+    auto txq = duct_conn_tx_seq(conn);
+    txq->done_skip += 1u;
+    if (txq->done_ctl && s_this_worker
+        && duct_conn_phase(conn) < conn_quiesced
+        && txq->done_reported < txq->done_posted
+        && duct_atomic_load(&duct_conn_tx_done(conn)->seq, relaxed)
+           + txq->done_skip + txq->done_ctl == txq->done_posted)
+        s_bitmap_arm_2lvl(s_this_worker->done_armed, s_this_worker->done_summary,
+                          duct_conn_idx_get(conn));
 }
 
 /** @brief Per-response payload cap; 0 indicates no explicit cap (coarse
@@ -1382,14 +1577,19 @@ static inline bool s_admit_leg_room(const duct_conn_t *conn, size_t need)
 }
 
 /** @brief Arm @p conn's TX-room wake ahead of the caller's last room check.
- *  The fence pairs with the one io runs after freeing room: either that check
- *  sees the room, or io sees @c fl_conn_tx_wait and wakes this worker. An arm
- *  placed after a failed check lets io free the room unseen.
+ *  The stored value is the monotonic packed-head target the wait resolves at
+ *  — @p need is the contiguous span a refused room check demanded, 0 the
+ *  coarse backpressure form — and the fence pairs with the one io runs after
+ *  each head advance: either that check sees the room, or io sees the target
+ *  and its next advance's crossing edge wakes this worker. An arm placed
+ *  after a failed check lets io free the room unseen. A lane conn arms on
+ *  its resident header's zeroed words: the target takes the any-signal
+ *  shape its device wake reads.
  */
-static void s_tx_wait_arm(duct_conn_t *conn)
+static void s_tx_wait_arm(duct_conn_t *conn, size_t need)
 {
-    duct_conn_state_set(conn, fl_conn_tx_wait);
-    atomic_thread_fence(memory_order_seq_cst);
+    duct_olb_tx_wait_arm(duct_conn_tx_hdr(conn),
+                         duct_olb_tx_wait_target(duct_conn_tx_hdr(conn), need));
 }
 
 /** @brief Test @p conn's TX room for @p need, and on a refusal flush this
@@ -1410,7 +1610,7 @@ bool duct_worker_admit_leg(duct_conn_handle_t handle, size_t need)
     auto conn = duct_conn_by_handle(handle);
     if (s_admit_leg_room_flushed(handle, conn, need))
         return true;
-    s_tx_wait_arm(conn);
+    s_tx_wait_arm(conn, need);
     return s_admit_leg_room(conn, need);
 }
 
@@ -1616,8 +1816,9 @@ static duct_nonnull(1) size_t s_drain_pass(duct_worker_t *w,
     return drained;
 }
 
-/** @brief Deferred batch node: inline batch copy + cursor. One heap alloc
- *  per deferred batch lifetime — cursor moves, node stays in FIFO.
+/** @brief Deferred batch node: inline batch copy + cursor. The node carves in
+ *  its session's page-0 defer region — a sessionless conn's batch, still
+ *  inside its bind window, in that conn block's TX retry copy units instead.
  */
 duct_msg_chain_decl(batch_defer_node_t,
     uint32_t from;  /**< Cursor: first unprocessed frame index. */
@@ -1630,12 +1831,96 @@ static inline size_t s_defer_node_size(unsigned n)
     return sizeof(batch_defer_node_t) + (size_t)n * sizeof(duct_msg_frame_t);
 }
 
+static uint32_t s_defer_units_of(unsigned n)
+{
+    return (uint32_t)((s_defer_node_size(n) + session_defer_grain - 1u)
+                      / session_defer_grain);
+}
+
+static uint8_t *s_defer_region_take(duct_session_t *s, uint32_t units)
+{
+    auto maps = duct_session_defer_maps(s);
+    uint32_t run = 0u;
+    for (uint32_t i = 0u; i < duct_session_defer_units; ++i) {
+        if (maps->units[i >> 6] & (1ull << (i & 63u))) {
+            run = 0u;
+            continue;
+        }
+        if (++run == units) {
+            uint32_t base = i + 1u - units;
+            for (uint32_t k = base; k <= i; ++k)
+                maps->units[k >> 6] |= 1ull << (k & 63u);
+            return duct_session_defer_region(s) + (size_t)base * session_defer_grain;
+        }
+    }
+    return nullptr;
+}
+
+static bool s_defer_in_session(const duct_session_t *s, const void *p)
+{
+    auto base = duct_session_defer_region(s);
+    return (const uint8_t *)p >= base
+        && (const uint8_t *)p < base + duct_session_defer_bytes;
+}
+
+static void s_defer_region_release(const duct_session_t *s, batch_defer_node_t *node)
+{
+    auto maps = duct_session_defer_maps(s);
+    uint32_t base = (uint32_t)(((uintptr_t)node
+                                - (uintptr_t)duct_session_defer_region(s))
+                               / session_defer_grain);
+    for (uint32_t k = base, units = s_defer_units_of(node->batch.n);
+         k < base + units; ++k)
+        maps->units[k >> 6] &= ~(1ull << (k & 63u));
+}
+
+static uint8_t *s_retry_copy_take(duct_conn_t *conn, size_t len);
+static void s_retry_copy_release(duct_conn_t *conn, void *p, size_t len);
+
+/** @brief The session whose block carries @p p, by address alone.
+ *
+ *  A closing session no longer resolves through its conn, so the node's home
+ *  is a fact of the pool maps, not of any live binding.
+ *  @return The owning session, or null when @p p sits outside the session
+ *          pool — a conn-copy node of the bind window.
+ */
+static duct_session_t *s_defer_node_session(const void *p)
+{
+    auto blocks = duct_session_pool_blocks();
+    auto base = (const uint8_t *)blocks->vm.base;
+    if ((const uint8_t *)p < base
+        || (const uint8_t *)p >= base + (size_t)blocks->n_blocks * blocks->block_size)
+        return nullptr;
+    return (duct_session_t *)(base
+        + (size_t)(((const uint8_t *)p - base) / blocks->block_size)
+              * blocks->block_size);
+}
+
+/** @brief Return @p node to the region it carved: its session's defer region
+ *  where it holds one, else the TX retry copy units of @p conn — the
+ *  sessionless bind window's home. The teardown disciplines guarantee a live
+ *  owner here: a session's nodes leave the queue before its block returns, a
+ *  conn's before its block retires.
+ */
+static void s_defer_node_free(duct_conn_t *conn, batch_defer_node_t *node)
+{
+    assert(conn);
+    auto s = s_defer_node_session(node);
+    if (s) {
+        s_defer_region_release(s, node);
+        return;
+    }
+    s_retry_copy_release(conn, node, s_defer_node_size(node->batch.n));
+}
+
 static void s_defer_clear(duct_deferred_queue_t *q)
 {
     for (auto m = q->q.head; m; ) {
         auto next = duct_msg_next(m);
         auto node = DUCT_CAST(batch_defer_node_t, msg, m);
-        duct_del(node);
+        auto conn = duct_conn_by_handle((duct_conn_handle_t){ .word = node->batch.conn });
+        assert(conn);
+        s_defer_node_free(conn, node);
         m = next;
     }
     q->q.head = nullptr;
@@ -1667,9 +1952,13 @@ s_defer_node_push(duct_deferred_queue_t *q, batch_defer_node_t *node)
         duct_bits_set(q->mask, (unsigned)h.idx);
 }
 
-/** @brief Defer-node allocation from a VMQ batch, payload copied, cursor set.
+/** @brief Defer-node admission under its budget, payload copied, cursor set.
+ *  The node carves in the batch's session's page-0 defer region, first-fit
+ *  over the grain units; a conn still inside its bind window has no session,
+ *  so its node takes that conn block's TX retry copy units. Either home
+ *  answering empty is the allocation failing — the caller drops the suffix.
  *  @retval true   Success.
- *  @retval false  Allocation failed.
+ *  @retval false  Budget spent, or the copy region full.
  */
 static bool
 s_defer_batch_from_vmq(duct_deferred_queue_t *q,
@@ -1677,8 +1966,12 @@ s_defer_batch_from_vmq(duct_deferred_queue_t *q,
                        uint32_t from)
 {
     auto batch = (const duct_msg_frame_batch_t *)&hdr->payload[0];
-    size_t node_sz = s_defer_node_size(batch->n);
-    auto node = (batch_defer_node_t *)duct_at(duct_new(uint8_t, node_sz, alignof(batch_defer_node_t)));
+    auto conn = duct_conn_by_handle((duct_conn_handle_t){ .word = batch->conn });
+    assert(conn);
+    auto s = duct_session_by_conn(conn);
+    auto node = s ? (batch_defer_node_t *)s_defer_region_take(s, s_defer_units_of(batch->n))
+                  : (batch_defer_node_t *)s_retry_copy_take(conn,
+                                                            s_defer_node_size(batch->n));
     if (!node)
         return false;
     node->from = from;
@@ -1740,7 +2033,9 @@ static duct_nonnull(1) bool s_defer_drain(duct_worker_t *w)
                 kept_tail = m;
             } else {
                 progress = true;
-                duct_del(node);
+                auto live = duct_conn_by_handle(h);
+                assert(live);
+                s_defer_node_free(live, node);
             }
         }
         m = next;
@@ -1770,7 +2065,8 @@ void duct_worker_conn_defer_discard(const duct_conn_handle_t *conn)
                     auto f = &node->batch.frames[k];
                     s_rx_ack(c, f->len, f->offset + f->len);
                 }
-            duct_del(node);
+            assert(c);
+            s_defer_node_free(c, node);
         } else {
             duct_msg_next(m) = nullptr;
             if (kept_tail)
@@ -1796,12 +2092,16 @@ static duct_exec_rc_t s_dispatch_msg(duct_vmq_hdr_t *hdr)
 typedef enum : uint8_t { res_ok, res_gone, res_no_proto, res_unbound, res_retired } resolve_rc_t;
 
 /** @brief Shared handle → conn → session → proto resolution for frame/inter-pkt
- *  dispatch and frame retry. @c res_unbound is a live conn with no session yet
- *  and @c conn_fence == fence_unbound — its own ctrl (session_open/conn_join)
- *  is still queued behind the ext_pending backlog while this handle's WFQ
- *  traffic already drained, not a torn-down conn. @c res_retired is a live conn
- *  with no session at or past @c fence_retire_ready: its worker has confirmed
- *  no further access and io tears the rings down at any moment, so a caller
+ *  dispatch and frame retry. @c res_unbound is a live conn with no session yet,
+ *  @c phase == conn_unbound and no @c fl_req_close armed — its own ctrl
+ *  (session_open/conn_join) is still queued behind the ext_pending backlog
+ *  while this handle's WFQ traffic already drained, not a torn-down conn; a
+ *  close request posted means the ctrl handler already refused the bind and
+ *  the io run is dropping the last unit, so deferring to a bind that will
+ *  never come would orphan the node past the slot's recycle. Both tests read
+ *  one acquire load of the word. @c res_retired is a live conn
+ *  with no session at or past @c conn_retire_done: its worker has finished
+ *  the teardown half and the release count is draining, so a caller
  *  reads and acks none of them. Centralizes resolution only, not policy:
  *  callers apply their own distinct outcome per state (defer/drop/ack), and
  *  anything beyond conn+session+proto — @c rx_buf, @c wire_rebind_next —
@@ -1817,9 +2117,11 @@ s_dispatch_resolve(duct_conn_handle_t h, duct_conn_t **out_conn, duct_session_t 
     if (!conn)
         return res_gone;
     if (!s) {
-        auto fence = duct_atomic_load(&conn->conn_fence, acquire);
-        return fence == fence_unbound ? res_unbound
-             : fence >= fence_retire_ready ? res_retired : res_gone;
+        uint64_t word = duct_atomic_load(duct_conn_gen_req(conn), acquire);
+        auto phase = duct_gen_req_phase(word);
+        if (phase == conn_unbound && !(word & (uint64_t)fl_req_close))
+            return res_unbound;
+        return phase >= conn_retire_done ? res_retired : res_gone;
     }
     return s->proto ? res_ok : res_no_proto;
 }
@@ -1827,13 +2129,20 @@ s_dispatch_resolve(duct_conn_handle_t h, duct_conn_t **out_conn, duct_session_t 
 static inline bool s_hctx_parked(const duct_stream_ctx_t *h);
 static inline void s_hctx_wake(duct_coop_t *cp, duct_stream_ctx_t *h);
 
-static size_t s_engine_park_cap(const duct_conn_t *conn, const duct_wire_codec_t *codec);
 static bool s_engine_park_flush(duct_conn_t *conn);
 static uint8_t *s_engine_park_span(duct_conn_t *conn, duct_wire_codec_t *codec, size_t len);
 
+static void redirect_take(duct_session_t *s, const duct_proto_cfg_t *cfg,
+                          duct_conn_id_t cid, duct_stream_id_t sid,
+                          const duct_wire_codec_t *codec, duct_view_u8 pdu,
+                          redirect_t *out);
+static void s_redirect_release(redirect_t *r);
+static void *s_redirect_reserve(duct_unseal_ctx_t *self, size_t *out_cap);
+static bool s_redirect_commit(duct_unseal_ctx_t *self, size_t len);
+
 static duct_exec_rc_t s_dispatch_one_frame(duct_worker_t *w, duct_conn_t *conn,
     duct_session_t *s, duct_conn_id_t cid,
-    duct_frame_t frame, duct_frame_ack_t ack);
+    duct_frame_t frame, duct_span_t ack, redirect_t *redirect);
 
 static duct_exec_rc_t s_dispatch_sealed_frame(duct_worker_t *w, duct_conn_t *conn,
     duct_session_t *s, duct_conn_handle_t handle, const duct_msg_frame_t *task);
@@ -1851,8 +2160,20 @@ static duct_exec_rc_t s_dispatch_frame(duct_worker_t *w, duct_conn_handle_t hand
         return exec_done;
     if (rr == res_gone) {
         /* A closing session is a sink until its outbound ring drains. Leaving
-         * these bytes unacked can close both peers' windows permanently. */
-        if (conn && duct_conn_rx_olb(conn)) {
+         * these bytes unacked can close both peers' windows permanently.
+         * Bound conns only: a word still at conn_bound has not taken the
+         * close claim, so nothing has entered any release path and the ring
+         * is stable under the ack; past the claim, a bound conn's finalize
+         * runs at the conn_lost consume on this same worker — never parallel
+         * to a frame of its own — while an unbound conn io discards
+         * mid-batch with its frames deferred unacked, io's release and the
+         * next acquire's page-0 reset running parallel to this frame. The
+         * session_token load — retained until that consume — is the one
+         * race-free word that still names the bound conns among them. */
+        if (conn
+            && (duct_conn_phase(conn) == conn_bound
+                || duct_atomic_load(&conn->session_token, acquire) != handle_null)
+            && duct_conn_rx_olb(conn)) {
             auto sc = duct_conn_sealed_ctx(conn);
             if (task->sealed_epoch && sc && sc->head_unsealed)
                 sc->head_unsealed = false;
@@ -1875,7 +2196,7 @@ static duct_exec_rc_t s_dispatch_frame(duct_worker_t *w, duct_conn_handle_t hand
         s_rx_ack(conn, task->len, task->offset + task->len);
         return exec_done;
     }
-    if (s->wire_rebind_next)
+    if (s->switch_stage == switch_fencing)
         return exec_defer; /* wire-changing switch in flight; replayed once every leg's fence lands, no ack */
     if (task->flags & duct_frame_pad) {
         s_rx_ack(conn, task->len, task->offset + task->len);
@@ -1913,11 +2234,11 @@ static duct_exec_rc_t s_dispatch_frame(duct_worker_t *w, duct_conn_handle_t hand
     duct_frame_t frame = {
         .stream_id = task->stream_id,
         .flags = task->flags,
-        .payload = { .data = conn->rx_buf->data + task->offset + hdr,
+        .payload = { .data = duct_conn_rx_data(conn) + task->offset + hdr,
                      .size = task->len - hdr },
     };
     return s_dispatch_one_frame(w, conn, s, cid, frame,
-        (duct_frame_ack_t){ .kind = ack_ring, .ring = { task->len, task->offset + task->len } });
+        duct_span_of_rx((duct_conn_t *)conn, task->offset, task->len), nullptr);
 }
 
 typedef enum duct_stream_claim_rc : uint8_t {
@@ -1943,12 +2264,12 @@ static void s_stream_close_on_flags(duct_session_t *s, duct_stream_id_t sid,
  *  Shared by @c s_dispatch_frame_body and @c s_inter_pkt, which differ in what
  *  a failed claim or a busy stream should do — replay versus drop — so that
  *  decision, and the hold ahead of it, stay with each caller.
- *  @p ack is only read from, or handed off into the handler ctx; the caller
- *  still owns applying it on every returned path.
+ *  @p ack — the frame's held-payload span — is only read from, or handed off into the
+ *  handler ctx; the caller still owns resolving it on every returned path.
  */
 static duct_stream_claim_rc_t s_dispatch_stream_claim(duct_worker_t *w, duct_conn_t *conn,
     duct_session_t *s, const duct_proto_cfg_t *cfg, duct_conn_id_t cid,
-    duct_frame_t frame, duct_frame_ack_t ack)
+    duct_frame_t frame, duct_span_t ack)
 {
     /* An RST names a stream to end, so it opens none: a refusal below answers
      * the peer's RST with an RST, and two ends doing that never stop. The term
@@ -1957,7 +2278,8 @@ static duct_stream_claim_rc_t s_dispatch_stream_claim(duct_worker_t *w, duct_con
      * the slot is taken; duct_stream_state answers slot->proto_state instead,
      * null on a claimed stream whenever the proto sets no create_stream_state,
      * and costs a second hash lookup per frame. */
-    if (duct_has(cfg->flags, fl_proto_multiplexed) && frame.stream_id != 0u && s->streams
+    if (duct_has(cfg->flags, fl_proto_multiplexed) && frame.stream_id != 0u
+        && duct_has(s->flags, fl_session_multiplexed)
         && !duct_has(frame.flags, fl_frame_rst)
         && !duct_session_stream_slot(s, frame.stream_id)) {
         duct_response_t open_out = {};
@@ -1977,6 +2299,7 @@ static duct_stream_claim_rc_t s_dispatch_stream_claim(duct_worker_t *w, duct_con
                 s_fire_error(s, cfg, rc_invalid_arg);
             }
             s_frame_ack_apply(conn, ack);
+            s_ingress_drop_created(ack);
             return claim_handled;
         }
         if (cfg->on_stream_open)
@@ -1994,6 +2317,7 @@ static duct_stream_claim_rc_t s_dispatch_stream_claim(duct_worker_t *w, duct_con
     if (duct_has(frame.flags, fl_frame_rst)) {
         s_stream_close_on_flags(s, frame.stream_id, frame.flags);
         s_frame_ack_apply(conn, ack);
+        s_ingress_drop_created(ack);
         return claim_handled;
     }
     /* Past its own end: the peer already said it was done. */
@@ -2001,6 +2325,7 @@ static duct_stream_claim_rc_t s_dispatch_stream_claim(duct_worker_t *w, duct_con
         s_ctl_send_fin(s, cid, frame.stream_id, fl_frame_rst, stream_err_rejected);
         s_fire_error(s, cfg, rc_invalid_arg);
         s_frame_ack_apply(conn, ack);
+        s_ingress_drop_created(ack);
         return claim_handled;
     }
     if (slot && slot->handler_ctx && !s_hctx_parked(slot->handler_ctx))
@@ -2019,7 +2344,7 @@ static duct_stream_claim_rc_t s_dispatch_stream_claim(duct_worker_t *w, duct_con
          * dispatch_frontier once the handler is truly done. */
         hctx->frame = frame;
         hctx->conn_id = cid;
-        hctx->ack = ack;
+        hctx->span = ack;
         s_frame_hold_pin(conn, ack);
         duct_response_reset(&hctx->out);
         s_hctx_wake(cp, hctx);
@@ -2028,19 +2353,17 @@ static duct_stream_claim_rc_t s_dispatch_stream_claim(duct_worker_t *w, duct_con
     /* First frame: create handler coro + ctx. RX not acked — handler owns it.
      * slot is non-NULL here: claim above succeeded (fl_proto_multiplexed +
      * handler_kind != none is validated by duct_proto_create, which also
-     * guarantees s->streams is allocated). */
+     * guarantees the streams region is initialized). */
     assert(slot);
     /* dispatch_frontier does not advance here either — same reasoning as
      * the existing-hctx branch above; s_hctx_rx_ack advances it once the
      * handler is truly done with frame.payload. handler_oom below is the
      * one exit from this branch that never reads it, so it advances
      * frontier itself. */
-    duct_auto_del auto hctx = duct_new(duct_stream_ctx_t);
-    if (!hctx)
-        goto handler_oom;
+    auto hctx = duct_session_stream_ctx_slot(s, slot);
     *hctx = (duct_stream_ctx_t){
         .s = s, .stream_id = frame.stream_id, .conn_id = cid,
-        .frame = frame, .ack = ack,
+        .frame = frame, .span = ack,
         .out = { .control.stream_op_conn_id = duct_conn_id_same },
         .stream_state = slot->proto_state,
     };
@@ -2048,10 +2371,8 @@ static duct_stream_claim_rc_t s_dispatch_stream_claim(duct_worker_t *w, duct_con
     slot->handler_ctx = hctx;
     if (cfg->handler_kind == handler_async) {
         auto co = duct_async_acquire(&cp->async_pool, cfg->handler_async);
-        if (!co) {
-            slot->handler_ctx = nullptr;
+        if (!co)
             goto handler_oom;
-        }
         co->state = hctx;
         co->on_done = s_hctx_async_done;
         co->on_done_ctx = hctx;
@@ -2060,10 +2381,8 @@ static duct_stream_claim_rc_t s_dispatch_stream_claim(duct_worker_t *w, duct_con
         duct_async_queue_enqueue(&cp->async_queue, co, coop_run);
     } else if (cfg->handler_kind == handler_coro) {
         auto co = duct_coro_acquire(&cp->pool, cfg->handler_coro, hctx);
-        if (!co) {
-            slot->handler_ctx = nullptr;
+        if (!co)
             goto handler_oom;
-        }
         co->on_resume = s_hctx_sf_resume;
         co->on_resume_ctx = hctx;
         hctx->co = co;
@@ -2072,16 +2391,19 @@ static duct_stream_claim_rc_t s_dispatch_stream_claim(duct_worker_t *w, duct_con
         /* handler_kind == handler_none is rejected by duct_proto_create for
          * multiplexed protos with a stream_handler; reaching here means a
          * bypass. Roll back the ctx — no coro to cancel. */
-        slot->handler_ctx = nullptr;
         goto handler_oom;
     }
-    duct_discard duct_move(hctx);
     return claim_handled;
 
 handler_oom:
+    slot->handler_ctx = nullptr;
     s_fire_error(s, cfg, rc_no_memory);
     duct_session_stream_close(s, frame.stream_id, close_internal_error);
+    /* The hold this branch raised above is this path's own to drop — a
+     * leaked pin would hold the ring's window (and the conn's refs unit)
+     * past every resolution this frame will ever get. */
     s_frame_ack_apply(conn, ack);
+    s_ingress_drop_pinned(conn, &ack);
     return claim_handled;
 }
 
@@ -2109,11 +2431,11 @@ static inline void s_count_rx(const duct_session_t *s, duct_conn_id_t cid, size_
  *  frame, wherever its bytes came from.
  *
  *  The RX ring through @c s_dispatch_frame, or a sealed wire's decrypted
- *  cleartext through @c s_dispatch_sealed_frame. @p ack tells every ack site
- *  in this body — and the multiplexed-handler completion path, which can
- *  finish long after this call returns — which sink to advance. An answer
- *  parked aliasing the frame carries @p ack, which lands as the answer
- *  resolves.
+ *  cleartext through @c s_dispatch_sealed_frame. @p ack — the held payload's
+ *  span — tells every ack site in this body, and the multiplexed-handler
+ *  completion path which can finish long after this call returns, which
+ *  sink to advance. An answer parked aliasing the frame carries @p ack,
+ *  which lands as the answer resolves.
  *
  *  A frame counts in its leg's rx tally once a stream handler claims it or
  *  @c on_frame answers with anything but @c rc_defer; a deferred frame counts
@@ -2126,7 +2448,7 @@ static inline void s_count_rx(const duct_session_t *s, duct_conn_id_t cid, size_
  */
 static duct_exec_rc_t s_dispatch_frame_body(duct_worker_t *w, duct_conn_t *conn,
     duct_session_t *s, const duct_proto_cfg_t *cfg, duct_conn_id_t cid,
-    duct_frame_t frame, duct_frame_ack_t ack)
+    duct_frame_t frame, duct_span_t ack, redirect_t *redirect)
 {
     switch (s_dispatch_stream_claim(w, conn, s, cfg, cid, frame, ack)) {
     case claim_handled:
@@ -2149,14 +2471,19 @@ static duct_exec_rc_t s_dispatch_frame_body(duct_worker_t *w, duct_conn_t *conn,
         /* Discard: ack the bytes, no response / control / stream close. A
          * proto_switch recorded during the callback still applies. */
         s_frame_ack_apply(conn, ack);
+        s_ingress_drop_created(ack);
         s_response_drop(s, &out);
         return exec_done;
     }
     s_idle_heard(w, conn, s);
     w->rx_ack = &ack;
-    auto c_rc = s_response_take(s, &out, cid, frame.stream_id, frame.flags, nullptr, nullptr);
-    if (w->rx_ack)
+    auto c_rc = s_response_take(s, &out, cid, frame.stream_id, frame.flags, redirect, nullptr);
+    if (w->rx_ack) {
+        /* No park took the frame's reference over: its ack lands and what
+         * the producer created drops here. */
         s_frame_ack_apply(conn, ack);
+        s_ingress_drop_created(ack);
+    }
     w->rx_ack = nullptr;
     if (c_rc == commit_internal)
         return exec_done;
@@ -2167,10 +2494,13 @@ static duct_exec_rc_t s_dispatch_frame_body(duct_worker_t *w, duct_conn_t *conn,
      * stream handler still holds only keeps acked short, deferring the move
      * to a later accept. */
     if (duct_has(duct_conn_state(conn), fl_conn_roaming)) {
-        auto rx = conn->rx_buf;
+        auto rx = duct_conn_rx_olb(conn);
         uint64_t at = duct_atomic_load(&rx->acked, relaxed);
         if (at >= duct_atomic_load(&rx->roam_at, acquire)) {
             duct_atomic_store(&rx->accept_at, at, release);
+            auto sc = duct_conn_sealed_ctx(conn);
+            if (sc && sc->codec)
+                duct_wire_codec_owd_reset(sc->codec);
             auto rh = duct_conn_handle_get(conn);
             /* io re-points the socket on this post: records committed ahead
              * of it leave through the current peer. */
@@ -2189,16 +2519,17 @@ static duct_exec_rc_t s_dispatch_frame_body(duct_worker_t *w, duct_conn_t *conn,
  *  those outputs publish, fail or lose their legs. */
 static duct_exec_rc_t s_dispatch_one_frame(duct_worker_t *w, duct_conn_t *conn,
     duct_session_t *s, duct_conn_id_t cid,
-    duct_frame_t frame, duct_frame_ack_t ack)
+    duct_frame_t frame, duct_span_t ack, redirect_t *redirect)
 {
     auto cfg = duct_proto_cfg_of(s->proto);
     duct_do_if(!cfg->on_frame, return exec_done);
     auto hold = s_conn_tx_hold(conn);
-    if (s_tx_held(s, hold, conn))
+    if (s_tx_held(s, hold, conn)) {
         return exec_defer;
+    }
     w->hold_into = hold;
     w->hold_conn = conn;
-    auto rc = s_dispatch_frame_body(w, conn, s, cfg, cid, frame, ack);
+    auto rc = s_dispatch_frame_body(w, conn, s, cfg, cid, frame, ack, redirect);
     w->hold_into = nullptr;
     w->hold_conn = nullptr;
     return rc;
@@ -2217,7 +2548,7 @@ static duct_exec_rc_t s_dispatch_one_frame(duct_worker_t *w, duct_conn_t *conn,
 static void *s_unseal_reserve(duct_unseal_ctx_t *self, size_t *out_cap)
 {
     auto codec = self->codec;
-    *out_cap = duct_byte_len(codec->ct_buf) - codec->ct_len;
+    *out_cap = duct_x_slot_obj_cap(duct_at(codec->ct_buf)) - codec->ct_len;
     return duct_at(codec->ct_buf) + codec->ct_len;
 }
 
@@ -2234,7 +2565,7 @@ static void *s_unseal_reserve(duct_unseal_ctx_t *self, size_t *out_cap)
 static bool s_unseal_commit(duct_unseal_ctx_t *self, size_t len)
 {
     auto codec = self->codec;
-    size_t room = duct_byte_len(codec->ct_buf) - codec->ct_len;
+    size_t room = duct_x_slot_obj_cap(duct_at(codec->ct_buf)) - codec->ct_len;
     duct_do_if(len > room, return false);
     codec->ct_len += (uint32_t)len;
     return true;
@@ -2266,31 +2597,30 @@ static bool s_redirect_commit(duct_unseal_ctx_t *self, size_t len)
     return true;
 }
 
-/** @brief Stage engine egress, a handshake reply or an alert, into @p self's TX
- *  OLB or its codec's engine park.
- *  The codec's PDU prefix goes out ahead of @p bytes, counted with them into the
- *  record header a record-framed conn takes: handshake bytes never pass the
- *  packer, so the prefix is added here. A codec with a join lead leads the
+/** @brief Stage engine egress, a handshake reply or an alert, into @p self's
+ *  TX descriptor ring or its codec's engine park.
+ *  The codec's PDU prefix goes out ahead of @p bytes: handshake bytes never
+ *  pass the packer, so the prefix is added here, both materializing into the
+ *  arena run the record's span names. A codec with a join lead leads the
  *  record once the bytes behind its prefix are written. The ring takes the
- *  record only while the park is empty, and publishes it and posts io's drain;
- *  otherwise the park keeps it, ahead of every later byte of the conn. @p bare
- *  sends one opening packet alone and never parks: an @c x_udp_peer conn stages
- *  it as a record, an @c x_tcp conn also writes the packet's end into the
- *  socket's opening, for io to cut its writes at.
+ *  record only while the park is empty, and publishes it and posts io's
+ *  drain; otherwise the park keeps it, ahead of every later byte of the
+ *  conn. @p bare sends one opening packet alone and never parks: an
+ *  @c x_udp_peer conn stages it as a record, an @c x_tcp conn also writes
+ *  the packet's end into the socket's opening, for io to cut its writes at.
  *  @return @c false once the conn is gone, for a @p bare the conn refuses or
  *  finds no room for in the ring or the opening, and when the park has no room
  *  or no memory.
  */
 static bool s_unseal_tx_stage(duct_unseal_ctx_t *self, duct_view_u8 bytes, bool bare)
 {
-    assert(self->tx_buf->kind == wire_tx_olb);
-    auto olb = self->tx_buf->olb;
+    assert(self->tx_buf->kind == wire_tx_ring);
+    auto olb = self->tx_buf->ring.tx;
     auto h = (duct_conn_handle_t){ .word = self->handle };
     auto conn = duct_conn_by_handle(h);
     if (!conn || (bare && conn->xport_type != x_udp_peer && conn->xport_type != x_tcp))
         return false;
-    /* Train records staged in this pass take its room, and the span below
-     * never opens the next pass: they go out first. */
+    /* Train records staged in this pass take its room: they go out first. */
     s_tx_train_flush_for(h);
     /* The opening's cuts count from the stream's first byte, so its first
      * packet stages ahead of every byte published or written, a lead apart. */
@@ -2299,27 +2629,40 @@ static bool s_unseal_tx_stage(duct_unseal_ctx_t *self, duct_view_u8 bytes, bool 
     if (opening && (!duct_x_opening_room(opening, ahead, bytes.size)
                     || (!duct_x_opening_count(opening) && olb->stream_end != 0u)))
         return false;
-    size_t rec = s_tx_rec_size(conn),
-           pre = bare ? 0u : self->codec->tx_prefix_len,
-           len = rec + pre + bytes.size;
-    auto span = self->codec->engine_park_len ? nullptr
-              : (uint8_t *)duct_olb_tx_span_open(olb, len);
+    auto mark = duct_olb_tx_mark(olb);
+    size_t pre = bare ? 0u : self->codec->tx_prefix_len,
+           len = pre + bytes.size;
+    uint8_t *span = self->codec->engine_park_len ? nullptr
+                  : (uint8_t *)duct_olb_tx_span_open(olb, len);
     bool ring = span != nullptr;
     if (!ring && !bare)
         span = s_engine_park_span(conn, self->codec, len);
     if (!span)
         return false;
+    duct_tx_desc_t *d = nullptr;
+    if (ring) {
+        d = duct_olb_tx_desc_open(olb);
+        if (!d) {
+            duct_olb_tx_unmark(olb, mark);
+            return false;
+        }
+    }
     if (opening)
         duct_x_opening_push(opening, ahead, bytes.size);
-    if (rec)
-        duct_dgram_rec_hdr_encode(span, pre + bytes.size);
     if (pre)
-        memcpy(span + rec, self->codec->prefix, pre);
+        memcpy(span, self->codec->prefix, pre);
     if (bytes.size)
-        memcpy(span + rec + pre, bytes.data, bytes.size);
+        memcpy(span + pre, bytes.data, bytes.size);
     if (pre)
-        duct_wire_codec_lead(self->codec, span + rec, pre + bytes.size);
-    if (ring) {
+        duct_wire_codec_lead(self->codec, pre + bytes.size, span);
+    if (d) {
+        /* The arena run span_open took is the record's span whole; its wire
+         * length carries no inline header. */
+        d->span = duct_span_of_mat(duct_conn_tx_mat(conn),
+                                   (uint32_t)((olb->mat_tail - len)
+                                              % duct_conn_tx_mat_cap),
+                                   (uint32_t)len);
+        duct_olb_tx_staged_bytes_add(olb, (uint32_t)len);
         duct_olb_tx_publish(olb);
         duct_io_post_tx_drain(DUCT_CAST(duct_conn_handle_t, word, &self->handle));
     }
@@ -2347,23 +2690,45 @@ static bool s_unseal_tx_append_dgram(duct_unseal_ctx_t *self, duct_view_u8 bytes
 {
     auto h = (duct_conn_handle_t){ .word = self->handle };
     auto conn = duct_conn_by_handle(h);
-    if (!conn || conn->xport_type != x_udp_shared || !conn->ctx)
+    if (!conn || conn->xport_type != x_udp_shared
+        || !duct_conn_dgram_ctx(conn)->listener)
         return false;
-    auto dctx = (duct_dgram_shared_ctx_t *)conn->ctx;
+    auto dctx = duct_conn_dgram_ctx(conn);
     auto listener = dctx->listener;
     size_t pre = self->codec->tx_prefix_len;
     duct_io_post_dgram_tx(listener);
     dgram_out_t dout;
     duct_vmq_push_rc_t push_rc;
-    if (!s_dgram_out_open(listener, &dctx->peer, pre + bytes.size, &dout, &push_rc))
+    if (!s_dgram_out_open(listener, &dctx->peer, &dctx->local, pre + bytes.size, &dout, &push_rc))
         return false;
-    auto at = (uint8_t *)dout.span.data;
+    if (dout.pools) {
+        auto at = (uint8_t *)dout.span.data;
+        if (pre)
+            memcpy(at, self->codec->prefix, pre);
+        if (bytes.size)
+            memcpy(at + pre, bytes.data, bytes.size);
+        if (pre)
+            duct_wire_codec_lead(self->codec, pre + bytes.size, at);
+        s_dgram_out_publish(&dout, pre + bytes.size);
+        duct_io_post_dgram_tx(listener);
+        return true;
+    }
+    /* The descriptor form: sealed engine bytes exist only here, so the whole
+     * datagram materializes into one block the entry's span names — no
+     * inline header, the prefix part of the payload. */
+    auto copy = duct_at(duct_new(uint8_t, pre + bytes.size));
+    if (!copy) {
+        s_dgram_out_abort(&dout);
+        return false;
+    }
     if (pre)
-        memcpy(at, self->codec->prefix, pre);
+        memcpy(copy, self->codec->prefix, pre);
     if (bytes.size)
-        memcpy(at + pre, bytes.data, bytes.size);
+        memcpy(copy + pre, bytes.data, bytes.size);
     if (pre)
-        duct_wire_codec_lead(self->codec, at, pre + bytes.size);
+        duct_wire_codec_lead(self->codec, pre + bytes.size, copy);
+    *(duct_span_t *)(void *)(dout.entry->desc + dgram_tx_desc_half)
+        = duct_span_of_ptr(copy, 0u, (uint32_t)(pre + bytes.size));
     s_dgram_out_publish(&dout, pre + bytes.size);
     duct_io_post_dgram_tx(listener);
     return true;
@@ -2379,8 +2744,8 @@ static duct_peer_t s_conn_peer(const duct_conn_t *conn)
     auto rx = duct_conn_rx_olb(conn);
     if (rx)
         return rx->peer;
-    if (conn->xport_type == x_udp_shared && conn->ctx)
-        return ((const duct_dgram_shared_ctx_t *)conn->ctx)->peer;
+    if (conn->xport_type == x_udp_shared && duct_conn_dgram_ctx(conn)->listener)
+        return duct_conn_dgram_ctx(conn)->peer;
     return (duct_peer_t){};
 }
 
@@ -2397,7 +2762,7 @@ static duct_unseal_ctx_t s_engine_ctx(duct_conn_t *conn,
                                       duct_wire_tx_t *tx_stage)
 {
     auto handle = duct_conn_handle_get(conn);
-    *tx_stage = (duct_wire_tx_t){ .kind = wire_tx_olb, .olb = conn->tx_buf };
+    *tx_stage = (duct_wire_tx_t){ .kind = wire_tx_ring, .ring = { .tx = duct_conn_tx_olb(conn) } };
     return (duct_unseal_ctx_t){
         .handle = handle.word,
         .codec = codec, .tx_buf = tx_stage,
@@ -2436,56 +2801,54 @@ static void s_close_notify(duct_conn_t *conn, duct_close_reason_t reason)
     codec->engine->vtbl->close_notify(codec->engine, &ctx);
 }
 
+static duct_timer_handle_t s_timer_handle_of(const duct_worker_t *w, const duct_timer_t *t)
+{
+    return duct_timer_make_handle(w->worker_id, 0u, t->id);
+}
+
 /** @brief Mark the codec this timer was armed for as past its key lifetime.
  *  The conn is resolved from @c token afresh, so one reclaimed since the arm is
  *  passed over, and a codec rebuilt since carries another @c rekey_timer. Nothing
  *  is sent here: the conn's next PDU either way takes the rekey. */
 static duct_exec_rc_t s_rekey_fire(void *arg)
 {
-    auto ctx = (timer_ctx_t *)arg;
-    duct_do_if(!ctx, return exec_done);
-    duct_conn_handle_t handle = { .word = ctx->token };
+    auto t = (duct_timer_t *)arg;
+    duct_do_if(!t, return exec_done);
+    auto w = s_this_worker;
+    duct_do_if(!w, return exec_done);
+    duct_conn_handle_t handle = { .word = t->ctx.token };
     auto conn = duct_conn_by_handle(handle);
     auto sc = conn ? duct_conn_sealed_ctx(conn) : nullptr;
-    if (sc && sc->codec && sc->codec->rekey_timer == ctx->self)
+    if (sc && sc->codec && sc->codec->rekey_timer == s_timer_handle_of(w, t))
         sc->codec->rekey_due = true;
     return exec_done;
 }
 
-/** @brief Add @p ctx as a timer node running @p exec after @p delay_us, again
- *  every @p interval_us unless that is 0.
- *  Sets the context's worker and own handle.
- *  @return the timer's handle, @c timer_handle_null when no timer node is to be
- *  had; the context is released then, and otherwise by the timer.
+uint64_t _Atomic duct_timer_global_id = 0;
+
+/** @brief Arm a timer of @p w's set running @p exec after @p delay_us, again
+ *  every @p interval_us unless that is 0, its payload @p ctx folded into the
+ *  wheel node — no heap allocation, nothing to release at retirement.
+ *  @return the timer's handle, @c timer_handle_null when no node is to be had.
  */
 static duct_timer_handle_t
-s_timer_start(duct_worker_t *w, timer_ctx_t *ctx, uint64_t delay_us, uint64_t interval_us,
-              duct_exec_fn exec)
+s_timer_arm(duct_worker_t *w, duct_timer_ctx_t ctx, uint64_t delay_us, uint64_t interval_us,
+            duct_exec_fn exec)
 {
-    ctx->w = w;
-    auto h = duct_timer_add(&w->timers, w->worker_id, 0u, delay_us, interval_us,
-                            interval_us ? 0u : 1u, exec, ctx, duct_del_fn);
-    if (h == timer_handle_null)
-        duct_del(ctx);
-    else
-        ctx->self = h;
-    return h;
+    return duct_timer_add_ctx(&w->timers, w->worker_id, 0u, delay_us, interval_us,
+                              interval_us ? 0u : 1u, exec, &ctx);
 }
 
-/** @brief Arm a one-shot timer running @p exec after @p delay_us, its argument a
- *  fresh @c timer_ctx_t holding @p session_tok and @p token.
- *  @return the timer's handle, @c timer_handle_null when no context or timer
- *  node is to be had.
+/** @brief Arm a one-shot timer running @p exec after @p delay_us, its payload
+ *  holding @p session_tok and @p token.
+ *  @return the timer's handle, @c timer_handle_null when no node is to be had.
  */
 static duct_timer_handle_t
 s_timer_arm_once(duct_worker_t *w, duct_handle_t session_tok, uint64_t token, uint64_t delay_us,
                  duct_exec_fn exec)
 {
-    auto ctx = duct_new(timer_ctx_t);
-    duct_do_if(!ctx, return timer_handle_null);
-    ctx->session_tok = session_tok;
-    ctx->token = token;
-    return s_timer_start(w, ctx, delay_us, 0u, exec);
+    duct_timer_ctx_t ctx = { .session_tok = session_tok, .token = token };
+    return s_timer_arm(w, ctx, delay_us, 0u, exec);
 }
 
 /** @brief Find the slot of @p tk holding @p key, @c session_timer_keys for none.
@@ -2559,7 +2922,8 @@ static void s_rekey_arm(duct_conn_t *conn, duct_wire_codec_t *codec)
      * call out. */
     uint64_t spread = delay_us / rekey_spread_div;
     uint64_t first = delay_us - duct_splitmix64(token) % (spread + 1u);
-    auto h = s_timer_arm_once(w, conn->session_token, token, first, s_rekey_fire);
+    auto h = s_timer_arm_once(w, duct_atomic_load(&conn->session_token, acquire),
+                              token, first, s_rekey_fire);
     if (h != timer_handle_null)
         codec->rekey_timer = h;
 }
@@ -2570,9 +2934,9 @@ static void s_rekey_arm(duct_conn_t *conn, duct_wire_codec_t *codec)
  *  timer retires with this fire; @c retry arms the next. */
 static duct_exec_rc_t s_hs_retry_fire(void *arg)
 {
-    auto ctx = (timer_ctx_t *)arg;
-    assert(ctx);
-    duct_conn_handle_t handle = { .word = ctx->token };
+    auto t = (duct_timer_t *)arg;
+    assert(t);
+    duct_conn_handle_t handle = { .word = t->ctx.token };
     auto conn = duct_conn_by_handle(handle);
     auto sc = conn ? duct_conn_sealed_ctx(conn) : nullptr;
     auto codec = sc ? sc->codec : nullptr;
@@ -2596,15 +2960,17 @@ static duct_result_t s_hs_arm(duct_unseal_ctx_t *self, uint32_t delay_ms)
     auto h = (duct_conn_handle_t){ .word = self->handle };
     auto conn = duct_conn_by_handle(h);
     duct_do_if(!conn, return rc_closed);
-    return s_timer_arm_once(w, conn->session_token, h.word, (uint64_t)delay_ms * 1000u,
+    return s_timer_arm_once(w, duct_atomic_load(&conn->session_token, acquire),
+                            h.word, (uint64_t)delay_ms * 1000u,
                             s_hs_retry_fire) == timer_handle_null ? rc_no_memory : rc_ok;
 }
 
 /** @brief Bytes one engine message takes on @p conn's egress: the engine's
- *  budget, the codec's PDU prefix and a record-framed ring's record header. */
-static size_t s_hs_need(const duct_conn_t *conn, const duct_wire_codec_t *codec)
+ *  budget and the codec's PDU prefix, the record the descriptor carries. */
+static size_t s_hs_need([[maybe_unused]] const duct_conn_t *conn,
+                        const duct_wire_codec_t *codec)
 {
-    return codec->engine->vtbl->engine_hs_budget + codec->tx_prefix_len + s_tx_rec_size(conn);
+    return codec->engine->vtbl->engine_hs_budget + codec->tx_prefix_len;
 }
 
 /** @brief Test whether one engine message fits @p conn's egress now.
@@ -2617,9 +2983,9 @@ static bool s_hs_fits(const duct_conn_t *conn, const duct_wire_codec_t *codec)
 {
     size_t need = s_hs_need(conn, codec);
     if (conn->xport_type == x_udp_shared)
-        return s_dgram_out_fits(((const duct_dgram_shared_ctx_t *)conn->ctx)->listener, need);
+        return s_dgram_out_fits(duct_conn_dgram_ctx(conn)->listener, need);
     auto tx = duct_conn_tx_olb(conn);
-    return !tx || duct_olb_tx_space(tx) >= need;
+    return !tx || duct_olb_tx_room_contig(tx, need);
 }
 
 /** @brief Run @p codec's due rekey through @p ctx and arm its next lifetime.
@@ -2634,6 +3000,7 @@ static void s_rekey_take(duct_conn_t *conn, duct_wire_codec_t *codec, duct_unsea
     if (rc == rc_again || rc == rc_no_memory)
         return;
     codec->rekey_due = false;
+    duct_wire_codec_owd_reset(codec);
     if (rc != rc_fatal)
         s_rekey_arm(conn, codec);
 }
@@ -2658,9 +3025,9 @@ static void s_rekey_on_send(duct_conn_t *conn)
  *  alone. */
 static duct_exec_rc_t s_join_deadline_fire(void *arg)
 {
-    auto ctx = (timer_ctx_t *)arg;
-    duct_do_if(!ctx, return exec_done);
-    duct_conn_handle_t handle = { .word = ctx->token };
+    auto t = (duct_timer_t *)arg;
+    duct_do_if(!t, return exec_done);
+    duct_conn_handle_t handle = { .word = t->ctx.token };
     auto conn = duct_conn_by_handle(handle);
     auto sc = conn ? duct_conn_sealed_ctx(conn) : nullptr;
     if (!sc || (sc->codec && sc->codec->peer_announced))
@@ -2715,10 +3082,11 @@ static uint64_t s_idle_span_ns(const duct_session_t *s)
  *  session unarmed. */
 static duct_exec_rc_t s_idle_fire(void *arg)
 {
-    auto ctx = (timer_ctx_t *)arg;
-    assert(ctx);
-    auto w = ctx->w;
-    auto s = duct_session_attached_by_handle((duct_session_handle_t){ .word = ctx->session_tok });
+    auto t = (duct_timer_t *)arg;
+    assert(t);
+    auto w = s_this_worker;
+    assert(w);
+    auto s = duct_session_attached_by_handle((duct_session_handle_t){ .word = t->ctx.session_tok });
     if (!s)
         return exec_done;
     assert(s->idle_at != session_idle_unarmed);
@@ -2754,6 +3122,46 @@ void duct_worker_idle_arm(duct_session_t *s)
  *  destroyed unarmed. It tests the wire itself: s_tx_stage_frame's hot path
  *  proves it first, duct_worker_tls_ensure_started does not.
  */
+/** @brief This worker's cleartext chunk pool, made on the first sealed
+ *  codec it builds.
+ *  Slots of @c duct_wire_ct_buf_max payload bytes, grown eight at a time;
+ *  a codec holds a borrowed chunk, and a cross-leg pin outlives both it and
+ *  the conn through the slot's own header.
+ *  @return The pool, @c nullptr when its range cannot be made.
+ */
+static duct_x_slot_pool_t *s_ct_chunks(duct_worker_t *w)
+{
+    if (!w->ct_chunks_live) {
+        bool ok = duct_x_slot_pool_init(&w->ct_chunks, duct_wire_ct_chunks,
+                                        duct_x_slot_span_bytes(0u, 0u,
+                                                               (uint32_t)duct_wire_ct_buf_max),
+                                        0u, 0u, 8u, (duct_x_slot_hooks_t){});
+        duct_x_slot_pool_engage(&w->ct_chunks);
+        duct_do_if(!ok, duct_x_slot_pool_free(&w->ct_chunks); return nullptr);
+        w->ct_chunks_live = true;
+    }
+    return &w->ct_chunks;
+}
+
+/** @brief Carve @p conn's codec slot and its inner parser slot over
+ *  pre-zeroed block storage and build the codec into them.
+ *  The slots are wiped ahead of the build — a worker-side rebuild of a
+ *  rekeyed codec must read nothing of the old one — and @c init_codec takes
+ *  @p chunks for the codec's cleartext buffer.
+ *  @return The codec, or @c nullptr without a chunk pool or when the wire
+ *          refuses the build.
+ */
+duct_zero_regs static duct_wire_codec_t *s_codec_carve(duct_conn_t *conn, duct_x_slot_pool_t *chunks)
+{
+    auto codec = duct_conn_codec_slot(conn);
+    auto inner_parser = duct_conn_wire_parser_slot(conn, 1u);
+    duct_secure_zero(codec, sizeof *codec);
+    memset(inner_parser, 0, duct_wire_parser_slot);
+    return chunks
+         ? conn->wire->init_codec(conn->wire, conn->xport_type, codec, inner_parser, chunks)
+         : nullptr;
+}
+
 static duct_wire_codec_t *s_tls_codec_open(duct_conn_t *conn, duct_view_u8 tx_prefix)
 {
     if (!conn->wire || !conn->wire->unseal)
@@ -2763,7 +3171,7 @@ static duct_wire_codec_t *s_tls_codec_open(duct_conn_t *conn, duct_view_u8 tx_pr
         return nullptr;
     if (sc->codec)
         return sc->codec;
-    auto codec = conn->wire->create_codec(conn->wire, conn->xport_type);
+    auto codec = s_codec_carve(conn, s_ct_chunks(s_this_worker));
     if (!codec)
         return nullptr;
     /* A dial's prefix lands here and nowhere else: the codec exists from here
@@ -2778,7 +3186,7 @@ static duct_wire_codec_t *s_tls_codec_open(duct_conn_t *conn, duct_view_u8 tx_pr
                  && (conn->xport_type == x_tcp || conn->xport_type == x_local))
             lead = tx_prefix;
         else {
-            codec->destroy(codec);
+            duct_wire_codec_destroy(codec);
             return nullptr;
         }
     }
@@ -2791,8 +3199,10 @@ static duct_wire_codec_t *s_tls_codec_open(duct_conn_t *conn, duct_view_u8 tx_pr
      * alone; with no start, or one emitting nothing, the publish below hands it
      * to the next drain. A dialed conn builds its codec at its join, its ring
      * still empty, so a lead of at most duct_seal_prefix_max bytes stages. */
-    if (lead.size)
+    if (lead.size) {
         duct_discard duct_olb_tx_stage(tx, nullptr, 0u, lead.data, lead.size);
+        duct_conn_tx_staged(conn, lead.size);
+    }
     if (codec->engine->vtbl->start) {
         duct_wire_tx_t tx_stage;
         auto ctx = s_engine_ctx(conn, codec, &tx_stage);
@@ -2940,45 +3350,59 @@ static duct_exec_rc_t s_dispatch_sealed_frame(duct_worker_t *w, duct_conn_t *con
     }
     auto codec = sc->codec;
     if (!codec) {
-        codec = conn->wire->create_codec(conn->wire, conn->xport_type);
+        codec = s_codec_carve(conn, s_ct_chunks(s_this_worker));
         if (!codec) {
             s_sealed_fatal(handle, s, cfg, rc_no_memory);
             return exec_done;
         }
         sc->codec = codec;
     }
+    [[gnu::cleanup(s_redirect_release)]] redirect_t redirect;
+    redirect.span = nullptr;
+    redirect.ct = nullptr;
     if (!sc->head_unsealed) {
         auto vt = codec->engine->vtbl;
-        if (duct_byte_len(codec->ct_buf) - codec->ct_len < vt->pdu_ct_max)
-            return exec_defer;
+        if (duct_x_slot_obj_cap(duct_at(codec->ct_buf)) - codec->ct_len < vt->pdu_ct_max) {
+            s_codec_compact(codec);
+            if (duct_x_slot_obj_cap(duct_at(codec->ct_buf)) - codec->ct_len < vt->pdu_ct_max
+                && !s_codec_spill(codec, s_ct_chunks(s_this_worker), vt->pdu_ct_max)) {
+                return exec_defer;
+            }
+        }
         if (codec->engine_park_len
-            && duct_byte_len(codec->engine_park) - codec->engine_park_len < s_hs_need(conn, codec)
-            && !s_engine_park_flush(conn))
+            && duct_conn_park_cap - codec->engine_park_len < s_hs_need(conn, codec)
+            && !s_engine_park_flush(conn)) {
             return exec_defer;
-        auto tx_stage = (duct_wire_tx_t){ .kind = wire_tx_olb, .olb = conn->tx_buf };
-        duct_unseal_ctx_t ctx = {
-            .handle = handle.word,
-            .codec = codec, .tx_buf = &tx_stage,
-            .peer = s_conn_peer(conn),
-            .reserve = s_unseal_reserve, .commit = s_unseal_commit,
-            .tx_append = s_unseal_tx_append,
-        };
+        }
         /* task->header_size specifies the frame slice for rebind-replay
          * safety. Zero indicates datagram transports that carry no record
          * header. */
         size_t hdr = task->header_size;
-        duct_view_u8 pdu = { .data = conn->rx_buf->data + task->offset + hdr,
+        duct_view_u8 pdu = { .data = duct_conn_rx_data(conn) + task->offset + hdr,
                            .size = task->len - hdr };
+        if (duct_conn_record_framed(conn) && !s_tx_held(s, s_conn_tx_hold(conn), conn))
+            redirect_take(s, cfg, cid, 0u, codec, pdu, &redirect);
+        auto tx_stage = (duct_wire_tx_t){ .kind = wire_tx_ring, .ring = { .tx = duct_conn_tx_olb(conn) } };
+        redirect.at = redirect.span;
+        redirect.base = (duct_unseal_ctx_t){
+            .handle = handle.word,
+            .codec = codec, .tx_buf = &tx_stage,
+            .peer = s_conn_peer(conn),
+            .reserve = redirect.span ? s_redirect_reserve : s_unseal_reserve,
+            .commit = redirect.span ? s_redirect_commit : s_unseal_commit,
+            .tx_append = s_unseal_tx_append,
+        };
         auto ct_was = codec->ct_len;
-        s_rekey_take(conn, codec, &ctx);
-        auto rc = conn->wire->unseal(conn->wire, codec, pdu, &ctx);
+        s_rekey_take(conn, codec, &redirect.base);
+        auto rc = conn->wire->unseal(conn->wire, codec, pdu, &redirect.base);
         /* rc_again leaves the PDU to replay whole, as the deferred task replays
          * it; the run after the arm is the room check the arm pairs with. */
         if (rc == rc_again) {
-            s_tx_wait_arm(conn);
-            rc = conn->wire->unseal(conn->wire, codec, pdu, &ctx);
-            if (rc == rc_again)
+            s_tx_wait_arm(conn, 0u);
+            rc = conn->wire->unseal(conn->wire, codec, pdu, &redirect.base);
+            if (rc == rc_again) {
                 return exec_defer;
+            }
         }
         /* On datagram transports with independent records, unseal failures are
          * acknowledged and dropped while preserving the session. On stream
@@ -3009,19 +3433,26 @@ static duct_exec_rc_t s_dispatch_sealed_frame(duct_worker_t *w, duct_conn_t *con
          * at all (a handshake-only record — the null engine's own hello
          * exchange never calls commit) has nothing to dispatch: a
          * zero-size phantom frame is not a real application message. */
-        uint32_t consumed = codec->ct_len - codec->ct_parse_off;
-        if (consumed == 0u) {
-            sc->head_unsealed = false;
-            s_codec_compact(codec);
-            return exec_done;
+        bool redir = redirect.span != nullptr;
+        uint32_t consumed = redir ? (uint32_t)redirect.len
+                                  : (codec->ct_len - codec->ct_parse_off);
+        if (consumed > 0u) {
+            void *src = redir ? redirect.span
+                              : (void *)(duct_at(codec->ct_buf) + codec->ct_parse_off);
+            duct_frame_t frame = { .payload = { .data = src, .size = consumed } };
+            duct_span_t span = redir ? (duct_span_t){}
+                                     : duct_span_of_ptr(duct_at(codec->ct_buf), 0u, consumed);
+            if (s_dispatch_one_frame(w, conn, s, cid, frame, span,
+                                     redir ? &redirect : nullptr) == exec_defer) {
+                if (redir) {
+                    memcpy(duct_at(codec->ct_buf) + codec->ct_len, redirect.span, consumed);
+                    codec->ct_len += consumed;
+                }
+                return exec_defer; /* ct_parse_off not advanced: replayed next pass */
+            }
+            if (!redir)
+                codec->ct_parse_off += consumed;
         }
-        duct_frame_t frame = { .payload = {
-            .data = duct_at(codec->ct_buf) + codec->ct_parse_off, .size = consumed } };
-        auto ack = (duct_frame_ack_t){ .kind = ack_ct,
-            .ct = { .data = duct_at(codec->ct_buf), .size = consumed } };
-        if (s_dispatch_one_frame(w, conn, s, cid, frame, ack) == exec_defer)
-            return exec_defer; /* ct_parse_off not advanced: replayed next pass */
-        codec->ct_parse_off += consumed;
         sc->head_unsealed = false;
         s_codec_compact(codec);
         return exec_done;
@@ -3045,9 +3476,8 @@ static duct_exec_rc_t s_dispatch_sealed_frame(duct_worker_t *w, duct_conn_t *con
             s_sealed_fatal(handle, s, cfg, rc == rc_ok ? rc_invalid_arg : rc);
             return exec_done;
         }
-        auto ack = (duct_frame_ack_t){ .kind = ack_ct,
-            .ct = { .data = duct_at(codec->ct_buf), .size = consumed } };
-        if (s_dispatch_one_frame(w, conn, s, cid, frame, ack) == exec_defer)
+        auto span = duct_span_of_ptr(duct_at(codec->ct_buf), 0u, consumed);
+        if (s_dispatch_one_frame(w, conn, s, cid, frame, span, nullptr) == exec_defer)
             return exec_defer; /* ct_parse_off not advanced: replayed next pass */
         codec->ct_parse_off += (uint32_t)consumed;
     }
@@ -3098,10 +3528,21 @@ s_dispatch_batch_frames(duct_worker_t *w, const duct_msg_frame_batch_t *b,
     s_rx_ack_batch.conn = conn;
     auto rc = s_dispatch_batch_run(w, h, b, from, out_defer_idx);
     bool owed = s_rx_ack_batch.owed;
+    uint64_t prev = s_rx_ack_batch.prev;
     s_rx_ack_batch.conn = nullptr;
     s_rx_ack_batch.owed = false;
-    if (owed)
-        s_rx_ack_check(conn, duct_atomic_load(&conn->rx_buf->acked, relaxed));
+    /* The batch holds no refs unit of its own — generations guard its stale
+     * runs — but this deferred ack-check touches the ring past the run, and
+     * a close that drained every unit lets the slot's next acquire memset
+     * that ring under the load. The §5 word pin is the gate the resolve
+     * cannot be: pinned, the word cannot reach its generation bump (the
+     * finish parks it at conn_spent), so the check below either sees a live
+     * conn or pins nothing at all. */
+    if (owed && duct_conn_pin(conn, h.gen) == rc_ok) {
+        s_rx_ack_check(conn, prev,
+                       duct_atomic_load(&duct_conn_rx_olb(conn)->acked, relaxed));
+        duct_conn_unpin(conn);
+    }
     w->tx_train.more = false;
     s_tx_train_flush(w);
     s_worker_dgram_flush();
@@ -3151,43 +3592,55 @@ static void *s_inter_payload(const duct_msg_inter_batch_t *b,
     if (held) {
         auto lent = held[pkt - duct_msg_inter_pkts((duct_msg_inter_batch_t *)b)];
         if (lent)
-            return lent;
+            return (uint8_t *)lent + pkt->offset;
     }
     if (b->rx_pool)
         return duct_x_slot_data(b->rx_pool, b->rx_slot) + pkt->offset;
     return (char *)b + pkt->offset;
 }
 
-/** @brief Reserve @p size bytes on the leg @c route sends this packet to, for
- *  the unseal to decrypt straight into.
+/** @brief Strip @p codec's prefix from @p pdu, size its cleartext and reserve
+ *  space on the leg @c route sends this packet to, for the unseal to decrypt
+ *  straight into.
  *
- *  The caller has checked that @p cfg routes. @p out's @c span stays null, and
- *  the packet takes the copy path, for a @p size of 0 and for a destination that
- *  is no live @c x_inter leg, has no room, or is a read-only device.
+ *  @p out's @c span stays null, and the packet takes the copy path, when @p cfg
+ *  does not route, @p codec carries an inner wire, @p unseal_size is absent or
+ *  0, or the destination is no live @c x_inter leg, has no room, or is a
+ *  read-only device.
  *
  *  @c route is evaluated here before @c on_frame using pre-frame protocol state.
  */
 static void redirect_take(duct_session_t *s, const duct_proto_cfg_t *cfg,
-                            duct_conn_id_t cid, duct_stream_id_t sid,
-                            size_t size, redirect_t *out)
+                          duct_conn_id_t cid, duct_stream_id_t sid,
+                          const duct_wire_codec_t *codec, duct_view_u8 pdu,
+                          redirect_t *out)
 {
+    if (!cfg->route || codec->inner)
+        return;
+    auto vt = codec->engine->vtbl;
+    size_t size = 0u;
+    if (vt->unseal_size && duct_wire_codec_rx_strip(codec, &pdu))
+        size = vt->unseal_size(codec->engine, pdu);
     if (size == 0u)
         return;
     duct_conn_id_t   rconn = cid;
     duct_stream_id_t rstream = sid;
     cfg->route(cid, sid, s->proto_state, &rconn, &rstream);
-    duct_do_if(rconn >= duct_session_max_legs, return);
+    if (rconn >= duct_session_max_legs)
+        return;
     auto conn = duct_conn_by_handle(duct_session_conn_at(s, rconn));
-    duct_do_if(!conn || conn->xport_type != x_inter, return);
+    if (!conn || conn->xport_type != x_inter)
+        return;
     out->conn_id = rconn;
     out->stream_id = rstream;
     out->cap = size;
     out->len = 0u;
-    auto dev = (const duct_device_ops_t *)conn->ctx;
+    auto dev = duct_conn_device_ops(conn);
     out->dev = dev;
     if (dev) {
         /* A read-only device has no send memory to lend. */
-        duct_do_if(!dev->write_reserve, return);
+        if (!dev->write_reserve)
+            return;
         auto span = dev->write_reserve(dev->ctx, size);
         duct_do_if(!span, return);
         out->span = span;
@@ -3204,8 +3657,7 @@ static void redirect_take(duct_session_t *s, const duct_proto_cfg_t *cfg,
  */
 static void s_redirect_release(redirect_t *r)
 {
-    if (r->ct)
-        s_tx_pool_drop_hold(r->ct);
+    duct_del(r->ct);
     if (!r->span)
         return;
     if (r->dev)
@@ -3232,6 +3684,71 @@ static void s_redirect_release(redirect_t *r)
  *  sized to the datagram and the inner header; @ref s_redirect_release closes
  *  either on every return.
  */
+/** @brief Compare peer IP networks ignoring port and low IPv6 host bits so
+ *  proactive 5-tuple rotation does not discard the OWD baseline. */
+static inline bool s_same_ip_net(const duct_peer_t *a, const duct_peer_t *b)
+{
+    if (a->family != b->family)
+        return false;
+    if (a->family == AF_INET)
+        return memcmp(a->addr.v4, b->addr.v4, sizeof a->addr.v4) == 0;
+    if (a->family == AF_INET6)
+        return memcmp(a->addr.v6, b->addr.v6, 8u) == 0;
+    return true;
+}
+
+/** @brief Record worker acceptance or rejection of @p b's candidate sequence
+ *  and nudge I/O to reconcile @c dgram_peers when roaming is active.
+ *  Stores @c accepted_seq before @c settled_seq (both release) so I/O loading in
+ *  the opposite order never observes a settled candidate without its acceptance. */
+static void s_shared_peer_settle(duct_conn_t *conn, const duct_msg_inter_batch_t *b, bool accept)
+{
+    if (!b->cand_seq)
+        return;
+    auto ctx = duct_conn_dgram_ctx(conn);
+    uint64_t acc = duct_atomic_load(&ctx->accepted_seq, relaxed);
+    if (accept) {
+        if (b->cand_seq > acc)
+            duct_atomic_store(&ctx->accepted_seq, b->cand_seq, release);
+    } else if (b->cand_seq <= acc) {
+        return;
+    }
+    if (b->cand_seq > duct_atomic_load(&ctx->settled_seq, relaxed))
+        duct_atomic_store(&ctx->settled_seq, b->cand_seq, release);
+    if (duct_has(duct_conn_state(conn), fl_conn_roaming)) {
+        auto h = (duct_conn_handle_t){ .word = b->conn };
+        duct_io_post_peer_roam(&h);
+    }
+}
+
+/** @brief Adopt @p b's peer/local endpoint on a shared UDP leg and advance
+ *  candidate promotion when @p b carries a candidate sequence. */
+static void s_shared_peer_update(duct_conn_t *conn, const duct_msg_inter_batch_t *b,
+                                 bool sealed)
+{
+    auto ctx = duct_conn_dgram_ctx(conn);
+    uint64_t prev = duct_atomic_load(&ctx->accepted_seq, relaxed);
+    if (b->cand_seq < prev)
+        return;
+    if (sealed && !s_same_ip_net(&ctx->peer, &b->peer)) {
+        auto sc = duct_conn_sealed_ctx(conn);
+        if (sc && sc->codec)
+            duct_wire_codec_owd_reset(sc->codec);
+    }
+    ctx->peer = b->peer;
+    ctx->local = b->local;
+    if (b->cand_seq) {
+        uint64_t prev = duct_atomic_load(&ctx->accepted_seq, relaxed);
+        if (b->cand_seq > prev)
+            duct_atomic_store(&ctx->accepted_seq, b->cand_seq, release);
+        if (duct_has(duct_conn_state(conn), fl_conn_roaming)) {
+            auto h = (duct_conn_handle_t){ .word = b->conn };
+            duct_io_post_peer_roam(&h);
+        }
+    }
+    s_shared_peer_settle(conn, b, true);
+}
+
 static void s_inter_pkt(duct_conn_handle_t handle,
                                   const duct_msg_inter_batch_t *b, const duct_msg_inter_pkt_t *pkt)
 {
@@ -3239,7 +3756,7 @@ static void s_inter_pkt(duct_conn_handle_t handle,
     duct_session_t *s;
     if (s_dispatch_resolve(handle, &conn, &s) != res_ok)
         return;
-    if (s->wire_rebind_next)
+    if (s->switch_stage == switch_fencing)
         return; /* wire-changing switch in flight elsewhere in the session; no replay path here */
     auto cfg = duct_proto_cfg_of(s->proto);
     duct_do_if(!cfg->on_frame, return);
@@ -3259,6 +3776,7 @@ static void s_inter_pkt(duct_conn_handle_t handle,
     [[gnu::cleanup(s_redirect_release)]] redirect_t redirect;
     redirect.span = nullptr;
     redirect.ct = nullptr;
+    bool shared = conn->xport_type == x_udp_shared;
     bool sealed = conn->wire && conn->wire->unseal;
     if (sealed) {
         auto codec = s_tls_codec(conn);
@@ -3269,24 +3787,16 @@ static void s_inter_pkt(duct_conn_handle_t handle,
          * over-reserves on the destination leg, while a datagram too short to
          * hold an engine PDU at all answers nonzero and takes cfg->route plus a
          * reservation on forged bytes. */
-        if (cfg->route) {
-            auto vt = codec->engine->vtbl;
-            duct_view_u8 sized = frame.payload;
-            size_t want = 0u;
-            if (vt->unseal_size && duct_wire_codec_rx_strip(codec, &sized))
-                want = vt->unseal_size(codec->engine, sized);
-            redirect_take(s, cfg, cid, frame.stream_id, want, &redirect);
-        }
+        redirect_take(s, cfg, cid, frame.stream_id, codec, frame.payload, &redirect);
         if (!redirect.span) {
-            /* The cleartext is the datagram at most, plus the inner wire's header a
-             * control datagram gets ahead of its payload. A full ring is full of the
-             * train's references: writing the train frees them for one more ask. */
+            /* The cleartext is the datagram at most, plus the inner wire's
+             * header a control datagram gets ahead of its payload. The
+             * decrypt target is a whole duct_new block — the packet's
+             * cleartext rides it pinned (a handler claim, a batch entry or
+             * a vnet train take a duct_share of it) instead of a bump
+             * region no one could hold. */
             size_t room = frame.payload.size + (codec->inner ? codec->inner->header_size : 0u);
-            redirect.ct = s_pool_acquire(&w->ct_pool, room);
-            if (!redirect.ct) {
-                s_vnet_train_flush(w);
-                redirect.ct = s_pool_acquire(&w->ct_pool, room);
-            }
+            redirect.ct = duct_at(duct_new(uint8_t, room));
             if (!redirect.ct) {
                 s_fire_error(s, cfg, rc_again);
                 return;
@@ -3306,11 +3816,17 @@ static void s_inter_pkt(duct_conn_handle_t handle,
         s_rekey_take(conn, codec, &redirect.base);
         auto urc = conn->wire->unseal(conn->wire, codec, frame.payload, &redirect.base);
         if (urc != rc_ok) {
+            if (shared)
+                s_shared_peer_settle(conn, b, false);
             s_fire_error(s, cfg, urc);
             return;
         }
         if (!s_peer_auth_fire(s, cfg, cid, codec))
+        if (!s_peer_auth_fire(s, cfg, cid, codec)) {
+            if (shared)
+                s_shared_peer_settle(conn, b, false);
             return;
+        }
         frame.payload = duct_view(duct_view_u8, (void *)redirect.at, redirect.len);
         if (frame.payload.size == 0u)
             return;
@@ -3327,6 +3843,8 @@ static void s_inter_pkt(duct_conn_handle_t handle,
                                                 &needed) == rc_ok
                       && consumed == frame.payload.size;
             if (!whole) {
+                if (shared)
+                    s_shared_peer_settle(conn, b, false);
                 s_fire_error(s, cfg, rc_invalid_arg);
                 return;
             }
@@ -3340,24 +3858,46 @@ static void s_inter_pkt(duct_conn_handle_t handle,
      * engine carries the replay window @c fl_wire_dgram_ok stands for: without
      * one, a captured datagram replayed from a foreign address moves the
      * endpoint. */
-    if (sealed && shared)
-        ((duct_dgram_shared_ctx_t *)conn->ctx)->peer = b->peer;
+    if (sealed && shared && !redirect.base.rx_stale)
+        s_shared_peer_update(conn, b, true);
+    if (sealed && shared) {
+        if (!redirect.base.rx_stale)
+            s_shared_peer_update(conn, b, true);
+        else
+            s_shared_peer_settle(conn, b, false);
+    }
     if (duct_has(cfg->flags, fl_proto_multiplexed) && frame.stream_id != 0u
         && cfg->handler_kind != handler_none) {
         /* Claim-eligible: the VMQ batch this frame lives in commits — frees
          * for producer reuse — the instant s_inter_drain's loop returns, but
          * handler dispatch is always queued to a later duct_coop_cycle pass,
          * so the payload needs a hold of its own before the coroutine is
-         * queued: a claim on the RX slot it lies in, else a copy. An RST
-         * takes neither, still closing the stream before any handler reads
-         * its bytes; a fin takes one like any other. An empty payload takes
-         * neither: a count of 0 makes duct_new answer nullptr, not out-of-memory. */
+         * queued: a claim on the RX slot it lies in, a share of the sealed
+         * packet's decrypt block (§2: the !sealed carve-out dies — the
+         * cleartext block is a whole duct_new block, pinnable through
+         * duct_share with no copy), else a copy. An RST takes neither, still
+         * closing the stream before any handler reads its bytes; a fin takes
+         * one like any other. An empty payload takes neither: a count of 0
+         * makes duct_new answer nullptr, not out-of-memory. */
         bool is_rst = duct_has(frame.flags, fl_frame_rst);
         void *copy = nullptr;
-        bool pinned = frame.payload.size && !is_rst && !sealed && b->rx_pool
-                   && duct_x_slot_holds(b->rx_pool, b->rx_slot, frame.payload.data)
-                   && duct_x_slot_claim(b->rx_pool, b->rx_slot);
-        if (!pinned && frame.payload.size && !is_rst) {
+        bool slot_pinned = frame.payload.size && !is_rst && !sealed && b->rx_pool
+                       && duct_x_slot_holds(b->rx_pool, b->rx_slot, frame.payload.data)
+                       && duct_x_slot_claim(b->rx_pool, b->rx_slot);
+        void *pin_blk = sealed ? redirect.ct : (w ? (void *)w->host_hold : nullptr);
+        size_t pin_cap = sealed ? redirect.cap
+                       : (w && w->host_hold ? duct_byte_len(w->host_hold) : 0u);
+        bool ct_pinned = false;
+        if (frame.payload.size && !is_rst && !slot_pinned && pin_blk
+            && (const uint8_t *)frame.payload.data >= (const uint8_t *)pin_blk
+            && (size_t)((const uint8_t *)frame.payload.data - (const uint8_t *)pin_blk) <= pin_cap
+            && frame.payload.size <= pin_cap
+                   - (size_t)((const uint8_t *)frame.payload.data - (const uint8_t *)pin_blk)) {
+            ct_pinned = duct_try_share(pin_blk) != nullptr;
+            if (ct_pinned)
+                copy = pin_blk;
+        }
+        if (!slot_pinned && !ct_pinned && frame.payload.size && !is_rst) {
             copy = duct_new(uint8_t, frame.payload.size);
             if (!copy) {
                 s_fire_error(s, cfg, rc_no_memory);
@@ -3366,24 +3906,38 @@ static void s_inter_pkt(duct_conn_handle_t handle,
             memcpy(copy, frame.payload.data, frame.payload.size);
         }
         /* An RST never reaches a handler (s_dispatch_stream_claim closes the
-         * stream first) — payload.data stays whatever it was, unread. Every
-         * other path lands frame.payload.data on the copy, nullptr for a
-         * zero-size payload, ensuring handlers never retain pointers into the
-         * freed inter batch. */
-        if (!is_rst && !pinned)
+         *  stream first) — payload.data stays whatever it was, unread. Every
+         *  other path keeps frame.payload.data where it lies — a claimed slot
+         *  byte, the pinned block's interior, the copy — with the span
+         *  naming the substrate: the slot object its claim pins, the block's
+         *  base (the decrypt block for a ct pin, duct_del of whose base drops
+         *  the share), so handlers never retain pointers into the freed
+         *  inter batch. */
+        if (!is_rst && !slot_pinned && !ct_pinned)
             frame.payload.data = copy;
-        duct_frame_ack_t ack = pinned
-            ? (duct_frame_ack_t){ .kind = ack_slot,
-                                  .slot = { .pool = b->rx_pool, .idx = b->rx_slot } }
-            : (duct_frame_ack_t){ .kind = ack_owned, .owned = { .ptr = copy } };
-        switch (s_dispatch_stream_claim(w, conn, s, cfg, cid, frame, ack)) {
+        duct_span_t span;
+        if (is_rst || !frame.payload.size)
+            span = (duct_span_t){}; /* nothing held: mat without a window */
+        else if (slot_pinned) {
+            auto obj = duct_x_slot_obj(b->rx_pool, b->rx_slot);
+            span = duct_span_of_ptr(obj,
+                (uint32_t)((const uint8_t *)frame.payload.data - (const uint8_t *)obj),
+                (uint32_t)frame.payload.size);
+        } else if (ct_pinned)
+            span = duct_span_of_ptr(copy,
+                (uint32_t)((const uint8_t *)frame.payload.data - (const uint8_t *)copy),
+                (uint32_t)frame.payload.size);
+        else
+            span = duct_span_of_ptr(copy, 0u, (uint32_t)frame.payload.size);
+        switch (s_dispatch_stream_claim(w, conn, s, cfg, cid, frame, span)) {
         case claim_handled:
             s_count_rx(s, cid, frame.payload.size);
             s_idle_heard(w, conn, s);
             return;
         case claim_busy:
             /* No replay path here: the frame is already off the lane. */
-            s_frame_ack_apply(conn, ack);
+            s_frame_ack_apply(conn, span);
+            s_ingress_drop_created(span);
             s_fire_error(s, cfg, rc_again);
             return;
         case claim_fallthrough:
@@ -3399,6 +3953,8 @@ static void s_inter_pkt(duct_conn_handle_t handle,
      * counts it. */
     s_count_rx(s, cid, frame.payload.size);
     if (rc != rc_ok) {
+        if (!sealed && shared)
+            s_shared_peer_settle(conn, b, false);
         if (rc == rc_defer)
             s_fire_error(s, cfg, rc_again);
         s_response_drop(s, &out);
@@ -3413,39 +3969,8 @@ static void s_inter_pkt(duct_conn_handle_t handle,
      * creation this worker both writes and reads the field, so the plain write
      * races nothing. */
     if (!sealed && shared)
-        ((duct_dgram_shared_ctx_t *)conn->ctx)->peer = b->peer;
+        s_shared_peer_update(conn, b, false);
     duct_discard s_response_take(s, &out, cid, frame.stream_id, frame.flags, &redirect, nullptr);
-}
-
-/** @brief Pin RX slot pool for @p conn during parked responses.
- *  Applicable to @c x_udp_shared conns; readers copy unslotted packets while
- *  pinned to prevent socket stalling.
- */
-static void s_rx_pin(duct_conn_t *conn, duct_x_slot_pool_t *pool)
-{
-    if (conn->xport_type != x_udp_shared)
-        return;
-    auto dctx = (duct_dgram_shared_ctx_t *)conn->ctx;
-    if (!pool)
-        pool = dctx->rx_pin ? dctx->rx_pin : duct_io_dgram_shared_rx_slots(dctx->listener);
-    if (dctx->rx_pin == pool)
-        return;
-    if (dctx->rx_pin)
-        duct_io_rx_unpin(dctx->rx_pin);
-    dctx->rx_pin = pool;
-    duct_io_rx_pin(pool);
-}
-
-/** @brief Take @p conn's pin back, where it holds one. */
-static void s_rx_unpin(duct_conn_t *conn)
-{
-    if (conn->xport_type != x_udp_shared)
-        return;
-    auto dctx = (duct_dgram_shared_ctx_t *)conn->ctx;
-    if (!dctx->rx_pin)
-        return;
-    duct_io_rx_unpin(dctx->rx_pin);
-    dctx->rx_pin = nullptr;
 }
 
 /** @brief Dispatch every packet of one message on the inter lane of @p arg, a
@@ -3454,8 +3979,7 @@ static void s_rx_unpin(duct_conn_t *conn)
  *  message's packets park, and stands until the last is served on whichever leg
  *  it parked, so a conn parks at most one message's answers.
  *  @return false to leave this message, and the lane behind it, unread: a
- *  producer then meets a full lane, and a shared datagram conn pins its slot's
- *  pool so the socket reads on for other conns. */
+ *  producer then meets a full lane. */
 static bool s_inter_msg_take(duct_vmq_hdr_t *hdr, void *arg)
 {
     auto conn = (duct_conn_t *)arg;
@@ -3464,17 +3988,22 @@ static bool s_inter_msg_take(duct_vmq_hdr_t *hdr, void *arg)
     auto w = s_this_worker;
     if (s_tx_held(duct_session_by_conn(conn), hold, conn)) {
         duct_rtstat_obj_inc(w, rtstats.inter_held, 1);
-        s_rx_pin(conn, b->rx_pool);
         return false;
     }
     auto h = (duct_conn_handle_t){ .word = b->conn };
     auto pkts = duct_msg_inter_pkts(b);
-    duct_frame_ack_t slot = { .kind = ack_slot, .slot = { .pool = b->rx_pool, .idx = b->rx_slot } };
+    auto held = duct_msg_inter_holds(b);
     w->hold_into = hold;
     w->hold_conn = conn;
-    w->slot_now = b->rx_pool ? &slot : nullptr;
-    for (uint32_t i = 0u; i < b->n; ++i)
+    w->slot_now = b->rx_pool ? b : nullptr;
+    for (uint32_t i = 0u; i < b->n; ++i) {
+        bool host_hold = !duct_conn_device_ops(conn) && held && held[i];
+        w->host_hold = host_hold ? (duct_ptr_t(uint8_t))held[i] : nullptr;
         s_inter_pkt(h, b, &pkts[i]);
+        w->host_hold = nullptr;
+        if (host_hold)
+            duct_del(held[i]);
+    }
     w->slot_now = nullptr;
     w->hold_into = nullptr;
     w->hold_conn = nullptr;
@@ -3498,58 +4027,122 @@ static bool s_inter_msg_take(duct_vmq_hdr_t *hdr, void *arg)
  *  or reuses what it names.
  *  @return Messages drained.
  */
+typedef struct {
+    uint64_t _Atomic *summary;
+    uint64_t _Atomic *armed;
+    unsigned          sw;
+    uint64_t          sbits;
+    unsigned          word;
+    uint64_t          bits;
+} bitmap_2lvl_iter_t;
+
+static inline bool s_bitmap_2lvl_next(bitmap_2lvl_iter_t *it, unsigned *out_idx)
+{
+    static constexpr unsigned sum_words =
+        (DUCT_BITMAP_WORDS + bits_index_mask) >> bits_word_shift;
+    for (;;) {
+        if (it->bits) {
+            unsigned bit = duct_ctz_ull(it->bits);
+            it->bits &= it->bits - 1u;
+            *out_idx = (it->word << bits_word_shift) | bit;
+            return true;
+        }
+        while (it->sbits) {
+            unsigned sbit = duct_ctz_ull(it->sbits);
+            it->sbits &= it->sbits - 1u;
+            unsigned word = ((it->sw - 1u) << bits_word_shift) | sbit;
+            if (word >= DUCT_BITMAP_WORDS)
+                break;
+            it->bits = duct_bits_grab(it->armed, word);
+            if (it->bits) {
+                it->word = word;
+                break;
+            }
+        }
+        if (it->bits)
+            continue;
+        while (it->sw < sum_words) {
+            uint64_t sbits = duct_bits_grab(it->summary, it->sw++);
+            if (sbits) {
+                atomic_thread_fence(memory_order_seq_cst);
+                it->sbits = sbits;
+                break;
+            }
+        }
+        if (!it->sbits)
+            return false;
+    }
+}
+
+static bool s_done_drain(duct_worker_t *w)
+{
+    bitmap_2lvl_iter_t it = { .summary = w->done_summary, .armed = w->done_armed };
+    bool progress = false;
+    unsigned idx;
+    while (s_bitmap_2lvl_next(&it, &idx)) {
+        auto conn = duct_conn_by_idx(idx);
+        if (!conn || conn->worker_id != w->worker_id
+            || duct_conn_phase(conn) >= conn_retire_done)
+            continue;
+        auto s = duct_session_by_conn(conn);
+        if (!s || !s->proto)
+            continue;
+        auto cid = duct_session_conn_id_by_handle(s, duct_conn_handle_get(conn));
+        if (cid >= duct_session_max_legs)
+            continue;
+        s_conn_done_flush(s, cid, conn);
+        s_response_switch(s);
+        progress = true;
+    }
+    return progress;
+}
+
 static size_t s_inter_drain(duct_worker_t *w)
 {
-    if (!duct_atomic_load(&w->inter_pending, relaxed))
-        return 0u;
+    bitmap_2lvl_iter_t it = { .summary = w->inter_summary, .armed = w->inter_armed };
     size_t total = 0u;
-    for (unsigned word = 0u; word < DUCT_BITMAP_WORDS; ++word) {
-        uint64_t bits = duct_bits_grab(w->inter_armed, word);
-        while (bits) {
-            unsigned bit = duct_ctz_ull(bits);
-            bits &= bits - 1u;
-            duct_atomic_fetch(sub, &w->inter_pending, 1u, relaxed);
-            unsigned idx = (word << bits_word_shift) | bit;
-            auto conn = duct_conn_by_idx(idx);
-            /* A bit outlives its conn and names a slot io has retired or handed
-             * to another worker, so this is the one field read before the match. */
-            if (duct_atomic_load(&conn->bound_worker, relaxed) != w->worker_id + 1u)
-                continue;
-            auto lane = duct_conn_lane(conn);
-            if (!lane)
-                continue;
-            assert(duct_atomic_load(&conn->conn_fence, relaxed) < fence_retire_ready);
-            bool stopped = false;
-            /* Handle taken before the drain: dispatching a packet can close
-             * this conn, and the resume is addressed to the leg that was
-             * read, not to whatever the slot holds afterwards. Null for
-             * anything but a device leg, which the post below tests —
-             * a live conn's handle never carries a zero generation. */
-            auto ch = conn->xport_type == x_inter && conn->ctx
-                    ? duct_conn_handle_get(conn) : conn_handle_null;
-            /* The hold is read per message: the first one it stops stays on
-             * the lane with every message behind it, and the conn is re-armed
-             * so the pass after the parked answer leaves finds it again. */
-            w->tx_train.more = true;
-            total += duct_vmq_mpsc_drain_while(lane, s_inter_msg_take, conn, &stopped);
-            w->tx_train.more = false;
-            s_tx_train_flush(w);
-            s_worker_dgram_flush();
-            if (stopped) {
-                if (duct_bits_set_if_new(w->inter_armed, idx))
-                    duct_atomic_fetch(add, &w->inter_pending, 1u, relaxed);
-                continue;
-            }
-            s_rx_unpin(conn);
-            /* Only a lane this pass emptied resumes the device: an io thread
-             * woken over a partly full lane has to stop again without reading,
-             * and a lane still holding bytes is still armed, so the pass that
-             * does empty it carries the resume instead. */
-            if (ch.word) {
-                auto ln = duct_mpsc_lane(lane, 0u);
-                if (!duct_vmq_unread(ln.ctrl))
-                    duct_io_post_rx_read(&ch);
-            }
+    unsigned idx;
+    while (s_bitmap_2lvl_next(&it, &idx)) {
+        auto conn = duct_conn_by_idx(idx);
+        /* A bit outlives its conn and names a slot io has retired or handed
+         * to another worker — or a slot nothing ever held — so this is the
+         * one field read before the match. */
+        if (!conn)
+            continue;
+        if (conn->worker_id != w->worker_id
+            || duct_conn_phase(conn) != conn_bound)
+            continue;
+        auto lane = duct_conn_lane(conn);
+        if (!lane)
+            continue;
+        bool stopped = false;
+        /* Handle taken before the drain: dispatching a packet can close
+         * this conn, and the resume is addressed to the leg that was
+         * read, not to whatever the slot holds afterwards. Null for
+         * anything but a device leg, which the post below tests —
+         * a live conn's handle never carries a zero generation. */
+        auto ch = conn->xport_type == x_inter && duct_conn_device_ops(conn)
+                ? duct_conn_handle_get(conn) : conn_handle_null;
+        /* The hold is read per message: the first one it stops stays on
+         * the lane with every message behind it, and the conn is re-armed
+         * so the pass after the parked answer leaves finds it again. */
+        w->tx_train.more = true;
+        total += duct_vmq_mpsc_drain_while(lane, s_inter_msg_take, conn, &stopped);
+        w->tx_train.more = false;
+        s_tx_train_flush(w);
+        s_worker_dgram_flush();
+        if (stopped) {
+            s_worker_inter_arm(w, idx);
+            continue;
+        }
+        /* Only a lane this pass emptied resumes the device: an io thread
+         * woken over a partly full lane has to stop again without reading,
+         * and a lane still holding bytes is still armed, so the pass that
+         * does empty it carries the resume instead. */
+        if (ch.word) {
+            auto ln = duct_mpsc_lane(lane, 0u);
+            if (!duct_vmq_unread(ln.ctrl))
+                duct_io_post_rx_read(&ch);
         }
     }
     /* on_inter_resume is a coarse "a lane made room, maybe retry a
@@ -3610,10 +4203,10 @@ static inline void s_hctx_remove_release(duct_coop_t *cp, duct_stream_ctx_t *h)
 /** @brief Held-frame ack (RX byte count + dispatch_frontier) without pin
  *  release.
  *
- *  Idempotent through @c frame_acked: a frame acked at a TX-backpressure park
- *  is acked once, and the handler's own later @c async_wait or @c async_done
- *  adds nothing — @ref duct_olb_rx_ack sums, so a second call moves @c head
- *  past bytes nobody read.
+ *  Idempotent through the span's own window: a frame acked at a
+ *  TX-backpressure park leaves @c span.len at zero, and the handler's own
+ *  later @c async_wait or @c async_done adds nothing — @ref duct_olb_rx_ack
+ *  sums, so a second call moves @c head past bytes nobody read.
  *
  *  Leaves the pin up and @c frame in place, which lets a
  *  handler read @c duct_stream_frame again after the park.
@@ -3622,77 +4215,54 @@ static inline void s_hctx_remove_release(duct_coop_t *cp, duct_stream_ctx_t *h)
  */
 static void s_hctx_rx_ack_only(duct_stream_ctx_t *hctx)
 {
-    if (hctx->frame_acked)
+    uint32_t len = duct_span_len(&hctx->span);
+    if (!len)
         return;
     auto c = duct_conn_by_handle(duct_session_conn_at(hctx->s, hctx->conn_id));
-    switch (hctx->ack.kind) {
-    case ack_ring:
-        auto rx = c ? duct_conn_rx_olb(c) : nullptr;
-        if (rx) {
-            uint32_t end_off = s_dispatch_frontier_skip;
-            if (hctx->frame.payload.data)
-                /* End offset of the held frame, derived the same way
-                 * s_dispatch_frame computed its start (rx->data + task->offset +
-                 * hdr, size = task->len - hdr) — hdr cancels out, so this always
-                 * equals task->offset + task->len exactly. */
-                end_off = (uint32_t)((const uint8_t *)hctx->frame.payload.data
-                         - rx->data + (ptrdiff_t)hctx->frame.payload.size);
-            s_rx_ack(c, hctx->ack.ring.task_len, end_off);
-        }
+    switch (duct_span_kind_of(&hctx->span)) {
+    case span_rx:
+        if (c && duct_conn_rx_olb(c))
+            /* The window's end is the span's own off + len — the offset
+             * pair the frame was dispatched with, hdr cancelling out the
+             * same way s_dispatch_frame computed its payload. */
+            s_rx_ack(c, len, duct_span_off(&hctx->span) + len);
         break;
-    case ack_ct:
+    case span_ptr:
         /* No ring, no dispatch_frontier — the sealed record this frame came
-         * from was already s_rx_ack'd at unseal time. The conn only finds the
-         * codec that owns the acked buffer, and c is nullptr once the leg is
-         * gone. */
-        s_frame_ack_apply(c, hctx->ack);
-        break;
-    case ack_owned:
-    case ack_slot:
+         * from was already s_rx_ack'd at unseal time. The conn only finds
+         * the codec that owns the acked chunk, and c is nullptr once the leg
+         * is gone. */
+        if (s_ct_chunk_is(duct_span_base(&hctx->span)))
+            s_frame_ack_apply(c, hctx->span);
         break;
     default:
-        duct_unreachable();
+        break;
     }
-    hctx->frame_acked = true;
+    /* The window is accounted; the substrate stays named for the pin's
+     * release alone. */
+    hctx->span.len = 0u;
 }
 
 /** @brief Held-frame pin release, @c frame cleared.
  *
  *  Idempotent — a no-op if the frame was never held or the pin was
- *  already released. The ring decrement is release-ordered, so it, and
- *  everything this handler step did with the frame's bytes before it, is
- *  visible to a racing compaction check the instant it observes either.
+ *  already released. The ring pin's drop is the §2.3 step, acq_rel and
+ *  ending in the conn's release, so it, and everything this handler step
+ *  did with the frame's bytes before it, is visible to a racing compaction
+ *  check the instant it observes the count.
  *
- *  Sealed case: the pin is a hold on the codec's cleartext buffer. A codec a
- *  @c proto_switch fence destroyed while this handler was parked on it leaves
- *  the buffer to this release, which frees it as the last holder.
+ *  Sealed case: the pin is a hold on the codec's cleartext chunk. A codec a
+ *  @c proto_switch fence destroyed while this handler was parked on it
+ *  leaves the chunk to this release, which frees it as the last holder.
  */
 static void s_hctx_hold_release(duct_stream_ctx_t *hctx)
 {
-    if (hctx->frame.payload.data) {
-        switch (hctx->ack.kind) {
-        case ack_ring:
-            auto c = duct_conn_by_handle(duct_session_conn_at(hctx->s, hctx->conn_id));
-            auto rx = c ? duct_conn_rx_olb(c) : nullptr;
-            if (rx)
-                duct_discard duct_atomic_fetch(sub, &rx->held_frames, 1u, release);
-            break;
-        case ack_ct:
-            s_ct_pin_release(duct_conn_by_handle(duct_session_conn_at(hctx->s, hctx->conn_id)),
-                             hctx->ack.ct.data);
-            break;
-        case ack_owned:
-            duct_del(hctx->ack.owned.ptr);
-            break;
-        case ack_slot:
-            duct_io_rx_slot_drop(hctx->ack.slot.pool, hctx->ack.slot.idx, true);
-            break;
-        default:
-            duct_unreachable();
-        }
-    }
+    if (hctx->frame.payload.data)
+        s_ingress_drop_pinned(
+            duct_conn_by_handle(duct_session_conn_at(hctx->s, hctx->conn_id)),
+            &hctx->span);
     hctx->frame = (duct_frame_t){};
-    hctx->frame_acked = false;
+    hctx->span = (duct_span_t){};
 }
 
 /** @brief Full release: ack then drop the pin in one step —
@@ -3744,14 +4314,16 @@ static bool s_conn_ctl_stageable(const duct_conn_t *conn)
  */
 static void s_hctx_stream_fail(duct_session_t *s, duct_stream_ctx_t *hctx)
 {
-    auto slot = duct_session_stream_slot(s, hctx->stream_id);
+    auto sid = hctx->stream_id;
+    auto cid = hctx->conn_id;
+    auto slot = duct_session_stream_slot(s, sid);
     if (slot && s->proto) {
-        auto conn = duct_conn_by_handle(duct_session_conn_at(s, hctx->conn_id));
-        if (s_conn_can_send_fin(conn, hctx->stream_id))
-            s_ctl_send_fin(s, hctx->conn_id, hctx->stream_id, fl_frame_rst,
-                           stream_err_internal);
+        slot->handler_ctx = nullptr;
+        auto conn = duct_conn_by_handle(duct_session_conn_at(s, cid));
+        if (s_conn_can_send_fin(conn, sid))
+            s_ctl_send_fin(s, cid, sid, fl_frame_rst, stream_err_internal);
         else
-            duct_discard duct_conn_close(s, hctx->conn_id, close_internal_error);
+            duct_discard duct_conn_close(s, cid, close_internal_error);
         duct_session_stream_teardown(s, slot, close_internal_error);
     } else if (slot)
         slot->handler_ctx = nullptr;
@@ -3761,8 +4333,10 @@ static void s_hctx_stream_fail(duct_session_t *s, duct_stream_ctx_t *hctx)
 static void s_hctx_stream_done(duct_session_t *s, duct_stream_ctx_t *hctx)
 {
     auto slot = duct_session_stream_slot(s, hctx->stream_id);
-    if (slot)
+    if (slot) {
+        slot->handler_ctx = nullptr;
         duct_session_stream_teardown(s, slot, close_normal);
+    }
 }
 
 /* Word-wise compare against duct_response_reset's own state: a step that
@@ -3799,10 +4373,22 @@ static inline bool s_response_is_clean(const duct_response_t *out)
  *  @ref duct_handler_outcome_t — rescheduling for run/park, releasing the
  *  coroutine for their own runtime on release.
  */
+static void s_hctx_release(duct_stream_ctx_t *hctx)
+{
+    *hctx = (duct_stream_ctx_t){};
+}
+
+static inline bool s_hctx_live_stepping(const duct_stream_ctx_t *hctx,
+                                        const duct_session_t *s, duct_stream_id_t sid)
+{
+    return hctx->s == s && hctx->stream_id == sid && !hctx->au && !hctx->co;
+}
+
 static duct_handler_outcome_t s_hctx_complete(duct_stream_ctx_t *hctx,
                                                  duct_handler_event_t event)
 {
     auto s = hctx->s;
+    auto sid = hctx->stream_id;
     switch (event) {
     case handler_event_emit:
         if (s_response_is_clean(&hctx->out)) {
@@ -3810,31 +4396,48 @@ static duct_handler_outcome_t s_hctx_complete(duct_stream_ctx_t *hctx,
              * duct_proto_switch is imperative state outside out, so its
              * apply still runs. */
             s_response_drop(s, &hctx->out);
-            return handler_outcome_run;
+            return s_hctx_live_stepping(hctx, s, sid) ? handler_outcome_run : handler_outcome_release;
         }
-        switch (s_response_take(s, &hctx->out, hctx->conn_id, hctx->stream_id, fl_frame_none,
+        switch (s_response_take(s, &hctx->out, hctx->conn_id, sid, fl_frame_none,
                                 nullptr, hctx)) {
         case commit_ok:
+            if (!s_hctx_live_stepping(hctx, s, sid))
+                return handler_outcome_release;
             duct_response_reset(&hctx->out);
             return handler_outcome_run;
         case commit_internal:
+            if (!s_hctx_live_stepping(hctx, s, sid))
+                return handler_outcome_release;
             duct_response_reset(&hctx->out);
             return handler_outcome_retry;
         default:
+            if (!s_hctx_live_stepping(hctx, s, sid))
+                return handler_outcome_release;
             s_hctx_rx_ack(hctx);
             s_hctx_stream_fail(s, hctx);
-            duct_del(hctx);
+            s_hctx_release(hctx);
             return handler_outcome_release;
         }
     case handler_event_wait:
         /* Ack deferred until handler parks — OLB won't compact past un-acked offset. */
         s_hctx_rx_ack(hctx);
+        if (!s_response_is_clean(&hctx->out)) {
+            s_response_drop(s, &hctx->out);
+            if (!s_hctx_live_stepping(hctx, s, sid))
+                return handler_outcome_release;
+            duct_response_reset(&hctx->out);
+        }
         hctx->frame = (duct_frame_t){};
         return handler_outcome_park;
     default: /* handler_event_done */
+        if (!s_response_is_clean(&hctx->out)) {
+            s_response_drop(s, &hctx->out);
+            if (!s_hctx_live_stepping(hctx, s, sid))
+                return handler_outcome_release;
+        }
         s_hctx_rx_ack(hctx);
         s_hctx_stream_done(s, hctx);
-        duct_del(hctx);
+        s_hctx_release(hctx);
         return handler_outcome_release;
     }
 }
@@ -3845,29 +4448,33 @@ static void s_hctx_async_done(duct_async_t *co, duct_async_rc_t rc, void *ctx)
     auto w = s_this_worker;
     assert(w);
     auto cp = &w->coop;
+    if (hctx->au != co)
+        return;
+    hctx->au = nullptr;
     duct_handler_event_t event = rc == async_yield ? handler_event_emit :
                                  rc == async_wait  ? handler_event_wait :
                                                   handler_event_done;
 
     switch (s_hctx_complete(hctx, event)) {
     case handler_outcome_run:
+        hctx->au = co;
         s_hctx_enqueue(cp, hctx, true);
         break;
     case handler_outcome_park:
+        hctx->au = co;
         s_hctx_enqueue(cp, hctx, false);
         break;
     case handler_outcome_retry:
         /* Left unenqueued while tracked in w->retry_head until s_retry_drain
          * resumes it. */
+        hctx->au = co;
         break;
     case handler_outcome_release:
         /* async_done: duct_coop_cycle releases after this callback returns.
-         * emit-turned-failure: the step returned async_yield, not async_done, so
-         * the drain loop will not release it — do it here. */
-        if (event == handler_event_emit) {
-            duct_async_queue_remove(&cp->async_queue, co);
+         * emit/wait-turned-failure or re-entrant cancel: step did not return
+         * async_done, so release here once. */
+        if (event != handler_event_done)
             duct_async_release(&cp->async_pool, co);
-        }
         break;
     }
 }
@@ -3878,6 +4485,9 @@ static void s_hctx_sf_resume(duct_coro_t *co, void *ctx)
     auto w = s_this_worker;
     assert(w);
     auto cp = &w->coop;
+    if (hctx->co != co)
+        return;
+    hctx->co = nullptr;
     duct_handler_event_t event = co->state == coro_state_suspended ? handler_event_emit :
                                  co->state == coro_state_waiting  ? handler_event_wait :
                                                                handler_event_done;
@@ -3885,11 +4495,13 @@ static void s_hctx_sf_resume(duct_coro_t *co, void *ctx)
     switch (s_hctx_complete(hctx, event)) {
     case handler_outcome_run:
     case handler_outcome_park:
+        hctx->co = co;
         s_hctx_enqueue(cp, hctx, true); /* run inert on the co path, see s_hctx_enqueue's own doc */
         break;
     case handler_outcome_retry:
         /* Left unenqueued while tracked in w->retry_head until s_retry_drain
          * resumes it; co->state remains coro_state_suspended. */
+        hctx->co = co;
         break;
     case handler_outcome_release:
         /* duct_coop_cycle destroys on coro_state_done; it already popped co off
@@ -3917,16 +4529,21 @@ void duct_stream_cancel(duct_stream_ctx_t *hctx)
         s_retry_emit_discard(w, hctx);
         s_hctx_remove_release(&w->coop, hctx);
     }
-    duct_del(hctx);
+    s_hctx_release(hctx);
 }
 
 /** @brief Which TX-backpressure class an @c retry_node_t holds. */
 typedef enum : uint8_t { retry_emit, retry_frame, retry_timer, retry_fin,
                          retry_dgram_tx, retry_engine, retry_close } retry_kind_t;
 
-/** @brief Inbound buffer a parked payload points into: none, the inbound conn's
- *  RX ring, or the inbound sealed conn's cleartext buffer. */
-typedef enum : uint8_t { alias_none, alias_ring, alias_ct } alias_t;
+/** @brief Inbound substrate a parked payload points into, as a
+ *  @c duct_span_kind_t: @c span_mat none or copied, @c span_rx the inbound
+ *  conn's RX ring, @c span_ptr the inbound sealed conn's cleartext chunk.
+ *  The node's @c ack_len / @c ack_end / @c ct_block words are that span's
+ *  unpacked @c len and @c off + @c len / @c base — one reference per held
+ *  payload, §1.1, stored in the slot's own words. */
+typedef duct_span_kind_t alias_t;
+static_assert(span_mat == 0u, "the parked substrate kind keeps the none slot");
 
 /** @brief Unified TX-backpressure retry node: one list and one drain for
  *  every class that parks work on a transient failure.
@@ -3940,11 +4557,22 @@ typedef enum : uint8_t { alias_none, alias_ring, alias_ct } alias_t;
  *  The rest carry a handle or token and re-resolve fresh each pass, since none
  *  has a per-stream owner to discard its node on teardown.
  *
+ *  Storage splits by lifetime class (map §2, amendment "1b tail 2"): the
+ *  frame, fin, engine, close and dgram_tx nodes die with their conn and come
+ *  from that conn block's own TX retry region — @c s_retry_node_take hands
+ *  one out, @c s_retry_node_drop returns it, both behind the
+ *  @c duct_conn_retry_tx_nodes quota. The emit (stream-owned) and timer
+ *  (session-owned) nodes come from their session block's own emit and timer
+ *  regions through @c s_retry_sess_node_take and @c s_retry_sess_node_release
+ *  — the session block, never the conn block.
+ *
  *  Lifetime invariant: every path that frees a @c duct_stream_ctx_t must
  *  first remove its emit node from this list, or @c s_retry_drain
  *  dereferences a dangling @c emit.hctx. Exactly two paths do:
  *  @ref duct_stream_cancel through @c s_retry_emit_discard, and this drain's
- *  own terminal branch, which consumes the node in place.
+ *  own terminal branch, which consumes the node in place. The drain's emit
+ *  case also treats a ctx whose @c s reads null as voided, so a release that
+ *  skipped the discard empties the node in place instead of faulting.
  */
 typedef struct retry_node {
     struct retry_node *next;
@@ -3954,23 +4582,33 @@ typedef struct retry_node {
     union {
         /* A copy-mode payload is the node's own copy; a static or owned one
          * keeps pointing where it did. hctx's pin stays live until this node
-         * resolves. See s_retry_emit_save. */
+         * resolves; a voided node (teardown or dead-stream exit) nulls
+         * @c hctx as its marker -- the drain's voided branch, the hold scan
+         * and the switch gate read that, and @c tok resolves the session
+         * safely across teardown for ticket pass and slot drop. The ticket
+         * stays for the drain to resolve at its turn.
+         * See s_retry_emit_save. */
         struct { duct_stream_ctx_t *hctx;
+                 duct_handle_t     tok;
                  duct_response_t out;
                  uint32_t ticket; } emit;
         /* pin: the inbound buffer the payload, uncopied, points into, for an
-         * answer carrying its frame's ack or one s_retry_payload_own left in
+         * answer carrying its frame's ack or one s_retry_copy_own left in
          * place. ack_len is a carried ack's length, 0 for none; ack_end is its
-         * ring end under alias_ring, ct_block the pinned buffer under alias_ct.
-         * handle is the ticket-owning routed leg, re-resolve target and
-         * fl_conn_tx_wait owner; rx_handle is the inbound leg the payload was
-         * read from, meaningful only while pinned or carrying an ack. hold_of
-         * is the conn whose dispatch parked the node, 0 for none. */
+         * ring end under span_rx, ct_block the pinned buffer under span_ptr.
+         * A slot-pinned answer (span_mat, the response's release hook set)
+         * carries its RX slot claim in slot_pool/slot_idx — the node is the pin
+         * record, the claim outliving no node that holds it. handle is the
+         * ticket-owning routed leg, re-resolve target and TX-wait
+         * owner; rx_handle is the inbound leg the payload was read from,
+         * meaningful only while pinned or carrying an ack. hold_of is the conn
+         * whose dispatch parked the node, 0 for none. */
         struct { duct_conn_handle_t handle, rx_handle, hold_of; duct_stream_id_t sid;
                  duct_frame_flags_t flags; duct_response_t out; alias_t pin;
                  uint32_t ack_len,
                           ticket;
-                 union { uint32_t ack_end; void *ct_block; }; } frame;
+                 union { uint32_t ack_end; void *ct_block; };
+                 struct duct_x_slot_pool *slot_pool; uint32_t slot_idx; } frame;
         struct { duct_handle_t tok; uint64_t token; duct_timer_handle_t self; uint32_t key; } timer;
         /* Bare control frame: no payload, so no ring pin and no ownership
          * to settle. Carries a handle and re-resolves like frame does, for
@@ -3979,14 +4617,17 @@ typedef struct retry_node {
         struct { duct_conn_handle_t handle, hold_of; duct_stream_id_t sid;
                  duct_frame_flags_t flags; duct_stream_error_t err;
                  uint32_t ticket; } fin;
-        /* Heap-allocated copy of datagram payload to outlive the pass arena.
-         * listener is used after handle re-resolution. No subsequent worker
-         * datagram leaves ahead of a parked one; dgram_parked gates flush and
-         * commits while any is parked. */
+        /* The parked datagram's own descriptor — the entry's span taken over
+         * whole, pin and inline header included (§2.1): the payload stays
+         * where its author built it and the node holds its reference until
+         * the drain resolves it. listener is used after handle
+         * re-resolution. No subsequent worker datagram leaves ahead of a
+         * parked one; dgram_parked gates flush and commits while any is
+         * parked. */
         struct { duct_conn_handle_t handle; duct_listener_t *listener;
-                 duct_peer_t peer; void *block; duct_view_u8 bytes;
-                 duct_conn_id_t conn_id; duct_stream_id_t stream_id;
-                 duct_send_flags_t flags; uintptr_t send_token; } dgram_tx;
+                 duct_peer_t peer; duct_peer_t local; duct_span_t span;
+                 uint8_t hdr[wire_tx_hdr_max]; uint8_t hdr_len;
+                 bool send_done; } dgram_tx;
         /* The conn whose codec's engine park holds bytes, and the wire
          * binding they were staged under: a rebind since drops the node. */
         struct { duct_conn_handle_t handle; uint8_t wire_epoch; } engine;
@@ -3999,6 +4640,237 @@ typedef struct retry_node {
 } retry_node_t;
 
 static void s_retry_enqueue(duct_worker_t *w, retry_node_t *node);
+
+/* The conn block's TX retry node slot is the worker's own retry_node_t,
+ * exactly: the stride constant in duct_conn_block.h and the type cannot
+ * drift apart. */
+static_assert(sizeof(retry_node_t) == conn_retry_tx_node_span,
+              "the TX retry node slot must carry a retry_node_t whole");
+
+/** @brief The conn whose block a parked node's storage belongs to, by its
+ *  handle word: the leg the node leaves on, for every conn-owned class.
+ *  @return null for the two session-owned classes (emit, timer — heap nodes)
+ *  and for a handle that no longer resolves. */
+static duct_conn_t *s_retry_node_owner(const retry_node_t *node)
+{
+    switch (node->kind) {
+    case retry_frame:    return duct_conn_by_handle(node->frame.handle);
+    case retry_fin:      return duct_conn_by_handle(node->fin.handle);
+    case retry_engine:   return duct_conn_by_handle(node->engine.handle);
+    case retry_close:    return duct_conn_by_handle(node->close.handle);
+    case retry_dgram_tx: return duct_conn_by_handle(node->dgram_tx.handle);
+    case retry_emit:
+    case retry_timer:    return nullptr;
+    }
+    return nullptr;
+}
+
+/** @brief Mask of the valid bits of bitmap word @p w over @p n slots. */
+static inline uint64_t s_retry_word_mask(size_t w, uint32_t n)
+{
+    uint32_t rem = n - (uint32_t)(w << 6);
+    return rem >= 64u ? ~0ull : ((1ull << rem) - 1ull);
+}
+
+/** @brief Take one of @p conn's TX retry node slots, lowest free index first.
+ *
+ *  The maps are the owning worker's alone (plain words): saves, the drain, the
+ *  conn-lost discard and the teardown clear all run on it, and page 0's
+ *  acquire reset zeroed the maps before the io-to-worker handoff published
+ *  the conn. A save past the @c duct_conn_retry_tx_nodes quota answers null —
+ *  the caller's allocation-failure path, as B2b's batch retry region refuses.
+ *
+ *  @return the slot, or null when the conn's quota is spent.
+ */
+static retry_node_t *s_retry_node_take(duct_conn_t *conn)
+{
+    auto maps = duct_conn_tx_retry_maps(conn);
+    for (size_t w = 0u; w < sizeof maps->nodes / sizeof maps->nodes[0]; ++w) {
+        uint64_t free_bits = ~maps->nodes[w] & s_retry_word_mask(w, duct_conn_retry_tx_nodes);
+        if (!free_bits)
+            continue;
+        uint32_t idx = (uint32_t)(w << 6) + duct_ctz_ull(free_bits);
+        maps->nodes[w] |= 1ull << (idx & 63u);
+        return (retry_node_t *)duct_conn_tx_retry_node_slot(conn, idx);
+    }
+    return nullptr;
+}
+
+/** @brief Return @p node to its conn's TX retry node slot. */
+static void s_retry_node_release(duct_conn_t *conn, retry_node_t *node)
+{
+    auto base = duct_conn_tx_retry_node_slot(conn, 0u);
+    uint32_t idx = (uint32_t)(((uintptr_t)node - (uintptr_t)base)
+                              / conn_retry_tx_node_span);
+    auto maps = duct_conn_tx_retry_maps(conn);
+    maps->nodes[idx >> 6] &= ~(1ull << (idx & 63u));
+}
+
+static_assert(sizeof(retry_node_t) == session_retry_node_span,
+              "the session block's retry slot must carry a retry_node_t whole");
+
+/** @brief Test whether @p node lies inside @p s's two session-owned retry
+ *  regions. */
+static bool s_retry_sess_is_regional(const duct_session_t *s, const retry_node_t *node)
+{
+    uint8_t *base = duct_session_retry_emit_slot(s, 0u);
+    return (const uint8_t *)node >= base
+        && (const uint8_t *)node < base + session_emit_region + session_timer_region;
+}
+
+/** @brief Return @p node to the session region it carved, its map bit back. */
+static void s_retry_sess_node_release(duct_session_t *s, retry_node_t *node)
+{
+    duct_do_if(!s_retry_sess_is_regional(s, node), return);
+    auto maps = duct_session_retry_maps(s);
+    if ((uint8_t *)node < duct_session_retry_emit_slot(s, duct_session_retry_emit_nodes)) {
+        uint32_t idx = (uint32_t)(((uintptr_t)node
+                                   - (uintptr_t)duct_session_retry_emit_slot(s, 0u))
+                                  / session_retry_node_span);
+        maps->emit[idx >> 6] &= ~(1ull << (idx & 63u));
+        return;
+    }
+    uint32_t idx = (uint32_t)(((uintptr_t)node
+                               - (uintptr_t)duct_session_retry_timer_slot(s, 0u))
+                              / session_retry_node_span);
+    maps->timer[idx >> 6] &= ~(1ull << (idx & 63u));
+}
+
+/** @brief Take one of @p s's session-owned retry node slots for @p kind,
+ *  lowest free index first; @c nullptr past the region's quota — the
+ *  caller's allocation-failure path. */
+static retry_node_t *s_retry_sess_node_take(duct_session_t *s, retry_kind_t kind)
+{
+    uint32_t n = kind == retry_emit ? duct_session_retry_emit_nodes
+                                    : duct_session_retry_timer_nodes;
+    auto maps = duct_session_retry_maps(s);
+    uint64_t *words = kind == retry_emit ? maps->emit : maps->timer;
+    for (size_t w = 0u; w < (n + 63u) / 64u; ++w) {
+        uint64_t free_bits = ~words[w] & s_retry_word_mask(w, n);
+        if (!free_bits)
+            continue;
+        uint32_t idx = (uint32_t)(w << 6) + duct_ctz_ull(free_bits);
+        words[w] |= 1ull << (idx & 63u);
+        return (retry_node_t *)(kind == retry_emit
+             ? duct_session_retry_emit_slot(s, idx)
+             : duct_session_retry_timer_slot(s, idx));
+    }
+    return nullptr;
+}
+
+/** @brief End @p node: every class returns to the region it was carved in —
+ *  a conn-owned node to its conn block, the session-owned emit and timer
+ *  nodes to their session block.
+ *
+ *  A node whose owner no longer resolves returns nothing: its teardown
+ *  dropped every such node off this list ahead of the block's release, so a
+ *  straggler here means the block is already past reuse — its maps were
+ *  zeroed at the next acquire, and the stale slot dies with the block. */
+static void s_retry_node_drop(retry_node_t *node)
+{
+    switch (node->kind) {
+    case retry_emit: {
+        auto h = (duct_session_handle_t){ .word = node->emit.tok };
+        auto s = duct_session_by_handle(h);
+        if (s)
+            s_retry_sess_node_release(s, node);
+        return;
+    }
+    case retry_timer:
+        auto h = (duct_session_handle_t){ .word = node->timer.tok };
+        if (duct_session_block_live(h.id))
+            s_retry_sess_node_release(duct_session_block_at(h.id), node);
+        return;
+    default:
+        auto conn = s_retry_node_owner(node);
+        if (conn)
+            s_retry_node_release(conn, node);
+        return;
+    }
+}
+
+static uint32_t s_retry_copy_units(size_t len)
+{
+    return (uint32_t)(len / duct_conn_retry_tx_copy_max
+                      + (len % duct_conn_retry_tx_copy_max != 0u));
+}
+
+/** @brief Take @p conn's TX retry copy units for @p len bytes: a copy that
+ *  fits a unit of @c duct_conn_retry_tx_copy_max takes one, a wider copy
+ *  spans the consecutive units it needs, first-fit from the lowest. A copy
+ *  past the whole copy budget, an empty one, or one without a free run
+ *  answers null — the caller's allocation-failure path.
+ *  @return the first spanned unit's bytes, or null. */
+static uint8_t *s_retry_copy_take(duct_conn_t *conn, size_t len)
+{
+    uint32_t units = s_retry_copy_units(len);
+    duct_do_if(units == 0u || units > duct_conn_retry_tx_copies, return nullptr);
+    auto maps = duct_conn_tx_retry_maps(conn);
+    uint32_t run = 0u;
+    for (uint32_t i = 0u; i < duct_conn_retry_tx_copies; ++i) {
+        if (maps->copies[i >> 6] & (1ull << (i & 63u))) {
+            run = 0u;
+            continue;
+        }
+        if (++run == units) {
+            for (uint32_t u = units; u--; )
+                maps->copies[(i - u) >> 6] |= 1ull << ((i - u) & 63u);
+            return duct_conn_tx_retry_copy_slot(conn, i - units + 1u);
+        }
+    }
+    return nullptr;
+}
+
+/** @brief True when @p p is one of @p conn's TX retry copy slots. */
+static bool s_retry_copy_is_regional(const duct_conn_t *conn, const void *p)
+{
+    auto base = duct_conn_tx_retry_copy_slot(conn, 0u);
+    return (const uint8_t *)p >= base
+        && (const uint8_t *)p
+               < base + (size_t)duct_conn_retry_tx_copies * duct_conn_retry_tx_copy_max;
+}
+
+/** @brief Return the copy @p p of @p len bytes to @p conn's TX retry region:
+ *  the same consecutive units its take spanned — the ceil count @p len
+ *  derives, never a stored length. */
+static void s_retry_copy_release(duct_conn_t *conn, void *p, size_t len)
+{
+    auto base = duct_conn_tx_retry_copy_slot(conn, 0u);
+    uint32_t idx = (uint32_t)(((uintptr_t)p - (uintptr_t)base)
+                              / duct_conn_retry_tx_copy_max);
+    uint32_t units = s_retry_copy_units(len);
+    auto maps = duct_conn_tx_retry_maps(conn);
+    for (uint32_t u = 0u; u < units; ++u)
+        maps->copies[(idx + u) >> 6] &= ~(1ull << ((idx + u) & 63u));
+}
+
+/** @brief Release a parked frame answer's payload: a copy the conn's TX
+ *  retry region took returns its slot, any other payload releases through
+ *  the response's own ownership. The payload leaves holding nothing, on
+ *  either path. */
+static void s_retry_frame_out_release(retry_node_t *node)
+{
+    auto conn = s_retry_node_owner(node);
+    if (conn && s_retry_copy_is_regional(conn, node->frame.out.payload.data))
+        s_retry_copy_release(conn, node->frame.out.payload.data,
+                             node->frame.out.payload.size);
+    else
+        duct_response_release_owned(&node->frame.out);
+    node->frame.out.payload = (duct_view_u8){};
+    node->frame.out.flags = duct_and(node->frame.out.flags, duct_not(fl_send_owned));
+    node->frame.out.release = nullptr;
+    node->frame.out.release_arg = nullptr;
+}
+
+/** @brief Drop a parked dgram's span — the §5.1 matrix unpin, rx spans the
+ *  §2.3 step, whose last pin may post a read and release the base conn. The
+ *  parked conn and the span's substrate need not agree: an rx span outlives
+ *  its own leg's death by its refs unit, the pin's own base naming the leg. */
+static void s_retry_dgram_block_release(retry_node_t *node)
+{
+    s_dgram_span_drop(&node->dgram_tx.span);
+    node->dgram_tx.span = (duct_span_t){};
+}
 
 /** @brief Hand @p h to a parked answer of @p owner's dispatch that still waits on its ticket.
  *  A frame or fin node matches by its @c hold_of, an emit node by the inbound
@@ -4020,8 +4892,9 @@ static bool s_hold_adopt(const duct_session_t *s, duct_tx_hold_t *h, const duct_
                 waits = (duct_tx_hold_t){ n->fin.handle.word, n->fin.ticket };
             break;
         case retry_emit:
-            if (n->emit.hctx->s == s
-                && duct_session_conn_at(s, n->emit.hctx->conn_id).word == of.word)
+            if (!n->emit.hctx || n->emit.hctx->s != s)
+                break; /* voided: the answer is gone, the hold moot */
+            if (duct_session_conn_at(s, n->emit.hctx->conn_id).word == of.word)
                 waits = (duct_tx_hold_t){ duct_session_conn_at(s, n->emit.out.conn_id).word,
                                           n->emit.ticket };
             break;
@@ -4039,16 +4912,6 @@ static bool s_hold_adopt(const duct_session_t *s, duct_tx_hold_t *h, const duct_
     return false;
 }
 
-/** @brief Capacity of @p codec's engine park on @p conn, bytes: two engine
- *  messages.
- *  One reply parked leaves room for a second in flight, and the unseal waits
- *  while the park has no room for one more. A sealed wire refuses a budget
- *  whose park the smallest TX ring cannot take whole. */
-static size_t s_engine_park_cap(const duct_conn_t *conn, const duct_wire_codec_t *codec)
-{
-    return 2u * s_hs_need(conn, codec);
-}
-
 /** @brief Stage @p conn's parked engine bytes whole into its TX ring, ahead of
  *  every later byte.
  *  @return true once the park is empty; false while the ring has no room for
@@ -4061,10 +4924,11 @@ static bool s_engine_park_flush(duct_conn_t *conn)
         return true;
     auto tx = duct_conn_tx_olb(conn);
     size_t n = codec->engine_park_len;
-    if (!tx || duct_olb_tx_stage(tx, nullptr, 0u, duct_at(codec->engine_park), n) != olb_tx_ok) {
-        s_tx_wait_arm(conn);
+    if (!tx || duct_olb_tx_stage(tx, nullptr, 0u, duct_conn_engine_park(conn), n) != olb_tx_ok) {
+        s_tx_wait_arm(conn, n);
         return false;
     }
+    duct_conn_tx_staged(conn, n);
     codec->engine_park_len = 0u;
     duct_olb_tx_publish(tx);
     auto handle = duct_conn_handle_get(conn);
@@ -4072,24 +4936,20 @@ static bool s_engine_park_flush(duct_conn_t *conn)
     return true;
 }
 
-/** @brief Reserve @p len bytes at the end of @p codec's engine park.
- *  The park allocates at its first use, and bytes into an empty park queue a
- *  @c retry_engine node that flushes them once the ring frees; the conn's
- *  TX-room wake is armed.
- *  @return the span, nullptr when the park has no room or no memory. */
+/** @brief Reserve @p len bytes at the end of @p conn's engine park region.
+ *  Bytes into an empty park queue a @c retry_engine node that flushes them
+ *  once the ring frees; the conn's TX-room wake is armed.
+ *  @return the span, nullptr when the park has no room or its conn's TX retry
+ *          node quota is spent. */
 static uint8_t *s_engine_park_span(duct_conn_t *conn, duct_wire_codec_t *codec, size_t len)
 {
-    size_t cap = codec->engine_park ? duct_byte_len(codec->engine_park)
-                                    : s_engine_park_cap(conn, codec);
-    if (len > cap - codec->engine_park_len)
-        return nullptr;
-    if (!codec->engine_park) {
-        codec->engine_park = duct_new(uint8_t, cap);
-        if (!codec->engine_park)
-            return nullptr;
-    }
+    /* The park's whole capacity is two engine messages — one reply parked
+     * leaves room for a second in flight — which a sealed wire refuses a
+     * budget the smallest TX ring cannot take whole. */
+    assert(2u * s_hs_need(conn, codec) <= duct_conn_park_cap);
+    duct_do_if(len > duct_conn_park_cap - codec->engine_park_len, return nullptr);
     if (!codec->engine_park_len) {
-        auto node = duct_new(retry_node_t);
+        auto node = s_retry_node_take(conn);
         if (!node)
             return nullptr;
         *node = (retry_node_t){
@@ -4098,35 +4958,38 @@ static uint8_t *s_engine_park_span(duct_conn_t *conn, duct_wire_codec_t *codec, 
         };
         s_retry_enqueue(s_this_worker, node);
     }
-    auto span = duct_at(codec->engine_park) + codec->engine_park_len;
+    auto span = duct_conn_engine_park(conn) + codec->engine_park_len;
     codec->engine_park_len += (uint32_t)len;
-    s_tx_wait_arm(conn);
+    s_tx_wait_arm(conn, 0u);
     return span;
 }
 
-/** @brief Drop the pin a parked @c retry_frame node holds on its inbound buffer.
- *  A ring pin resolves @c node->frame.rx_handle, not its @c handle: the pin was
- *  taken against the leg the payload was read from, which routing can make a
- *  different one from the leg that owns the ticket. A cleartext pin drops its
- *  hold on the buffer whether that leg resolves or not. Resets @c pin, so a
- *  second call on a node kept voided does nothing.
+/** @brief Drop the pin a parked @c retry_frame node holds on its inbound
+ *  buffer.
+ *  A ring pin resolves @c node->frame.rx_handle, not its @c handle: the pin
+ *  was taken against the leg the payload was read from, which routing can
+ *  make a different one from the leg that owns the ticket — and runs the
+ *  §2.3 step, whose last action may release that leg's block. A cleartext
+ *  pin drops its hold on the chunk whether that leg resolves or not.
+ *  Resets @c pin, so a second call on a node kept voided does nothing.
  */
 static void s_retry_frame_pins_release(retry_node_t *node)
 {
     switch (node->frame.pin) {
-    case alias_ring:
+    case span_rx: {
         auto rx_conn = duct_conn_by_handle(node->frame.rx_handle);
-        auto rx = rx_conn ? duct_conn_rx_olb(rx_conn) : nullptr;
-        if (rx)
-            duct_discard duct_atomic_fetch(sub, &rx->held_frames, 1u, release);
-        break;
-    case alias_ct:
-        s_ct_pin_release(duct_conn_by_handle(node->frame.rx_handle), node->frame.ct_block);
-        break;
-    case alias_none:
+        if (rx_conn && duct_conn_rx_olb(rx_conn))
+            duct_span_rx_unpin(rx_conn, duct_conn_rx_hdr(rx_conn));
         break;
     }
-    node->frame.pin = alias_none;
+    case span_ptr:
+        s_ct_pin_release(duct_conn_by_handle(node->frame.rx_handle), node->frame.ct_block);
+        break;
+    case span_mat:
+    case span_static:
+        break;
+    }
+    node->frame.pin = span_mat;
 }
 
 /** @brief End a parked @c retry_frame node: land the frame ack it carries, then
@@ -4138,11 +5001,10 @@ static void s_retry_frame_done(retry_node_t *node)
     if (node->frame.ack_len) {
         auto rx = duct_conn_by_handle(node->frame.rx_handle);
         if (rx && duct_conn_rx_olb(rx))
-            s_frame_ack_apply(rx, node->frame.pin == alias_ring
-                ? (duct_frame_ack_t){ .kind = ack_ring,
-                                      .ring = { node->frame.ack_len, node->frame.ack_end } }
-                : (duct_frame_ack_t){ .kind = ack_ct,
-                                      .ct = { node->frame.ct_block, node->frame.ack_len } });
+            s_frame_ack_apply(rx, node->frame.pin == span_rx
+                ? duct_span_of_rx(rx, node->frame.ack_end - node->frame.ack_len,
+                                  node->frame.ack_len)
+                : duct_span_of_ptr(node->frame.ct_block, 0u, node->frame.ack_len));
         node->frame.ack_len = 0u;
     }
     s_retry_frame_pins_release(node);
@@ -4161,13 +5023,18 @@ static void s_response_void_payload(duct_response_t *out)
 }
 
 /** @brief Empty a parked @c retry_frame node in place: land its carried ack,
- *  drop its pin and release its payload.
+ *  drop its pin and release its payload — a regional copy back to its slot.
  *  Its ticket stays for the drain to resolve in turn, and its frame flags
  *  clear, so no fin or rst follows; a second call does nothing. */
 static void s_retry_frame_void(retry_node_t *node)
 {
+    if (duct_has(node->frame.out.flags, fl_send_done)) {
+        auto conn = duct_conn_by_handle(node->frame.handle);
+        if (conn)
+            s_tx_done_skip(conn);
+    }
     s_retry_frame_done(node);
-    s_response_void_payload(&node->frame.out);
+    s_retry_frame_out_release(node);
     node->frame.out.flags = (duct_send_flags_t)0;
     node->frame.flags = fl_frame_none;
 }
@@ -4201,38 +5068,31 @@ static void s_retry_enqueue(duct_worker_t *w, retry_node_t *node)
 /** @brief Park one packed @c x_udp_shared datagram whose outbox-lane reserve
  *  failed at flush time.
  *
- *  The bytes are copied out of the dying pass arena into an owned buffer and
- *  retried by @c s_retry_drain until the lane has room again; send_done and
- *  on_error for the entry are deferred to the node's own resolution.
- *  @return false only when the copy allocation itself fails; the caller keeps
- *  its terminal-drop accounting for that. */
+ *  The node is the conn's own TX retry region and takes the entry's descriptor
+ *  over whole — span with its pin, inline header — so the payload stays where
+ *  its author built it and retries by @c s_retry_drain until the lane has
+ *  room again; send_done and on_error for the entry are deferred to the
+ *  node's own resolution.
+ *  @return false when the region refuses — its node quota spent — or the
+ *  entry's conn is already gone, whose silent-drop discipline the caller's
+ *  terminal-drop accounting carries; both leave the span to the caller's
+ *  drop, which the flush runs on every non-parked path. */
 static bool s_retry_dgram_tx_save(duct_worker_t *w, const duct_worker_dgram_batch_entry_t *e,
-                                  duct_listener_t *listener, uint8_t *bytes)
+                                  duct_listener_t *listener)
 {
-    auto node = duct_new(retry_node_t);
+    auto conn = duct_conn_by_handle(e->handle);
+    duct_do_if(!conn, return false);
+    auto node = s_retry_node_take(conn);
     duct_do_if(!node, return false);
-    if (!e->hdr_len && !s_tx_pool_owns(&w->tx_pool, bytes)) {
-        node->dgram_tx.block = duct_share(e->block);
-        node->dgram_tx.bytes = (duct_view_u8){ .data = bytes, .size = e->len };
-    } else {
-        size_t total = (size_t)e->hdr_len + e->len;
-        auto data = duct_new(uint8_t, total);
-        duct_do_if(!data, duct_del(node); return false);
-        auto copy = duct_at(data);
-        if (e->hdr_len)
-            memcpy(copy, e->hdr, e->hdr_len);
-        memcpy(copy + e->hdr_len, bytes, e->len);
-        node->dgram_tx.block = copy;
-        node->dgram_tx.bytes = (duct_view_u8){ .data = copy, .size = total };
-    }
     node->kind = retry_dgram_tx;
     node->dgram_tx.handle = e->handle;
     node->dgram_tx.listener = listener;
     node->dgram_tx.peer = e->peer;
-    node->dgram_tx.conn_id = e->conn_id;
-    node->dgram_tx.stream_id = e->stream_id;
-    node->dgram_tx.flags = e->flags;
-    node->dgram_tx.send_token = e->send_token;
+    node->dgram_tx.local = e->local;
+    node->dgram_tx.send_done = e->send_done;
+    node->dgram_tx.span = e->span;
+    node->dgram_tx.hdr_len = e->hdr_len;
+    memcpy(node->dgram_tx.hdr, e->hdr, e->hdr_len);
     s_retry_enqueue(w, node);
     ++w->dgram_parked;
     duct_rtstat_obj_inc(w, rtstats.retry_saved, 1);
@@ -4252,43 +5112,88 @@ s_dgram_tx_lane_reserve(const duct_vmq_lane_t *ln, size_t entry_bytes,
         duct_vmq_reserve_armed(ln, dgram_tx_msg, 0u, entry_bytes, out_pos, out_rc);
 }
 
-/** @brief Release of a pinned answer: drop its claim on the RX slot and free the pin. */
+/** @brief Validate a slot pin for @p out and take the claim: the payload lies
+ *  wholly inside @p batch's RX slot and is copy-mode. The copy path stays for
+ *  a batch without one, a payload that is empty, owned or static, one that
+ *  does not lie wholly inside the slot, and a claim past the pool's bound.
+ *  @return true with the claim taken, @p *out_pool and @p *out_idx naming it. */
+static bool s_slot_pin_claim(duct_response_t *out, const duct_msg_inter_batch_t *batch,
+                             struct duct_x_slot_pool **out_pool, uint32_t *out_idx)
+{
+    if (!batch || !batch->rx_pool || !out->payload.data
+        || duct_has(out->flags, duct_or(fl_send_owned, fl_send_static)))
+        return false;
+    auto pool = batch->rx_pool;
+    auto at = (const char *)out->payload.data;
+    auto end = (const char *)duct_x_slot_data(pool, batch->rx_slot) + pool->slot_bytes;
+    if (!duct_x_slot_holds(pool, batch->rx_slot, at) || out->payload.size > (size_t)(end - at))
+        return false;
+    if (!duct_x_slot_claim(pool, batch->rx_slot))
+        return false;
+    *out_pool = pool;
+    *out_idx = batch->rx_slot;
+    return true;
+}
+
+/** @brief A pinned emit answer's heap record: the claimed RX slot by its
+ *  pool and index, freed with the record. Heap by the same map rule as the
+ *  emit node itself — an emit answer is stream-owned and outlives its
+ *  inbound leg, so the conn block cannot carry it (session block, Step 2). */
+typedef struct {
+    struct duct_x_slot_pool *pool;
+    uint32_t                  idx;
+} s_slot_pin_t;
+
+/** @brief Release of a pinned emit answer: drop its claim on the RX slot and
+ *  free the pin record. */
 static void s_slot_pin_drop(void *arg)
 {
-    auto pin = (duct_frame_ack_t *)arg;
-    duct_io_rx_slot_drop(pin->slot.pool, pin->slot.idx, true);
+    auto pin = (s_slot_pin_t *)arg;
+    duct_io_rx_slot_drop(pin->pool, pin->idx, true);
     duct_del(pin);
 }
 
-/** @brief Pin the payload of a parked answer that lies in the RX slot @p slot, in place of a copy.
- *  Takes a claim on the slot and hands it to the answer as its release, so the slot stays out of the
- *  pool until the answer resolves. The copy path stays for a null slot, a payload that is empty, owned
- *  or static, one that does not lie wholly inside the slot, a failed allocation and a claim past the
- *  pool's bound.
- *  @return true when the answer is pinned.
- */
-static bool s_slot_pin(duct_response_t *out, const duct_frame_ack_t *slot)
+/** @brief Pin a parked emit answer's payload onto the RX slot its frame's
+ *  span names, through a heap record: the payload lies wholly inside the
+ *  slot and is copy-mode, the claim taken on it; false leaves the answer
+ *  unpinned, the copy path next. */
+static bool s_slot_pin_heap(duct_response_t *out, const duct_span_t *slot)
 {
-    if (!slot || !out->payload.data
+    if (!out->payload.data
         || duct_has(out->flags, duct_or(fl_send_owned, fl_send_static)))
         return false;
-    auto pool = slot->slot.pool;
+    auto base = duct_span_base(slot);
+    auto pool = duct_x_slot_pool_of(base);
+    uint32_t idx = duct_x_slot_index(pool, base);
     auto at = (const char *)out->payload.data;
-    auto end = (const char *)duct_x_slot_data(pool, slot->slot.idx) + pool->slot_bytes;
-    if (!duct_x_slot_holds(pool, slot->slot.idx, at) || out->payload.size > (size_t)(end - at))
+    auto end = (const char *)duct_x_slot_data(pool, idx) + pool->slot_bytes;
+    if (!duct_x_slot_holds(pool, idx, at) || out->payload.size > (size_t)(end - at))
         return false;
-    auto pin = duct_new(duct_frame_ack_t);
-    if (!pin)
+    if (!duct_x_slot_claim(pool, idx))
         return false;
-    if (!duct_x_slot_claim(pool, slot->slot.idx)) {
-        duct_del(pin);
+    auto pin = duct_new(s_slot_pin_t);
+    if (!pin) {
+        duct_io_rx_slot_drop(pool, idx, true);
         return false;
     }
-    *pin = *slot;
+    *pin = (s_slot_pin_t){ .pool = pool, .idx = idx };
     out->flags = duct_or(out->flags, fl_send_owned);
     out->release = s_slot_pin_drop;
     out->release_arg = pin;
     return true;
+}
+
+/** @brief Release of a pinned frame answer: drop its claim on the RX slot.
+ *  The pin record is the parked node itself (@c frame.slot_pool/slot_idx), so
+ *  nothing frees here — every release path that fires this hook (the replay
+ *  commit's own cleanup, a void, the conn-lost discard, the teardown clear)
+ *  runs while the node still exists, the drain returning it to its region
+ *  after. */
+static void s_slot_pin_node_drop(void *arg)
+{
+    auto node = (retry_node_t *)arg;
+    duct_io_rx_slot_drop((struct duct_x_slot_pool *)node->frame.slot_pool,
+                         node->frame.slot_idx, true);
 }
 
 /** @brief Backpressure-hit commit save, as a retry_emit node in @p w's
@@ -4299,46 +5204,62 @@ static bool s_slot_pin(duct_response_t *out, const duct_frame_ack_t *slot)
  *  frame through @ref duct_stream_frame until it answers @c async_wait or
  *  @c async_done, which drop it; @ref s_retry_drain drops it only where the
  *  retry fails outright. A payload inside the frame's owned copy rides a share
- *  of it and one inside its claimed RX slot is pinned by @ref s_slot_pin; any
- *  other copy-mode payload is copied through @ref s_retry_payload_own, a failed
- *  copy leaving it in place, valid while the handler is suspended, and a TX-pool
- *  payload is abandoned instead. The park holds the stream's inbound conn: its
- *  hold takes the emit's ticket on the routed leg.
+ *  of it and one inside its claimed RX slot is pinned by @ref s_slot_pin_heap;
+ *  any other copy-mode payload is copied through @ref s_retry_emit_payload_own, a
+ *  failed copy leaving it in place, valid while the handler is suspended. The
+ *  park holds the stream's inbound conn: its hold takes the emit's ticket on
+ *  the routed leg.
  *  @p hctx->out parks as the handler left it otherwise: @ref s_commit_response
  *  skips releasing an @c fl_send_owned buffer on @c commit_internal, and an
  *  early release here leaves the deferred retry staging freed bytes.
  *
- *  @return false when the node or a TX-pool payload's copy finds no memory:
- *          ticket abandoned, owned payload released, @c rc_again through on_send_done.
+ *  The emit node and its copy stay heap — deferred to the session block by
+ *  the map's "1b tail 2" amendment: an emit answer is stream-owned and
+ *  outlives any conn block a carrier could name.
+ *
+ *  @return false when the node finds no memory: ticket abandoned, owned
+ *          payload released, @c rc_again through on_send_done.
  */
 static bool s_retry_emit_save(duct_worker_t *w, duct_stream_ctx_t *hctx, uint32_t ticket)
 {
     assert(!s_retry_has_emit(w, hctx)); /* single-membership: a parked coro cannot step again */
     auto s = hctx->s;
     auto at = (const char *)hctx->out.payload.data;
-    auto base = (const char *)hctx->ack.owned.ptr;
-    if (hctx->ack.kind == ack_owned && base && at
+    auto base = (const char *)duct_span_base(&hctx->span);
+    auto fstart = (const char *)hctx->frame.payload.data;
+    bool owned_block = duct_span_kind_of(&hctx->span) == span_ptr
+                    && !duct_x_slot_obj_is(base);
+    void *shared = nullptr;
+    if (owned_block && base && at && fstart
         && !duct_has(hctx->out.flags, duct_or(fl_send_owned, fl_send_static))
-        && at >= base && (size_t)(at - base) <= hctx->frame.payload.size
-        && hctx->out.payload.size <= hctx->frame.payload.size - (size_t)(at - base)) {
-        hctx->out.release_arg = duct_share(hctx->ack.owned.ptr);
+        && at >= fstart && (size_t)(at - fstart) <= hctx->frame.payload.size
+        && hctx->out.payload.size <= hctx->frame.payload.size - (size_t)(at - fstart)
+        && (shared = duct_try_share((void *)base)) != nullptr) {
+        hctx->out.release_arg = shared;
         hctx->out.release = nullptr;
         hctx->out.flags = duct_or(hctx->out.flags, fl_send_owned);
-    } else if (hctx->ack.kind == ack_slot)
-        duct_discard s_slot_pin(&hctx->out, &hctx->ack);
-    auto owned = hctx->out.payload.data ? s_retry_payload_own(&hctx->out) : own_kept;
-    auto node = owned == own_failed && s_tx_pool_owns(&w->tx_pool, hctx->out.payload.data)
-              ? nullptr : duct_new(retry_node_t);
+    } else if (duct_span_kind_of(&hctx->span) == span_ptr
+               && duct_x_slot_obj_is(base) && !s_ct_chunk_is(base))
+        duct_discard s_slot_pin_heap(&hctx->out, &hctx->span);
+    if (hctx->out.payload.data)
+        duct_discard s_retry_emit_payload_own(&hctx->out);
+    auto node = s_retry_sess_node_take(s, retry_emit);
+    auto out_conn = duct_conn_by_handle(duct_session_conn_at(s, hctx->out.conn_id));
     if (!node) {
-        s_commit_ticket_abandon(duct_conn_by_handle(duct_session_conn_at(s, hctx->out.conn_id)),
-                                ticket, &hctx->out);
-        s_fire_send_done(s, duct_proto_cfg_of(s->proto), hctx->out.conn_id, hctx->stream_id,
-                         &hctx->out, rc_again);
+        s_commit_ticket_abandon(out_conn, ticket, &hctx->out);
+        if (duct_has(hctx->out.flags, fl_send_done)) {
+            uint64_t frontier = out_conn ? duct_conn_tx_seq(out_conn)->done_reported : 0u;
+            s_fire_send_done_raw(s, duct_proto_cfg_of(s->proto), hctx->out.conn_id,
+                                 frontier, rc_again);
+        }
         return false;
     }
+    if (out_conn && duct_has(hctx->out.flags, fl_send_done))
+        duct_conn_tx_seq(out_conn)->done_posted += 1u;
     *node = (retry_node_t){
         .kind = retry_emit,
-        .emit = { .hctx = hctx, .out = hctx->out, .ticket = ticket },
+        .emit = { .hctx = hctx, .tok = duct_session_handle_from_live(s).word,
+                  .out = hctx->out, .ticket = ticket },
     };
     s_retry_enqueue(w, node);
     auto rx_conn = duct_conn_by_handle(duct_session_conn_at(s, hctx->conn_id));
@@ -4350,16 +5271,12 @@ static bool s_retry_emit_save(duct_worker_t *w, duct_stream_ctx_t *hctx, uint32_
     return true;
 }
 
-/** @brief Copy a copy-mode payload into a buffer the response itself owns.
+/** @brief Copy a copy-mode emit payload into a heap buffer the response
+ *  itself owns.
  *
- *  A parked response waits on TX room with no bound, so a payload left
- *  aliasing a receive buffer holds that buffer for the same stretch — which
- *  on the RX ring blocks compaction and stops the conn reading for every
- *  other stream — and one left aliasing author memory outlives the callback
- *  that lent it. Re-flagged @c fl_send_owned with @c release and @c release_arg
- *  cleared, so the default release frees the copy exactly once, on whichever
- *  terminal outcome the retry resolves to. Both savers and the conn-lost
- *  discard take it.
+ *  The emit class's copy stays heap with its node — deferred to the session
+ *  block by the map's "1b tail 2" amendment. The copy discipline is
+ *  @ref s_retry_copy_own's; only the backing store differs.
  *
  *  @p out carries a payload — the caller tests that to decide whether the
  *  alias question arises at all.
@@ -4367,14 +5284,10 @@ static bool s_retry_emit_save(duct_worker_t *w, duct_stream_ctx_t *hctx, uint32_
  *  payload it already owns or declares static, @c own_failed when the
  *  allocation fails, the payload then staying where it was.
  */
-static own_t s_retry_payload_own(duct_response_t *out)
+static own_t s_retry_emit_payload_own(duct_response_t *out)
 {
     assert(out->payload.data);
-    /* A pooled payload copies whatever its flags say: the region's own hold
-     * ends with the pass that took it, and a parked node outlives that. */
-    bool pooled = s_this_worker
-               && s_tx_pool_owns(&s_this_worker->tx_pool, out->payload.data);
-    if (!pooled && duct_has(out->flags, duct_or(fl_send_owned, fl_send_static)))
+    if (duct_has(out->flags, duct_or(fl_send_owned, fl_send_static)))
         return own_kept;
     auto copy = duct_new(uint8_t, out->payload.size);
     duct_do_if(!copy, return own_failed);
@@ -4386,20 +5299,56 @@ static own_t s_retry_payload_own(duct_response_t *out)
     return own_copied;
 }
 
-/** @brief Classify @p p against RX ring @p rx and @p codec's cleartext buffer,
- *  either of them null for none, as is a codec that has no buffer. */
-static alias_t s_rx_alias(const duct_olb_rx_t *rx, const duct_wire_codec_t *codec,
-                            const void *p)
+/** @brief Copy a copy-mode frame payload into @p conn's TX retry copy region.
+ *
+ *  A parked response waits on TX room with no bound, so a payload left
+ *  aliasing a receive buffer holds that buffer for the same stretch — which
+ *  on the RX ring blocks compaction and stops the conn reading for every
+ *  other stream — and one left aliasing author memory outlives the callback
+ *  that lent it. The copy lands in one of the conn block's own knob-capped
+ *  slots and dies with the block, so the payload is deliberately left
+ *  unflagged: @c fl_send_owned promises a whole heap block whose header the
+ *  drop path reads, and a carved copy has none — an owning flag here would
+ *  have the replay's classification pin a non-object. The frame saver and
+ *  the conn-lost discard take it.
+ *
+ *  @p out carries a payload — the caller tests that to decide whether the
+ *  alias question arises at all.
+ *  @return @c own_copied once the response owns the copy, @c own_kept for a
+ *  payload it already owns or declares static, @c own_failed when the copy
+ *  exceeds the region's ceiling or its slots are spent — the payload then
+ *  staying where it was, as an allocation failure leaves it.
+ */
+static own_t s_retry_copy_own(duct_conn_t *conn, duct_response_t *out)
 {
-    ptrdiff_t delta = rx ? (const uint8_t *)p - rx->data : -1;
-    if (delta >= 0 && (size_t)delta < rx->h.buf_size)
-        return alias_ring;
-    delta = codec && codec->ct_buf ? (const uint8_t *)p - duct_at(codec->ct_buf) : -1;
-    return delta >= 0 && (size_t)delta < duct_byte_len(codec->ct_buf) ? alias_ct : alias_none;
+    assert(out->payload.data);
+    if (duct_has(out->flags, duct_or(fl_send_owned, fl_send_static)))
+        return own_kept;
+    auto copy = s_retry_copy_take(conn, out->payload.size);
+    duct_do_if(!copy, return own_failed);
+    memcpy(copy, out->payload.data, out->payload.size);
+    out->payload.data = copy;
+    out->release = nullptr;
+    out->release_arg = nullptr;
+    return own_copied;
 }
 
-/** @brief Backpressure-hit response save, as a retry_frame node in @p w's
- *  unified retry list.
+/** @brief Classify @p p against RX ring @p rx and @p codec's cleartext
+ *  buffer, either of them null for none, as is a codec that has no buffer:
+ *  the §1.1 substrate question, answered with the span kind whose pin the
+ *  parked answer's source takes. */
+static alias_t s_rx_span_kind(const duct_olb_rx_t *rx, const duct_wire_codec_t *codec,
+                              const void *p)
+{
+    ptrdiff_t delta = rx ? (const uint8_t *)p - duct_olb_rx_data(rx) : -1;
+    if (delta >= 0 && (size_t)delta < rx->h.buf_size)
+        return span_rx;
+    delta = codec && codec->ct_buf ? (const uint8_t *)p - duct_at(codec->ct_buf) : -1;
+    return delta >= 0 && (size_t)delta < duct_x_slot_obj_cap(duct_at(codec->ct_buf)) ? span_ptr : span_mat;
+}
+
+/** @brief Backpressure-hit response save, as a retry_frame node of @p conn's
+ *  own TX retry region, on @p w's unified retry list.
  *
  *  @p frame_flags replays the inbound frame's flags into a post-retry fin or
  *  rst, none where no frame came in. The ticket's leg comes from
@@ -4407,16 +5356,20 @@ static alias_t s_rx_alias(const duct_olb_rx_t *rx, const duct_wire_codec_t *code
  *  one at @p conn_id the payload was read on, which it stands in for out of
  *  range or gone. The node writes @c w->hold_into's hold and records
  *  @c w->hold_conn's handle as its @c hold_of. An answer lying in the RX slot of
- *  the batch in dispatch, @c w->slot_now, is pinned by @ref s_slot_pin. One
- *  aliasing the frame in dispatch stays uncopied
+ *  the batch in dispatch, @c w->slot_now, is pinned onto the node itself —
+ *  the claim rides @c frame.slot_pool/slot_idx, no heap record on a conn
+ *  path. One aliasing the frame in dispatch stays uncopied
  *  and takes over its ack from @c w->rx_ack, landing it as the answer resolves;
- *  any other payload @ref s_retry_payload_own copies, an alias staying where it
- *  declines or the copy fails. An alias pins the inbound rx ring's held_frames
- *  or the sealed codec's cleartext buffer, released by @ref s_retry_frame_done.
+ *  any other payload @ref s_retry_copy_own copies into the region, an alias
+ *  staying where it declines or the copy fails. An alias pins the inbound rx
+ *  ring's span or the sealed codec's cleartext chunk, released by
+ *  @ref s_retry_frame_done.
  *  A torn-down conn drops the node at retry: a ring pin stays unreleased, a
  *  cleartext pin is released and the last release frees the buffer.
- *  @return false on allocation failure, of the node or of a copy no pin covers:
- *          ticket abandoned, owned payload released, @c rc_again reported.
+ *  @return false on the region's refusal — its node quota spent, or a copy no
+ *          pin covers past its slots or ceiling — exactly the allocation
+ *          failure of old: ticket abandoned, owned payload released,
+ *          @c rc_again reported.
  */
 static bool s_retry_frame_save(duct_worker_t *w, duct_session_t *s, duct_conn_id_t conn_id,
                                duct_stream_id_t stream_id, duct_frame_flags_t frame_flags,
@@ -4432,21 +5385,41 @@ static bool s_retry_frame_save(duct_worker_t *w, duct_session_t *s, duct_conn_id
     auto rx = duct_conn_rx_olb(rx_conn);
     auto sc = duct_conn_sealed_ctx(rx_conn);
     auto codec = sc ? sc->codec : nullptr;
-    alias_t alias = out->payload.data ? s_rx_alias(rx, codec, out->payload.data) : alias_none;
-    if (alias == alias_none)
-        duct_discard s_slot_pin(out, w->slot_now);
-    auto ack = w->rx_ack;
-    bool carry = ack && !duct_has(out->flags, duct_or(fl_send_owned, fl_send_static))
-              && (alias == alias_ring ? ack->kind == ack_ring
-                  : alias == alias_ct && ack->kind == ack_ct && ack->ct.data == duct_at(codec->ct_buf));
-    auto owned = out->payload.data && !carry ? s_retry_payload_own(out) : own_kept;
-    auto node = owned == own_failed && alias == alias_none ? nullptr : duct_new(retry_node_t);
+    alias_t alias = out->payload.data ? s_rx_span_kind(rx, codec, out->payload.data) : span_mat;
+    auto node = s_retry_node_take(conn);
     if (!node) {
         s_commit_ticket_abandon(conn, ticket, out);
-        s_fire_send_done(s, duct_proto_cfg_of(s->proto), out->conn_id, stream_id, out, rc_again);
+        if (duct_has(out->flags, fl_send_done))
+            s_fire_send_done_raw(s, duct_proto_cfg_of(s->proto), out->conn_id,
+                                 duct_conn_tx_seq(conn)->done_reported, rc_again);
         return false;
     }
-    alias_t pin = owned == own_copied ? alias_none : alias;
+    /* The claim rides the node; the hook lands on out ahead of the fill below
+     * so the parked copy carries it, the slot words after it. */
+    struct duct_x_slot_pool *pin_pool;
+    uint32_t pin_idx;
+    bool slot_pinned = alias == span_mat
+                     && s_slot_pin_claim(out, w->slot_now, &pin_pool, &pin_idx);
+    if (slot_pinned) {
+        out->flags = duct_or(out->flags, fl_send_owned);
+        out->release = s_slot_pin_node_drop;
+        out->release_arg = node;
+    }
+    auto ack = w->rx_ack;
+    bool carry = ack && !duct_has(out->flags, duct_or(fl_send_owned, fl_send_static))
+              && (alias == span_rx ? duct_span_kind_of(ack) == span_rx
+                  : alias == span_ptr && duct_span_kind_of(ack) == span_ptr
+                    && duct_span_base(ack) == duct_at(codec->ct_buf));
+    auto owned = out->payload.data && !carry ? s_retry_copy_own(conn, out) : own_kept;
+    if (owned == own_failed && alias == span_mat && !slot_pinned) {
+        s_retry_node_release(conn, node);
+        s_commit_ticket_abandon(conn, ticket, out);
+        if (duct_has(out->flags, fl_send_done))
+            s_fire_send_done_raw(s, duct_proto_cfg_of(s->proto), out->conn_id,
+                                 duct_conn_tx_seq(conn)->done_reported, rc_again);
+        return false;
+    }
+    alias_t pin = owned == own_copied ? span_mat : alias;
     *node = (retry_node_t){
         .kind = retry_frame,
         .frame = { .handle = handle, .rx_handle = duct_conn_handle_get(rx_conn),
@@ -4454,21 +5427,35 @@ static bool s_retry_frame_save(duct_worker_t *w, duct_session_t *s, duct_conn_id
                    .sid = stream_id, .flags = frame_flags,
                    .out = *out, .pin = pin, .ticket = ticket },
     };
+    if (slot_pinned) {
+        node->frame.slot_pool = pin_pool;
+        node->frame.slot_idx = pin_idx;
+    }
     switch (pin) {
-    case alias_ring:
-        duct_discard duct_atomic_fetch(add, &rx->held_frames, 1u, release);
-        node->frame.ack_len = carry ? (uint32_t)ack->ring.task_len : 0u;
-        node->frame.ack_end = carry ? ack->ring.end_off : 0u;
+    case span_rx:
+        /* The §2.3 window pin, its 0 → 1 edge taking the inbound conn's
+         * refs unit: the parked answer's bytes stay read-able whatever
+         * becomes of the leg, and the last drop returns them. */
+        duct_span_rx_pin(rx_conn, rx);
+        node->frame.ack_len = carry ? duct_span_len(ack) : 0u;
+        node->frame.ack_end = carry ? duct_span_off(ack) + duct_span_len(ack) : 0u;
         break;
-    case alias_ct:
-        node->frame.ct_block = duct_share(codec->ct_buf);
-        node->frame.ack_len = carry ? (uint32_t)ack->ct.size : 0u;
+    case span_ptr: {
+        auto buf = duct_at(codec->ct_buf);
+        auto pool = duct_x_slot_pool_of(buf);
+        duct_x_slot_pin(pool, duct_x_slot_index(pool, buf));
+        node->frame.ct_block = buf;
+        node->frame.ack_len = carry ? duct_span_len(ack) : 0u;
         break;
-    case alias_none:
+    }
+    case span_mat:
+    case span_static:
         break;
     }
     if (carry)
         w->rx_ack = nullptr;
+    if (duct_has(out->flags, fl_send_done))
+        duct_conn_tx_seq(conn)->done_posted += 1u;
     s_retry_enqueue(w, node);
     if (w->hold_into)
         *w->hold_into = (duct_tx_hold_t){ handle.word, ticket };
@@ -4476,24 +5463,24 @@ static bool s_retry_frame_save(duct_worker_t *w, duct_session_t *s, duct_conn_id
     return true;
 }
 
-/** @brief Blocked FIN/RST save, as a retry_fin node in @p w's unified retry
- *  list.
+/** @brief Blocked FIN/RST save, as a retry_fin node of @p conn's own TX retry
+ *  region, on @p w's unified retry list.
  *
  *  Re-resolved fresh via @c handle at retry time, like @ref
  *  s_retry_frame_save; a conn gone by then drops the node, its ticket dying
  *  with the OLB that issued it. The node writes @c w->hold_into's hold and
  *  records @c w->hold_conn's handle as its @c hold_of.
  *
- *  @return false on allocation failure — @p ticket is then still outstanding
- *  and the caller must resolve it, or every later commit on this OLB waits
- *  on one that never publishes.
+ *  @return false when the region's node quota is spent — @p ticket is then
+ *  still outstanding and the caller must resolve it, or every later commit on
+ *  this OLB waits on one that never publishes.
  */
 static bool s_retry_fin_save(duct_worker_t *w, duct_conn_t *conn,
                              duct_stream_id_t stream_id,
                              duct_frame_flags_t flags, duct_stream_error_t err,
                              uint32_t ticket)
 {
-    auto node = duct_new(retry_node_t);
+    auto node = s_retry_node_take(conn);
     if (!node)
         return false;
     *node = (retry_node_t){
@@ -4509,8 +5496,8 @@ static bool s_retry_fin_save(duct_worker_t *w, duct_conn_t *conn,
     return true;
 }
 
-/** @brief Blocked on_timer-fire save, as a retry_timer node in @p w's
- *  unified retry list.
+/** @brief Blocked on_timer-fire save, as a retry_timer node of @p s's own
+ *  timer region, on @p w's unified retry list.
  *
  *  Re-resolved fresh via @c session_tok at retry time (@ref s_retry_drain),
  *  same rationale as @ref s_retry_frame_save. The node carries the fire's key
@@ -4518,17 +5505,18 @@ static bool s_retry_fin_save(duct_worker_t *w, duct_conn_t *conn,
  *  at retry. The fire waits on its session's @c timer_hold: the parked output
  *  it names arms the leg's TX-room wake at each attempt, and resolving it is
  *  progress that brings this node another one.
- *  @return false on node-OOM: the fire is lost.
+ *
+ *  @return false when the region's node quota is spent: the fire is lost.
  */
-static bool s_retry_timer_save(duct_worker_t *w, const timer_ctx_t *ctx)
+static bool s_retry_timer_save(duct_worker_t *w, duct_session_t *s, const duct_timer_t *t)
 {
-    auto node = duct_new(retry_node_t);
+    auto node = s_retry_sess_node_take(s, retry_timer);
     if (!node)
         return false;
     *node = (retry_node_t){
         .kind = retry_timer,
-        .timer = { .tok = ctx->session_tok, .token = ctx->token, .self = ctx->self,
-                   .key = ctx->key },
+        .timer = { .tok = t->ctx.session_tok, .token = t->ctx.token,
+                   .self = s_timer_handle_of(w, t), .key = t->ctx.key },
     };
     s_retry_enqueue(w, node);
     duct_rtstat_obj_inc(w, rtstats.retry_saved, 1);
@@ -4548,12 +5536,13 @@ static bool s_close_ready(duct_conn_t *conn, duct_close_reason_t reason)
     return !codec || duct_worker_admit_leg(duct_conn_handle_get(conn), s_hs_need(conn, codec));
 }
 
-/** @brief Park @p conn's close for @p reason as a @c retry_close node on a
- *  ticket of its own, behind every ticket the conn has issued.
- *  @return false when no node is to be had, nothing taken. */
+/** @brief Park @p conn's close for @p reason as a @c retry_close node of its
+ *  own TX retry region, on a ticket of its own, behind every ticket the conn
+ *  has issued.
+ *  @return false when the region's node quota is spent, nothing taken. */
 static bool s_retry_close_save(duct_worker_t *w, duct_conn_t *conn, duct_close_reason_t reason)
 {
-    auto node = duct_new(retry_node_t);
+    auto node = s_retry_node_take(conn);
     if (!node)
         return false;
     uint32_t ticket = duct_tx_ticket_fresh;
@@ -4628,7 +5617,7 @@ static duct_nonnull(1) bool s_retry_drain(duct_worker_t *w)
                 keep = true;
                 break;
             }
-            duct_del(node);
+            s_retry_node_drop(node);
             /* This engine output may have been the switch's last barrier. */
             if (session)
                 s_response_switch(session);
@@ -4649,41 +5638,74 @@ static duct_nonnull(1) bool s_retry_drain(duct_worker_t *w)
             }
             auto close_s = close_conn ? duct_session_by_conn(close_conn) : nullptr;
             progress = true;
-            duct_del(node);
+            s_retry_node_drop(node);
             if (close_s)
                 s_response_switch(close_s);
             break;
-        case retry_emit:
+        case retry_emit: {
             auto hctx = node->emit.hctx;
-            auto s = hctx->s;
-            auto emit_ticket = node->emit.ticket;
-            /* node->emit.out.conn_id, not hctx->conn_id: s_commit_response
-             * already route-resolved the real target leg, which a multiplexed
-             * emit's round-robin routing can differ from. */
-            auto emit_conn = duct_conn_by_handle(duct_session_conn_at(s, node->emit.out.conn_id));
-            if (emit_conn)
-                s_tx_wait_arm(emit_conn);
-            auto c_rc = s_response_retry(s, &node->emit.out, hctx->conn_id, hctx->stream_id,
-                                         fl_frame_none, &emit_ticket);
-            if (c_rc == commit_internal) {
+            if (hctx && !hctx->s) {
+                /* Released in place without a cancel while popped: void in
+                 * place and settle its ticket on the voided branch below. */
+                s_response_void_payload(&node->emit.out);
+                node->emit.hctx = hctx = nullptr;
+            }
+            if (hctx) {
+                auto s = hctx->s;
+                auto sid = hctx->stream_id;
+                auto emit_ticket = node->emit.ticket;
+                /* node->emit.out.conn_id, not hctx->conn_id: s_commit_response
+                 * already route-resolved the real target leg, which a multiplexed
+                 * emit's round-robin routing can differ from. */
+                auto emit_conn = duct_conn_by_handle(duct_session_conn_at(s, node->emit.out.conn_id));
+                if (emit_conn)
+                    s_tx_wait_arm(emit_conn, 0u);
+                auto c_rc = s_response_retry(s, &node->emit.out, hctx->conn_id, sid,
+                                             fl_frame_none, &emit_ticket);
+                bool alive = hctx->s == s && hctx->stream_id == sid;
+                if (c_rc != commit_internal) {
+                    progress = true;
+                    if (alive) {
+                        if (c_rc == commit_ok)
+                            /* Frame and pin survive: handler parked on async_yield. */
+                            s_hctx_enqueue(&w->coop, hctx, true);
+                        else {
+                            s_hctx_hold_release(hctx);
+                            s_hctx_remove_release(&w->coop, hctx);
+                            s_hctx_stream_fail(s, hctx);
+                            s_hctx_release(hctx);
+                        }
+                    }
+                    s_retry_node_drop(node);
+                    break;
+                }
+                if (alive) {
+                    keep = true;
+                    break;
+                }
+                /* The stream died while its answer waits for the ring: void in
+                 * place and settle the ticket below in sequence order so an
+                 * abandon never holes tx_seq_serve mid-run. */
+                auto drop_conn = duct_conn_by_handle(duct_session_conn_at(s, node->emit.out.conn_id));
+                if (drop_conn && duct_has(node->emit.out.flags, fl_send_done))
+                    s_tx_done_skip(drop_conn);
+                s_response_void_payload(&node->emit.out);
+                node->emit.hctx = nullptr;
+            }
+            auto es = duct_session_attached_by_handle((duct_session_handle_t){ .word = node->emit.tok });
+            auto conn = es ? duct_conn_by_handle(duct_session_conn_at(es, node->emit.out.conn_id))
+                           : nullptr;
+            if (!s_tx_ticket_pass(conn, node->emit.ticket)) {
                 keep = true;
                 break;
             }
             progress = true;
-            if (c_rc == commit_ok) {
-                /* Frame and pin survive: the handler parked on an async_yield
-                 * and reads duct_stream_frame again on the step this queues.
-                 * Its own async_wait or async_done drops them. */
-                s_hctx_enqueue(&w->coop, hctx, true);
-            } else {
-                s_hctx_hold_release(hctx);
-                s_hctx_stream_fail(s, hctx);
-                duct_del(hctx);
-            }
-            duct_del(node);
+            s_retry_node_drop(node);
             break;
-        case retry_frame:
+        }
+        case retry_frame: {
             duct_conn_t *conn;
+            duct_session_t *s;
             bool live = s_dispatch_resolve(node->frame.handle, &conn, &s) == res_ok;
             if (!live)
                 s_retry_frame_void(node);
@@ -4697,38 +5719,40 @@ static duct_nonnull(1) bool s_retry_drain(duct_worker_t *w)
                     s_response_settle(s, &node->frame.out, node->frame.sid, node->frame.flags);
                     s_response_switch(s);
                 }
-                duct_del(node);
+                s_retry_node_drop(node);
                 break;
             }
             auto cid = duct_session_conn_id_by_handle(s, node->frame.handle);
             auto frame_ticket = node->frame.ticket;
-            s_tx_wait_arm(conn);
-            c_rc = s_response_retry(s, &node->frame.out, cid, node->frame.sid, node->frame.flags,
-                                    &frame_ticket);
+            s_tx_wait_arm(conn, 0u);
+            auto c_rc = s_response_retry(s, &node->frame.out, cid, node->frame.sid,
+                                         node->frame.flags, &frame_ticket);
             if (c_rc == commit_internal) {
                 keep = true;
                 break;
             }
             progress = true;
             /* Resolved (success or terminal) — s_commit_response's own
-             * cleanup already advanced conn->tx_buf->tx_seq_serve past this
+             * cleanup already advanced duct_conn_tx_olb(conn)->tx_seq_serve past this
              * ticket; nothing to clear here explicitly. */
             s_retry_frame_done(node);
-            duct_del(node);
+            s_retry_node_drop(node);
             break;
-        case retry_fin:
+        }
+        case retry_fin: {
             duct_conn_t *fin_conn;
+            duct_session_t *s;
             if (s_dispatch_resolve(node->fin.handle, &fin_conn, &s) != res_ok) {
                 if (!s_tx_ticket_pass(fin_conn, node->fin.ticket)) {
                     keep = true;
                     break;
                 }
                 progress = true;
-                duct_del(node);
+                s_retry_node_drop(node);
                 break;
             }
             uint32_t fin_ticket = node->fin.ticket;
-            s_tx_wait_arm(fin_conn);
+            s_tx_wait_arm(fin_conn, 0u);
             auto fin_st = s_ctl_fin_stage(fin_conn, s, node->fin.sid, node->fin.flags,
                                           node->fin.err, &fin_ticket);
             if (fin_st == olb_tx_full) {
@@ -4741,15 +5765,16 @@ static duct_nonnull(1) bool s_retry_drain(duct_worker_t *w)
             if (fin_st != olb_tx_ok && s->proto)
                 s_fire_error(s, duct_proto_cfg_of(s->proto), rc_invalid_arg);
             s_response_switch(s);
-            duct_del(node);
+            s_retry_node_drop(node);
             break;
-        case retry_timer:
+        }
+        case retry_timer: {
             auto stok = (duct_session_handle_t){ .word = node->timer.tok };
-            s = duct_session_attached_by_handle(stok);
+            auto s = duct_session_attached_by_handle(stok);
             auto cfg = s && s->proto ? duct_proto_cfg_of(s->proto) : nullptr;
             bool fresh = s && (!node->timer.key || s_timer_key_held(s, node->timer.key, node->timer.self)),
                  due = fresh && cfg && cfg->on_timer;
-            if (due && s_tx_held(s, &s->timer_hold, nullptr)) {
+            if (due && s_tx_held(s, duct_session_timer_hold(s), nullptr)) {
                 keep = true;
                 break;
             }
@@ -4758,15 +5783,16 @@ static duct_nonnull(1) bool s_retry_drain(duct_worker_t *w)
                 s_timer_key_spend(w, s, node->timer.key, node->timer.self);
             if (due)
                 s_timer_invoke(s, cfg, node->timer.token);
-            duct_del(node);
+            s_retry_node_drop(node);
             break;
+        }
         case retry_dgram_tx: {
             auto dconn = duct_conn_by_handle(node->dgram_tx.handle);
             if (!dconn) {
                 /* Conn/session closed while parked -- same silent-drop
                  * discipline as the flush's own dead-handle case. */
-                duct_del(node->dgram_tx.block);
-                duct_del(node);
+                s_retry_dgram_block_release(node);
+                s_retry_node_drop(node);
                 --w->dgram_parked;
                 progress = true;
                 break;
@@ -4778,26 +5804,30 @@ static duct_nonnull(1) bool s_retry_drain(duct_worker_t *w)
             /* Pre-arm ahead of the reserve below; the post-write kick
              * after publish stays the race backstop. */
             duct_io_post_dgram_tx(node->dgram_tx.listener);
-            size_t parked = node->dgram_tx.bytes.size;
+            size_t parked = (size_t)node->dgram_tx.hdr_len
+                          + duct_span_len(&node->dgram_tx.span);
             duct_vmq_push_rc_t drc;
             dgram_out_t dout;
             bool staged = s_dgram_out_open(node->dgram_tx.listener, &node->dgram_tx.peer,
-                                           parked, &dout, &drc);
+                                           &node->dgram_tx.local, parked, &dout, &drc);
             if (!staged && drc == vmq_push_too_large) {
                 /* Terminal: this entry can never fit the lane at all --
                  * unreachable for any datagram a commit already staged
-                 * once. The drop accounting stays, and the send-done
-                 * still fires: same open-token rule as the flush drop path. */
+                 * once. The drop accounting stays, and send_done
+                 * reports failure at the current frontier (slot enters done_skip). */
                 duct_rtstat_obj_inc(w, rtstats.dgram_shared_tx_drop, 1);
-                auto ds = duct_session_by_conn(dconn);
-                if (ds)
-                    s_fire_send_done(ds, duct_proto_cfg_of(ds->proto),
-                                     node->dgram_tx.conn_id, node->dgram_tx.stream_id,
-                                     &(duct_response_t){ .flags = node->dgram_tx.flags,
-                                                         .send_token = node->dgram_tx.send_token },
-                                     rc_no_memory);
-                duct_del(node->dgram_tx.block);
-                duct_del(node);
+                if (node->dgram_tx.send_done) {
+                    s_tx_done_skip(dconn);
+                    auto ds = duct_session_by_conn(dconn);
+                    if (ds) {
+                        auto cid = duct_session_conn_id_by_handle(ds, node->dgram_tx.handle);
+                        s_fire_send_done_raw(ds, duct_proto_cfg_of(ds->proto), cid,
+                                             duct_conn_tx_seq(dconn)->done_reported,
+                                             rc_no_memory);
+                    }
+                }
+                s_retry_dgram_block_release(node);
+                s_retry_node_drop(node);
                 --w->dgram_parked;
                 progress = true;
                 break;
@@ -4807,18 +5837,36 @@ static duct_nonnull(1) bool s_retry_drain(duct_worker_t *w)
                 keep = true; /* lane still full -- next pass, wait_latch armed */
                 break;
             }
-            memcpy(dout.span.data, node->dgram_tx.bytes.data, parked);
-            s_dgram_out_publish(&dout, parked);
+            uint32_t dd = node->dgram_tx.send_done ? s_tx_done_take_delta(dconn) : 0u;
+            dout.entry->handle = node->dgram_tx.handle.word;
+            bool moved = false;
+            if (dout.pools) {
+                if (node->dgram_tx.hdr_len)
+                    memcpy(dout.span.data, node->dgram_tx.hdr, node->dgram_tx.hdr_len);
+                auto body = s_dgram_span_body(&node->dgram_tx.span);
+                memcpy(dout.span.data + node->dgram_tx.hdr_len, body.data, body.size);
+                dout.entry->staged.done_delta = dd;
+                s_dgram_out_publish(&dout, parked);
+            } else {
+                /* The node's descriptor moves into the lane record whole:
+                 * from the publish on, the io thread's send owns the span's
+                 * pin and drops it at delivery. */
+                if (dd)
+                    duct_span_done_set(&node->dgram_tx.span, dd);
+                memcpy(dout.entry->desc, node->dgram_tx.hdr, wire_tx_hdr_max);
+                memcpy(dout.entry->desc + dgram_tx_desc_half,
+                       &node->dgram_tx.span, sizeof(duct_span_t));
+                s_dgram_out_publish(&dout, parked);
+                moved = true;
+            }
             duct_rtstat_obj_inc(w, rtstats.dgram_lane_staged, 1);
             duct_io_post_dgram_tx(node->dgram_tx.listener);
-            auto ds = duct_session_by_conn(dconn);
-            if (ds)
-                s_fire_send_done(ds, duct_proto_cfg_of(ds->proto), node->dgram_tx.conn_id,
-                                 node->dgram_tx.stream_id,
-                                 &(duct_response_t){ .flags = node->dgram_tx.flags,
-                                                     .send_token = node->dgram_tx.send_token }, rc_ok);
-            duct_del(node->dgram_tx.block);
-            duct_del(node);
+            /* A moved span released here would drop a pin the lane record
+             * now owns — only a copied one (the slot path) still belongs to
+             * the node. */
+            if (!moved)
+                s_retry_dgram_block_release(node);
+            s_retry_node_drop(node);
             --w->dgram_parked;
             progress = true;
             break;
@@ -4849,7 +5897,10 @@ static duct_nonnull(1) bool s_retry_drain(duct_worker_t *w)
  *  Each kind releases what it owns, through the same calls @ref s_retry_drain
  *  makes when it gives a node up, with one exception: an emit node's hctx is
  *  left to @ref duct_stream_cancel. Enumerating all seven with no @c default
- *  makes an eighth kind warn here as well as there.
+ *  makes an eighth kind warn here as well as there. A conn-owned node returns
+ *  to its block's region through @ref s_retry_node_drop; at this worker's
+ *  teardown the blocks may follow it down whole, and a handle already past
+ *  resolving simply returns nothing.
  */
 static void s_retry_clear(duct_worker_t *w)
 {
@@ -4861,10 +5912,10 @@ static void s_retry_clear(duct_worker_t *w)
             break;
         case retry_frame:
             s_retry_frame_pins_release(node);
-            duct_response_release_owned(&node->frame.out);
+            s_retry_frame_out_release(node);
             break;
         case retry_dgram_tx:
-            duct_del(node->dgram_tx.block);
+            s_retry_dgram_block_release(node);
             break;
         case retry_engine: /* Codec teardown owns the bounded buffer. */
         case retry_timer:
@@ -4872,7 +5923,7 @@ static void s_retry_clear(duct_worker_t *w)
         case retry_close:
             break;
         }
-        duct_del(node);
+        s_retry_node_drop(node);
         node = next;
     }
     w->retry_head = nullptr;
@@ -4891,17 +5942,26 @@ static void s_retry_emit_discard(duct_worker_t *w, duct_stream_ctx_t *target)
     for (auto node = w->retry_head; node; prev = node, node = node->next) {
         if (node->kind != retry_emit || node->emit.hctx != target)
             continue;
-        if (prev)
-            prev->next = node->next;
-        else
-            w->retry_head = node->next;
-        if (node == w->retry_tail)
-            w->retry_tail = prev;
-        /* node->emit.out.conn_id, not target->conn_id -- see
-         * s_retry_emit_save's own note. */
+        /* node->emit.out.conn_id, not target->conn_id -- see s_retry_emit_save.
+         * If this node's ticket sits at the front (or its leg is gone), drop it
+         * now; if behind earlier tickets, empty in place so s_retry_drain
+         * advances tx_seq_serve in order without taking the leg down. */
         auto conn = duct_conn_by_handle(duct_session_conn_at(target->s, node->emit.out.conn_id));
-        s_commit_ticket_abandon(conn, node->emit.ticket, &node->emit.out);
-        duct_del(node);
+        if (conn && duct_has(node->emit.out.flags, fl_send_done))
+            s_tx_done_skip(conn);
+        s_response_void_payload(&node->emit.out);
+        if (!conn || s_tx_ticket_pass(conn, node->emit.ticket)) {
+            if (prev)
+                prev->next = node->next;
+            else
+                w->retry_head = node->next;
+            if (w->retry_tail == node)
+                w->retry_tail = prev;
+            node->next = nullptr;
+            s_retry_node_drop(node);
+        } else {
+            node->emit.hctx = nullptr;
+        }
         return;
     }
 }
@@ -4932,6 +5992,27 @@ static void s_retry_frame_void_stream(duct_worker_t *w, duct_conn_handle_t handl
     }
 }
 
+static void s_retry_timer_discard(duct_worker_t *w, duct_handle_t tok)
+{
+    retry_node_t *prev = nullptr;
+    for (auto node = w->retry_head; node; ) {
+        auto next = node->next;
+        if (node->kind != retry_timer || node->timer.tok != tok) {
+            prev = node;
+            node = next;
+            continue;
+        }
+        if (prev)
+            prev->next = next;
+        else
+            w->retry_head = next;
+        if (w->retry_tail == node)
+            w->retry_tail = prev;
+        s_retry_node_drop(node);
+        node = next;
+    }
+}
+
 void duct_worker_conn_retry_discard(const duct_conn_handle_t *conn)
 {
     auto w = s_this_worker;
@@ -4945,10 +6026,14 @@ void duct_worker_conn_retry_discard(const duct_conn_handle_t *conn)
         case retry_frame:
             if (node->frame.handle.word == h.word) {
                 s_retry_frame_done(node);
-                duct_response_release_owned(&node->frame.out);
+                s_retry_frame_out_release(node);
                 drop = true;
-            } else if (node->frame.rx_handle.word == h.word && node->frame.pin != alias_none) {
-                if (s_retry_payload_own(&node->frame.out) == own_copied)
+            } else if (node->frame.rx_handle.word == h.word && node->frame.pin != span_mat) {
+                /* The inbound leg is going and the payload still aliases its
+                 * buffer: copy it onto the node's own conn's region — the
+                 * target leg, alive while its node stays parked. */
+                auto owner = duct_conn_by_handle(node->frame.handle);
+                if (owner && s_retry_copy_own(owner, &node->frame.out) == own_copied)
                     s_retry_frame_done(node);
                 else
                     s_retry_frame_void(node);
@@ -4966,7 +6051,7 @@ void duct_worker_conn_retry_discard(const duct_conn_handle_t *conn)
         case retry_dgram_tx:
             drop = node->dgram_tx.handle.word == h.word;
             if (drop) {
-                duct_del(node->dgram_tx.block);
+                s_retry_dgram_block_release(node);
                 --w->dgram_parked;
             }
             break;
@@ -4984,7 +6069,7 @@ void duct_worker_conn_retry_discard(const duct_conn_handle_t *conn)
             w->retry_head = next;
         if (w->retry_tail == node)
             w->retry_tail = prev;
-        duct_del(node);
+        s_retry_node_drop(node);
     }
 }
 
@@ -5025,16 +6110,15 @@ s_commit_ticket_abandon(duct_conn_t *conn, uint32_t ticket, duct_response_t *out
  */
 static duct_commit_rc_t
 s_commit_fail(duct_session_t *s, const duct_proto_cfg_t *cfg,
-              duct_conn_id_t conn_id, duct_stream_id_t stream_id, duct_response_t *out,
+              duct_conn_id_t conn_id, duct_conn_t *conn, duct_response_t *out,
               duct_result_t done_rc, duct_commit_rc_t commit_rc, bool is_replay)
 {
-    /* fl_send_done promises exactly one completion per response. A
-     * commit_internal is not this response's resolution -- a retry node takes
-     * (or already holds) the token, and the completion fires when that node
-     * resolves: inside the replayed commit on success, at the terminal-failure
-     * sites otherwise. */
-    if (commit_rc != commit_internal)
-        s_fire_send_done(s, cfg, conn_id, stream_id, out, done_rc);
+    if (commit_rc != commit_internal && duct_has(out->flags, fl_send_done)) {
+        if (is_replay && conn)
+            s_tx_done_skip(conn);
+        uint64_t frontier = conn ? duct_conn_tx_seq(conn)->done_reported : 0u;
+        s_fire_send_done_raw(s, cfg, conn_id, frontier, done_rc);
+    }
     if (commit_rc != commit_closed && !(commit_rc == commit_internal && is_replay))
         s_fire_error(s, cfg, done_rc);
     if (commit_rc == commit_internal && s_this_worker)
@@ -5088,7 +6172,8 @@ s_worker_dgram_flush(void)
             for (uint32_t i = 0u; i + 2u < n; ++i) {
                 uint32_t put = i + 1u;
                 for (uint32_t j = put; j < n; ++j) {
-                    if (!duct_x_same_peer(&pass->entries[j].peer, &pass->entries[i].peer))
+                    if (!duct_x_same_peer(&pass->entries[j].peer, &pass->entries[i].peer)
+                        || !duct_x_same_peer(&pass->entries[j].local, &pass->entries[i].local))
                         continue;
                     if (j != put) {
                         auto tmp = pass->entries[j];
@@ -5105,9 +6190,11 @@ s_worker_dgram_flush(void)
         duct_dgram_out_t msgs[n];
         for (uint32_t i = 0u; i < n; ++i)
             msgs[i] = (duct_dgram_out_t){
-                .peer = pass->entries[i].peer,
-                .hdr  = { .data = pass->entries[i].hdr, .size = pass->entries[i].hdr_len },
-                .body = { .data = pass->entries[i].ptr, .size = pass->entries[i].len },
+                .peer  = pass->entries[i].peer,
+                .local = pass->entries[i].local,
+                .hdr   = { .data = pass->entries[i].hdr,
+                           .size = pass->entries[i].hdr_len },
+                .body  = s_dgram_entry_body(&pass->entries[i]),
             };
         duct_x_gso_tally_t tally = {};
         resolved = duct_io_dgram_shared_send_batch(listener, msgs, n, &tally);
@@ -5129,55 +6216,69 @@ s_worker_dgram_flush(void)
         auto e = &pass->entries[i];
         bool ok = i < resolved;
         bool parked = false;
+        bool moved = false;
         if (!ok) {
             duct_vmq_push_rc_t push_rc;
             dgram_out_t o;
-            size_t bytes = (size_t)e->hdr_len + e->len;
+            size_t bytes = (size_t)e->hdr_len + duct_span_len(&e->span);
             bool staged = !w->dgram_parked
-                       && s_dgram_out_open(listener, &e->peer, bytes, &o, &push_rc);
+                       && s_dgram_out_open(listener, &e->peer, &e->local, bytes, &o, &push_rc);
             if (staged) {
-                if (e->hdr_len)
-                    memcpy(o.span.data, e->hdr, e->hdr_len);
-                memcpy(o.span.data + e->hdr_len, e->ptr, e->len);
-                s_dgram_out_publish(&o, bytes);
+                auto c = duct_conn_by_handle(e->handle);
+                uint32_t dd = e->send_done && c ? s_tx_done_take_delta(c) : 0u;
+                o.entry->handle = e->handle.word;
+                if (o.pools) {
+                    if (e->hdr_len)
+                        memcpy(o.span.data, e->hdr, e->hdr_len);
+                    auto body = s_dgram_entry_body(e);
+                    memcpy(o.span.data + e->hdr_len, body.data, body.size);
+                    o.entry->staged.done_delta = dd;
+                    s_dgram_out_publish(&o, bytes);
+                } else {
+                    if (dd)
+                        duct_span_done_set(&e->span, dd);
+                    s_dgram_out_desc(&o, e);
+                    s_dgram_out_publish(&o, bytes);
+                    /* The descriptor carries the span's pin: from here the
+                     * io thread's send owns and drops the reference, and
+                     * this entry holds nothing. */
+                    moved = true;
+                }
                 duct_rtstat_obj_inc(w, rtstats.dgram_lane_staged, 1);
                 need_kick = true;
                 ok = true;
-            } else if (s_retry_dgram_tx_save(w, e, listener, e->ptr))
-                parked = true; /* send_done/on_error fire when the node resolves */
+            } else if (s_retry_dgram_tx_save(w, e, listener))
+                parked = true; /* send_done/on_error defer until drain */
             else
                 duct_rtstat_obj_inc(w, rtstats.dgram_shared_tx_drop, 1);
         }
-        /* Every path above -- sent, lane-copied, retry-copied, terminal-
-         * dropped -- is done reading e->ptr here, so this entry's own
-         * reference on its pool region drops now. Every x_udp_shared entry
-         * carries exactly one, set in s_commit_response's x_udp_shared case,
-         * never null. */
-        if (s_tx_pool_owns(&w->tx_pool, e->ptr))
-            --e->region->refs;
-        else
-            duct_del(e->block);
+        if (!parked && !moved)
+            s_dgram_entry_span_drop(e);
         if (parked)
             continue;
-        auto conn = duct_conn_by_handle(e->handle);
-        auto s = conn ? duct_session_by_conn(conn) : nullptr;
-        if (!s)
-            continue;
-        auto cfg = duct_proto_cfg_of(s->proto);
-        if (ok)
-            s_fire_send_done(s, cfg, e->conn_id, e->stream_id,
-                             &(duct_response_t){ .flags = e->flags, .send_token = e->send_token }, rc_ok);
-        else {
-            /* Terminal drop still owes the send-done: fl_send_done promises
-             * exactly one completion per response, and a token left open
-             * leaks whatever the protocol gates on it (a leg wedged at its
-             * inflight cap for ever). info.result carries the failure. */
-            s_fire_send_done(s, cfg, e->conn_id, e->stream_id,
-                             &(duct_response_t){ .flags = e->flags, .send_token = e->send_token },
-                             rc_no_memory);
-            s_fire_error(s, cfg, rc_again);
+        if (!ok || (i < resolved && e->send_done)) {
+            auto conn = duct_conn_by_handle(e->handle);
+            auto s = conn ? duct_session_by_conn(conn) : nullptr;
+            if (!s)
+                continue;
+            if (ok) {
+                duct_atomic_fetch(add, &duct_conn_tx_done(conn)->seq,
+                                  s_tx_done_take_all(conn), relaxed);
+            } else {
+                auto cfg = duct_proto_cfg_of(s->proto);
+                if (e->send_done) {
+                    s_tx_done_skip(conn);
+                    auto cid = duct_session_conn_id_by_handle(s, e->handle);
+                    s_fire_send_done_raw(s, cfg, cid, duct_conn_tx_seq(conn)->done_reported,
+                                         rc_no_memory);
+                }
+                s_fire_error(s, cfg, rc_again);
+            }
         }
     }
+    for (uint32_t i = 0u; i < resolved; ++i)
+        if (pass->entries[i].send_done)
+            s_conn_done_flush_handle(pass->entries[i].handle);
     if (need_kick && pass->kick_n < duct_async_cycle_quota)
         pass->kick_listeners[pass->kick_n++] = listener;
     else if (need_kick)
@@ -5185,7 +6286,6 @@ s_worker_dgram_flush(void)
     /* The callbacks above invoke close, attach, timer, and rx operations,
      * which post messages without committing to this batch. */
     assert(pass->n == 0u);
-    s_tx_pool_reclaim(&w->tx_pool);
     }
 kick:
     duct_do_if(!pass, return);
@@ -5195,15 +6295,16 @@ kick:
 }
 
 #if !DUCT_EVENTS_MODEL_IOCP
-/** @brief Acquire @p need bytes from the shared TX pool, retrying once after a dgram-batch flush. */
-static void *s_dgram_acquire_or_flush(size_t need)
+/** @brief Stage @p need bytes of one whole packed datagram, retrying the
+ *  allocation once after a dgram-batch flush freed this pass's entries. */
+static void *s_dgram_stage_or_flush(size_t need)
 {
-    auto acquired = duct_tx_pool_acquire(need);
-    if (!acquired) {
+    auto staged = duct_at(duct_new(uint8_t, need));
+    if (!staged) {
         s_worker_dgram_flush();
-        acquired = duct_tx_pool_acquire(need);
+        staged = duct_at(duct_new(uint8_t, need));
     }
-    return acquired;
+    return staged;
 }
 #endif
 
@@ -5226,19 +6327,27 @@ typedef struct {
 static duct_commit_rc_t
 s_commit_ctx_fail(const commit_ctx_t *ctx, duct_result_t err, duct_commit_rc_t crc)
 {
-    return s_commit_fail(ctx->s, duct_proto_cfg_of(ctx->s->proto), ctx->out_conn, ctx->out_stream, ctx->out,
+    return s_commit_fail(ctx->s, duct_proto_cfg_of(ctx->s->proto), ctx->out_conn, ctx->conn, ctx->out,
                          err, crc, ctx->is_replay);
 }
 
-/** @brief Publish a successful stage and fire the response's completion.
- *  The shared tail for every xport that stages into a real per-conn TX OLB.
- */
+/** @brief Advance @c tx_done->seq inline and flush frontier for non-ring paths. */
+static void
+s_conn_done_inline_settle(const commit_ctx_t *ctx)
+{
+    if (!duct_has(ctx->out->flags, fl_send_done))
+        return;
+    duct_atomic_fetch(add, &duct_conn_tx_done(ctx->conn)->seq,
+                      s_tx_done_take_all(ctx->conn), relaxed);
+    s_conn_done_flush(ctx->s, ctx->out_conn, ctx->conn);
+}
+
+/** @brief Publish a successful stage; drain-completion frontier fires when io drains it. */
 static duct_commit_rc_t
 s_commit_ctx_ok(const commit_ctx_t *ctx)
 {
-    duct_olb_tx_publish(ctx->conn->tx_buf);
+    duct_olb_tx_publish(duct_conn_tx_olb(ctx->conn));
     duct_io_post_tx_drain(&ctx->handle);
-    s_fire_send_done(ctx->s, duct_proto_cfg_of(ctx->s->proto), ctx->out_conn, ctx->out_stream, ctx->out, rc_ok);
     return commit_ok;
 }
 
@@ -5274,12 +6383,12 @@ s_commit_stage_result(const commit_ctx_t *ctx, duct_olb_tx_result_t st)
 static duct_commit_rc_t
 s_commit_inter(const commit_ctx_t *ctx)
 {
-    auto s = ctx->s; auto cfg = duct_proto_cfg_of(s->proto); auto out = ctx->out;
-    auto out_conn = ctx->out_conn; auto out_stream = ctx->out_stream;
+    auto s = ctx->s; auto out = ctx->out;
+    auto out_conn = ctx->out_conn;
     auto r = ctx->redirect;
     bool direct = r && r->span && r->conn_id == out_conn
                && out->payload.data == r->span && out->payload.size == r->len && r->len == r->cap;
-    auto dev = (const duct_device_ops_t *)ctx->conn->ctx;
+    auto dev = duct_conn_device_ops(ctx->conn);
     if (dev) {
         /* A response routed to a read-only device is refused. */
         duct_do_if(!dev->write_reserve, return s_commit_ctx_fail(ctx, rc_invalid_arg, commit_invalid));
@@ -5301,22 +6410,34 @@ s_commit_inter(const commit_ctx_t *ctx)
         }
         if (wrc != rc_ok)
             return s_commit_ctx_fail(ctx, wrc == rc_drop ? rc_drop : rc_invalid_arg, commit_invalid);
-        s_fire_send_done(s, cfg, out_conn, out_stream, out, rc_ok);
+        s_conn_done_inline_settle(ctx);
         return commit_ok;
     }
     if (direct) {
         r->span = nullptr;
         duct_host_egress_publish(&r->host, out->payload.size);
-        s_fire_send_done(s, cfg, out_conn, out_stream, out, rc_ok);
+        s_conn_done_inline_settle(ctx);
+        return commit_ok;
+    }
+    if (!duct_host_egress_enabled()) {
+        s_conn_done_inline_settle(ctx);
         return commit_ok;
     }
     auto stok = duct_session_handle_from_live(s);
-    auto hrc = duct_host_packet_out(&stok, out_conn, out->payload);
+    duct_result_t hrc;
+    duct_span_t span;
+    if (s_payload_classify(out->payload, out->flags, out->release,
+                           out->release_arg, r, &span) == payload_ref) {
+        hrc = duct_host_packet_out_span(&stok, out_conn, &span);
+        if (hrc != rc_ok)
+            duct_span_payload_drop(&span);
+    } else
+        hrc = duct_host_packet_out(&stok, out_conn, out->payload);
     if (hrc == rc_again)
         return s_commit_ctx_fail(ctx, rc_again, commit_internal);
     if (hrc != rc_ok)
         return s_commit_ctx_fail(ctx, rc_invalid_arg, commit_invalid);
-    s_fire_send_done(s, cfg, out_conn, out_stream, out, rc_ok);
+    s_conn_done_inline_settle(ctx);
     return commit_ok;
 }
 
@@ -5328,18 +6449,11 @@ s_commit_inter(const commit_ctx_t *ctx)
 static duct_commit_rc_t
 s_commit_dgram_shared(const commit_ctx_t *ctx)
 {
-    auto s = ctx->s; auto cfg = duct_proto_cfg_of(s->proto); auto out = ctx->out;
+    auto s = ctx->s; auto out = ctx->out;
     auto conn = ctx->conn;
-    auto out_conn = ctx->out_conn; auto out_stream = ctx->out_stream;
-    auto dctx = (const duct_dgram_shared_ctx_t *)conn->ctx;
+    auto out_stream = ctx->out_stream;
+    auto dctx = duct_conn_dgram_ctx(conn);
     auto listener = dctx->listener;
-    size_t need = 0u;
-    if (!s_tx_wire_need(conn, out->payload.size, &need))
-        return s_commit_ctx_fail(ctx, rc_invalid_arg, commit_invalid);
-    auto codec = conn->wire && conn->wire->unseal ? s_tls_codec(conn) : nullptr;
-    duct_frame_t frame = {
-        .stream_id = out_stream, .payload = out->payload, .flags = out->frame_flags,
-    };
 #if !DUCT_EVENTS_MODEL_IOCP
     if (!duct_io_dgram_shared_needs_lane_tx(listener)) {
         if (s_this_worker->dgram_parked)
@@ -5351,19 +6465,30 @@ s_commit_dgram_shared(const commit_ctx_t *ctx)
         bool no_room = pass->n >= duct_async_cycle_quota
                      || (pass->listener && pass->listener != listener)
                      || (pass->n && now - pass->first_ns >= duct_dgram_batch_wait_ns);
-        if (no_room)
+        if (no_room) {
             s_worker_dgram_flush();
+            duct_do_if(!s->proto || duct_conn_phase(conn) >= conn_quiesced,
+                       return s_commit_ctx_fail(ctx, rc_closed, commit_closed));
+        }
+        size_t need = 0u;
+        duct_do_if(!s_tx_wire_need(conn, out->payload.size, &need),
+                   return s_commit_ctx_fail(ctx, rc_invalid_arg, commit_invalid));
+        auto codec = conn->wire && conn->wire->unseal ? s_tls_codec(conn) : nullptr;
+        duct_frame_t frame = {
+            .stream_id = out_stream, .payload = out->payload, .flags = out->frame_flags,
+        };
 
         duct_worker_dgram_batch_entry_t *entry;
         /* fl_wire_gather is the wire declaring it packs into a span pair, so
-         * on_pack writes its header straight into the entry and leaves the
-         * payload where its author built it; the send puts the two on the wire
-         * as one datagram. The pool term is the lifetime: only a pool region
-         * outlives this commit, held by the refs bump below until the flush
-         * resolves the entry. */
-        bool pooled = s_tx_pool_owns(&s_this_worker->tx_pool, out->payload.data);
-        bool owned = !pooled && duct_has(out->flags, fl_send_owned) && !out->release;
-        if (duct_has(conn->wire->flags, fl_wire_gather) && (pooled || owned)) {
+         * on_pack writes its header straight into the entry and the payload
+         * rides the entry's span where its author built it — §2.4's
+         * { hdr[16], duct_span_t }: the recognized substrates pin, sealed
+         * wires and foreign or sub-threshold payloads materialize (the
+         * sealed ciphertext does not exist before staging — §2.1's
+         * encrypt-destination class — and a gather target carries no
+         * encrypt destination). */
+        bool gathers = duct_has(conn->wire->flags, fl_wire_gather) && !codec;
+        if (gathers) {
             entry = &pass->entries[pass->n];
             duct_view_u8 bufs[2] = { { .data = entry->hdr } };
             auto stage = (duct_wire_tx_t){ .kind = wire_tx_gather, .gather = bufs };
@@ -5371,67 +6496,53 @@ s_commit_dgram_shared(const commit_ctx_t *ctx)
             if (prc != olb_tx_ok)
                 return s_commit_stage_result(ctx, prc);
             entry->hdr_len = (uint8_t)bufs[0].size;
-            auto region = pooled ? s_tx_pool_hdr_of(out->payload.data) : nullptr;
-            /* Contract: payload.data is exactly duct_tx_pool_acquire's own
-             * returned pointer, still held. An interior pointer lands this
-             * header read inside payload bytes -- both asserts catch that
-             * in debug. */
-            assert(!region || region->hold);
-            assert(!region || out->payload.size <= region->len);
-            if (region)
-                ++region->refs;
-            /* The entry carries the buffer refs above pinned, not the span
-             * on_pack echoed into bufs[1]: the two agree by the gather
-             * contract, and only this one is held for the send. */
-            if (region)
-                entry->region = region;
-            else
-                entry->block = duct_share(out->release_arg ? out->release_arg : out->payload.data);
-            entry->ptr = out->payload.data;
-            entry->len = (uint32_t)out->payload.size;
-        } else {
-            auto acquired = s_dgram_acquire_or_flush(need);
-            if (!acquired)
+            duct_span_t span;
+            if (!s_dgram_span_take(out, ctx->redirect, &span))
                 return s_commit_ctx_fail(ctx, rc_again, commit_internal);
-            auto view = (duct_vmq_tx_view_t){ .data = acquired, .stage = 0u, .capacity = need };
+            entry->span = span;
+        } else {
+            duct_auto_del auto staged = s_dgram_stage_or_flush(need);
+            duct_do_if(!staged, return s_commit_ctx_fail(ctx, rc_again, commit_internal));
+            duct_do_if(!s->proto || duct_conn_phase(conn) >= conn_quiesced || !conn->wire,
+                       return s_commit_ctx_fail(ctx, rc_closed, commit_closed));
+            codec = conn->wire->unseal ? s_tls_codec(conn) : nullptr;
+            auto view = (duct_vmq_tx_view_t){ .data = staged, .stage = 0u, .capacity = need };
             auto stage = (duct_wire_tx_t){ .kind = wire_tx_vmq_view, .vmq_view = view };
             auto prc = s_wire_pack_into(conn->wire, s, &frame, &stage, codec);
-            if (prc != olb_tx_ok) {
-                s_tx_pool_drop_hold(acquired);
+            if (prc != olb_tx_ok)
                 return s_commit_stage_result(ctx, prc);
-            }
-            auto region = s_tx_pool_hdr_of(acquired);
-            region->refs = 1u;
-            s_tx_pool_drop_hold(acquired);
             entry = &pass->entries[pass->n];
             entry->hdr_len = 0u;
-            entry->region = region;
-            entry->ptr = acquired;
-            entry->len = (uint32_t)stage.vmq_view.stage;
+            entry->span = duct_span_of_ptr(duct_move(staged), 0u, (uint32_t)stage.vmq_view.stage);
         }
         pass->listener = listener;
         /* Each branch takes its slot past its own last chance to flush --
-         * nothing reaches the pass from on_pack, while s_dgram_acquire_or_flush
-         * empties it and renumbers from zero on an exhausted pool. */
+         * nothing reaches the pass from on_pack, while s_dgram_stage_or_flush
+         * empties it and renumbers from zero on an exhausted allocation. */
         assert(entry == &pass->entries[pass->n]);
         entry->handle = ctx->handle;
         entry->peer = dctx->peer;
-        entry->conn_id = out_conn;
-        entry->stream_id = out_stream;
-        entry->flags = out->flags;
-        entry->send_token = out->send_token;
+        entry->local = dctx->local;
+        entry->send_done = duct_has(out->flags, fl_send_done);
         if (!pass->n)
             pass->first_ns = now;
         ++pass->n;
         return commit_ok;
     }
 #endif
+    size_t need = 0u;
+    duct_do_if(!s_tx_wire_need(conn, out->payload.size, &need),
+               return s_commit_ctx_fail(ctx, rc_invalid_arg, commit_invalid));
+    auto codec = conn->wire && conn->wire->unseal ? s_tls_codec(conn) : nullptr;
+    duct_frame_t frame = {
+        .stream_id = out_stream, .payload = out->payload, .flags = out->frame_flags,
+    };
     /* Pre-arm ahead of the reserve below; the post-write kick after publish
      * is the race backstop. */
     duct_io_post_dgram_tx(listener);
     dgram_out_t dout;
     duct_vmq_push_rc_t push_rc;
-    if (!s_dgram_out_open(listener, &dctx->peer, need, &dout, &push_rc)) {
+    if (!s_dgram_out_open(listener, &dctx->peer, &dctx->local, need, &dout, &push_rc)) {
         duct_rtstat_obj_inc(s_this_worker, rtstats.dgram_shared_tx_drop, 1);
         return push_rc == vmq_push_too_large
              ? s_commit_ctx_fail(ctx, rc_invalid_arg, commit_invalid)
@@ -5445,19 +6556,22 @@ s_commit_dgram_shared(const commit_ctx_t *ctx)
         s_dgram_out_abort(&dout);
         return s_commit_stage_result(ctx, prc);
     }
+    dout.entry->handle = ctx->handle.word;
+    dout.entry->staged.done_delta = duct_has(out->flags, fl_send_done)
+                                  ? s_tx_done_take_delta(conn) : 0u;
     s_dgram_out_publish(&dout, tx_stage.vmq_view.stage);
     duct_io_post_dgram_tx(listener);
-    s_fire_send_done(s, cfg, out_conn, out_stream, out, rc_ok);
     return commit_ok;
 }
 
 /** @brief Send @p w's train from its ring, or hand it to io.
- *  While io has nothing published on the ring, the worker sends the frames
- *  itself and publishes only what the socket refused: an @c x_udp_peer train
- *  in segmented or batched calls, an @c x_tcp one as one write, and that only
- *  while @ref duct_io_parked reports its io thread parked. Otherwise the frames
- *  are published for io's drain. A leg gone or fenced for close drops the
- *  train. */
+ *  While io has nothing published on the ring, the worker sends the staged
+ *  records itself — gathering their spans straight from the sources — and
+ *  publishes only what the socket refused: an @c x_udp_peer train in
+ *  segmented or batched calls, an @c x_tcp one as one write, and that only
+ *  while @ref duct_io_parked reports its io thread parked. Otherwise the
+ *  records are published for io's drain. A leg gone or fenced for close
+ *  drops the train, its records completing with their unpins. */
 static void s_tx_train_flush(duct_worker_t *w)
 {
     auto t = &w->tx_train;
@@ -5466,15 +6580,15 @@ static void s_tx_train_flush(duct_worker_t *w)
     t->frames = 0u;
     auto conn = duct_conn_by_handle(t->conn);
     auto tx = conn ? duct_conn_tx_olb(conn) : nullptr;
-    if (!tx || duct_atomic_load(&conn->conn_fence, acquire) >= fence_quiescing)
-        return;
+    if (!tx || duct_conn_phase(conn) >= conn_quiesced)
+        return; /* the close paths' purge drops the train's records */
     if (!duct_olb_tx_published(tx) && (conn->xport_type != x_tcp || duct_io_parked(conn))) {
         size_t sent = 0u;
         duct_result_t rc;
         if (conn->xport_type == x_tcp) {
-            size_t base = olb_off(duct_atomic_load(&tx->h.tail, relaxed));
-            auto span = (duct_view_u8){ .data = tx->data + base, .size = tx->h.stage - base };
-            rc = duct_io_stream_send_fast(conn, &span, 1u, &sent) ? rc_ok : rc_again;
+            duct_view_u8 iov[2u * duct_dgram_tx_batch];
+            unsigned n = duct_olb_tx_peek_staged_iov(tx, duct_dgram_tx_batch, iov);
+            rc = n && duct_io_stream_send_fast(conn, iov, n, &sent) ? rc_ok : rc_again;
         } else {
             duct_x_gso_tally_t tally = {};
             rc = duct_io_udp_peer_send_staged(conn, &sent, &tally);
@@ -5483,10 +6597,13 @@ static void s_tx_train_flush(duct_worker_t *w)
         }
         if (rc == rc_ok) {
             duct_olb_tx_sent_staged(tx);
+            s_conn_done_flush_handle(t->conn);
             return;
         }
-        if (sent)
+        if (sent) {
             duct_olb_tx_advance_worker(tx, sent);
+            s_conn_done_flush_handle(t->conn);
+        }
     }
     duct_olb_tx_publish(tx);
     duct_io_post_tx_drain(&t->conn);
@@ -5504,7 +6621,7 @@ static void s_tx_train_flush_for(duct_conn_handle_t conn)
 /** @brief Put @p ctx's commit on this worker's train, opening one for its leg
  *  where none is.
  *  A train bound for another leg is flushed first. False off a worker thread,
- *  and while io holds published bytes or a write-armed socket on the leg: a
+ *  and while io holds queued records or a write-armed socket on the leg: a
  *  direct send starts only where io has nothing left to drain, so that commit
  *  stages and publishes behind them. */
 static bool s_tx_train_board(const commit_ctx_t *ctx)
@@ -5517,7 +6634,9 @@ static bool s_tx_train_board(const commit_ctx_t *ctx)
         return true;
     s_tx_train_flush(w);
     auto conn = ctx->conn;
-    if (!duct_olb_tx_rewind_idle(conn->tx_buf) || duct_has(duct_conn_state(conn), fl_conn_write_armed))
+    if (duct_has(duct_conn_state(conn), fl_conn_hopping)
+        || duct_olb_tx_published(duct_conn_tx_olb(conn))
+        || duct_olb_tx_write_armed(duct_conn_tx_olb(conn)))
         return false;
     t->conn = ctx->handle;
     t->first_ns = duct_ticks_mono_ns();
@@ -5536,10 +6655,12 @@ static duct_commit_rc_t s_commit_train(const commit_ctx_t *ctx, const duct_frame
 {
     auto w = s_this_worker;
     auto t = &w->tx_train;
-    auto st = s_tx_stage_frame(ctx->conn, ctx->s, frame);
+    auto st = s_tx_stage_frame(ctx->conn, ctx->s, frame, ctx->out, ctx->redirect);
     if (st == olb_tx_full && t->frames) {
         s_tx_train_flush(w);
-        return s_commit_stage_result(ctx, s_tx_stage_frame(ctx->conn, ctx->s, frame));
+        duct_do_if(!ctx->s->proto || duct_conn_phase(ctx->conn) >= conn_quiesced,
+                   return s_commit_ctx_fail(ctx, rc_closed, commit_closed));
+        return s_commit_stage_result(ctx, s_tx_stage_frame(ctx->conn, ctx->s, frame, ctx->out, ctx->redirect));
     }
     if (st != olb_tx_ok)
         return s_commit_stage_result(ctx, st);
@@ -5552,8 +6673,6 @@ static duct_commit_rc_t s_commit_train(const commit_ctx_t *ctx, const duct_frame
                             t->frames < duct_dgram_tx_batch && t->more);
         s_tx_train_flush(w);
     }
-    s_fire_send_done(ctx->s, duct_proto_cfg_of(ctx->s->proto), ctx->out_conn,
-                     ctx->out_stream, ctx->out, rc_ok);
     return commit_ok;
 }
 #endif
@@ -5574,76 +6693,20 @@ s_commit_udp_peer(const commit_ctx_t *ctx)
     if (s_tx_train_board(ctx))
         return s_commit_train(ctx, &wire_frame);
 #endif
-    return s_commit_stage_result(ctx, s_tx_stage_frame(conn, ctx->s, &wire_frame));
+    return s_commit_stage_result(ctx, s_tx_stage_frame(conn, ctx->s, &wire_frame, ctx->out, ctx->redirect));
 }
 
-#if !DUCT_EVENTS_MODEL_IOCP
-/** @brief Commit a response by sending the pack's own header and payload
- *  spans, neither of them passing through the TX ring.
+/** @brief Commit an @c x_tcp, @c x_raw or @c x_local response, trying one
+ *  direct send whenever the TX ring was idle before staging.
  *
- *  Room for the whole frame is claimed in the ring before a byte goes out: a
- *  short write leaves no staged copy behind it, so the remainder has to be
- *  known to fit first. That remainder is the only thing this path ever
- *  stages, and the payload reaches the socket from wherever its author built
- *  it.
- *
- *  Transports without framing headers supply a single payload span to
- *  @ref duct_xwritev.
- */
-static duct_commit_rc_t
-s_commit_stream_gather(const commit_ctx_t *ctx, const duct_frame_t *frame)
-{
-    auto conn = ctx->conn;
-    size_t need = 0u;
-    if (!s_tx_frame_need(conn, frame->payload.size, &need))
-        return s_commit_stage_result(ctx, olb_tx_too_large);
-    if (!duct_olb_tx_align(conn->tx_buf, need))
-        return s_commit_stage_result(ctx, olb_tx_full);
-
-    uint8_t hdr[wire_tx_hdr_max];
-    duct_view_u8 bufs[2] = { { .data = hdr } };
-    auto stage = (duct_wire_tx_t){ .kind = wire_tx_gather, .gather = bufs };
-    auto st = s_wire_pack_into(conn->wire, ctx->s, frame, &stage, nullptr);
-    if (st != olb_tx_ok)
-        return s_commit_stage_result(ctx, st);
-
-    size_t written = 0u;
-    bool hdr_span = bufs[0].size != 0u;
-    duct_discard duct_io_stream_send_fast(conn, hdr_span ? bufs : &bufs[1],
-                                          hdr_span ? 2u : 1u, &written);
-    duct_olb_tx_sent_direct(conn->tx_buf, written);
-    size_t hdr_sent = written < bufs[0].size ? written : bufs[0].size,
-           pl_sent  = written - hdr_sent,
-           hdr_left = bufs[0].size - hdr_sent,
-           pl_left  = bufs[1].size - pl_sent;
-    if (!hdr_left && !pl_left) {
-        s_fire_send_done(ctx->s, duct_proto_cfg_of(ctx->s->proto), ctx->out_conn,
-                         ctx->out_stream, ctx->out, rc_ok);
-        return commit_ok;
-    }
-    return s_commit_stage_result(ctx,
-        duct_olb_tx_stage(conn->tx_buf,
-                          hdr_left ? hdr + hdr_sent : nullptr, hdr_left,
-                          pl_left ? (const uint8_t *)bufs[1].data + pl_sent : nullptr,
-                          pl_left));
-}
-#endif
-
-/** @brief Commit an @c x_tcp, @c x_raw or @c x_local response, trying one direct
- *  send whenever the TX ring was idle before staging.
- *
- *  An idle ring makes an immediate send safe: @c write and @c send
- *  can fall short, so this path runs only with nothing else queued ahead of
- *  these bytes. The wire picks between two shapes. One raising
- *  @ref fl_wire_gather, and a leg carrying no wire at all, send the spans through
- *  @ref s_commit_stream_gather and touch the ring only for what the kernel
- *  refused. Every other wire stages through @ref s_tx_stage_frame first and
- *  sends from the ring, a short or failed attempt then publishing what is
- *  already sitting there. An @c x_tcp frame on such a wire boards this
- *  worker's train instead, @ref s_commit_train; only one the train turns away
- *  takes the send here. A gather wire's frame never boards: the frames of a
- *  train are staged and unpublished, which an idle ring does not count, and a
- *  direct send passes them to the socket.
+ *  An idle ring — nothing queued ahead of io — makes an immediate send
+ *  safe: @c write and @c send can fall short, so this path runs only with
+ *  nothing else ahead of these bytes. The stage is the descriptor the wire
+ *  built either way, and the direct attempt gathers its spans straight
+ *  from the sources (§2's one commit: the old gather fork is gone); what
+ *  the socket refused stays staged and publishes for io's stepper. An
+ *  @c x_tcp frame behind a busy ring boards this worker's train instead,
+ *  @ref s_commit_train; only one the train turns away takes the send here.
  */
 static duct_commit_rc_t
 s_commit_stream(const commit_ctx_t *ctx)
@@ -5656,37 +6719,30 @@ s_commit_stream(const commit_ctx_t *ctx)
         .stream_id = out_stream, .payload = out->payload, .flags = out->frame_flags,
     };
 #if !DUCT_EVENTS_MODEL_IOCP
-    bool olb_was_idle = duct_olb_tx_rewind_idle(conn->tx_buf);
-    bool gathers = !conn->wire || duct_has(conn->wire->flags, fl_wire_gather);
-    if (olb_was_idle && gathers)
-        return s_commit_stream_gather(ctx, &wire_frame);
-    if (!gathers && conn->xport_type == x_tcp && s_tx_train_board(ctx))
+    bool olb_was_idle = !duct_olb_tx_published(duct_conn_tx_olb(conn));
+    if (olb_was_idle && conn->xport_type == x_tcp && s_tx_train_board(ctx))
         return s_commit_train(ctx, &wire_frame);
-    auto mark = duct_olb_tx_mark(conn->tx_buf);
 #endif
-    auto st = s_tx_stage_frame(conn, s, &wire_frame);
+    auto st = s_tx_stage_frame(conn, s, &wire_frame, out, ctx->redirect);
     if (st != olb_tx_ok)
         return s_commit_stage_result(ctx, st);
 #if !DUCT_EVENTS_MODEL_IOCP
     if (olb_was_idle) {
-        size_t off_now = olb_off(duct_olb_tx_stage_packed(conn->tx_buf)),
-               staged = duct_olb_tx_staged_since(conn->tx_buf, mark),
-               off = off_now - staged,
-               written = 0u;
-        auto span = (duct_view_u8){ .data = conn->tx_buf->data + off, .size = staged };
-        if (duct_io_stream_send_fast(conn, &span, 1u, &written)) {
-            /* Every byte reached the kernel -- nothing to publish, the span
-             * counting on the stream past the ring. Staging resyncs from
-             * tail's current value: s_tx_stage_frame's own align may have
-             * opened a new pass since mark, which leaves mark in a pass io
-             * may still drain, and stage rewound there desyncs from tail for
-             * good. */
-            duct_olb_tx_sent_staged(conn->tx_buf);
-            s_fire_send_done(s, duct_proto_cfg_of(s->proto), ctx->out_conn, out_stream, out, rc_ok);
+        auto tx = duct_conn_tx_olb(conn);
+        duct_view_u8 iov[2u * duct_dgram_tx_batch];
+        unsigned n = duct_olb_tx_peek_staged_iov(tx, duct_dgram_tx_batch, iov);
+        size_t written = 0u;
+        if (n && duct_io_stream_send_fast(conn, iov, n, &written)) {
+            /* Every byte reached the kernel -- nothing to publish, the
+             * records completing here with their unpins. */
+            duct_olb_tx_sent_staged(tx);
+            s_conn_done_flush(s, ctx->out_conn, conn);
             return commit_ok;
         }
-        if (written > 0u)
-            duct_olb_tx_advance_worker(conn->tx_buf, written);
+        if (written > 0u) {
+            duct_olb_tx_advance_worker(tx, written);
+            s_conn_done_flush(s, ctx->out_conn, conn);
+        }
     }
 #endif
     return s_commit_ctx_ok(ctx);
@@ -5702,11 +6758,13 @@ static void s_vnet_train_flush(duct_worker_t *w)
     unsigned segs = t->gro.segs;
     if (!segs)
         return;
+    uint64_t dp = t->done_pending;
+    t->done_pending = 0u;
     auto conn = duct_conn_by_handle(t->conn);
     uint8_t vh[duct_vnet_hdr_max];
     duct_vnet_gro_finish(&t->gro, vh);
-    if (conn && duct_atomic_load(&conn->conn_fence, acquire) < fence_quiescing) {
-        t->gro.bufs[0] = (duct_view_u8){ .data = vh, .size = conn->vnet_hdr_len };
+    if (conn && duct_conn_phase(conn) < conn_quiesced) {
+        t->gro.bufs[0] = (duct_view_u8)(duct_view_u8){ .size = conn->vnet_hdr_len, .data = vh };
         size_t written = 0u;
         if (!duct_io_stream_send_fast(conn, t->gro.bufs, duct_vnet_gro_front + t->gro.nspans,
                                       &written) && !written)
@@ -5716,10 +6774,13 @@ static void s_vnet_train_flush(duct_worker_t *w)
             duct_rtstat_obj_inc(w, rtstats.vnet_tx_gro_pkts, segs);
         } else
             duct_rtstat_obj_inc(w, rtstats.vnet_tx_gro_single, 1);
+        if (dp) {
+            duct_atomic_fetch(add, &duct_conn_tx_done(conn)->seq, dp, relaxed);
+            s_conn_done_flush_handle(t->conn);
+        }
     }
     for (unsigned i = 0u; i < t->gro.nspans; ++i)
-        if (t->regions[i])
-            --t->regions[i]->refs;
+        duct_del(t->blocks[i]);
 }
 
 /** @brief Flush this worker's train when it is bound for @p conn. */
@@ -5747,8 +6808,8 @@ void duct_worker_conn_train_flush(const duct_conn_handle_t *conn)
  *  payload in it.
  *  @return true once the train holds it; false hands it back, this worker's
  *          train already written. */
-static bool s_vnet_train_take(const duct_conn_t *conn, duct_view_u8 pkt, size_t mss,
-                              const redirect_t *redirect)
+static bool s_vnet_train_take(duct_conn_t *conn, duct_view_u8 pkt, size_t mss,
+                              const redirect_t *redirect, duct_send_flags_t send_flags)
 {
     auto w = s_this_worker;
     if (!w)
@@ -5760,7 +6821,7 @@ static bool s_vnet_train_take(const duct_conn_t *conn, duct_view_u8 pkt, size_t 
     auto merge = duct_has(duct_conn_state(conn), fl_conn_vnet_uso) ? vnet_merge_tcp_udp
                                                                     : vnet_merge_tcp;
     for (;;) {
-        auto rc = duct_vnet_gro_offer(&t->gro, (const uint8_t *)pkt.data, pkt.size, mss, merge);
+        auto rc = duct_vnet_gro_offer(&t->gro, pkt.size, (const uint8_t *)pkt.data, mss, merge);
         if (rc == vnet_gro_flush_first) {
             s_vnet_train_flush(w);
             continue;
@@ -5770,27 +6831,27 @@ static bool s_vnet_train_take(const duct_conn_t *conn, duct_view_u8 pkt, size_t 
             return false;
         }
         t->conn = h;
+        if (duct_has(send_flags, fl_send_done))
+            t->done_pending += s_tx_done_take_all(conn);
         unsigned k = t->gro.nspans - 1u;
         auto span = &t->gro.bufs[duct_vnet_gro_front + k];
         auto at = (const char *)span->data;
         auto home = redirect ? (const char *)redirect->ct : nullptr;
-        duct_tx_pool_hdr_t *region;
-        if (home && at >= home && at + span->size <= home + redirect->cap)
-            region = s_tx_pool_hdr_of(redirect->ct);
-        else {
-            void *copy = s_pool_acquire(&w->ct_pool, span->size);
+        void *block = home && at >= home && at + span->size <= home + redirect->cap
+                    ? duct_try_share(redirect->ct)
+                    : nullptr;
+        if (!block) {
+            auto copy = duct_at(duct_new(uint8_t, span->size));
             if (!copy) {
-                t->regions[k] = nullptr;
+                t->blocks[k] = nullptr;
                 s_vnet_train_flush(w);
                 return true;
             }
             memcpy(copy, span->data, span->size);
             span->data = copy;
-            region = s_tx_pool_hdr_of(copy);
-            s_tx_pool_drop_hold(copy);
+            block = copy;
         }
-        ++region->refs;
-        t->regions[k] = region;
+        t->blocks[k] = block;
         if (rc == vnet_gro_taken_last)
             s_vnet_train_flush(w);
         return true;
@@ -5801,22 +6862,18 @@ static bool s_vnet_train_take(const duct_conn_t *conn, duct_view_u8 pkt, size_t 
 /** @brief Commit a response on a packet-fd leg, reaching the device ahead of
  *  the ring where there is nothing queued.
  *
- *  @ref s_commit_stream cannot serve this xport. Its second fast path sends a
- *  span read back out of the ring, and on a record-framed leg that span opens
- *  with the internal record header delimiting packets there — bytes a device
- *  must never receive. Packing into gather buffers sends what the wire
- *  produced, and the fallback goes through @ref s_tx_stage_frame, so the ring
- *  still gets the header its reader expects.
- *
- *  A write that moved anything counts as sent: a packet fd takes a datagram
- *  whole, leaving no remainder to resume, and staging the frame again puts the
- *  packet's head on the wire a second time.
+ *  The stage is the descriptor either way — its inline header carrying the
+ *  record's virtio header on a vnet leg, its GSO prefix built at the stage —
+ *  and an idle ring's direct send gathers the staged records' spans straight
+ *  from the sources. A write that moved anything counts as sent: a packet fd
+ *  takes a datagram whole, leaving no remainder to resume, and staging the
+ *  frame again puts the packet's head on the wire a second time.
  *
  *  On a vnet leg a packet goes to this worker's train first, and the direct
- *  write and the stage below both flush that train before they touch the conn,
+ *  send and the stage below both flush that train before they touch the conn,
  *  which keeps the leg's packets in order. A GSO record's header is built
  *  before either path, so one no segmentation takes fails with
- *  @c rc_invalid_arg, and the direct write sends its packet under that header.
+ *  @c rc_invalid_arg, and the direct send posts its packet under that header.
  */
 static duct_commit_rc_t
 s_commit_packet_fd(const commit_ctx_t *ctx)
@@ -5830,48 +6887,51 @@ s_commit_packet_fd(const commit_ctx_t *ctx)
         .flags = ctx->out->frame_flags,
     };
     duct_view_u8 pkt = wire_frame.payload;
-    bool gso = conn->vnet_hdr_len && duct_has(wire_frame.flags, fl_frame_gso);
+    /* Only a transparent record wire without framing flags carries raw IP packets
+     * for the GRO train; sealed or header-framing wires must go through s_tx_stage_frame. */
+    bool vnet_raw = conn->vnet_hdr_len
+                 && (!conn->wire || (!conn->wire->unseal
+                                     && duct_wire_records(conn->wire)
+                                     && !duct_has(conn->wire->flags, fl_wire_frame_flags)));
+    bool gso = vnet_raw && duct_has(wire_frame.flags, fl_frame_gso);
     uint8_t vh[duct_vnet_hdr_max];
     size_t mss = gso ? duct_vnet_gso_open(&pkt, vh) : 0u;
     bool bad = gso && (!mss || (duct_vnet_gso_is_udp(vh) && !duct_has(duct_conn_state(conn), fl_conn_vnet_uso)));
     duct_do_if(bad, return s_commit_ctx_fail(ctx, rc_invalid_arg, commit_invalid));
 #if !DUCT_EVENTS_MODEL_IOCP
-    if (duct_olb_tx_rewind_idle(conn->tx_buf)
-        && (!conn->wire || duct_has(conn->wire->flags, fl_wire_gather))) {
-        uint8_t hdr[wire_tx_hdr_max];
-        duct_view_u8 bufs[2] = { { .data = hdr } };
-        auto stage = (duct_wire_tx_t){ .kind = wire_tx_gather, .gather = bufs };
-        auto st = s_wire_pack_into(conn->wire, ctx->s, &wire_frame, &stage, nullptr);
+    bool idle = !duct_olb_tx_published(duct_conn_tx_olb(conn));
+    if (idle && vnet_raw
+        && s_vnet_train_take(conn, wire_frame.payload, mss, ctx->redirect,
+                             ctx->out->flags)) {
+        return commit_ok;
+    }
+    s_vnet_train_flush_for(ctx->handle);
+    duct_do_if(!ctx->s->proto || duct_conn_phase(conn) >= conn_quiesced,
+               return s_commit_ctx_fail(ctx, rc_closed, commit_closed));
+    if (idle) {
+        auto st = s_tx_stage_frame(conn, ctx->s, &wire_frame, ctx->out, ctx->redirect);
         if (st != olb_tx_ok)
             return s_commit_stage_result(ctx, st);
-        if (!mss)
-            pkt = bufs[1];
-        if (conn->vnet_hdr_len && !bufs[0].size
-            && s_vnet_train_take(conn, pkt, mss, ctx->redirect)) {
-            s_fire_send_done(ctx->s, duct_proto_cfg_of(ctx->s->proto),
-                             ctx->out_conn, ctx->out_stream, ctx->out, rc_ok);
-            return commit_ok;
-        }
-        s_vnet_train_flush_for(ctx->handle);
+        auto tx = duct_conn_tx_olb(conn);
+        duct_view_u8 iov[2u * duct_dgram_tx_batch];
+        unsigned n = duct_olb_tx_peek_staged_iov(tx, duct_dgram_tx_batch, iov);
         size_t written = 0u;
-        duct_view_u8 spans[3];
-        unsigned ns = 0u;
-        if (conn->vnet_hdr_len)
-            spans[ns++] = (duct_view_u8){ .data = mss ? vh : (uint8_t *)&duct_vnet_zero[0],
-                                        .size = conn->vnet_hdr_len };
-        if (bufs[0].size)
-            spans[ns++] = bufs[0];
-        spans[ns++] = pkt;
-        bool sent = duct_io_stream_send_fast(conn, spans, ns, &written);
-        if (sent || written != 0u) {
-            s_fire_send_done(ctx->s, duct_proto_cfg_of(ctx->s->proto),
-                             ctx->out_conn, ctx->out_stream, ctx->out, rc_ok);
+        if (n && duct_io_stream_send_fast(conn, iov, n, &written)) {
+            duct_olb_tx_sent_staged(tx);
+            s_conn_done_flush(ctx->s, ctx->out_conn, conn);
             return commit_ok;
         }
+        if (written > 0u) {
+            /* A packet fd takes a datagram whole: no remainder to resume. */
+            duct_olb_tx_sent_staged(tx);
+            s_conn_done_flush(ctx->s, ctx->out_conn, conn);
+            return commit_ok;
+        }
+        return s_commit_ctx_ok(ctx);
     }
 #endif
     s_vnet_train_flush_for(ctx->handle);
-    return s_commit_stage_result(ctx, s_tx_stage_frame(conn, ctx->s, &wire_frame));
+    return s_commit_stage_result(ctx, s_tx_stage_frame(conn, ctx->s, &wire_frame, ctx->out, ctx->redirect));
 }
 
 /** @brief Commit a response for any xport without its own s_commit_* case.
@@ -5888,7 +6948,7 @@ s_commit_generic(const commit_ctx_t *ctx)
         .payload = ctx->out->payload,
         .flags = ctx->out->frame_flags,
     };
-    return s_commit_stage_result(ctx, s_tx_stage_frame(conn, ctx->s, &wire_frame));
+    return s_commit_stage_result(ctx, s_tx_stage_frame(conn, ctx->s, &wire_frame, ctx->out, ctx->redirect));
 }
 
 /** @brief Validate and dispatch one response commit to its xport's own
@@ -5916,9 +6976,6 @@ static duct_commit_rc_t s_commit_response(duct_session_t *s,
                                           redirect_t *redirect)
 {
     duct_do_if(!s->proto, return commit_closed);
-    if (duct_has(out->flags, fl_send_pool_keep) && out->payload.data && s_this_worker
-        && s_tx_pool_owns(&s_this_worker->tx_pool, out->payload.data))
-        s_tx_pool_hdr_of(out->payload.data)->keep = 1u;
     duct_commit_rc_t rc = commit_ok;
     /* Early declare: assigned once resolved below, read at cleanup's own
      * ticket bookkeeping -- several earlier guards goto cleanup before that
@@ -5961,7 +7018,8 @@ static duct_commit_rc_t s_commit_response(duct_session_t *s,
      * already-published payload; the push reports its own failure. */
     if (duct_has(cfg->flags, fl_proto_multiplexed)
         && out_stream_pre != 0u && out_stream_pre != duct_stream_id_same
-        && s->streams && !duct_session_stream_slot(s, out_stream))
+        && duct_has(s->flags, fl_session_multiplexed)
+        && !duct_session_stream_slot(s, out_stream))
     {
         duct_response_t open_out = {};
         duct_stream_admit_t admit;
@@ -5973,7 +7031,18 @@ static duct_commit_rc_t s_commit_response(duct_session_t *s,
             s_fire_error(s, cfg, admit == stream_admit_full ? rc_again : rc_invalid_arg);
     }
     if (out->payload.size == 0u) {
-        s_fire_send_done(s, cfg, out_conn, out_stream, out, rc_ok);
+        if (duct_has(out->flags, fl_send_done)) {
+            auto c = out_conn < duct_session_max_legs
+                   ? duct_conn_by_handle(duct_session_conn_at(s, out_conn)) : nullptr;
+            duct_do_if(!c,
+                       s_fire_send_done_raw(s, cfg, out_conn, 0u,
+                                            out_conn < duct_session_max_legs ? rc_closed : rc_invalid_arg);
+                       goto cleanup);
+            auto txq = duct_conn_tx_seq(c);
+            txq->done_posted += 1u;
+            txq->done_ctl += 1u;
+            s_conn_done_flush(s, out_conn, c);
+        }
         goto cleanup;
     }
     size_t eff_max = s_admit_eff_max(cfg);
@@ -6025,6 +7094,10 @@ static duct_commit_rc_t s_commit_response(duct_session_t *s,
         goto cleanup;
     }
 
+    bool posted_now = !is_replay && duct_has(out->flags, fl_send_done);
+    if (posted_now)
+        duct_conn_tx_seq(conn)->done_posted += 1u;
+
     switch (conn->xport_type) {
     case x_inter:
         rc = s_commit_inter(&ctx);
@@ -6047,7 +7120,10 @@ static duct_commit_rc_t s_commit_response(duct_session_t *s,
         rc = s_commit_generic(&ctx);
         break;
     }
-    if (rc == commit_ok) {
+    if (rc != commit_ok) {
+        if (posted_now)
+            duct_conn_tx_seq(conn)->done_posted -= 1u;
+    } else {
         auto tally = &duct_session_counters(s)[out_conn];
         tally->tx_frames += 1u;
         tally->tx_bytes += out->payload.size;
@@ -6062,9 +7138,20 @@ cleanup:
     /* commit_internal is the one exception: ownership passes back to the
      * caller for a possible retry-save read before release -- releasing
      * here too double-releases, and reading after is a use-after-free.
-     * Every other outcome releases unconditionally. */
-    if (rc != commit_internal)
-        duct_response_release_owned(out);
+     * Every other outcome releases unconditionally. A replay of a parked
+     * frame answer may carry its conn block's own regional copy: the slot
+     * returns there, the payload leaving holding nothing. */
+    if (rc != commit_internal) {
+        if (conn && s_retry_copy_is_regional(conn, out->payload.data)) {
+            s_retry_copy_release(conn, out->payload.data, out->payload.size);
+            out->payload = (duct_view_u8){};
+            out->flags = duct_and(out->flags, duct_not(fl_send_owned));
+            out->release = nullptr;
+            out->release_arg = nullptr;
+        } else {
+            duct_response_release_owned(out);
+        }
+    }
     return rc;
 }
 
@@ -6096,7 +7183,7 @@ static void s_ctl_apply_now(duct_session_t *s, const duct_response_t *out)
      * nothing to the author: a declaration the session cannot honour is logged
      * by s_leg_refused and absorbed, the author having no move to make on it.
      * A dial already in flight is the exception, reaching on_error through
-     * s_msg_exec_connect_leg_error — that failure is the peer's, and retry or
+     * s_msg_exec_leg_error — that failure is the peer's, and retry or
      * fallback is the author's. */
     auto leg = &out->control.open_leg;
     duct_result_t rc = rc_ok;
@@ -6112,7 +7199,7 @@ static void s_ctl_apply_now(duct_session_t *s, const duct_response_t *out)
         rc = duct_join_lead(s, leg->conn_id, lead)
            ? duct_conn_attach_connect(
                  s, leg->conn_id, leg->connect_addr, x_tcp,
-                 (duct_view_u8){ .data = lead, .size = sizeof lead }, leg->tcp_congestion,
+                 (duct_view_u8)(duct_view_u8){ .size = sizeof lead, .data = lead }, leg->tcp_congestion,
                  leg->egress_if)
            : rc_invalid_order;
     }
@@ -6136,16 +7223,10 @@ static void s_ctl_apply_now(duct_session_t *s, const duct_response_t *out)
                  interval_us = 0u;
         bool of = duct_ckd_mul(&delay_us, tm->delay_ms, 1000u)
                || duct_ckd_mul(&interval_us, tm->interval_ms, 1000u);
-        auto ctx = duct_new(timer_ctx_t);
-        duct_timer_handle_t h = timer_handle_null;
-        if (!of && ctx) {
-            auto live = duct_session_handle_from_live(s);
-            ctx->session_tok = live.word;
-            ctx->token = tm->arg;
-            ctx->key = tm->key;
-            h = s_timer_start(w, ctx, delay_us, interval_us, s_timer_fire);
-        } else
-            duct_del(ctx);
+        duct_timer_ctx_t ctx = { .session_tok = duct_session_handle_from_live(s).word,
+                                 .token = tm->arg, .key = tm->key };
+        duct_timer_handle_t h = of ? timer_handle_null
+                                   : s_timer_arm(w, ctx, delay_us, interval_us, s_timer_fire);
         if (tm->id_out)
             *tm->id_out = h != timer_handle_null ? duct_timer_handle_id(h) : 0u;
         if (tm->key && h != timer_handle_null)
@@ -6165,10 +7246,12 @@ static void s_ctl_apply_now(duct_session_t *s, const duct_response_t *out)
             auto conn = duct_conn_by_handle(handle);
             if (!conn)
                 continue;
+            /* The suspend bit lives on the rx header's ack line — this
+             * worker's own line — for every leg, ring or lane. */
             if (out->control.rx == rx_op_pause)
-                duct_conn_state_set(conn, fl_conn_suspended);
+                duct_atomic_store(&duct_conn_rx_hdr(conn)->suspended, 1u, relaxed);
             else {
-                duct_conn_state_clear(conn, fl_conn_suspended);
+                duct_atomic_store(&duct_conn_rx_hdr(conn)->suspended, 0u, relaxed);
                 /* A reactive backend's readiness signal may not re-fire for
                  * data that arrived while suspended; post an rx_read so the
                  * io thread reads explicitly on resume. */
@@ -6217,21 +7300,22 @@ static void s_response_take_control(duct_session_t *s, const duct_response_t *ou
     s_ctl_apply_after(s, out);
 }
 
-/** @brief Apply @p s's pending protocol switch once no response of it waits
- *  parked.
- *  A parked emit, frame, engine output or FIN/RST stages under its original
- *  wire, so the switch waits for the last of them. Refused switches across
- *  incompatible legs deliver @c rc_invalid_order via @c on_error. */
-static void s_response_switch(duct_session_t *s)
+/** @brief Test whether any TX retry node of @p s's responses sits parked on
+ *  this worker's retry list.
+ *  The protocol switch's retry gate: a parked emit by its handler context,
+ *  a conn-owned class by a leg of @p s; a switch recorded while any stands
+ *  waits at @c switch_parked_tx.
+ */
+bool duct_worker_session_tx_parked(const duct_session_t *s)
 {
-    if (!s->pending_switch_next)
-        return;
-    for (auto n = s_this_worker->retry_head; n; n = n->next) {
+    auto w = s_this_worker;
+    duct_do_if(!w, return false);
+    for (auto n = w->retry_head; n; n = n->next) {
         duct_conn_handle_t leg;
         switch (n->kind) {
         case retry_emit:
-            if (n->emit.hctx->s == s)
-                return;
+            if (n->emit.hctx && n->emit.hctx->s == s)
+                return true;
             continue;
         case retry_frame:
             leg = n->frame.handle;
@@ -6250,8 +7334,21 @@ static void s_response_switch(duct_session_t *s)
             continue;
         }
         if (duct_session_conn_id_by_handle(s, leg) < duct_session_max_legs)
-            return;
+            return true;
     }
+    return false;
+}
+
+/** @brief Apply @p s's pending protocol switch once no response of it waits
+ *  parked.
+ *  A parked emit, frame, engine output or FIN/RST stages under its original
+ *  wire, so the switch waits for the last of them — @c duct_session_apply_switch
+ *  parks in @c switch_parked_tx until then. Refused switches across
+ *  incompatible legs deliver @c rc_invalid_order via @c on_error. */
+static void s_response_switch(duct_session_t *s)
+{
+    if (!s->switch_next || s->switch_stage == switch_fencing)
+        return;
     if (duct_session_apply_switch(s) == rc_invalid_order)
         s_fire_error(s, duct_proto_cfg_of(s->proto), rc_invalid_order);
 }
@@ -6289,11 +7386,27 @@ static duct_commit_rc_t s_response_put(duct_session_t *s, duct_response_t *out,
     auto rc = s_commit_response(s, conn_id, stream_id, out, &ticket, false, redirect);
     if (rc == commit_ok)
         s_response_settle(s, out, stream_id, flags);
-    else if (rc == commit_internal
-             && !(hctx ? s_retry_emit_save(s_this_worker, hctx, ticket)
-                       : s_retry_frame_save(s_this_worker, s, conn_id, stream_id, flags, out,
-                                            ticket)))
-        rc = commit_invalid;
+    else if (rc == commit_internal) {
+        if (hctx && !s_hctx_live_stepping(hctx, s, stream_id)) {
+            /* The stream died with its answer mid-commit: drop its payload and
+             * settle its ticket in order (immediately if at front or leg gone,
+             * else parked empty as a retry_frame) so later commits never wedge
+             * behind an abandoned ticket hole. */
+            s_response_void_payload(out);
+            auto conn = duct_conn_by_handle(duct_session_conn_at(s, out->conn_id));
+            if (!conn || s_tx_ticket_pass(conn, ticket)) {
+                s_response_switch(s);
+                return commit_closed;
+            }
+            duct_discard s_retry_frame_save(s_this_worker, s, conn_id, stream_id,
+                                            fl_frame_none, out, ticket);
+            return commit_closed;
+        }
+        if (!(hctx ? s_retry_emit_save(s_this_worker, hctx, ticket)
+                   : s_retry_frame_save(s_this_worker, s, conn_id, stream_id, flags, out,
+                                        ticket)))
+            rc = commit_invalid;
+    }
     return rc;
 }
 
@@ -6345,23 +7458,46 @@ s_ctl_fin_stage_dgram(duct_conn_t *conn, duct_session_t *s, const duct_frame_t *
     size_t need = 0u;
     bool sized = s_tx_wire_need(conn, wf->payload.size, &need);
     duct_do_if(!sized, return olb_tx_too_large);
-    auto dctx = (const duct_dgram_shared_ctx_t *)conn->ctx;
+    auto dctx = duct_conn_dgram_ctx(conn);
     auto listener = dctx->listener;
 
     s_worker_dgram_flush();
     dgram_out_t dout;
     duct_vmq_push_rc_t push_rc;
-    if (!s_dgram_out_open(listener, &dctx->peer, need, &dout, &push_rc)) {
+    if (!s_dgram_out_open(listener, &dctx->peer, &dctx->local, need, &dout, &push_rc)) {
         duct_rtstat_obj_inc(w, rtstats.dgram_shared_tx_drop, 1);
         return push_rc == vmq_push_too_large ? olb_tx_too_large : olb_tx_full;
     }
-    auto view = (duct_vmq_tx_view_t){ .data = dout.span.data, .stage = 0u, .capacity = need };
+    if (dout.pools) {
+        auto view = (duct_vmq_tx_view_t){ .data = dout.span.data, .stage = 0u, .capacity = need };
+        auto tx_stage = (duct_wire_tx_t){ .kind = wire_tx_vmq_view, .vmq_view = view };
+        auto prc = s_wire_pack_into(conn->wire, s, wf, &tx_stage, s_tls_codec(conn));
+        if (prc != olb_tx_ok) {
+            s_dgram_out_abort(&dout);
+            return prc;
+        }
+        duct_rtstat_obj_inc(w, rtstats.dgram_lane_staged, 1);
+        s_dgram_out_publish(&dout, tx_stage.vmq_view.stage);
+        duct_io_post_dgram_tx(listener);
+        return olb_tx_ok;
+    }
+    /* The descriptor form: a control frame is sub-threshold, §2.1's copy
+     * class — one block holds the packed record and the entry's span names
+     * it, no inline header. */
+    duct_auto_del auto copy = duct_at(duct_new(uint8_t, need));
+    if (!copy) {
+        s_dgram_out_abort(&dout);
+        return olb_tx_full;
+    }
+    auto view = (duct_vmq_tx_view_t){ .data = copy, .stage = 0u, .capacity = need };
     auto tx_stage = (duct_wire_tx_t){ .kind = wire_tx_vmq_view, .vmq_view = view };
     auto prc = s_wire_pack_into(conn->wire, s, wf, &tx_stage, s_tls_codec(conn));
     if (prc != olb_tx_ok) {
         s_dgram_out_abort(&dout);
         return prc;
     }
+    *(duct_span_t *)(void *)(dout.entry->desc + dgram_tx_desc_half)
+        = duct_span_of_ptr(duct_move(copy), 0u, tx_stage.vmq_view.stage);
     duct_rtstat_obj_inc(w, rtstats.dgram_lane_staged, 1);
     s_dgram_out_publish(&dout, tx_stage.vmq_view.stage);
     duct_io_post_dgram_tx(listener);
@@ -6392,7 +7528,7 @@ static duct_olb_tx_result_t s_ctl_fin_stage(duct_conn_t *conn, duct_session_t *s
                                             duct_frame_flags_t flg,
                                             duct_stream_error_t err, uint32_t *ticket)
 {
-    /* duct_conn_tx_olb, never conn->tx_buf: on a leg without a ring that word
+    /* duct_conn_tx_olb, never duct_conn_tx_olb(conn): on a leg without a ring that word
      * carries duct_conn_t::tx_seq, which as a pointer looks live once the
      * counters advance. Null from it is the fork below, not a refusal — only a
      * leg with neither ring nor outbox stops here, and every entry filters on
@@ -6408,7 +7544,7 @@ static duct_olb_tx_result_t s_ctl_fin_stage(duct_conn_t *conn, duct_session_t *s
     duct_frame_t wf = { .stream_id = stream_id, .flags = flg };
     if (duct_has(flg, fl_frame_rst))
         wf.payload = duct_view(duct_view_u8, (void *)code, sizeof code);
-    auto st = tx ? s_tx_stage_frame(conn, s, &wf)
+    auto st = tx ? s_tx_stage_frame(conn, s, &wf, nullptr, nullptr)
                  : s_ctl_fin_stage_dgram(conn, s, &wf);
     if (st == olb_tx_full)
         return olb_tx_full;
@@ -6489,7 +7625,7 @@ static void s_timer_invoke(duct_session_t *s, const duct_proto_cfg_t *cfg, uint6
 {
     auto w = s_this_worker;
     assert(!w->hold_conn);
-    w->hold_into = &s->timer_hold;
+    w->hold_into = duct_session_timer_hold(s);
     duct_response_t out;
     duct_response_reset(&out);
     duct_discard cfg->on_timer(s, &out, s->proto_state, token);
@@ -6506,46 +7642,46 @@ static void s_timer_invoke(duct_session_t *s, const duct_proto_cfg_t *cfg, uint6
  */
 static duct_exec_rc_t s_timer_fire_free(void *arg)
 {
-    auto ctx = (const timer_ctx_t *)arg;
-    duct_do_if(!ctx, return exec_done);
+    auto t = (const duct_timer_t *)arg;
+    duct_do_if(!t, return exec_done);
     duct_response_t out;
     duct_response_reset(&out);
-    duct_discard duct_proto_cfg_of(ctx->proto)->on_timer(nullptr, &out, ctx->user_ctx, ctx->arg);
+    duct_discard duct_proto_cfg_of(t->ctx.proto)->on_timer(nullptr, &out, t->ctx.user_ctx,
+                                                           t->ctx.arg);
     duct_response_release_owned(&out);
     return exec_done;
 }
 
 static duct_exec_rc_t s_timer_fire(void *arg)
 {
-    auto ctx = (timer_ctx_t *)arg;
-    duct_do_if(!ctx, return exec_done);
-    auto w = ctx->w;
-    auto stok = (duct_session_handle_t){ .word = ctx->session_tok };
+    auto t = (duct_timer_t *)arg;
+    duct_do_if(!t, return exec_done);
+    auto w = s_this_worker;
+    assert(w);
+    duct_timer_handle_t self = s_timer_handle_of(w, t);
+    auto stok = (duct_session_handle_t){ .word = t->ctx.session_tok };
     auto s = duct_session_attached_by_handle(stok);
     if (!s) {
         /* Reclaimed or closing: cancel this (possibly recurring) timer now —
          * resolve will keep failing every future fire otherwise. */
-        duct_timer_cancel(&w->timers, ctx->self);
+        duct_timer_cancel(&w->timers, self);
         return exec_done;
     }
     auto cfg = s->proto ? duct_proto_cfg_of(s->proto) : nullptr;
     bool runs = cfg && cfg->on_timer;
-    if (runs && s_tx_held(s, &s->timer_hold, nullptr)) {
+    if (runs && s_tx_held(s, duct_session_timer_hold(s), nullptr)) {
         /* The session's last timer output waits parked. A repeating timer's
          * tick is dropped, its next one taking its place as the timer set
          * folds overdue ticks; a one-shot fire parks as a retry_timer node,
          * run once that output resolves, its key keeping its slot meanwhile.
          * The timer node itself is left as-is either way. */
-        if (s_timer_repeats(w, ctx->self) || s_retry_timer_save(w, ctx))
+        if (s_timer_repeats(w, self) || s_retry_timer_save(w, s, t))
             return exec_done;
         runs = false;
     }
-    s_timer_key_spend(w, s, ctx->key, ctx->self);
+    s_timer_key_spend(w, s, t->ctx.key, self);
     if (runs)
-        s_timer_invoke(s, cfg, ctx->token);
-    /* Retirement (drain/cancel/destroy) calls t->arg_free(ctx) — here duct_del_fn.
-     * exec must not free ctx: drain needs arg alive during exec, and cancel/
-     * destroy release it for unfired timers. */
+        s_timer_invoke(s, cfg, t->ctx.token);
     return exec_done;
 }
 
@@ -6556,11 +7692,11 @@ void duct_worker_session_timers_cancel(const duct_session_handle_t *h)
         return;
     auto sen = &w->timers.sentinel;
     for (auto t = sen->next; t != sen; t = t->next) {
-        /* A free timer holds no session handle to match. */
+        /* A free timer holds no session handle to match; a cancelled node has
+         * already released its hash link. */
         if (!t->arg || t->exec == s_timer_fire_free)
             continue;
-        auto ctx = (timer_ctx_t *)t->arg;
-        if (ctx->session_tok != h->word)
+        if (t->ctx.session_tok != h->word)
             continue;
         if (t->arg_free)
             t->arg_free(t->arg);
@@ -6568,6 +7704,77 @@ void duct_worker_session_timers_cancel(const duct_session_handle_t *h)
         t->arg_free = nullptr;
         duct_hash_remove(&t->hh);
     }
+    s_retry_timer_discard(w, h->word);
+}
+
+/** @brief Push the freshly dead @p s onto this worker's reclaim list, its
+ *  head. The owner's closing→dead transition calls it; off a worker thread
+ *  it is a no-op, the shutdown walk returning the block itself. */
+void duct_worker_reclaim_add(duct_session_t *s)
+{
+    auto w = s_this_worker;
+    duct_do_if(!w, return);
+    s->reclaim_next = w->reclaim_head
+        ? duct_session_idx_get(w->reclaim_head) : duct_blk_none;
+    w->reclaim_head = s;
+}
+
+void duct_worker_session_defer_discard(const duct_session_t *s)
+{
+    auto w = s_this_worker;
+    duct_do_if(!w, return);
+    auto q = &w->defer_q;
+    duct_msg_t *kept = nullptr,
+               *kept_tail = nullptr;
+    for (auto m = q->q.head; m; ) {
+        auto next = duct_msg_next(m);
+        auto node = DUCT_CAST(batch_defer_node_t, msg, m);
+        if (s_defer_in_session(s, node))
+            s_defer_region_release(s, node);
+        else {
+            duct_msg_next(m) = nullptr;
+            if (kept_tail)
+                duct_msg_next(kept_tail) = m;
+            else
+                kept = m;
+            kept_tail = m;
+        }
+        m = next;
+    }
+    q->q.head = kept;
+    q->q.tail = kept_tail;
+}
+
+void duct_worker_reclaim_reset_all(void)
+{
+    for (unsigned i = 0u; i < s_wmod.n_workers; ++i)
+        s_wmod.workers[i].reclaim_head = nullptr;
+}
+
+/** @brief The owner's idle-pass drain: tick every dead session's grace,
+ *  return the spent ones' blocks, and give the session pool one sweep step.
+ *  A non-owner's pass never reaches a foreign session — each list is its
+ *  owner's alone.
+ */
+static void s_sessions_reclaim_drain(duct_worker_t *w)
+{
+    duct_session_t *prev = nullptr;
+    for (auto s = w->reclaim_head; s; ) {
+        uint32_t next = s->reclaim_next;
+        duct_session_t *next_s = next == duct_blk_none
+            ? nullptr : duct_session_block_at(next);
+        if (!duct_session_dead_tick(s)) {
+            prev = s;
+            s = next_s;
+            continue;
+        }
+        if (prev)
+            prev->reclaim_next = next;
+        else
+            w->reclaim_head = next_s;
+        s = next_s;
+    }
+    duct_discard duct_block_pool_sweep_step(duct_session_pool_blocks(), &w->sess_sweep, 1u);
 }
 
 /** @brief Shutdown drain: flush the defer queue and this worker's own lanes,
@@ -6629,7 +7836,8 @@ static duct_nonnull(1) void s_shutdown_drain(duct_worker_t *w)
 static size_t s_run_pass(duct_worker_t *w, unsigned hi_lane, unsigned norm_lane,
                          unsigned lo_lane, struct timespec now)
 {
-    bool progress = s_defer_drain(w);
+    bool progress = s_done_drain(w);
+    progress |= s_defer_drain(w);
     s_drain_harvest_ext(w);
     size_t drained = s_drain_pass(w, hi_lane, norm_lane, lo_lane);
     drained += s_inter_drain(w);
@@ -6646,10 +7854,6 @@ static size_t s_run_pass(duct_worker_t *w, unsigned hi_lane, unsigned norm_lane,
     s_worker_dgram_flush();
     s_vnet_train_flush(w);
     assert(!w->tx_train.frames);
-    /* Nothing wakes a retry node blocked on the pool; the pass that frees the
-     * held regions has to run on its own. */
-    if (s_tx_pool_pass_end(&w->tx_pool) && w->retry_head)
-        progress = true;
     return drained ? drained : progress;
 }
 
@@ -6666,15 +7870,15 @@ static void s_run_loop(duct_worker_t *w)
      * path and returns the real clock on its own. */
 
     /* x_udp_shared batching scratch, allocated once per worker thread
-     * lifetime. Entry bytes live in w->tx_pool; these arrays carry only entry
-     * and kick bookkeeping. */
-    auto dgram_entries = duct_at(duct_new(duct_worker_dgram_batch_entry_t, duct_async_cycle_quota));
-    auto dgram_kick_listeners = duct_at(duct_new(duct_listener_t *, duct_async_cycle_quota));
-    auto dgram_pass = duct_new(dgram_pass_t);
-    auto vnet_train = duct_new(vnet_train_t);
-    duct_do_if(!dgram_entries || !dgram_kick_listeners || !dgram_pass || !vnet_train,
-        duct_del(dgram_entries); duct_del(dgram_kick_listeners);
-        duct_del(dgram_pass); duct_del(vnet_train); return);
+     * lifetime. Entry payloads ride their spans; these arrays carry only
+     * entry and kick bookkeeping. */
+    duct_auto_del auto dgram_entries =
+        duct_at(duct_new(duct_worker_dgram_batch_entry_t, duct_async_cycle_quota));
+    duct_auto_del auto dgram_kick_listeners =
+        duct_at(duct_new(duct_listener_t *, duct_async_cycle_quota));
+    duct_auto_del auto dgram_pass = duct_new(dgram_pass_t);
+    duct_auto_del auto vnet_train = duct_new(vnet_train_t);
+    duct_do_if(!dgram_entries || !dgram_kick_listeners || !dgram_pass || !vnet_train, return);
     *dgram_pass = (dgram_pass_t){
         .entries = dgram_entries,
         .kick_listeners = dgram_kick_listeners,
@@ -6697,13 +7901,14 @@ static void s_run_loop(duct_worker_t *w)
             duct_spin_next(&w->spin, true, now_ns);
             continue;
         }
-        /* Idle: reclaim quarantined session slots. The close callback fires
-         * at the detach/close-request transition, not here — this only
-         * reclaims slots, safe with a non-empty defer_q since conn-lost
-         * consume discards a conn's defer node before its leg detaches. Conn
-         * slots need no idle drain of their own: duct_conn_fence_retire
-         * tears one down synchronously the instant no reference remains. */
-        duct_sessions_reclaim_idle();
+        /* Idle: tick this worker's dead sessions and step the session pool's
+         * tail sweep. The close callback fires at the detach/close-request
+         *  transition, not here — this only reclaims slots, safe with a
+         * non-empty defer_q since conn-lost consume discards a conn's defer
+         * node before its leg detaches. Conn slots need no idle drain of
+         * their own: the release count tears one down the instant its last
+         * unit drains. */
+        s_sessions_reclaim_drain(w);
         if (duct_atomic_load(&w->shutdown, acquire))
             break;
         duct_timers_maybe_trim(&w->timers);
@@ -6757,11 +7962,12 @@ static void s_run_loop(duct_worker_t *w)
     assert(!w->tx_train.frames);
     w->dgram_pass = nullptr;
     w->vnet_train = nullptr;
-    duct_del(dgram_pass);
-    duct_del(vnet_train);
-    duct_del(dgram_entries);
-    duct_del(dgram_kick_listeners);
     s_this_worker = nullptr;
+}
+
+bool duct_worker_module_alive(void)
+{
+    return s_wmod.workers != nullptr;
 }
 
 bool duct_worker_module_init(unsigned n_workers,
@@ -6769,6 +7975,7 @@ bool duct_worker_module_init(unsigned n_workers,
                              duct_vmq_mpsc_t *wfq,
                              uint64_t seal_key_lifetime_ms)
 {
+    duct_do_if(s_wmod.workers, return false);
     s_wmod.seal_key_lifetime_ms = seal_key_lifetime_ms;
 
     s_wmod.workers = duct_at(duct_new(duct_worker_t, n_workers));
@@ -6908,6 +8115,7 @@ void duct_worker_module_join(void)
 
 void duct_worker_module_cleanup(void)
 {
+    duct_do_if(!s_wmod.workers, return);
     for (unsigned i = 0u; i < s_wmod.n_workers; ++i) {
         duct_timers_destroy(&s_wmod.workers[i].timers);
         s_defer_clear(&s_wmod.workers[i].defer_q);
@@ -6927,6 +8135,10 @@ void duct_worker_module_cleanup(void)
         if (s_wmod.workers[i].host_egress) {
             duct_vmq_mpsc_del(s_wmod.workers[i].host_egress);
             s_wmod.workers[i].host_egress = nullptr;
+        }
+        if (s_wmod.workers[i].ct_chunks_live) {
+            duct_x_slot_pool_free(&s_wmod.workers[i].ct_chunks);
+            s_wmod.workers[i].ct_chunks_live = false;
         }
     }
     /* Clear worker count prior to deallocating worker arrays to safeguard
@@ -6979,19 +8191,20 @@ void duct_worker_post_connect_error(unsigned worker_id, const duct_proto_t *prot
         duct_msg_done(m);
 }
 
-/** @brief Live-session leg-dial failure payload.
+/** @brief Live-session leg error payload: a leg dial's failure, or a standing
+ *  leg's wire refusing a frame for its size.
  *  The session already exists and is resolved by token, same as any other
  *  cross-thread session ctrl message; @see duct_msg_connect_error for the
  *  shape carrying a dial that never reached one.
  */
-duct_msg_chain_decl(duct_msg_connect_leg_error,
+duct_msg_chain_decl(duct_msg_leg_error,
     duct_handle_t tok;
     duct_result_t err;
 );
 
-static duct_exec_rc_t s_msg_exec_connect_leg_error(void *self)
+static duct_exec_rc_t s_msg_exec_leg_error(void *self)
 {
-    auto m = (duct_msg_connect_leg_error *)self;
+    auto m = (duct_msg_leg_error *)self;
     auto stok = (duct_session_handle_t){ .word = m->tok };
     auto s = duct_session_attached_by_handle(stok);
     if (s && s->proto)
@@ -6999,13 +8212,13 @@ static duct_exec_rc_t s_msg_exec_connect_leg_error(void *self)
     return duct_msg_done(m);
 }
 
-void duct_worker_post_connect_leg_error(unsigned worker_id, 
-                                        const duct_session_handle_t *h,
-                                        duct_result_t err)
+void duct_worker_post_leg_error(unsigned worker_id,
+                                const duct_session_handle_t *h,
+                                duct_result_t err)
 {
-    auto m = duct_msg_new(duct_msg_connect_leg_error,
-                                                        s_msg_exec_connect_leg_error,
-                                                        nullptr);
+    auto m = duct_msg_new(duct_msg_leg_error,
+                          s_msg_exec_leg_error,
+                          nullptr);
     duct_do_if(!m, return);
     m->tok = h->word;
     m->err = err;
@@ -7029,13 +8242,8 @@ duct_msg_chain_decl(duct_msg_timer_start,
 static duct_exec_rc_t s_msg_exec_timer_start(void *self)
 {
     auto m = (duct_msg_timer_start *)self;
-    auto ctx = duct_new(timer_ctx_t);
-    if (ctx) {
-        ctx->proto = m->proto;
-        ctx->user_ctx = m->user_ctx;
-        ctx->arg = m->arg;
-        duct_discard s_timer_start(s_this_worker, ctx, m->delay_us, 0u, s_timer_fire_free);
-    }
+    duct_timer_ctx_t ctx = { .proto = m->proto, .user_ctx = m->user_ctx, .arg = m->arg };
+    duct_discard s_timer_arm(s_this_worker, ctx, m->delay_us, 0u, s_timer_fire_free);
     return duct_msg_done(m);
 }
 
@@ -7047,6 +8255,70 @@ duct_result_t duct_worker_post_timer_start(unsigned worker_id, const duct_proto_
     m->proto = proto;
     m->user_ctx = user_ctx;
     m->delay_us = delay_us;
+    m->arg = arg;
+    if (duct_worker_post_ctrl(worker_id, m))
+        return rc_ok;
+    duct_msg_done(m);
+    return rc_invalid_order;
+}
+
+duct_msg_chain_decl(duct_msg_worker_post,
+    duct_engine_t *e;
+    duct_worker_fn fn;
+    void          *ctx;
+);
+
+static duct_exec_rc_t s_msg_exec_worker_post(void *self)
+{
+    auto m = (duct_msg_worker_post *)self;
+    m->fn(m->e, s_this_worker->worker_id, m->ctx);
+    return duct_msg_done(m);
+}
+
+duct_result_t duct_worker_post_work(unsigned worker_id, duct_engine_t *e,
+                                    duct_worker_fn fn, void *ctx)
+{
+    auto m = duct_msg_new(duct_msg_worker_post, s_msg_exec_worker_post, nullptr);
+    duct_do_if(!m, return rc_no_memory);
+    m->e = e;
+    m->fn = fn;
+    m->ctx = ctx;
+    if (duct_worker_post_ctrl(worker_id, m))
+        return rc_ok;
+    duct_msg_done(m);
+    return rc_invalid_order;
+}
+
+duct_msg_chain_decl(duct_msg_proto_post,
+    duct_engine_t *e;
+    duct_proto_t  *proto;
+    void          *user_ctx;
+    uintptr_t      arg;
+);
+
+static duct_exec_rc_t s_msg_exec_proto_post(void *self)
+{
+    auto m = (duct_msg_proto_post *)self;
+    auto cfg = duct_proto_cfg_of(m->proto);
+    cfg->on_work(m->e, s_this_worker->worker_id,
+                 m->user_ctx ? m->user_ctx : cfg->user_ctx, m->arg);
+    duct_proto_release(m->proto);
+    return duct_msg_done(m);
+}
+
+static void s_ctrl_abandon_proto_post(duct_msg_proto_post *m)
+{
+    duct_proto_release(m->proto);
+}
+
+duct_result_t duct_worker_post_proto(unsigned worker_id, duct_engine_t *e,
+                                     duct_proto_t *proto, void *user_ctx, uintptr_t arg)
+{
+    auto m = duct_msg_new_kind(proto_post, s_msg_exec_proto_post);
+    duct_do_if(!m, return rc_no_memory);
+    m->e = e;
+    m->proto = proto;
+    m->user_ctx = user_ctx;
     m->arg = arg;
     if (duct_worker_post_ctrl(worker_id, m))
         return rc_ok;
@@ -7310,6 +8582,50 @@ duct_result_t duct_conn_addrs(duct_session_t *s, duct_conn_id_t conn_id,
     return duct_io_addrs(conn, local, remote);
 }
 
+duct_result_t duct_conn_hop_dgram(duct_session_t *s, duct_conn_id_t conn_id,
+                                  const char *addr, uint32_t egress_if)
+{
+    duct_do_if(conn_id >= duct_session_max_legs, return rc_invalid_arg);
+    auto w = s_this_worker;
+    duct_do_if(!w || s->worker_id != w->worker_id, return rc_invalid_order);
+#if DUCT_EVENTS_MODEL_IOCP
+    (void)addr;
+    (void)egress_if;
+    return rc_not_supported;
+#else
+    auto h = duct_session_conn_at(s, conn_id);
+    auto conn = duct_conn_by_handle(h);
+    duct_do_if(!conn || duct_conn_phase(conn) >= conn_quiesced, return rc_invalid_order);
+    if (conn->xport_type != x_udp_peer)
+        return rc_not_supported;
+    if (duct_has(duct_conn_state(conn), fl_conn_hopping))
+        return rc_again;
+    duct_peer_t peer = {};
+    if (addr && *addr) {
+        if (!duct_connect_parse_peer(addr, &peer))
+            return rc_invalid_arg;
+    } else {
+        auto rx = duct_conn_rx_olb(conn);
+        peer = rx ? rx->peer : (duct_peer_t){};
+        if (!peer.family && duct_io_addrs(conn, nullptr, &peer) != rc_ok)
+            return rc_invalid_order;
+    }
+    if (w->tx_train.frames && w->tx_train.conn.word == h.word) {
+        s_tx_train_flush(w);
+        duct_do_if(!s->proto || duct_conn_phase(conn) >= conn_quiesced,
+                   return rc_invalid_order);
+    }
+    return duct_io_dgram_hop_start(conn, h, &peer, egress_if);
+#endif
+}
+
+bool duct_conn_hopping(const duct_session_t *s, duct_conn_id_t conn_id)
+{
+    duct_do_if(conn_id >= duct_session_max_legs, return false);
+    auto conn = duct_conn_by_handle(duct_session_conn_at(s, conn_id));
+    return conn && duct_has(duct_conn_state(conn), fl_conn_hopping);
+}
+
 duct_result_t duct_conn_tcp_congestion(duct_session_t *s, duct_conn_id_t conn_id,
                                        char out[duct_tcp_cc_name_max])
 {
@@ -7387,6 +8703,30 @@ duct_result_t duct_conn_set_uso(duct_session_t *s, duct_conn_id_t conn_id, bool 
     return rc_ok;
 }
 
+duct_result_t duct_conn_set_dgram_env(duct_session_t *s, duct_conn_id_t conn_id, bool on)
+{
+    duct_do_if(conn_id >= duct_session_max_legs, return rc_invalid_arg);
+    auto conn = duct_conn_by_handle(duct_session_conn_at(s, conn_id));
+    duct_do_if(!conn, return rc_invalid_order);
+    auto codec = conn->wire && conn->wire->unseal ? s_tls_codec(conn) : nullptr;
+    duct_do_if(!codec || !codec->env_capable, return rc_not_supported);
+    codec->env_on = on;
+    return rc_ok;
+}
+
+uint64_t duct_conn_dgram_remote_q(const duct_session_t *s, duct_conn_id_t conn_id, uint64_t now)
+{
+    if (conn_id >= duct_session_max_legs)
+        return 0u;
+    auto conn = duct_conn_by_handle(duct_session_conn_at(s, conn_id));
+    auto sc = conn ? duct_conn_sealed_ctx(conn) : nullptr;
+    auto codec = sc ? sc->codec : nullptr;
+    if (!codec || !codec->owd.remote_q_have
+        || now - codec->owd.remote_q_at > duct_owd_stale_ns)
+        return 0u;
+    return codec->owd.remote_q_ns;
+}
+
 duct_result_t duct_conn_tx_end(duct_session_t *s, duct_conn_id_t conn_id,
                                duct_tx_pos_t *out, size_t *queued)
 {
@@ -7454,7 +8794,9 @@ size_t duct_conn_tx_cap(duct_session_t *s, duct_conn_id_t conn_id)
         return 0u;
     auto conn = duct_conn_by_handle(duct_session_conn_at(s, conn_id));
     auto tx = conn ? duct_conn_tx_olb(conn) : nullptr;
-    return tx ? tx->h.buf_size : 0u;
+    /* The logical wire budget — the protocol's own ceiling where it named
+     * one — not the region the carve placed descriptors and arena in. */
+    return tx ? duct_olb_tx_byte_cap(tx) : 0u;
 }
 
 duct_conn_counters_t duct_conn_counters(const duct_session_t *s, duct_conn_id_t conn_id)
@@ -7465,7 +8807,7 @@ duct_conn_counters_t duct_conn_counters(const duct_session_t *s, duct_conn_id_t 
 
 bool duct_session_closing(const duct_session_t *s)
 {
-    return duct_atomic_load(&s->state, acquire) != session_state_attached;
+    return duct_atomic_load(&s->state, acquire) != sess_attached;
 }
 
 duct_result_t duct_conn_attach_device(duct_session_t *s, duct_conn_id_t conn_id,
@@ -7475,7 +8817,7 @@ duct_result_t duct_conn_attach_device(duct_session_t *s, duct_conn_id_t conn_id,
     bool usable = ops->wait_handle && ops->read
                && (ops->write_reserve != nullptr) == (ops->write_commit != nullptr);
     duct_do_if(!usable, ops->release(ops->ctx); return rc_invalid_arg);
-    duct_do_if(ops->rx_span > duct_ipv4_len_max,
+    duct_do_if(ops->rx_span > duct_ipv4_len_max || ops->rx_span > duct_device_rx_span_max,
                ops->release(ops->ctx); return rc_invalid_arg);
     duct_do_if(conn_id >= duct_session_max_legs,
                ops->release(ops->ctx); return rc_invalid_arg);
@@ -7501,6 +8843,7 @@ duct_result_t duct_conn_attach_connect(duct_session_t *s, duct_conn_id_t conn_id
     auto live = duct_session_handle_from_live(s);
     auto seed = (duct_conn_intent_t){
         .kind = intent_leg, .proto = s->proto, .xport = xport, .egress_if = egress_if,
+        .worker = conn_worker_none,
         .leg = { .hsession = live.word, .conn_id = conn_id },
     };
     size_t cc_len = tcp_congestion ? strnlen(tcp_congestion, sizeof seed.leg.tcp_congestion) : 0u;

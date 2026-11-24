@@ -219,7 +219,7 @@ static void io_stack_sweep(duct_vmq_mpsc_t *wfq)
     pending_leg_seed.leg.hsession = (duct_handle_t)(uintptr_t)&g_pending_leg_ctx;
     duct_pre_conn_t *list[3];
     for (unsigned i = 0u; i < 3u; ++i) {
-        list[i] = duct_new(duct_pre_conn_t);
+        list[i] = s_pre_conn_take(&s_imod.xports[0]);
         assert(list[i]);
         list[i]->timeout = timer_handle_null;
         list[i]->next = s_imod.xports[0].pre_conns;
@@ -261,8 +261,7 @@ static void io_stack_sweep(duct_vmq_mpsc_t *wfq)
     auto req_conn = duct_conn_acquire();
     assert(req_conn);
     assert(duct_io_trunk_req_post(&s_imod.xports[0].trunk, duct_conn_handle_get(req_conn), fl_req_tx_drain));
-    for (unsigned i = 0u; i < duct_max_conns; ++i)
-        assert(duct_conn_req_msg(duct_conn_by_idx(i))->msg.arg == (void *)msg_kind_embedded);
+    assert(duct_conn_req_msg(req_conn)->msg.arg == (void *)msg_kind_embedded);
     assert(s_imod.xports[0].rx_resume.msg.arg == (void *)msg_kind_embedded);
     assert(kick_listener->dgram_tx_kick.msg.arg == (void *)msg_kind_embedded);
 

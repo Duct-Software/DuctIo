@@ -28,6 +28,17 @@
 #define MSG_DONTWAIT 0
 #endif
 
+/** @brief Read how many bytes the socket still holds undelivered.
+ *  @return false where Winsock refuses the reading, @p out untouched. */
+duct_nonnull(2) static inline bool duct_x_dgram_held(SOCKET fd, size_t *out)
+{
+    u_long held = 0u;
+    if (ioctlsocket(fd, FIONREAD, &held) != 0)
+        return false;
+    *out = held > 0 ? (size_t)held : 0u;
+    return true;
+}
+
 /** @brief Event a @c WSAPoll() @c POLLHUP stands for: a read. A graceful peer
  *  FIN raises it without @c POLLIN, and @c recv's own 0-byte end then
  *  classifies the close. */
@@ -113,6 +124,17 @@ static inline void duct_xset_dgram_bufs(SOCKET fd, [[maybe_unused]] int family)
     if (family == AF_INET6)
         duct_discard setsockopt(fd, IPPROTO_IPV6, IPV6_DONTFRAG,
                                 (const char *)&(DWORD){ TRUE }, sizeof(DWORD));
+#endif
+#ifdef SIO_UDP_CONNRESET
+    /* An inbound ICMP unreachable would arm the socket: every read after it
+     * answers WSAECONNRESET until the error is consumed, which reads on a
+     * connected datagram socket has no way to tell from a real failure. The
+     * hop's retired legs drain through reads like these -- the poison turns a
+     * full band into one error and a closed socket. Winsock's own behaviour
+     * for the condition, a silent drop, is what the wire wants here. */
+    duct_discard WSAIoctl(fd, SIO_UDP_CONNRESET, &(DWORD){ FALSE }, sizeof(DWORD),
+                          &(DWORD){ 0u }, sizeof(DWORD), &(DWORD){ 0u },
+                          nullptr, nullptr);
 #endif
 }
 
@@ -232,14 +254,65 @@ duct_xset_tcp_ack_timeout(SOCKET fd, uint32_t ms)
                       (const char *)&(DWORD){ ms }, sizeof(DWORD)) == 0;
 }
 
-/** @brief Leave a new conn's socket send options as Winsock set them.
- *  Winsock takes @c TCP_CONGESTION_ALGORITHM only before connect, which a dial
- *  sets in @ref duct_xconnect. */
+/** @brief One stderr line of a closed tcp socket's stack wire state off
+ *  SIO_TCP_INFO: the pending error, the socket state, the round trip,
+ *  retransmitted bytes, timeout episodes, SYN retransmits. Answers only a
+ *  close_io_error or a close_timeout reason. */
+static inline void duct_x_tcp_close_diag(SOCKET fd, duct_close_reason_t reason)
+{
+    if (reason != close_io_error && reason != close_timeout)
+        return;
+    duct_do_if(fd == INVALID_SOCKET, return);
+    DWORD version = 0u, got = 0u;
+    duct_x_tcp_info_v0_t info;
+    if (WSAIoctl(fd, _WSAIORW(IOC_VENDOR, 39), &version, sizeof version, &info,
+                 sizeof info, &got, nullptr, nullptr) != 0
+        || got < offsetof(duct_x_tcp_info_v0_t, TimeoutEpisodes)
+                   + sizeof info.TimeoutEpisodes) {
+        int so_err = 0;
+        int so_len = (int)sizeof so_err;
+        duct_discard getsockopt(fd, SOL_SOCKET, SO_ERROR, (char *)&so_err, &so_len);
+        duct_log(stderr, "duct: tcp close reason %u fd %u so_error %d (no tcp info)",
+                 (unsigned)reason, (unsigned)fd, so_err);
+        return;
+    }
+    int so_err = 0;
+    int so_len = (int)sizeof so_err;
+    duct_discard getsockopt(fd, SOL_SOCKET, SO_ERROR, (char *)&so_err, &so_len);
+    duct_log(stderr,
+             "duct: tcp close reason %u fd %u so_error %d state %lu rtt_us %lu "
+             "retrans %lu timeouts %lu syn_retrans %u",
+             (unsigned)reason, (unsigned)fd, so_err, info.State, info.RttUs,
+             info.BytesRetrans, info.TimeoutEpisodes, (unsigned)info.SynRetrans);
+}
+
+/** @brief The send buffer a new conn's TCP socket asks Winsock for, bytes.
+ *  Winsock grants a small buffer by default and has no send autotuning: a
+ *  single flow stops at the bytes it may leave unacknowledged, which caps
+ *  every bulk leg on a long-fat path. The @c DUCT_TCP_SNDBUF environment
+ *  variable takes another figure for a bench. */
+static constexpr uint32_t duct_x_tcp_sndbuf = 4u << 20;
+
+/** @brief Grow a new conn's TCP send buffer; leave the rest as Winsock set it.
+ *  The receive side goes untaken on purpose: an explicit @c SO_RCVBUF would
+ *  turn Winsock's receive-window autotuning off. Winsock takes
+ *  @c TCP_CONGESTION_ALGORITHM only before connect, which a dial sets in
+ *  @ref duct_xconnect. */
 static inline void
-duct_xset_sock_tx([[maybe_unused]] duct_x_sock_tx_t *x, [[maybe_unused]] SOCKET fd,
-                  [[maybe_unused]] duct_xport_t xport, [[maybe_unused]] uint32_t notsent_lowat,
+duct_xset_sock_tx([[maybe_unused]] duct_x_sock_tx_t *x, SOCKET fd, duct_xport_t xport,
+                  [[maybe_unused]] uint32_t notsent_lowat,
                   [[maybe_unused]] uint32_t lowat_us, [[maybe_unused]] const char *congestion)
 {
+    if (xport != x_tcp)
+        return;
+    static thread_local int sndbuf_env = -1; /* per-thread resolve: no shared write */
+    if (sndbuf_env < 0) {
+        const char *s = getenv("DUCT_TCP_SNDBUF");
+        sndbuf_env = s ? atoi(s) : 0;
+    }
+    duct_discard setsockopt(fd, SOL_SOCKET, SO_SNDBUF,
+                            (const char *)&(int){ sndbuf_env > 0 ? sndbuf_env : (int)duct_x_tcp_sndbuf },
+                            sizeof(int));
 }
 
 /** @brief Outcome of one follow step, a lowat's or a receive buffer's. */
@@ -438,6 +511,87 @@ duct_xsend_gso_peers(SOCKET fd, const duct_dgram_out_t *msgs, unsigned n)
     duct_x_gso_msg_t m;
     return duct_x_gso_result(WSASendMsg(fd, duct_x_gso_msg_peers(&m, msgs, n), 0,
                                         &(DWORD){ 0 }, nullptr, nullptr));
+}
+
+/** @brief Fill @p m to send @p n records out a connected socket, each its
+ *  inline header and its payload span, cut at @p recs[0]'s length when @p n
+ *  is above 1.
+ *  @p n is at most @ref duct_x_gso_segs_max.
+ *  @return @p m's message. */
+duct_nonnull(1, 2) static inline WSAMSG *
+duct_x_gso_msg_recs(duct_x_gso_msg_t *m, const duct_tx_rec_t *recs, unsigned n)
+{
+    m->msg = (WSAMSG){};
+    DWORD cnt = 0u;
+    for (unsigned i = 0u; i < n; ++i) {
+        if (recs[i].hdr.size)
+            m->iov[cnt++] = (WSABUF){ (ULONG)recs[i].hdr.size, (char *)recs[i].hdr.data };
+        if (recs[i].body.size)
+            m->iov[cnt++] = (WSABUF){ (ULONG)recs[i].body.size, (char *)recs[i].body.data };
+    }
+    return duct_x_gso_msg_seg(m, cnt, n, duct_x_dgram_len_rec(&recs[0]));
+}
+
+/** @brief Send @p n records out connected socket @p fd as one USO write cut
+ *  at @p recs[0]'s length, each record its inline header and its payload
+ *  span.
+ *  @return @c rc_ok with all @p n taken; @c rc_again for a code worth
+ *  repeating; @c rc_not_supported for every other code, which sends the
+ *  group unsegmented. */
+duct_nonnull(2) static inline duct_result_t
+duct_xsend_gso_recs(SOCKET fd, const duct_tx_rec_t *recs, unsigned n)
+{
+    duct_x_gso_msg_t m;
+    return duct_x_gso_result(WSASendMsg(fd, duct_x_gso_msg_recs(&m, recs, n), 0,
+                                        &(DWORD){ 0 }, nullptr, nullptr));
+}
+
+/** @brief Send @p n records out the connected socket @p fd unsegmented, each
+ *  its inline header and its payload span.
+ *
+ *  One @c WSASend per record, its header and payload passed as two @c WSABUF
+ *  entries of one datagram, so the payload goes from wherever its record's
+ *  span keeps it; an empty span contributes no entry.
+ *
+ *  @param out_sent records Winsock took, a prefix of @p n, one a send will
+ *         never carry counted alongside them.
+ *  @return @c rc_ok with @p out_sent up to @p n, short of it once the socket
+ *          fills; @c rc_drop for a first record too large for the path;
+ *          @c rc_fatal for a socket to close.
+ */
+duct_nonnull(2, 4) static inline duct_result_t
+duct_xsend_recs(SOCKET fd, const duct_tx_rec_t *recs, unsigned n, unsigned *out_sent)
+{
+    *out_sent = 0u;
+    assert(n && n <= duct_dgram_tx_batch);
+    for (unsigned i = 0u; i < n; ++i) {
+        WSABUF wb[2];
+        DWORD cnt = 0u;
+        if (recs[i].hdr.size)
+            wb[cnt++] = (WSABUF){ .len = (ULONG)recs[i].hdr.size,
+                                  .buf = (CHAR *)recs[i].hdr.data };
+        if (recs[i].body.size)
+            wb[cnt++] = (WSABUF){ .len = (ULONG)recs[i].body.size,
+                                  .buf = (CHAR *)recs[i].body.data };
+        DWORD sent = 0u;
+        int r = cnt ? WSASend(fd, wb, cnt, &sent, 0, nullptr, nullptr) : 0;
+        if (r != SOCKET_ERROR) {
+            ++*out_sent;
+            continue;
+        }
+        int send_err = WSAGetLastError();
+        if (duct_x_send_retryable(send_err))
+            return rc_ok;
+        switch (send_err) {
+        case WSAEMSGSIZE:
+            duct_dbg_errf("WSAEMSGSIZE, %zu bytes", duct_x_dgram_len_rec(&recs[i]));
+            return i ? rc_ok : rc_drop;
+        default:
+            duct_dbg_errf("WSA error %d", send_err);
+            return rc_fatal;
+        }
+    }
+    return rc_ok;
 }
 
 /** @brief Send @p n whole datagrams out the connected socket @p fd, one span
@@ -774,9 +928,11 @@ duct_xwritev(SOCKET fd, duct_xport_t t, const duct_view_u8 *bufs, unsigned n,
     DWORD sent = 0;
     if (WSASend(fd, wbufs, n, &sent, (DWORD)flags, nullptr, nullptr) == SOCKET_ERROR) {
         int err = WSAGetLastError();
-        switch (err) {
-        case WSAEWOULDBLOCK:
+        if (duct_x_send_retryable(err))
             return rc_again;
+        switch (err) {
+        case WSAEMSGSIZE:
+            return duct_xport_delimited(t) ? rc_drop : rc_fatal;
         default:
             duct_dbg_errf("WSA error %d", err);
             return rc_fatal;
@@ -805,6 +961,14 @@ duct_xsend_dgram(SOCKET fd, const struct sockaddr *addr,
     int n = sendto(fd, (const char *)payload.data, (int)payload.size,
                    0, addr, addrlen);
     return duct_x_send_consumed(n);
+}
+
+/** @brief @ref duct_xsend_dgram ignoring @p local on platforms without @c PKTINFO. */
+duct_nonnull(2) static inline bool
+duct_xsend_dgram_from(SOCKET fd, const struct sockaddr *addr, int addrlen,
+                      [[maybe_unused]] const duct_peer_t *local, duct_view_u8 payload)
+{
+    return duct_xsend_dgram(fd, addr, addrlen, payload);
 }
 
 /** @brief Send @p n already wire-packed datagrams to @p fd, each from its own
@@ -857,9 +1021,10 @@ duct_xsend_peers(SOCKET fd, const duct_dgram_out_t *msgs, unsigned n, unsigned *
  *  nothing was received. A failure past the first read still answers @c rc_ok
  *  for what already arrived, and @p out_n < @p n tells the read loop to stop.
  */
-duct_nonnull(2, 5, 7) static inline duct_result_t
+duct_nonnull(2, 6, 8) static inline duct_result_t
 duct_xrecv_peers(SOCKET fd, const duct_view_u8 *bufs, uint32_t n,
-                 duct_peer_t *out_peers, uint32_t *out_lens, uint32_t *out_segs,
+                 duct_peer_t *out_peers, duct_peer_t *out_locals,
+                 uint32_t *out_lens, uint32_t *out_segs,
                  uint32_t *out_n)
 {
     *out_n = 0u;
@@ -873,6 +1038,8 @@ duct_xrecv_peers(SOCKET fd, const duct_view_u8 *bufs, uint32_t n,
             return *out_n ? rc_ok : rc;
         if (out_peers)
             out_peers[i] = duct_io_peer_from_sockaddr((struct sockaddr *)&addr);
+        if (out_locals)
+            out_locals[i] = (duct_peer_t){};
         out_lens[i] = (uint32_t)got;
         if (out_segs)
             out_segs[i] = (uint32_t)seg;

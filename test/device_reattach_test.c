@@ -65,7 +65,8 @@ static void s_signal_close(device_signal_t d) { close(d); }
 static void s_signal_drain(device_signal_t d)
 {
     uint64_t v = 0u;
-    duct_discard read(d, &v, sizeof v);
+    ssize_t drained = read(d, &v, sizeof v);
+    duct_discard drained;
 }
 #endif
 

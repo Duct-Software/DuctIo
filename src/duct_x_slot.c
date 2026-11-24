@@ -64,6 +64,9 @@ static bool s_grow(duct_x_slot_pool_t *pool)
         uint32_t base = c * pool->chunk_slots,
                  cnt = s_chunk_count(pool, c);
         auto links = duct_at(pool->slots);
+        if (pool->release)
+            for (uint32_t k = 0u; k < cnt; ++k)
+                duct_x_slot_stamp(pool, base + k);
         for (uint32_t k = 1u; k < cnt; ++k)
             duct_atomic_store(&links[base + k - 1u].next, base + k, relaxed);
         uint64_t head = duct_atomic_load(&pool->free_head, relaxed);
@@ -153,12 +156,15 @@ bool duct_x_slot_pool_sweep(duct_x_slot_pool_t *pool)
 }
 
 bool duct_x_slot_pool_init(duct_x_slot_pool_t *pool, uint32_t n, uint32_t slot_bytes,
-                           uint32_t lead, uint32_t chunk_slots, duct_x_slot_hooks_t hooks)
+                           uint32_t lead, uint32_t rec, uint32_t chunk_slots,
+                           duct_x_slot_hooks_t hooks)
 {
     *pool = (duct_x_slot_pool_t){};
     atomic_init(&pool->free_head, treiber_head_pack(0u, treiber_empty));
     duct_do_if(!n || !slot_bytes, return true);
-    duct_do_if(lead > slot_bytes, return false);
+    size_t word_off = duct_align_up((size_t)lead + duct_x_slot_word + rec, 8u);
+    duct_do_if(lead % 8u || slot_bytes % 8u, return false);
+    duct_do_if(word_off > slot_bytes, return false);
     size_t bytes = 0u;
     bool of = duct_ckd_mul(&bytes, (size_t)n, (size_t)slot_bytes);
     duct_do_if(of, return false);
@@ -166,20 +172,67 @@ bool duct_x_slot_pool_init(duct_x_slot_pool_t *pool, uint32_t n, uint32_t slot_b
              chunks = (n + per - 1u) / per;
     /* The links start on a cache line, so the allocation header that duct_len reads shares none with
      * the first links, the slots a LIFO list reuses first. */
-    auto slots = duct_new(duct_x_slot_t, n, duct_cacheline_size);
-    auto info = slots ? duct_new(duct_x_slot_chunk_t, chunks) : nullptr;
+    duct_auto_del auto slots = duct_new(duct_x_slot_t, n, duct_cacheline_size);
+    duct_auto_del auto info = slots ? duct_new(duct_x_slot_chunk_t, chunks) : nullptr;
     assert(!hooks.reserve || hooks.up);
     auto range = !info ? (duct_vm_handle_t){} : hooks.reserve ? duct_vm_reserve(bytes) : duct_vm_new(bytes);
-    duct_do_if(!range.base, duct_del(info); duct_del(slots); return false);
-    pool->slots = slots;
-    pool->chunks = info;
+    duct_do_if(!range.base, return false);
+    pool->slots = duct_move(slots);
+    pool->chunks = duct_move(info);
     pool->range = range;
     pool->hooks = hooks;
     pool->slot_bytes = slot_bytes;
     pool->lead = lead;
+    pool->payload_off = (uint32_t)word_off;
     pool->chunk_slots = per;
     pool->n_chunks = chunks;
     return true;
+}
+
+void duct_x_slot_release_obj(void *obj)
+{
+    auto pool = duct_x_slot_pool_of(obj);
+    uint32_t idx = duct_x_slot_index(pool, obj);
+    /* the lane's plain return: a pin standing on the record holds the slot */
+    if (duct_x_slot_drop(pool, idx, false))
+        duct_x_slot_release(pool, idx);
+}
+
+void duct_x_slot_pool_engage(duct_x_slot_pool_t *pool)
+{
+    duct_do_if(!pool->range.base, return);
+    pool->release = duct_x_slot_release_obj;
+    for (uint32_t c = 0u; c < pool->n_chunks; ++c) {
+        duct_do_if(duct_atomic_load(&duct_at(pool->chunks)[c].state, relaxed) != chunk_live, continue);
+        uint32_t base = c * pool->chunk_slots;
+        for (uint32_t k = 0u, cnt = s_chunk_count(pool, c); k < cnt; ++k)
+            duct_x_slot_stamp(pool, base + k);
+    }
+}
+
+void duct_x_slot_pool_reap(duct_x_slot_pool_t *pool)
+{
+    uint32_t state = duct_atomic_load(&pool->retire_state, acquire);
+    while (state == pool_retire_retired) {
+        if (duct_atomic_load(&pool->outstanding, acquire) != 0u)
+            return;
+        uint32_t retired = pool_retire_retired;
+        if (duct_atomic_cas(weak, &pool->retire_state, &retired, pool_retire_reaped,
+                            acq_rel, relaxed)) {
+            pool->on_reap(pool);
+            return;
+        }
+        state = retired;
+    }
+}
+
+void duct_x_slot_pool_retire(duct_x_slot_pool_t *pool, void (*on_reap)(duct_x_slot_pool_t *))
+{
+    pool->on_reap = on_reap;
+    uint32_t live = pool_retire_live;
+    if (duct_atomic_cas(strong, &pool->retire_state, &live, pool_retire_retired,
+                        acq_rel, relaxed))
+        duct_x_slot_pool_reap(pool);
 }
 
 duct_x_slot_pool_t *

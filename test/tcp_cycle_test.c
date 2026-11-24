@@ -6,13 +6,16 @@
  * @brief Two ductio ends of one loopback TCP session keep reading each other
  * while each has more queued for the other than the path holds.
  *
- * One io thread and one worker carry both ends. The accepting end posts its
- * whole run through duct_session_invoke ahead of any echo: frame_count frames
- * of frame_size bytes, 64 MiB. Its socket buffers are pinned small on the
- * listening socket, which the accepted one inherits, so its sends meet a full
- * ring and park almost at once; the dialing end autotunes, and the loop between
- * them still holds a small part of the run. Every frame carries its index, and
- * each end checks the order it arrives in.
+ * One io thread and one worker carry both ends. Each posting side feeds its
+ * whole run through duct_session_invoke behind a send-done window a little
+ * wider than the pinned path: frame_count frames of frame_size bytes, 64 MiB,
+ * of which at most the window's worth rests in the engine's knob-bounded park
+ * at once and the rest in the posting loop. The accepting end's socket
+ * buffers are pinned small on the listening socket, which the accepted one
+ * inherits, so its sends meet a full ring and park almost at once; the
+ * dialing end autotunes, and the loop between them still holds a small part
+ * of the run. Every frame carries its index, and each end checks the order it
+ * arrives in.
  *
  * Shapes: echo, where the dialing end answers each frame with its own bytes and
  * the accepting end answers nothing; sinks, where the dialing end posts the
@@ -78,7 +81,16 @@ static atomic_int    g_opened;
 static atomic_uint   g_got[side_count];
 static atomic_uint   g_bad[side_count];
 static duct_handle_t g_tok[side_count];
-static uint8_t       g_scratch[frame_size];
+static duct_session_t *g_sess[side_count];
+
+/* Posting window: reusable ring of post_window buffers per side.
+ * on_send_done settles on drain (frontier = 1-based monotonic count of
+ * drained frames), so slot (i % post_window) is guaranteed free to refill
+ * once frontier > i - post_window without staging-vs-wire races. */
+static constexpr unsigned post_window = 12u;
+static uint8_t       g_post_buf[side_count][post_window][frame_size];
+static _Atomic uint64_t g_post_done[side_count];
+static atomic_uint   g_post_failed;
 
 #ifdef TCP_CYCLE_NOISE
 static duct_noise_cfg_t g_accept_cfg,
@@ -131,36 +143,56 @@ s_dial_frame([[maybe_unused]] duct_session_t *s, [[maybe_unused]] duct_conn_id_t
 }
 
 static duct_result_t
-s_accept_open([[maybe_unused]] duct_session_t *s, duct_handle_t tok,
+s_accept_open(duct_session_t *s, duct_handle_t tok,
               [[maybe_unused]] void *user_ctx, [[maybe_unused]] duct_response_t *out,
               [[maybe_unused]] void *proto_state)
 {
     g_tok[side_accept] = tok;
+    g_sess[side_accept] = s;
     duct_atomic_fetch(add, &g_opened, 1, release);
     return rc_ok;
 }
 
 static duct_result_t
-s_dial_open([[maybe_unused]] duct_session_t *s, duct_handle_t tok,
+s_dial_open(duct_session_t *s, duct_handle_t tok,
             [[maybe_unused]] void *user_ctx, [[maybe_unused]] duct_response_t *out,
             [[maybe_unused]] void *proto_state)
 {
     g_tok[side_dial] = tok;
+    g_sess[side_dial] = s;
     duct_atomic_fetch(add, &g_opened, 1, release);
     return rc_ok;
 }
 
-/** @brief One frame of the run, its index in @p ctx. The scratch is shared:
- *  invokes run one at a time on the one worker, and the commit copies the
- *  bytes into the ring or into the parked response before the next runs. */
+/** @brief Which side a live session is: the session pointer its open callback
+ *  recorded. */
+static side_t s_side_of(const duct_session_t *s)
+{
+    return s == g_sess[side_dial] ? side_dial : side_accept;
+}
+
 static duct_result_t
-s_post([[maybe_unused]] duct_session_t *s, duct_response_t *out, void *ctx)
+s_post(duct_session_t *s, duct_response_t *out, void *ctx)
 {
     auto i = (uint32_t)(uintptr_t)ctx;
-    memcpy(g_scratch, &i, sizeof i);
-    memset(g_scratch + sizeof i, s_fill_byte(i), frame_size - sizeof i);
-    duct_response_same(out, duct_view(duct_view_u8, g_scratch, frame_size),
-                       fl_send_copy, 0);
+    auto side = s_side_of(s);
+    auto b = g_post_buf[side][i % post_window];
+    memcpy(b, &i, sizeof i);
+    memset(b + sizeof i, s_fill_byte(i), frame_size - sizeof i);
+    duct_response_same(out, duct_view(duct_view_u8, b, frame_size),
+                       (duct_send_flags_t)(fl_send_static | fl_send_done), 0);
+    return rc_ok;
+}
+
+/** @brief Send-done: advance drained frontier, releasing slots up to info->frontier. */
+static duct_result_t
+s_on_send_done(duct_session_t *s, const duct_send_done_info_t *info,
+               [[maybe_unused]] duct_response_t *out,
+               [[maybe_unused]] void *proto_state)
+{
+    if (info->result != rc_ok)
+        duct_atomic_fetch(add, &g_post_failed, 1u, relaxed);
+    duct_atomic_store(&g_post_done[s_side_of(s)], info->frontier, release);
     return rc_ok;
 }
 
@@ -192,6 +224,7 @@ static duct_proto_t *s_proto(const cell_t *cell, side_t side)
         .wire = wire,
         .on_frame = side == side_accept ? s_accept_frame : s_dial_frame,
         .on_session_open = side == side_accept ? s_accept_open : s_dial_open,
+        .on_send_done = s_on_send_done,
         .max_response = cell->max_response,
     });
     if (proto)
@@ -248,11 +281,13 @@ static const char *s_cell(duct_engine_t *io, const cell_t *cell, duct_proto_t *a
 {
     duct_atomic_store(&g_shape, cell->shape, relaxed);
     duct_atomic_store(&g_opened, 0, relaxed);
+    duct_atomic_store(&g_post_failed, 0u, relaxed);
     for (unsigned i = 0u; i < side_count; ++i) {
-        duct_atomic_store(&g_got[i], 0u, relaxed);
-        duct_atomic_store(&g_bad[i], 0u, relaxed);
+        duct_atomic_store(&g_got[i], 0, relaxed);
+        duct_atomic_store(&g_bad[i], 0, relaxed);
+        duct_atomic_store(&g_post_done[i], 0u, relaxed);
     }
-    uint16_t port = 0u;
+    uint16_t port = 0;
     char addr[64];
     if (!s_listen(io, accept, &port))
         return "listen failed";
@@ -262,13 +297,24 @@ static const char *s_cell(duct_engine_t *io, const cell_t *cell, duct_proto_t *a
     if (!th_wait_int(&g_opened, 2, open_ms))
         return "the sessions never opened";
     for (uint32_t i = 0u; i < frame_count; ++i) {
+        /* Hold the run in the posting loop: the engine carries at most
+         * post_window unresolved sends of a side, the buffers rotating by
+         * send-done. */
         auto ctx = (void *)(uintptr_t)i;
-        if (duct_session_invoke(io, g_tok[side_accept], s_post, ctx) != rc_ok
-            || (cell->shape == shape_sinks
-                && duct_session_invoke(io, g_tok[side_dial], s_post, ctx) != rc_ok))
+        while (i - duct_atomic_load(&g_post_done[side_accept], acquire) >= post_window)
+            th_sleep_ms(1);
+        if (duct_session_invoke(io, g_tok[side_accept], s_post, ctx) != rc_ok)
             return "an invoke was refused";
+        if (cell->shape == shape_sinks) {
+            while (i - duct_atomic_load(&g_post_done[side_dial], acquire) >= post_window)
+                th_sleep_ms(1);
+            if (duct_session_invoke(io, g_tok[side_dial], s_post, ctx) != rc_ok)
+                return "an invoke was refused";
+        }
     }
     auto err = s_drain(io, cell);
+    if (!err && duct_atomic_load(&g_post_failed, relaxed))
+        err = "a posted frame failed to pack";
     if (!err && (duct_atomic_load(&g_bad[side_accept], relaxed)
                  || duct_atomic_load(&g_bad[side_dial], relaxed)))
         err = "a frame arrived out of order or damaged";

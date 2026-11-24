@@ -33,7 +33,8 @@ typedef struct duct_worker_rt {
              batch_partial_defer, /**< Frame batches deferred mid-batch: a prefix already
                                     *  dispatched, the remainder parked on defer_q. */
              defer_oom_drop, /**< Frames ack+dropped because a defer-node alloc failed. */
-             rx_resume_post, /**< s_rx_ack cleared an RX-full latch and reposted. */
+             rx_resume_post, /**< s_rx_ack posted the read resume on its
+                              *  crossing edge over the armed target. */
              commit_internal, /**< s_commit_response returned commit_internal. */
              retry_saved,     /**< Successful emit/frame/timer retry save (s_retry_*_save). */
              dgram_shared_tx_drop, /**< x_udp_shared response dropped: its listener's
@@ -64,8 +65,6 @@ typedef struct duct_worker_rt {
              dgram_tx_gso_writes, /**< Segmented writes the fast-path batch made, each
                                     *  one peer's group of equal-sized datagrams. */
              dgram_tx_gso_dgrams, /**< Datagrams those writes carried. */
-             tx_pool_acquire_fail, /**< duct_tx_pool_acquire returned NULL: the worker's
-                                      *  TX staging pool had no room for the request. */
              vnet_tx_gro_writes, /**< Segmented writes a vnet leg's train made,
                                    *  each of two or more segments. */
              vnet_tx_gro_pkts,   /**< Segments those writes carried. */
@@ -138,6 +137,25 @@ typedef struct duct_io_rt {
                                         *  round-tripped through trunk.stack for nothing,
                                         *  because a real EPOLLOUT reconcile already emptied
                                         *  the lane first. */
+             dgram_hop_swap_fail,     /**< s_msg_exec_dgram_hop swaps that gave up: the
+                                        *  parked spare and a fresh open both failed to
+                                        *  connect, the leg staying on its current tuple
+                                        *  until the next threshold hop. */
+             dgram_hop_wheel_give,    /**< Retired sockets the socket wheel took in. */
+             dgram_hop_wheel_reap,    /**< ...of those, reaped by a hold's end: drained
+                                        *  dry, then closed. */
+             dgram_hop_wheel_extend,  /**< ...of those, a reap pass that could not prove
+                                        *  the band landed yet, the hold extended once more. */
+             dgram_hop_wheel_forced,  /**< ...of those, closed ahead of the hold: the wheel
+                                        *  full, the oldest giving its slot up. */
+             dgram_hop_band_taken,    /**< Retired bands' datagrams the drain committed into
+                                        *  the conn's rx ring. */
+             dgram_hop_band_stall,    /**< Drain passes the ring refused room to: the band
+                                        *  waits behind the live flow. */
+             dgram_hop_band_drop,     /**< Band datagrams dequeued whole and dropped: each
+                                        *  past the wire's bounds. */
+             dgram_hop_band_error,    /**< Drain reads that answered a socket error: counted
+                                        *  and stepped over, the queue carrying on. */
              dgram_tx_batch_calls,    /**< s_dgram_tx_lane_drain_batch calls that offered
                                         *  the socket at least one entry. */
              dgram_tx_batch_msgs,     /**< Entries those calls offered: submissions, so an

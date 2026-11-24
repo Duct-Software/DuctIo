@@ -91,8 +91,8 @@ static constexpr size_t duct_vnet_gso_lead = 2u;
  *  @return Bytes written from @p rec; 0, with nothing written, for a malformed
  *          read, another segmentation type, or a cut over @p room.
  */
-size_t duct_vnet_cut(const uint8_t *vh, uint8_t *rec, size_t len, size_t rec_max,
-                     bool uso, size_t room, unsigned *pkts);
+size_t duct_vnet_cut(const uint8_t vh[static 10], size_t room, uint8_t rec[static room],
+                     size_t len, size_t rec_max, bool uso, unsigned *pkts);
 
 /** @brief Outcome of offering one packet to a train. */
 typedef enum duct_vnet_gro_rc : uint8_t {
@@ -164,7 +164,7 @@ static constexpr unsigned duct_vnet_udp_segs_max = 64u;
  *  bytes of @p pkt stay unchanged until the train has been written. Its headers
  *  are copied only when it opens the train.
  */
-duct_vnet_gro_rc_t duct_vnet_gro_offer(duct_vnet_gro_t *g, const uint8_t *pkt, size_t len,
+duct_vnet_gro_rc_t duct_vnet_gro_offer(duct_vnet_gro_t *g, size_t len, const uint8_t pkt[static len],
                                        size_t mss, duct_vnet_merge_t merge);
 
 /** @brief Close the train in @p g and write its @c virtio_net_hdr to @p vnet.

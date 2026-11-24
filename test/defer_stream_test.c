@@ -11,6 +11,7 @@
 
 #include "duct.h"
 #include "duct_wire.h"
+#include "duct_session_block.h"
 #include "test_helpers.h"
 
 #include <stdatomic.h>
@@ -105,19 +106,12 @@ mux_pack([[maybe_unused]] const duct_wire_t *self, [[maybe_unused]] duct_session
         duct_view(duct_view_u8, hdr, mux_hdr_size), frame->payload);
 }
 
-static duct_wire_parser_t *
-mux_create_parser([[maybe_unused]] const duct_wire_t *self)
-{
-    auto st = duct_new(mux_parser_t);
-    duct_do_if(!st, return nullptr);
-    *st = (mux_parser_t){};
-    return (duct_wire_parser_t *)st;
-}
+static_assert(sizeof(mux_parser_t) <= duct_wire_parser_slot,
+              "the test wire's parser exceeds the conn block's parser slot");
 
-static void mux_destroy_parser([[maybe_unused]] const duct_wire_t *self, duct_wire_parser_t *parser)
+static void mux_init_parser([[maybe_unused]] const duct_wire_t *self,
+                            [[maybe_unused]] duct_wire_parser_t *storage)
 {
-    auto st = (mux_parser_t *)parser;
-    duct_del(st);
 }
 
 static void mux_destroy(duct_wire_t *self)
@@ -134,7 +128,7 @@ static duct_wire_t *mux_wire_create(void)
         .name = "test-mux",
         .header_size = mux_hdr_size,
         .destroy = mux_destroy, .on_parse = mux_parse, .on_pack = mux_pack,
-        .create_parser = mux_create_parser, .destroy_parser = mux_destroy_parser,
+        .parser_max = sizeof(mux_parser_t), .init_parser = mux_init_parser,
     };
     return &w->base;
 }
@@ -191,6 +185,8 @@ static ssize_t s_recv_mux(duct_sock_t fd, uint32_t *out_sid, char *buf, size_t b
 
 static atomic_int g_defer_phase = 0;
 static atomic_int g_frame_count = 0;
+static atomic_int g_mode = 0;
+static atomic_int g_error_no_mem = 0;
 
 static duct_result_t
 on_frame_defer([[maybe_unused]] duct_session_t *s,
@@ -199,8 +195,11 @@ on_frame_defer([[maybe_unused]] duct_session_t *s,
                duct_response_t *out,
                [[maybe_unused]] void *proto_state)
 {
+    int mode = duct_atomic_load(&g_mode, relaxed);
+    if (mode == 1)
+        return rc_defer;
     int phase = duct_atomic_fetch(add, &g_defer_phase, 1, relaxed);
-    if (phase == 0)
+    if (mode == 0 && phase == 0)
         return rc_defer;
     duct_atomic_fetch(add, &g_frame_count, 1, relaxed);
     /* Echo on the same stream. */
@@ -208,6 +207,15 @@ on_frame_defer([[maybe_unused]] duct_session_t *s,
     out->flags = fl_send_copy;
     out->conn_id = duct_conn_id_same;
     out->stream_id = frame->stream_id;
+    return rc_ok;
+}
+
+static duct_result_t
+on_error_budget([[maybe_unused]] duct_session_t *s, duct_result_t rc,
+                [[maybe_unused]] duct_response_t *out,
+                [[maybe_unused]] void *proto_state)
+{
+    duct_atomic_fetch(add, &g_error_no_mem, rc == rc_no_memory, relaxed);
     return rc_ok;
 }
 
@@ -263,6 +271,65 @@ static const char *test_defer_stream(duct_engine_t *io, duct_proto_t *proto)
     return nullptr;
 }
 
+/* A one-frame defer node is exactly one grain unit, so the paced sends keep
+ * every frame its own io batch, one node each, and the budget's node count is
+ * the region's unit count. */
+static constexpr unsigned budget_nodes = duct_session_defer_bytes / session_defer_grain;
+static constexpr unsigned budget_sends = budget_nodes + 8u;
+
+static const char *test_defer_budget(void)
+{
+    duct_atomic_store(&g_error_no_mem, 0, seq_cst);
+    duct_atomic_store(&g_mode, 1, seq_cst);
+
+    duct_sock_t fd = th_connect(th_port);
+    if (fd == duct_sock_bad) return "connect failed";
+    for (unsigned i = 0u; i < budget_sends; ++i) {
+        if (s_send_mux(fd, 9u, "b", 1u) != 0) { close(fd); return "budget send failed"; }
+        struct timespec ts = { .tv_nsec = 5L * 1000L * 1000L };
+        nanosleep(&ts, nullptr);
+    }
+    for (unsigned waits = 0u;
+         duct_atomic_load(&g_error_no_mem, seq_cst) == 0 && waits < 500u; ++waits) {
+        struct timespec ts = { .tv_nsec = 10L * 1000L * 1000L };
+        nanosleep(&ts, nullptr);
+    }
+    if (duct_atomic_load(&g_error_no_mem, seq_cst) == 0)
+        return "the defer budget never refused a batch";
+
+    duct_atomic_store(&g_mode, 2, seq_cst);
+    /* A parked worker replays its defer queue on the next pass alone: one more
+     * frame on the same conn is the wake that pass needs, whatever becomes of
+     * the frame itself. */
+    if (s_send_mux(fd, 9u, "b", 1u) != 0) { close(fd); return "wake send failed"; }
+    unsigned echoed = 0u;
+    for (unsigned waits = 0u; waits < 300u && echoed < budget_nodes + 1u; ++waits) {
+        struct pollfd pfd = { .fd = fd, .events = POLLIN };
+        if (poll(&pfd, 1, 10) == 1 && s_recv_mux(fd, &(uint32_t){0u}, &(char){0}, 1) == 1)
+            ++echoed;
+    }
+    if (echoed == 0u || echoed > budget_nodes + 1u)
+        return "the parked batches did not replay inside the budget's node count";
+
+    duct_atomic_store(&g_error_no_mem, 0, seq_cst);
+    duct_atomic_store(&g_mode, 1, seq_cst);
+    for (unsigned i = 0u; i < budget_sends; ++i) {
+        if (s_send_mux(fd, 9u, "b", 1u) != 0) { close(fd); return "second-round send failed"; }
+        struct timespec ts = { .tv_nsec = 5L * 1000L * 1000L };
+        nanosleep(&ts, nullptr);
+    }
+    for (unsigned waits = 0u;
+         duct_atomic_load(&g_error_no_mem, seq_cst) == 0 && waits < 500u; ++waits) {
+        struct timespec ts = { .tv_nsec = 10L * 1000L * 1000L };
+        nanosleep(&ts, nullptr);
+    }
+    close(fd);
+    if (duct_atomic_load(&g_error_no_mem, seq_cst) == 0)
+        return "the replayed nodes' units never returned to the region";
+    duct_atomic_store(&g_mode, 0, seq_cst);
+    return nullptr;
+}
+
 /* ── Main ────────────────────────────────────────────────────────── */
 
 int main(void)
@@ -276,6 +343,7 @@ int main(void)
     auto proto = duct_proto_create(&(duct_proto_cfg_t){
         .name = "defer-stream", .wire = wire,
         .on_frame = on_frame_defer,
+        .on_error = on_error_budget,
         .on_stream_open = on_stream_open,
         .create_stream_state = s_create_stream_state,
         .flags = fl_proto_multiplexed,
@@ -293,6 +361,8 @@ int main(void)
     }
 
     const char *err = test_defer_stream(io, proto);
+    if (!err)
+        err = test_defer_budget();
 
     duct_engine_stop(io);
     pthread_join(th, nullptr);

@@ -109,23 +109,23 @@ static const uint8_t k_sealed_r2i[37] = {
     0x53,
 };
 
-static void s_fill(uint8_t *p, size_t n, uint8_t first)
+static void s_fill(size_t n, uint8_t p[static n], uint8_t first)
 {
     for (size_t i = 0u; i < n; ++i)
         p[i] = (uint8_t)(first + i);
 }
 
-static duct_view_u8 s_bytes(const uint8_t *p, size_t n)
+static duct_view_u8 s_bytes(size_t n, const uint8_t p[static n])
 {
     return duct_view(duct_view_u8, (void *)p, n);
 }
 
 static duct_view_u8 s_text(const char *s)
 {
-    return s_bytes((const uint8_t *)s, strlen(s));
+    return s_bytes(strlen(s), (const uint8_t *)s);
 }
 
-static bool s_same(const uint8_t *got, size_t n, duct_view_u8 want)
+static bool s_same(size_t n, const uint8_t got[static n], duct_view_u8 want)
 {
     return n == want.size && memcmp(got, want.data, n) == 0;
 }
@@ -186,16 +186,16 @@ static const char *s_ik_messages(kat_t *k)
     uint8_t remote[duct_noise_key_size],
             payload[64];
     size_t payload_len = 0u;
-    if (!duct_noise_hs_write_msg1(k->hi, k->payload[0], k->msg[0], sizeof k->msg[0], &k->len[0]))
+    if (!duct_noise_hs_write_msg1(k->hi, k->payload[0], sizeof k->msg[0], k->msg[0], &k->len[0]))
         return "message 1 failed";
-    if (!duct_noise_hs_read_msg1(k->hr, s_bytes(k->msg[0], k->len[0]), remote, payload, sizeof payload,
-                                 &payload_len)
+    if (!duct_noise_hs_read_msg1(k->hr, s_bytes(k->len[0], k->msg[0]), remote, sizeof payload,
+                                 payload, &payload_len)
         || memcmp(remote, k->ki.pub, sizeof remote) != 0
-        || !s_same(payload, payload_len, k->payload[0]))
+        || !s_same(payload_len, payload, k->payload[0]))
         return "message 1 was not read";
-    if (!duct_noise_hs_write_msg2(k->hr, k->payload[1], k->msg[1], sizeof k->msg[1], &k->len[1]))
+    if (!duct_noise_hs_write_msg2(k->hr, k->payload[1], sizeof k->msg[1], k->msg[1], &k->len[1]))
         return "message 2 failed";
-    if (!duct_noise_hs_read_msg2(k->hi, s_bytes(k->msg[1], k->len[1])))
+    if (!duct_noise_hs_read_msg2(k->hi, s_bytes(k->len[1], k->msg[1])))
         return "message 2 was not read";
     return nullptr;
 }
@@ -207,21 +207,21 @@ static const char *s_xk_messages(kat_t *k)
     uint8_t remote[duct_noise_key_size],
             payload[64];
     size_t payload_len = 0u;
-    if (!duct_noise_hs_write_msg1_xk(k->hi, k->payload[0], k->msg[0], sizeof k->msg[0], &k->len[0]))
+    if (!duct_noise_hs_write_msg1_xk(k->hi, k->payload[0], sizeof k->msg[0], k->msg[0], &k->len[0]))
         return "message 1 failed";
-    if (!duct_noise_hs_read_msg1_xk(k->hr, s_bytes(k->msg[0], k->len[0]), payload, sizeof payload, &payload_len)
-        || !s_same(payload, payload_len, k->payload[0]))
+    if (!duct_noise_hs_read_msg1_xk(k->hr, s_bytes(k->len[0], k->msg[0]), sizeof payload, payload, &payload_len)
+        || !s_same(payload_len, payload, k->payload[0]))
         return "message 1 was not read";
-    if (!duct_noise_hs_write_msg2_xk(k->hr, k->payload[1], k->msg[1], sizeof k->msg[1], &k->len[1]))
+    if (!duct_noise_hs_write_msg2_xk(k->hr, k->payload[1], sizeof k->msg[1], k->msg[1], &k->len[1]))
         return "message 2 failed";
-    if (!duct_noise_hs_read_msg2_xk(k->hi, s_bytes(k->msg[1], k->len[1])))
+    if (!duct_noise_hs_read_msg2_xk(k->hi, s_bytes(k->len[1], k->msg[1])))
         return "message 2 was not read";
-    if (!duct_noise_hs_write_msg3_xk(k->hi, k->payload[2], k->msg[2], sizeof k->msg[2], &k->len[2]))
+    if (!duct_noise_hs_write_msg3_xk(k->hi, k->payload[2], sizeof k->msg[2], k->msg[2], &k->len[2]))
         return "message 3 failed";
-    if (!duct_noise_hs_read_msg3_xk(k->hr, s_bytes(k->msg[2], k->len[2]), s_psk_of, k, remote, payload,
-                                    sizeof payload, &payload_len)
+    if (!duct_noise_hs_read_msg3_xk(k->hr, s_bytes(k->len[2], k->msg[2]), s_psk_of, k, remote,
+                                    sizeof payload, payload, &payload_len)
         || memcmp(remote, k->ki.pub, sizeof remote) != 0
-        || !s_same(payload, payload_len, k->payload[2]))
+        || !s_same(payload_len, payload, k->payload[2]))
         return "message 3 was not read";
     return nullptr;
 }
@@ -249,11 +249,11 @@ static const char *s_run(kat_t *k)
 {
     uint8_t si[duct_noise_key_size], sr[duct_noise_key_size], psk[duct_noise_key_size];
     g_minted = 0u;
-    s_fill(g_ephemeral[0], sizeof g_ephemeral[0], 0x41u);
-    s_fill(g_ephemeral[1], sizeof g_ephemeral[1], 0x61u);
-    s_fill(si, sizeof si, 0x01u);
-    s_fill(sr, sizeof sr, 0x21u);
-    s_fill(psk, sizeof psk, 0xa1u);
+    s_fill(sizeof g_ephemeral[0], g_ephemeral[0], 0x41u);
+    s_fill(sizeof g_ephemeral[1], g_ephemeral[1], 0x61u);
+    s_fill(sizeof si, si, 0x01u);
+    s_fill(sizeof sr, sr, 0x21u);
+    s_fill(sizeof psk, psk, 0xa1u);
     if (!duct_noise_keypair_from_priv(&k->ki, si) || !duct_noise_keypair_from_priv(&k->kr, sr))
         return "static keys failed";
     k->hi = duct_noise_hs_create(&k->ki, k->kr.pub, psk, true);
@@ -268,8 +268,8 @@ static const char *s_run(kat_t *k)
         return err;
     if (k->len[0] != sizeof k_msg1 || k->len[1] != sizeof k_msg2)
         return "a message has another size";
-    size_t n1 = duct_noise_transport_seal(&k->ti, (duct_view_u8[]){ s_text(k_plain) }, 1u, k->sealed_i2r, sizeof k->sealed_i2r);
-    size_t n2 = duct_noise_transport_seal(&k->tr, (duct_view_u8[]){ s_text(k_plain) }, 1u, k->sealed_r2i, sizeof k->sealed_r2i);
+    size_t n1 = duct_noise_transport_seal(&k->ti, (duct_view_u8[]){ s_text(k_plain) }, 1u, sizeof k->sealed_i2r, k->sealed_i2r);
+    size_t n2 = duct_noise_transport_seal(&k->tr, (duct_view_u8[]){ s_text(k_plain) }, 1u, sizeof k->sealed_r2i, k->sealed_r2i);
     return n1 == sizeof k->sealed_i2r && n2 == sizeof k->sealed_r2i ? nullptr : "sealing failed";
 }
 
@@ -288,30 +288,30 @@ static const char *s_transport(kat_t *k, const vector_t *v)
                 plain[64];
         size_t sealed_len = sizeof counter + m->ct_len,
                plain_len = 0u;
-        if (duct_noise_transport_seal(from, (duct_view_u8[]){ s_bytes(m->payload, m->payload_len) }, 1u, wire, sizeof wire) != sealed_len)
+        if (duct_noise_transport_seal(from, (duct_view_u8[]){ s_bytes(m->payload_len, m->payload) }, 1u, sizeof wire, wire) != sealed_len)
             return "a transport message sealed to another size";
         uint8_t covered[duct_noise_counter_size];
         memcpy(covered, counter, sizeof counter);
-        duct_noise_counter_cover(from->send_key, covered, wire + sizeof counter,
-                                 from->counter_size);
+        duct_noise_counter_cover(from->send_key, from->counter_size, covered,
+                                 wire + sizeof counter);
         s_expect("vector transport counter", wire, covered, from->counter_size);
         s_expect("vector transport message", wire + sizeof counter, m->ct, m->ct_len);
         uint64_t used = from->send_counter - 1u;
         for (size_t cut = 0u; cut <= m->payload_len; ++cut) {
-            duct_view_u8 parts[3] = { s_bytes(m->payload, cut), {}, s_bytes(m->payload + cut, m->payload_len - cut) };
+            duct_view_u8 parts[3] = { s_bytes(cut, m->payload), {}, s_bytes(m->payload_len - cut, m->payload + cut) };
             uint8_t again[sizeof wire];
             from->send_counter = used;
-            if (duct_noise_transport_seal(from, parts, 3u, again, sizeof again) != sealed_len
+            if (duct_noise_transport_seal(from, parts, 3u, sizeof again, again) != sealed_len
                 || memcmp(again, wire, sealed_len) != 0)
                 return "a transport message cut into spans sealed to other bytes";
         }
         from->send_counter = used + 1u;
         memcpy(wire, counter, sizeof counter);
-        duct_noise_counter_cover(to->recv_key, wire, wire + sizeof counter,
-                                 to->counter_size);
+        duct_noise_counter_cover(to->recv_key, to->counter_size, wire,
+                                 wire + sizeof counter);
         memcpy(wire + sizeof counter, m->ct, m->ct_len);
-        if (!duct_noise_transport_unseal(to, s_bytes(wire, sealed_len), plain, sizeof plain, &plain_len)
-            || !s_same(plain, plain_len, s_bytes(m->payload, m->payload_len)))
+        if (!duct_noise_transport_unseal(to, s_bytes(sealed_len, wire), sizeof plain, plain, &plain_len)
+            || !s_same(plain_len, plain, s_bytes(m->payload_len, m->payload)))
             return "a transport message was not read";
     }
     return nullptr;
@@ -329,7 +329,7 @@ static const char *s_run_vector(kat_t *k, const vector_t *v)
     if (!duct_noise_keypair_from_priv(&k->ki, v->init_static) || !duct_noise_keypair_from_priv(&k->kr, v->resp_static)
         || memcmp(k->kr.pub, v->resp_static_pub, sizeof k->kr.pub) != 0)
         return "static keys failed";
-    duct_view_u8 prologue = s_bytes(v->prologue, v->prologue_len);
+    duct_view_u8 prologue = s_bytes(v->prologue_len, v->prologue);
     k->pattern = v->pattern;
     k->psk = v->psk;
     k->hi = duct_noise_hs_create_for(v->pattern, &k->ki, k->kr.pub, v->psk, true, prologue);
@@ -337,7 +337,7 @@ static const char *s_run_vector(kat_t *k, const vector_t *v)
     if (!k->hi || !k->hr)
         return "handshake state failed";
     for (unsigned i = 0u; i < v->handshake_messages; ++i)
-        k->payload[i] = s_bytes(v->message[i].payload, v->message[i].payload_len);
+        k->payload[i] = s_bytes(v->message[i].payload_len, v->message[i].payload);
     auto err = s_handshake(k);
     if (err)
         return err;
@@ -387,10 +387,12 @@ int main(void)
         s_expect("k_exporter", k.exporter, k_exporter, sizeof k_exporter);
         uint8_t want_i2r[sizeof k_sealed_i2r], want_r2i[sizeof k_sealed_r2i];
         memcpy(want_i2r, k_sealed_i2r, sizeof want_i2r);
-        duct_noise_counter_cover(k.ti.send_key, want_i2r, want_i2r + 8u, k.ti.counter_size);
+        duct_noise_counter_cover(k.ti.send_key, k.ti.counter_size, want_i2r,
+                                     want_i2r + 8u);
         s_expect("k_sealed_i2r", k.sealed_i2r, want_i2r, sizeof k.sealed_i2r);
         memcpy(want_r2i, k_sealed_r2i, sizeof want_r2i);
-        duct_noise_counter_cover(k.tr.send_key, want_r2i, want_r2i + 8u, k.tr.counter_size);
+        duct_noise_counter_cover(k.tr.send_key, k.tr.counter_size, want_r2i,
+                                     want_r2i + 8u);
         s_expect("k_sealed_r2i", k.sealed_r2i, want_r2i, sizeof k.sealed_r2i);
     }
     s_release(&k);

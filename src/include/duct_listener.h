@@ -11,8 +11,11 @@
  *  worker there instead: node k is read by io thread k % @c n_io and opens
  *  its sessions on worker k. A path bind, @c x_local, is one node whatever the
  *  platform spreads, and its node keeps the bound file's state in a
- *  @c duct_local_bind_t. A datagram node reads into its worker's RX slot
- *  pool, which the engine holds for its whole life. Each node lives on its
+ *  @c duct_local_bind_t. A datagram node owns the three pools it serves —
+ *  its RX slot pool, read into by classification, and the small and large
+ *  TX slot pair its node's workers stage sends into; each pool lives with
+ *  the node, its destroy retiring it and the last slot return reaping it.
+ *  Each node lives on its
  *  owning io thread's list, io-thread-exclusive from registration to free; the
  *  host only ever holds a pointer-free @c {fd, io_id} registry entry. Each node
  *  owns its @c protos array, the @c duct_proto_t elements stay borrowed from
@@ -243,10 +246,20 @@ typedef struct duct_listener {
     bool        rx_parked;      /**< Read interest withdrawn on a dry @c rx_slots,
                                    *  until that pool's resume puts it back.
                                    *  io-thread-private. */
-    uint8_t _Atomic dgram_tx_gso_off;
-    duct_x_slot_pool_t *rx_slots; /**< RX slot pool of this node's worker, held
-                                     *  and freed by the engine; null on a
-                                     *  stream node. */
+    uint8_t _Atomic dgram_tx_gso_off; /**< @c fl_proto_dgram_shared only: set
+                                          *  once the send path learns the
+                                          *  socket's segmentation offload is
+                                          *  off, so every later send of this
+                                          *  listener skips the grouping
+                                          *  attempt. Written by io, read by
+                                          *  both sides relaxed. */
+    duct_x_slot_pool_t *rx_slots; /**< This node's own RX slot pool: the
+                                     *  classification read lands in it, a
+                                     *  datagram arriving before any conn
+                                     *  exists. Retired with the node, and
+                                     *  reaped at the last slot's return, so
+                                     *  a slot held past the close keeps the
+                                     *  pool mapped; null on a stream node. */
     duct_x_slot_pool_t  *tx_slots; /**< The pair of TX slot pools workers stage sends into, small
                                      *  class first. Made by @ref duct_listener_tx_slots_new;
                                      *  nullptr where the listener's TX is not posted from slots. */
@@ -314,9 +327,6 @@ typedef struct duct_listener_route {
                                           *  bind. */
                         n_io;          /**< e->n_io; the fan-out of every other bind, and
                                          *  the modulus giving a node its io thread. */
-    duct_x_slot_pool_t *_Atomic *rx_pools; /**< e->rx_pools, each worker's RX slot
-                                             *  pool by worker index, null until
-                                             *  that worker's first datagram node. */
 } duct_listener_route_t;
 
 /** @brief Output span for registered listener fds, mirroring
@@ -391,6 +401,7 @@ duct_msg_chain_decl(duct_msg_pre_parse,
     duct_listener_t              *listener;
     duct_sock_t                   fd;
     duct_peer_t                   peer;
+    duct_peer_t                   local;
     bool                           fd_registered;
     duct_resolve_disposition_t    decision;    /**< resolve_new / resolve_join / resolve_reject / resolve_not_me. */
     uint16_t                      lead;        /**< Leading bytes of @c payload the preparse consumed. */

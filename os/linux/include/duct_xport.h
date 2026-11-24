@@ -29,11 +29,23 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/uio.h>
+#include <sys/ioctl.h>
 #include <unistd.h>
 
 /** @brief Event a @c poll() @c POLLHUP stands for: the local end hanging up,
  *  as @c EPOLLHUP does. */
 static constexpr duct_io_ev_flags_t duct_x_poll_hup = io_ev_hup;
+
+/** @brief Read how many bytes the socket still holds undelivered.
+ *  @return false where the kernel refuses the reading, @p out untouched. */
+duct_nonnull(2) static inline bool duct_x_dgram_held(int fd, size_t *out)
+{
+    int held = 0u;
+    if (ioctl(fd, FIONREAD, &held) != 0)
+        return false;
+    *out = held > 0 ? (size_t)held : 0u;
+    return true;
+}
 
 static inline void duct_xset_nonblock(int fd)
 {
@@ -326,6 +338,30 @@ duct_xget_tcp_stats(duct_x_sock_stats_t *x, int fd, duct_tcp_stats_t *out)
     return true;
 }
 
+/** @brief One stderr line of a closed tcp socket's kernel wire state: the
+ *  pending error, the socket state, the retransmit and RTO figures, the ages
+ *  of the last data each way, the window. Answers only a close_io_error or a
+ *  close_timeout reason. */
+static inline void duct_x_tcp_close_diag(duct_sock_t fd, duct_close_reason_t reason)
+{
+    if (reason != close_io_error && reason != close_timeout)
+        return;
+    duct_do_if(fd == duct_sock_bad, return);
+    struct tcp_info info;
+    socklen_t len = sizeof info;
+    if (getsockopt(fd, IPPROTO_TCP, TCP_INFO, &info, &len) < 0)
+        return;
+    int so_err = 0;
+    socklen_t so_len = sizeof so_err;
+    duct_discard getsockopt(fd, SOL_SOCKET, SO_ERROR, &so_err, &so_len);
+    duct_log(stderr,
+             "duct: tcp close reason %u fd %d so_error %d state %u retrans %u rto %u "
+             "sent_ms %u recv_ms %u cwnd %u",
+             (unsigned)reason, fd, so_err, info.tcpi_state, info.tcpi_retransmits,
+             info.tcpi_rto, info.tcpi_last_data_sent, info.tcpi_last_data_recv,
+             info.tcpi_snd_cwnd);
+}
+
 /** @brief Read TCP socket @p fd's unsent bytes.
  *  @return @c duct_tx_unsent_unread always: Linux reads no figure. */
 static inline uint64_t duct_xget_tx_unsent([[maybe_unused]] int fd)
@@ -595,6 +631,7 @@ duct_xsend_bufs(int fd, const duct_view_u8 *bufs, unsigned n, unsigned *out_sent
  *  @return @c rc_ok with @p out_read set, 0 for an empty datagram or packet;
  *          @c rc_again on would-block; @c rc_closed for a zero-length read on
  *          any transport but a datagram or packet one; @c rc_drop as above;
+ *          @c rc_frame_too_large on queued @c EMSGSIZE on datagram reads;
  *          @c rc_fatal on any other failure; @c rc_invalid_arg for @c x_udp
  *          without @p ctx and for a transport with no descriptor of its own.
  *          @p out_read is 0 on every outcome but @c rc_ok.
@@ -686,6 +723,11 @@ duct_xread(int fd, duct_xport_t t, duct_view_u8 dst, size_t *out_read, void *ctx
         case EWOULDBLOCK:
 #endif
             return rc_again;
+        case EMSGSIZE:
+            /* Queued EMSGSIZE consumed by recv; report size refusal on datagrams. */
+            if (t == x_udp || t == x_udp_peer)
+                return rc_frame_too_large;
+            [[fallthrough]];
         default:
             duct_dbg_errf("errno %d", errno);
             return rc_fatal;
@@ -823,6 +865,11 @@ duct_xwritev(int fd, duct_xport_t t, const duct_view_u8 *bufs, unsigned n,
         case EWOULDBLOCK:
 #endif
             return rc_again;
+        case EMSGSIZE:
+            /* The wire refuses the frame's size: the datagram dies whole, the
+             * queue moves, the conn lives -- same as the batched send. */
+            duct_dbg_errf("EMSGSIZE, %zu bytes", bufs[0].size);
+            return rc_drop;
         default:
             duct_dbg_errf("errno %d", errno);
             return rc_fatal;
@@ -835,6 +882,107 @@ duct_xwritev(int fd, duct_xport_t t, const duct_view_u8 *bufs, unsigned n,
     }
     *out_written = (size_t)r;
     return rc_ok;
+}
+
+static constexpr size_t duct_x_cmsg_cap = 128u;
+
+duct_nonnull(1, 2, 3, 6) static inline void
+duct_x_cmsg_append(struct msghdr *mh, struct cmsghdr **cm, size_t *used,
+                   int level, int type, const void *val, size_t len)
+{
+    *cm = *cm ? CMSG_NXTHDR(mh, *cm) : CMSG_FIRSTHDR(mh);
+    if (!*cm)
+        return;
+    (*cm)->cmsg_level = level;
+    (*cm)->cmsg_type = type;
+    (*cm)->cmsg_len = CMSG_LEN(len);
+    memcpy(CMSG_DATA(*cm), val, len);
+    *used += CMSG_SPACE(len);
+}
+
+/** @brief Populate @p mh's ancillary control buffer for optional UDP GSO and/or
+ *  source-address selection (@c PKTINFO). Clears @c msg_control when neither
+ *  is active. */
+duct_nonnull(1, 2) static inline void
+duct_x_tx_cmsg_fill(struct msghdr *mh, void *ctl_buf, size_t ctl_cap,
+                    const duct_peer_t *local, bool has_gso, uint16_t gso_seg)
+{
+    bool has_local = local && (local->family == AF_INET6 || local->family == AF_INET);
+    if (!has_gso && !has_local) {
+        mh->msg_control = nullptr;
+        mh->msg_controllen = 0;
+        return;
+    }
+    memset(ctl_buf, 0, ctl_cap);
+    mh->msg_control = ctl_buf;
+    mh->msg_controllen = ctl_cap;
+    struct cmsghdr *cm = nullptr;
+    size_t used = 0u;
+#ifdef UDP_SEGMENT
+    if (has_gso)
+        duct_x_cmsg_append(mh, &cm, &used, SOL_UDP, UDP_SEGMENT, &gso_seg, sizeof gso_seg);
+#else
+    (void)gso_seg;
+#endif
+    if (has_local) {
+        switch (local->family) {
+#ifdef IPV6_PKTINFO
+        case AF_INET6: {
+            struct in6_pktinfo pi = {};
+            memcpy(&pi.ipi6_addr, local->addr.v6, sizeof pi.ipi6_addr);
+            duct_x_cmsg_append(mh, &cm, &used, IPPROTO_IPV6, IPV6_PKTINFO, &pi, sizeof pi);
+            break;
+        }
+#endif
+#ifdef IP_PKTINFO
+        case AF_INET: {
+            struct in_pktinfo pi = {};
+            memcpy(&pi.ipi_spec_dst, local->addr.v4, sizeof pi.ipi_spec_dst);
+            duct_x_cmsg_append(mh, &cm, &used, IPPROTO_IP, IP_PKTINFO, &pi, sizeof pi);
+            break;
+        }
+#endif
+        default:
+            break;
+        }
+    }
+    if (!used) {
+        mh->msg_control = nullptr;
+        mh->msg_controllen = 0;
+    } else {
+        mh->msg_controllen = used;
+    }
+}
+
+/** @brief Send one already-framed datagram out @p fd to @p addr, optionally
+ *  forcing source address @p local via @c PKTINFO when non-null and set.
+ */
+duct_nonnull(2) static inline bool
+duct_xsend_dgram_from(int fd, const struct sockaddr *addr, socklen_t addrlen,
+                      const duct_peer_t *local, duct_view_u8 payload)
+{
+    if (!local || (local->family != AF_INET && local->family != AF_INET6)) {
+        ssize_t n;
+        do
+            n = sendto(fd, payload.data, payload.size, MSG_NOSIGNAL, addr, addrlen);
+        while (n < 0 && errno == EINTR);
+        return duct_x_send_consumed(n);
+    }
+    struct iovec iov = { .iov_base = payload.data, .iov_len = payload.size };
+    union {
+        struct cmsghdr align;
+        char           bytes[duct_x_cmsg_cap];
+    } ctl;
+    struct msghdr mh = {
+        .msg_name = (void *)addr, .msg_namelen = addrlen,
+        .msg_iov = &iov, .msg_iovlen = 1,
+    };
+    duct_x_tx_cmsg_fill(&mh, ctl.bytes, sizeof ctl.bytes, local, false, 0u);
+    ssize_t n;
+    do
+        n = sendmsg(fd, &mh, MSG_NOSIGNAL);
+    while (n < 0 && errno == EINTR);
+    return duct_x_send_consumed(n);
 }
 
 /** @brief Send one already-framed datagram out @p fd to @p addr.
@@ -850,11 +998,7 @@ duct_xwritev(int fd, duct_xport_t t, const duct_view_u8 *bufs, unsigned n,
 duct_nonnull(2) static inline bool
 duct_xsend_dgram(int fd, const struct sockaddr *addr, socklen_t addrlen, duct_view_u8 payload)
 {
-    ssize_t n;
-    do
-        n = sendto(fd, payload.data, payload.size, MSG_NOSIGNAL, addr, addrlen);
-    while (n < 0 && errno == EINTR);
-    return duct_x_send_consumed(n);
+    return duct_xsend_dgram_from(fd, addr, addrlen, nullptr, payload);
 }
 
 /** @brief Batch-write @p n already-framed buffers out @p fd for @p t.
@@ -911,30 +1055,32 @@ duct_xwrite_batch(int fd, duct_xport_t t, struct mmsghdr *msgs, unsigned n, unsi
  *          @c errno still holding the refusal @ref duct_x_gso_result classifies.
  */
 duct_nonnull(2) static inline bool
-duct_xsend_gso_iov(int fd, struct iovec *base, size_t cnt, size_t seg,
-                   struct sockaddr_storage *addr, socklen_t addrlen)
+duct_xsend_gso_iov_from(int fd, struct iovec *base, size_t cnt, size_t seg,
+                        struct sockaddr_storage *addr, socklen_t addrlen,
+                        const duct_peer_t *local)
 {
     union {
         struct cmsghdr align;
-        char           bytes[CMSG_SPACE(sizeof(uint16_t))];
+        char           bytes[duct_x_cmsg_cap];
     } ctl = {};
     struct msghdr mh = {
         .msg_name = addr, .msg_namelen = addrlen,
         .msg_iov = base, .msg_iovlen = cnt,
-        .msg_control = ctl.bytes, .msg_controllen = sizeof ctl.bytes,
     };
-    auto cm = CMSG_FIRSTHDR(&mh);
-    cm->cmsg_level = SOL_UDP;
-    cm->cmsg_type = UDP_SEGMENT;
-    cm->cmsg_len = CMSG_LEN(sizeof(uint16_t));
-    uint16_t size = (uint16_t)seg;
-    memcpy(CMSG_DATA(cm), &size, sizeof size);
+    duct_x_tx_cmsg_fill(&mh, ctl.bytes, sizeof ctl.bytes, local, true, (uint16_t)seg);
 
     ssize_t sent;
     do
         sent = sendmsg(fd, &mh, MSG_NOSIGNAL);
     while (sent < 0 && errno == EINTR);
     return sent >= 0;
+}
+
+duct_nonnull(2) static inline bool
+duct_xsend_gso_iov(int fd, struct iovec *base, size_t cnt, size_t seg,
+                   struct sockaddr_storage *addr, socklen_t addrlen)
+{
+    return duct_xsend_gso_iov_from(fd, base, cnt, seg, addr, addrlen, nullptr);
 }
 #endif
 
@@ -1005,11 +1151,93 @@ duct_xsend_gso_peers(int fd, const duct_dgram_out_t *msgs, unsigned n)
         iov[cnt++] = (struct iovec){ .iov_base = msgs[i].body.data,
                                      .iov_len = msgs[i].body.size };
     }
-    return duct_x_gso_result(duct_xsend_gso_iov(fd, iov, cnt, duct_x_dgram_len_out(&msgs[0]),
-                                                &ss, len));
+    return duct_x_gso_result(duct_xsend_gso_iov_from(fd, iov, cnt, duct_x_dgram_len_out(&msgs[0]),
+                                                     &ss, len, &msgs[0].local));
 #else
     return rc_not_supported;
 #endif
+}
+
+/** @brief Send @p n records out connected socket @p fd as one @c UDP_SEGMENT
+ *  write cut at @p recs[0]'s length, each record its inline header and its
+ *  payload span.
+ *  @p n is at most @ref duct_x_gso_segs_max, the cut @ref duct_x_gso_group makes.
+ *  @return @c rc_ok with all @p n taken; @c rc_again for a code worth
+ *  repeating; @c rc_not_supported for every other code, which sends the group
+ *  unsegmented, and always in a build whose headers lack @c UDP_SEGMENT.
+ */
+duct_nonnull(2) static inline duct_result_t
+duct_xsend_gso_recs(int fd, const duct_tx_rec_t *recs, unsigned n)
+{
+#ifdef UDP_SEGMENT
+    struct iovec iov[2u * duct_x_gso_segs_max];
+    size_t cnt = 0u;
+    for (unsigned i = 0u; i < n; ++i) {
+        if (recs[i].hdr.size)
+            iov[cnt++] = (struct iovec){ .iov_base = recs[i].hdr.data,
+                                         .iov_len = recs[i].hdr.size };
+        if (recs[i].body.size)
+            iov[cnt++] = (struct iovec){ .iov_base = recs[i].body.data,
+                                         .iov_len = recs[i].body.size };
+    }
+    return duct_x_gso_result(duct_xsend_gso_iov(fd, iov, cnt, duct_x_dgram_len_rec(&recs[0]),
+                                                nullptr, 0));
+#else
+    return rc_not_supported;
+#endif
+}
+
+/** @brief Send @p n records out the connected socket @p fd unsegmented, each
+ *  its inline header and its payload span.
+ *
+ *  One @c sendmmsg, a record's header and payload becoming the two iovecs of
+ *  its message, so the payload reaches the kernel from wherever its record's
+ *  span keeps it; an empty header contributes no iovec. A record a send will
+ *  never carry counts as taken, the datagram discipline of the connected
+ *  socket's ring.
+ *
+ *  @param out_sent records the kernel took, a prefix of @p n.
+ *  @return @c rc_ok with @p out_sent up to @p n, short of it once the socket
+ *          fills; @c rc_drop for a first record too large for the path;
+ *          @c rc_fatal for a socket to close.
+ */
+duct_nonnull(2, 4) static inline duct_result_t
+duct_xsend_recs(int fd, const duct_tx_rec_t *recs, unsigned n, unsigned *out_sent)
+{
+    *out_sent = 0u;
+    assert(n && n <= duct_dgram_tx_batch);
+    struct iovec   iov[2u * duct_dgram_tx_batch];
+    struct mmsghdr msgs[duct_dgram_tx_batch] = {};
+    unsigned cnt = 0u;
+    for (unsigned i = 0u; i < n; ++i) {
+        unsigned start = cnt;
+        if (recs[i].hdr.size)
+            iov[cnt++] = (struct iovec){ .iov_base = recs[i].hdr.data,
+                                         .iov_len = recs[i].hdr.size };
+        if (recs[i].body.size)
+            iov[cnt++] = (struct iovec){ .iov_base = recs[i].body.data,
+                                         .iov_len = recs[i].body.size };
+        msgs[i].msg_hdr.msg_iov = &iov[start];
+        msgs[i].msg_hdr.msg_iovlen = (size_t)(cnt - start);
+    }
+    int r;
+    do
+        r = sendmmsg(fd, msgs, (unsigned)n, MSG_NOSIGNAL);
+    while (r < 0 && errno == EINTR);
+    if (r >= 0) {
+        *out_sent = (unsigned)r;
+        return rc_ok;
+    }
+    if (duct_x_send_retryable(errno))
+        return rc_again;
+    switch (errno) {
+    case EMSGSIZE:
+        duct_dbg_errf("EMSGSIZE, %zu bytes", duct_x_dgram_len_rec(&recs[0]));
+        return rc_drop;
+    default:
+        duct_dbg_errf("errno %d", errno);
+        return rc_fatal;
+    }
 }
 
 /** @brief Send @p n already wire-packed datagrams to @p fd, each from its own
@@ -1034,6 +1262,10 @@ duct_xsend_peers(int fd, const duct_dgram_out_t *msgs_in, unsigned n, unsigned *
     struct sockaddr_storage addrs[n];
     struct iovec            iovs[2u * n];
     struct mmsghdr          msgs[n];
+    union {
+        struct cmsghdr align;
+        char           bytes[duct_x_cmsg_cap];
+    } ctls[n];
     unsigned iv = 0u;
     for (unsigned i = 0u; i < n; ++i) {
         socklen_t len = (socklen_t)duct_io_sockaddr_from_peer(&msgs_in[i].peer, &addrs[i]);
@@ -1049,6 +1281,8 @@ duct_xsend_peers(int fd, const duct_dgram_out_t *msgs_in, unsigned n, unsigned *
                 .msg_iov = &iovs[start], .msg_iovlen = iv - start,
             },
         };
+        duct_x_tx_cmsg_fill(&msgs[i].msg_hdr, ctls[i].bytes, sizeof ctls[i].bytes,
+                            &msgs_in[i].local, false, 0u);
     }
 
     if (n > 1u) {
@@ -1065,8 +1299,9 @@ duct_xsend_peers(int fd, const duct_dgram_out_t *msgs_in, unsigned n, unsigned *
 
 /** @brief Fill up to @p n of @p bufs from @p fd in one @c recvmmsg, reporting
  *  each datagram's length in @p out_lens.
- *  @p out_peers takes each source and @p out_segs a coalesced read's segment
- *  size; @c nullptr skips either report. Receive counterpart of
+ *  @p out_peers takes each source, @p out_locals each destination (from
+ *  @c PKTINFO when enabled), and @p out_segs a coalesced read's segment size;
+ *  @c nullptr skips any of those reports. Receive counterpart of
  *  @ref duct_xsend_peers: the buf -> mmsghdr translation stays in this header
  *  so the portable read loops carry no platform case. A datagram too large for
  *  its buffer reports @ref duct_dgram_len_truncated as its length; it still
@@ -1074,11 +1309,13 @@ duct_xsend_peers(int fd, const duct_dgram_out_t *msgs_in, unsigned n, unsigned *
  *  kernel handed back.
  *
  *  @return @c rc_ok with @p out_n >= 1; @c rc_again when the socket is empty;
- *  @c rc_fatal otherwise. @p out_n < @p n means the socket ran dry mid-batch.
+ *  @c rc_frame_too_large on queued @c EMSGSIZE; @c rc_fatal otherwise.
+ *  @p out_n < @p n means the socket ran dry mid-batch.
  */
-duct_nonnull(2, 5, 7) static inline duct_result_t
+duct_nonnull(2, 6, 8) static inline duct_result_t
 duct_xrecv_peers(int fd, const duct_view_u8 *bufs, uint32_t n,
-                 duct_peer_t *out_peers, uint32_t *out_lens, uint32_t *out_segs,
+                 duct_peer_t *out_peers, duct_peer_t *out_locals,
+                 uint32_t *out_lens, uint32_t *out_segs,
                  uint32_t *out_n)
 {
     *out_n = 0u;
@@ -1088,8 +1325,9 @@ duct_xrecv_peers(int fd, const duct_view_u8 *bufs, uint32_t n,
     struct mmsghdr          msgs[n];
     union {
         struct cmsghdr align;
-        char           bytes[CMSG_SPACE(sizeof(uint16_t))];
+        char           bytes[duct_x_cmsg_cap];
     } ctls[n];
+    bool need_ctl = out_segs != nullptr || out_locals != nullptr;
     for (uint32_t i = 0u; i < n; ++i) {
         iovs[i] = (struct iovec){ .iov_base = bufs[i].data, .iov_len = bufs[i].size };
         msgs[i] = (struct mmsghdr){ .msg_hdr = { .msg_iov = &iovs[i], .msg_iovlen = 1 } };
@@ -1097,7 +1335,7 @@ duct_xrecv_peers(int fd, const duct_view_u8 *bufs, uint32_t n,
             msgs[i].msg_hdr.msg_name = &addrs[i];
             msgs[i].msg_hdr.msg_namelen = sizeof addrs[i];
         }
-        if (out_segs) {
+        if (need_ctl) {
             msgs[i].msg_hdr.msg_control = ctls[i].bytes;
             msgs[i].msg_hdr.msg_controllen = sizeof ctls[i].bytes;
         }
@@ -1113,6 +1351,9 @@ duct_xrecv_peers(int fd, const duct_view_u8 *bufs, uint32_t n,
         case EWOULDBLOCK:
 #endif
             return rc_again;
+        case EMSGSIZE:
+            /* Queued EMSGSIZE consumed by recv; datagrams behind it wait for next read. */
+            return rc_frame_too_large;
         default:
             duct_dbg_errf("errno %d", errno);
             return rc_fatal;
@@ -1122,19 +1363,49 @@ duct_xrecv_peers(int fd, const duct_view_u8 *bufs, uint32_t n,
                     ? duct_dgram_len_truncated : msgs[i].msg_len;
         if (out_peers)
             out_peers[i] = duct_io_peer_from_sockaddr((struct sockaddr *)&addrs[i]);
-        if (!out_segs)
+        if (out_locals)
+            out_locals[i] = (duct_peer_t){};
+        if (out_segs)
+            out_segs[i] = 0u;
+        if (!need_ctl)
             continue;
-        out_segs[i] = 0u;
-#ifdef UDP_GRO
         for (auto cm = CMSG_FIRSTHDR(&msgs[i].msg_hdr); cm;
-             cm = CMSG_NXTHDR(&msgs[i].msg_hdr, cm))
-            if (cm->cmsg_level == SOL_UDP && cm->cmsg_type == UDP_GRO) {
+             cm = CMSG_NXTHDR(&msgs[i].msg_hdr, cm)) {
+#ifdef UDP_GRO
+            if (out_segs && cm->cmsg_level == SOL_UDP && cm->cmsg_type == UDP_GRO) {
                 uint16_t seg = 0u;
                 memcpy(&seg, CMSG_DATA(cm), sizeof seg);
                 out_segs[i] = seg;
-                break;
+                continue;
             }
 #endif
+#ifdef IPV6_PKTINFO
+            if (out_locals && cm->cmsg_level == IPPROTO_IPV6 && cm->cmsg_type == IPV6_PKTINFO) {
+                struct in6_pktinfo pi;
+                memcpy(&pi, CMSG_DATA(cm), sizeof pi);
+                if (IN6_IS_ADDR_V4MAPPED(&pi.ipi6_addr)) {
+                    out_locals[i] = (duct_peer_t){ .family = AF_INET };
+                    memcpy(out_locals[i].addr.v4, pi.ipi6_addr.s6_addr + 12,
+                           sizeof out_locals[i].addr.v4);
+                } else {
+                    out_locals[i] = (duct_peer_t){ .family = AF_INET6 };
+                    memcpy(out_locals[i].addr.v6, &pi.ipi6_addr,
+                           sizeof out_locals[i].addr.v6);
+                }
+                continue;
+            }
+#endif
+#ifdef IP_PKTINFO
+            if (out_locals && cm->cmsg_level == IPPROTO_IP && cm->cmsg_type == IP_PKTINFO) {
+                struct in_pktinfo pi;
+                memcpy(&pi, CMSG_DATA(cm), sizeof pi);
+                out_locals[i] = (duct_peer_t){ .family = AF_INET };
+                memcpy(out_locals[i].addr.v4, &pi.ipi_spec_dst,
+                       sizeof out_locals[i].addr.v4);
+                continue;
+            }
+#endif
+        }
     }
     *out_n = (uint32_t)r;
     return r > 0 ? rc_ok : rc_again;

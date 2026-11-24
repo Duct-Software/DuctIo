@@ -62,6 +62,18 @@
 [[maybe_unused]] constexpr uint32_t duct_dgram_tx_batch        = @DUCT_DGRAM_TX_BATCH@u;
 [[maybe_unused]] constexpr uint64_t duct_dgram_batch_wait_ns   = @DUCT_DGRAM_BATCH_WAIT_US@ull * 1000ull;
 [[maybe_unused]] constexpr unsigned duct_dgram_rx_max_passes   = @DUCT_DGRAM_RX_MAX_PASSES@u;
+[[maybe_unused]] constexpr size_t   duct_wire_ct_buf_max       = @DUCT_WIRE_CT_BUF_MAX@u;
+[[maybe_unused]] constexpr uint32_t duct_wire_ct_chunks        = @DUCT_WIRE_CT_CHUNKS@u;
+[[maybe_unused]] constexpr size_t   duct_device_rx_span_max    = @DUCT_DEVICE_RX_SPAN_MAX@u;
+[[maybe_unused]] constexpr uint32_t duct_preconn_slots         = @DUCT_PRECONN_SLOTS@u;
+[[maybe_unused]] constexpr size_t   duct_preconn_peek_max      = @DUCT_PRECONN_PEEK_MAX@u;
+[[maybe_unused]] constexpr size_t   duct_conn_park_cap         = @DUCT_CONN_PARK_CAP@u;
+[[maybe_unused]] constexpr uint32_t duct_conn_retry_tx_nodes   = @DUCT_CONN_RETRY_TX_NODES@u;
+[[maybe_unused]] constexpr uint32_t duct_conn_retry_tx_copies  = @DUCT_CONN_RETRY_TX_COPIES@u;
+[[maybe_unused]] constexpr size_t   duct_conn_retry_tx_copy_max = @DUCT_CONN_RETRY_TX_COPY_MAX@u;
+[[maybe_unused]] constexpr uint32_t duct_session_retry_emit_nodes  = @DUCT_SESSION_RETRY_EMIT_NODES@u;
+[[maybe_unused]] constexpr uint32_t duct_session_retry_timer_nodes = @DUCT_SESSION_RETRY_TIMER_NODES@u;
+[[maybe_unused]] constexpr uint32_t duct_session_defer_bytes    = @DUCT_SESSION_DEFER_BYTES@u;
 [[maybe_unused]] constexpr size_t   duct_cacheline_size        = @DUCT_CACHELINE_SIZE@u;
 
 /* Longest spin on one idle stretch, shared by the worker loop and every events
@@ -98,5 +110,11 @@
 [[maybe_unused]] constexpr size_t   duct_wfq_byte_quota_norm   = @DUCT_WFQ_BYTE_QUOTA_NORM@u;
 
 [[maybe_unused]] constexpr bool     duct_handshake_mask        = @DUCT_HANDSHAKE_MASK@ != 0;
+
+/* Compiler capability probes. */
+#define DUCT_HAS_PTR_COUNTED_BY      @DUCT_PTR_COUNTED_BY@
+#define DUCT_HAS_ZERO_CALL_USED_REGS @DUCT_ZERO_CALL_USED_REGS@
+#define DUCT_HAS_MEMSET_EXPLICIT     @DUCT_MEMSET_EXPLICIT@
+#define DUCT_HAS_EXPLICIT_BZERO      @DUCT_EXPLICIT_BZERO@
 
 #endif /* DUCT_BUILD_CONFIG_H */

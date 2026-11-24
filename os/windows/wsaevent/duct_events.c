@@ -36,6 +36,14 @@
  */
 static constexpr unsigned events_max_handles = WSA_MAXIMUM_WAIT_EVENTS;
 
+/** @brief Slots the wait set never hands to watches: the wake event's own
+ *  slot, the RIO completion's, and the headroom the wait's other consumers
+ *  keep. Registrations guard against the ceiling less this reserve. */
+static constexpr unsigned events_wsa_reserve = 8u;
+
+/** @brief The highest slot index a watch or a promote may take. */
+static constexpr unsigned events_watch_ceiling = events_max_handles - events_wsa_reserve;
+
 /** @brief RIO extension function table, @c nullptr where RIO is off.
  *  Set once by @ref s_events_ctor. Every RIO object of this backend, the
  *  completion queue, a ring and a pool, exists only while it is non-null.
@@ -119,10 +127,10 @@ bool duct_events_dgram_shared_rio_capable(void)
 
 duct_events_env_t *duct_events_init(void)
 {
-    auto env = duct_new(duct_events_env_t);
+    duct_auto_del auto env = duct_new(duct_events_env_t);
     duct_do_if(!env, return nullptr);
     auto wake = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-    duct_do_if(!wake, duct_del(env); return nullptr);
+    duct_do_if(!wake, return nullptr);
     env->handles[0] = wake;
     env->slots[0] = (duct_events_slot){ .fd = duct_sock_bad, .kind = io_tag_wake, .handle = wake };
     env->n_entries = 1u;
@@ -153,7 +161,7 @@ duct_events_env_t *duct_events_init(void)
                 WSACloseEvent(rio_ev);
         }
     }
-    return env;
+    return duct_move(env);
 }
 
 void (*duct_events_cancel_io_of(duct_events_env_t *env))(duct_sock_t fd)
@@ -285,9 +293,9 @@ void duct_events_drive_rx(void *tag)
             continue;
         }
         if (rc == rc_drop) {
-            /* Truncated datagram, already discarded by Winsock itself
-             * (WSAEMSGSIZE) — nothing to commit, keep draining. Reset rc
-             * so a stale rc_drop never reaches duct_io_rx_done below. */
+            /* A datagram longer than the buffer, already discarded by Winsock
+             * itself (WSAEMSGSIZE) — nothing to commit, keep draining. Reset
+             * rc so a stale rc_drop never reaches duct_io_rx_done below. */
             rc = rc_again;
             continue;
         }
@@ -383,36 +391,35 @@ fail:
  */
 static bool s_listener_create_rio(duct_events_env_t *env, duct_listener_t *listener)
 {
-    auto ctx = duct_new(listener_ctx_t);
+    duct_auto_del auto ctx = duct_new(listener_ctx_t);
     duct_do_if(!ctx, return false);
     ctx->listener = listener;
     bool ok = s_rio_dgram_init(env, ctx);
-    duct_do_if(!ok, duct_del(ctx); return false);
+    duct_do_if(!ok, return false);
     bool posted = duct_rio_rx_prime(s_rio,ctx->rio_rx);
     duct_do_if(!posted,
         duct_rio_rx_destroy(s_rio,ctx->rio_rx);
         duct_events_dgram_tx_pool_free(listener);
-        duct_del(ctx);
         return false
     );
     ctx->next = env->rio_listeners;
-    env->rio_listeners = ctx;
+    env->rio_listeners = duct_move(ctx);
     return true;
 }
 
 static bool s_probe_park_watch(duct_events_env_t *env, duct_sock_t fd, void *tag_ptr)
 {
     bool armed = env->probe_slot != UINT_MAX;
-    duct_do_if(!armed && env->n_entries >= events_max_handles, return false);
+    duct_do_if(!armed && env->n_entries >= events_watch_ceiling, return false);
     auto ev = armed ? env->probe_event : WSACreateEvent();
     duct_do_if(!armed && ev == WSA_INVALID_EVENT, return false);
-    auto park = duct_new(probe_park_t);
+    duct_auto_del auto park = duct_new(probe_park_t);
     duct_do_if(!park, goto fail);
     *park = (probe_park_t){ .fd = fd, .pre_conn = (duct_pre_conn_t *)tag_ptr };
     int rc = WSAEventSelect(fd, ev, FD_READ | FD_CLOSE);
-    duct_do_if(rc == SOCKET_ERROR, duct_del(park); goto fail);
+    duct_do_if(rc == SOCKET_ERROR, goto fail);
     park->next = env->probe_parks;
-    env->probe_parks = park;
+    env->probe_parks = duct_move(park);
     duct_do_if(armed, return true);
     env->probe_event = ev;
     env->probe_slot = env->n_entries++;
@@ -475,7 +482,7 @@ bool duct_events_watch(duct_events_env_t *env, duct_sock_t fd,
     }
     if (kind == io_tag_pre_conn && ((duct_pre_conn_t *)tag_ptr)->kind == pre_conn_probe)
         return s_probe_park_watch(env, fd, tag_ptr);
-    duct_do_if(env->n_entries >= events_max_handles, return false);
+    duct_do_if(env->n_entries >= events_watch_ceiling, return false);
     long bits = 0;
     switch (kind) {
     case io_tag_listener:
@@ -579,7 +586,7 @@ static unsigned s_device_slot(duct_events_env_t *env, const void *handle)
  * closed. A duplicate is refused because unwatch matches by handle alone. */
 bool duct_events_watch_device(duct_events_env_t *env, void *handle, void *tag_ptr)
 {
-    duct_do_if(env->n_entries >= events_max_handles, return false);
+    duct_do_if(env->n_entries >= events_watch_ceiling, return false);
     unsigned dup = s_device_slot(env, handle);
     duct_do_if(dup != UINT_MAX, return false);
     unsigned i = env->n_entries++;
@@ -611,8 +618,11 @@ bool duct_events_promote(duct_events_env_t *env, duct_sock_t fd, void *tag_ptr)
 {
     unsigned i = s_find_slot(env, fd);
     if (i == UINT_MAX) {
-        duct_do_if(!s_probe_park_detach(env, fd), return false);
-        duct_do_if(env->n_entries >= events_max_handles, return false);
+        /* A fresh fd promotes too -- the hop's swapped-in socket was never
+         * watched. A parked probe detaches first, as before; anything else
+         * takes the full conn set here. */
+        duct_discard s_probe_park_detach(env, fd);
+        duct_do_if(env->n_entries >= events_watch_ceiling, return false);
         auto ev = WSACreateEvent();
         duct_do_if(ev == WSA_INVALID_EVENT, return false);
         int rc = WSAEventSelect(fd, ev, FD_READ | FD_WRITE | FD_CLOSE);

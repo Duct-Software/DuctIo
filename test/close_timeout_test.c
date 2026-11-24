@@ -5,10 +5,11 @@
  * @file close_timeout_test.c
  * @brief A session closed with close_timeout behind a peer that reads nothing.
  *
- * The server streams 64 KB responses into a 1 MB TX ring behind a raw client
- * that never reads, until for 200 ms the ring takes no further response, and
- * then closes the session with close_timeout. The close lands within a second,
- * the ring still over half full and dropped with the conn.
+ * The server streams responses — a sixteenth of the ring each, the build's
+ * per-conn ceiling sizing it — into its TX ring behind a raw client that never
+ * reads, until for 200 ms the ring takes no further response, and then closes
+ * the session with close_timeout. The close lands within a second, the ring
+ * still over half full and dropped with the conn.
  */
 
 #include "duct.h"
@@ -21,6 +22,15 @@ static constexpr unsigned wait_ms       = 5000u;
 static constexpr uint64_t close_by_ns   = 1'000'000'000u;
 
 static constexpr uint64_t full_for_ns  = 200'000'000u;
+/** @brief TX ring capacity the protocol asks of a conn, bytes: the build's
+ *  per-conn ceiling, which a carved tx region can never exceed. */
+static constexpr size_t ring_cap       = duct_conn_tx_olb_cap;
+/** @brief One streamed response, a sixteenth of the ring — the share the
+ *  megabyte-ring form of this scenario streamed, so the ring's refusing a
+ *  response still means it holds all but that share. */
+static constexpr size_t chunk          = ring_cap / 16u;
+
+static_assert(chunk <= 65536u, "the staging buffer holds one chunk");
 
 static uint8_t          g_chunk[65536];
 static uint64_t         g_full_since;
@@ -46,10 +56,9 @@ srv_on_timer(duct_session_t *s, duct_response_t *out, [[maybe_unused]] void *pro
 {
     if (duct_atomic_load(&g_closing, relaxed))
         return rc_ok;
-    if (duct_conn_tx_fits(s, duct_conn_id_primary, sizeof g_chunk)) {
+    if (duct_conn_tx_fits(s, duct_conn_id_primary, chunk)) {
         g_full_since = 0u;
-        duct_response_same(out, duct_view(duct_view_u8, g_chunk, sizeof g_chunk),
-                           fl_send_static, 0);
+        duct_response_same(out, duct_view(duct_view_u8, g_chunk, chunk), fl_send_static, 0);
         return rc_ok;
     }
     uint64_t now = duct_ticks_mono_ns();
@@ -96,8 +105,8 @@ int main(void)
     auto proto = wire ? duct_proto_create(&(duct_proto_cfg_t){
         .name = "close-timeout-srv", .wire = wire, .on_frame = srv_on_frame,
         .on_session_open = srv_on_open, .on_timer = srv_on_timer,
-        .on_session_close = srv_on_close, .max_response = sizeof g_chunk,
-        .tx_olb_cap = (size_t)1u << 20u,
+        .on_session_close = srv_on_close, .max_response = chunk,
+        .tx_olb_cap = ring_cap,
     }) : nullptr;
     if (proto)
         proto->owned_wire = wire;
@@ -122,7 +131,7 @@ int main(void)
             err = "connect failed";
         else if (!th_wait_int(&g_closing, 1, wait_ms))
             err = "the ring never filled behind a peer that reads nothing";
-        else if (duct_atomic_load(&g_queued_at_close, relaxed) < ((size_t)1u << 19u))
+        else if (duct_atomic_load(&g_queued_at_close, relaxed) < ring_cap / 2u)
             err = "the ring held too little at the close to prove a discard";
         else if (!th_wait_int(&g_closed, 1, wait_ms))
             err = "a close on timeout waited for a drain the peer never takes";
