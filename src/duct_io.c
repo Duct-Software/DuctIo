@@ -536,7 +536,8 @@ static void s_connect_error(const duct_wfq_route_t *route,
 static void s_frame_refused(duct_conn_t *conn)
 {
     auto tok = duct_atomic_load(&conn->session_token, acquire);
-    duct_do_if(!duct_xport_delimited(conn->xport_type) || tok == handle_null, return);
+    bool delimited = duct_xport_delimited(conn->xport_type);
+    duct_do_if(!delimited || tok == handle_null, return);
     auto h = (duct_session_handle_t){ .word = tok };
     duct_worker_post_leg_error(conn->worker_id, &h, rc_frame_too_large);
 }
@@ -3913,11 +3914,10 @@ static bool s_tx_send_batch(duct_conn_t *conn, const duct_io_xfer_t *p,
         if (sent < n)
             *rc = rc_again;
         break;
-    case rc_drop: {
+    case rc_drop:
         size_t len = duct_x_dgram_len_rec(&recs[sent]);
         duct_discard s_tx_advance(conn, len, len);
         break;
-    }
     default:
         break;
     }
@@ -3970,13 +3970,12 @@ bool duct_io_tx_send(void *tag, const duct_io_xfer_t *p, duct_result_t *out_rc)
     rc = duct_xwritev(p->fd, p->xport_type, p->iov, p->iov_n, &nwritten, flags);
 advance:
     switch (rc) {
-    case rc_ok: {
+    case rc_ok:
         /* Whole or short, the send went: the cursor steps, and a refusal the
          * drive met stays for the drive's end. */
         bool go_on = s_tx_advance(conn, offered, nwritten);
         duct_discard s_tx_answer(conn, out_rc, rc);
         return go_on;
-    }
     case rc_drop:
         duct_discard s_tx_advance(conn, offered, offered);
         return s_tx_answer(conn, out_rc, rc);
@@ -5419,7 +5418,8 @@ static void s_device_holds_release(duct_device_leg_t *leg)
 
 void duct_io_device_teardown(duct_conn_t *conn)
 {
-    duct_do_if(conn->xport_type != x_inter || !duct_conn_device_ops(conn), return);
+    auto link = duct_conn_device_ops(conn);
+    duct_do_if(conn->xport_type != x_inter || !link, return);
     s_device_holds_release(duct_conn_device_leg(conn));
 }
 
@@ -5733,7 +5733,8 @@ static void s_device_drive(duct_conn_t *conn)
 void duct_io_on_device(void *tag)
 {
     auto conn = s_conn_from_tag(tag);
-    duct_do_if(!conn || !duct_conn_device_ops(conn), return);
+    auto link = conn ? duct_conn_device_ops(conn) : nullptr;
+    duct_do_if(!link, return);
     s_device_drive(conn);
 }
 

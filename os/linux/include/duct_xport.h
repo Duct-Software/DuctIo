@@ -693,7 +693,7 @@ duct_xread(int fd, duct_xport_t t, duct_view_u8 dst, size_t *out_read, void *ctx
             n = recv(fd, dst.data, dst.size, flags);
         while (n < 0 && errno == EINTR);
     break;
-    case x_udp_peer: {
+    case x_udp_peer:
         /* MSG_TRUNC reports the real datagram size even when it exceeds
          * dst.size, and the check past the switch below turns an oversized n
          * into rc_drop. A coalesced read is one unit to that rule,
@@ -728,7 +728,7 @@ duct_xread(int fd, duct_xport_t t, duct_view_u8 dst, size_t *out_read, void *ctx
                     *out_seg = seg;
                 }
 #endif
-    } break;
+    break;
     case x_udp:
         duct_do_if(!ctx, return rc_invalid_arg);
         do
@@ -862,13 +862,12 @@ duct_xwritev(int fd, duct_xport_t t, const duct_view_u8 *bufs, unsigned n,
             r = writev(fd, iov, (int)n);
         while (r < 0 && errno == EINTR);
         break;
-    case x_tcp: case x_bt: case x_can: case x_udp_peer: case x_local: {
+    case x_tcp: case x_bt: case x_can: case x_udp_peer: case x_local:
         struct msghdr msg = { .msg_iov = iov, .msg_iovlen = n };
         do
             r = sendmsg(fd, &msg, flags | MSG_NOSIGNAL);
         while (r < 0 && errno == EINTR);
         break;
-    }
     case x_udp:
     case x_inter:
     case x_udp_shared:
@@ -926,25 +925,23 @@ duct_x_tx_cmsg_fill(struct msghdr *mh, void *ctl_buf, size_t ctl_cap,
     if (has_gso)
         duct_x_cmsg_append(mh, &cm, &used, SOL_UDP, UDP_SEGMENT, &gso_seg, sizeof gso_seg);
 #else
-    (void)gso_seg;
+    duct_discard gso_seg;
 #endif
     if (has_local) {
         switch (local->family) {
 #ifdef IPV6_PKTINFO
-        case AF_INET6: {
-            struct in6_pktinfo pi = {};
-            memcpy(&pi.ipi6_addr, local->addr.v6, sizeof pi.ipi6_addr);
-            duct_x_cmsg_append(mh, &cm, &used, IPPROTO_IPV6, IPV6_PKTINFO, &pi, sizeof pi);
+        case AF_INET6:
+            struct in6_pktinfo pi6 = {};
+            memcpy(&pi6.ipi6_addr, local->addr.v6, sizeof pi6.ipi6_addr);
+            duct_x_cmsg_append(mh, &cm, &used, IPPROTO_IPV6, IPV6_PKTINFO, &pi6, sizeof pi6);
             break;
-        }
 #endif
 #ifdef IP_PKTINFO
-        case AF_INET: {
-            struct in_pktinfo pi = {};
-            memcpy(&pi.ipi_spec_dst, local->addr.v4, sizeof pi.ipi_spec_dst);
-            duct_x_cmsg_append(mh, &cm, &used, IPPROTO_IP, IP_PKTINFO, &pi, sizeof pi);
+        case AF_INET:
+            struct in_pktinfo pi4 = {};
+            memcpy(&pi4.ipi_spec_dst, local->addr.v4, sizeof pi4.ipi_spec_dst);
+            duct_x_cmsg_append(mh, &cm, &used, IPPROTO_IP, IP_PKTINFO, &pi4, sizeof pi4);
             break;
-        }
 #endif
         default:
             break;

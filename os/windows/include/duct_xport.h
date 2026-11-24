@@ -798,7 +798,7 @@ duct_xread(SOCKET fd, duct_xport_t t, duct_view_u8 dst,
         *out_seg = 0u;
     switch (t) {
     case x_udp_peer:
-    case x_udp: {
+    case x_udp:
         /* Both UDP kinds read through WSARecvMsg wherever a segment size can
          * arrive and be reported, x_udp naming the source as well. A flagged
          * read keeps the recv form: WSARecvMsg takes dwFlags as output alone. */
@@ -820,7 +820,6 @@ duct_xread(SOCKET fd, duct_xport_t t, duct_view_u8 dst,
                             (struct sockaddr *)name, &(int){ sizeof *name })
                  : recv(fd, (char *)dst.data, (int)dst.size, flags);
         break;
-    }
     case x_raw:
     case x_tcp: case x_bt: case x_can: case x_local:
         n = recv(fd, (char *)dst.data, (int)dst.size, flags);

@@ -454,7 +454,7 @@ duct_xread(int fd, duct_xport_t t, duct_view_u8 dst, size_t *out_read, void *ctx
             n = recv(fd, dst.data, dst.size, flags);
         while (n < 0 && errno == EINTR);
     break;
-    case x_udp_peer: {
+    case x_udp_peer:
         /* Darwin reports the copied length; recvmsg output flag identifies a
          * consumed oversized packet. */
         struct iovec iov = { .iov_base = dst.data, .iov_len = dst.size };
@@ -466,7 +466,7 @@ duct_xread(int fd, duct_xport_t t, duct_view_u8 dst, size_t *out_read, void *ctx
         while (n < 0 && errno == EINTR);
         if (n >= 0 && (mh.msg_flags & MSG_TRUNC))
             return rc_drop;
-    } break;
+    break;
     case x_udp:
         duct_do_if(!ctx, return rc_invalid_arg);
         do
@@ -591,13 +591,12 @@ duct_xwritev(int fd, duct_xport_t t, const duct_view_u8 *bufs, unsigned n,
             r = writev(fd, iov, (int)n);
         while (r < 0 && errno == EINTR);
         break;
-    case x_tcp: case x_bt: case x_can: case x_udp_peer: case x_local: {
+    case x_tcp: case x_bt: case x_can: case x_udp_peer: case x_local:
         struct msghdr msg = { .msg_iov = iov, .msg_iovlen = n };
         do
             r = sendmsg(fd, &msg, flags | MSG_NOSIGNAL);
         while (r < 0 && errno == EINTR);
         break;
-    }
     case x_udp:
     case x_inter:
     case x_udp_shared:

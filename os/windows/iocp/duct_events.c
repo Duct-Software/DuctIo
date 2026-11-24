@@ -659,7 +659,7 @@ void duct_events_drive_tx(void *tag)
         case NO_ERROR:
             duct_io_tx_done(tag, verdict);
             return;
-        case WSAEMSGSIZE: {
+        case WSAEMSGSIZE:
             size_t drop_len = 0u;
             for (unsigned i = 0u; i < p.iov_n; ++i)
                 drop_len += p.iov[i].size;
@@ -672,7 +672,6 @@ void duct_events_drive_tx(void *tag)
             verdict = rc_drop;
             duct_discard duct_io_tx_advance(tag, drop_len, drop_len);
             continue;
-        }
         default:
             if (duct_x_send_retryable(err)) {
                 op->ov = (OVERLAPPED){};
@@ -1003,7 +1002,8 @@ bool duct_events_promote(duct_events_env_t *env, duct_sock_t fd, void *tag_ptr)
     /* Already associated by duct_events_watch on the dial/probe path; a
      * hopped-in socket was never watched and associates here first (s_iocp_assoc
      * treats an existing association as success). */
-    duct_do_if(!s_iocp_assoc(env, fd), return false);
+    bool assoc = s_iocp_assoc(env, fd);
+    duct_do_if(!assoc, return false);
     duct_events_drive_rx(tag_ptr);
     return true;
 }
@@ -1397,7 +1397,7 @@ static inline void s_on_completion(duct_events_env_t *env, OVERLAPPED_ENTRY *ent
     switch (kind) {
     case iocp_op_rx:
     case iocp_op_rx_msg:
-    case iocp_op_rx_failed: {
+    case iocp_op_rx_failed:
         /* Fields read ahead of duct_olb_io_done: its release may finalize the
          * slot and hand the block to its next occupant. */
         size_t seg = kind == iocp_op_rx_msg ? duct_x_gro_seg(op->rx_msg->Control) : 0u;
@@ -1409,23 +1409,21 @@ static inline void s_on_completion(duct_events_env_t *env, OVERLAPPED_ENTRY *ent
             s_on_rx_completion(tag, entries[i].dwNumberOfBytesTransferred,
                                entries[i].Internal, seg);
         break;
-    }
-    case iocp_op_tx: {
+    case iocp_op_tx:
         size_t offered = (size_t)op->buf.len;
-        auto hdr = s_op_hdr(op);
+        hdr = s_op_hdr(op);
         duct_olb_io_done(hdr, duct_conn_of_olb_tx(hdr));
         s_on_tx_completion(tag, entries[i].dwNumberOfBytesTransferred, offered, entries[i].Internal);
         break;
-    }
-    case iocp_op_tx_records: {
+    case iocp_op_tx_records:
         unsigned records = op->records;
-        auto hdr = s_op_hdr(op);
+        hdr = s_op_hdr(op);
         duct_olb_io_done(hdr, duct_conn_of_olb_tx(hdr));
         s_on_tx_records_completion(tag, records, entries[i].Internal);
         break;
-    }
     case iocp_op_tx_retry:
-        duct_olb_io_done(s_op_hdr(op), duct_conn_of_olb_tx(s_op_hdr(op)));
+        hdr = s_op_hdr(op);
+        duct_olb_io_done(hdr, duct_conn_of_olb_tx(hdr));
         duct_events_drive_tx(tag);
         break;
     case iocp_op_connect:
